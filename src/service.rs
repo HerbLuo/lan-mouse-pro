@@ -10,8 +10,8 @@ use crate::{
 };
 use futures::StreamExt;
 use lan_mouse_ipc::{
-    AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
-    IpcListenerCreationError, Position, Status,
+    AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, InputChannelConfig,
+    IpcError, IpcListenerCreationError, Position, Status,
 };
 use log;
 use std::{
@@ -239,6 +239,10 @@ impl Service {
             FrontendRequest::UpdateEnterHook(handle, enter_hook) => {
                 self.update_enter_hook(handle, enter_hook)
             }
+            FrontendRequest::SetClientInputChannels(handle, cfg) => {
+                self.update_input_channels(handle, cfg);
+                self.save_config();
+            }
             FrontendRequest::SaveConfiguration => self.save_config(),
         }
     }
@@ -254,6 +258,14 @@ impl Service {
                 pos: c.pos,
                 active: s.active,
                 enter_hook: c.cmd,
+                // STEP-4.5a: forward the per-handle input-channel
+                // selection from runtime `ClientConfig` back to
+                // `ConfigClient` for `From<ConfigClient> for TomlClient`
+                // to write (or omit if == default). Closes the disk ↔
+                // runtime loop: STEP-4.2 stored the field on disk,
+                // STEP-4.5a (this step) reads it back from disk; this
+                // line ensures writes go the other way too.
+                input_channels: c.input_channels,
             })
             .collect();
         self.config.set_clients(clients);
@@ -596,6 +608,18 @@ impl Service {
     fn update_enter_hook(&mut self, handle: ClientHandle, enter_hook: Option<String>) {
         self.client_manager.set_enter_hook(handle, enter_hook);
         self.broadcast_client(handle);
+    }
+
+    /// Per-input-event transport selection (datagram vs reliable
+    /// stream) for the given outgoing client. Sender-side only — the
+    /// receiver doesn't see this preference. Mirrors the
+    /// `update_enter_hook` flow: setter → broadcast → save_config.
+    /// No mid-session hot reload yet (STEP-5.x wires
+    /// `PeerSession::with_config` at dial time).
+    fn update_input_channels(&mut self, handle: ClientHandle, cfg: InputChannelConfig) {
+        if self.client_manager.set_input_channels(handle, cfg) {
+            self.broadcast_client(handle);
+        }
     }
 
     fn broadcast_client(&mut self, handle: ClientHandle) {

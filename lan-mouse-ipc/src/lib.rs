@@ -140,6 +140,20 @@ pub struct ClientConfig {
     pub pos: Position,
     /// enter hook
     pub cmd: Option<String>,
+    /// Per-input-event transport selection (datagram vs reliable stream).
+    /// Sender-side preference; the receiver has no parallel concept. See
+    /// [`InputChannelConfig`] and STEP-4.4 `route_input` for the routing
+    /// side. The GTK client editor (STEP-4.5) writes this when the user
+    /// flips the mouse-button / keyboard channel dropdowns.
+    ///
+    /// `#[serde(default)]` makes the field backward-compatible: existing
+    /// GTK / daemon wire payloads that don't carry this field deserialize
+    /// as `InputChannelConfig::default()` (mouse → datagram,
+    /// keyboard → stream). Required because the wire is consumed by
+    /// older daemons that pre-date ChannelMode (STEP-4.1) and would
+    /// otherwise fail with "missing field `input_channels`".
+    #[serde(default)]
+    pub input_channels: InputChannelConfig,
 }
 
 impl Default for ClientConfig {
@@ -150,6 +164,7 @@ impl Default for ClientConfig {
             fix_ips: Default::default(),
             pos: Default::default(),
             cmd: None,
+            input_channels: InputChannelConfig::default(),
         }
     }
 }
@@ -232,6 +247,44 @@ mod input_channel_tests {
         let s = serde_json::to_string(&cfg).unwrap();
         let back: InputChannelConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn client_config_input_channels_default_when_missing() {
+        // Wire payload that pre-dates ChannelMode / InputChannelConfig.
+        // Must deserialize cleanly via #[serde(default)] on the new
+        // `input_channels` field; otherwise the GTK editor on a fresh
+        // build would fail every time it talks to a pre-M1 daemon.
+        let legacy = r#"{
+            "hostname": "peer-east",
+            "fix_ips": [],
+            "port": 4242,
+            "pos": "right",
+            "cmd": null
+        }"#;
+        let cfg: ClientConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cfg.input_channels, InputChannelConfig::default());
+        assert_eq!(cfg.input_channels.mouse_button, ChannelMode::Datagram);
+        assert_eq!(cfg.input_channels.keyboard, ChannelMode::Stream);
+    }
+
+    #[test]
+    fn client_config_input_channels_round_trip() {
+        // Forward direction: writer (new build) sends the field,
+        // reader (new build) decodes the same value back. Mirrors
+        // `add_with_config_preserves_input_channels` on the lan-mouse
+        // side; together they prove the IPC chain doesn't drop the
+        // field.
+        let cfg = ClientConfig {
+            input_channels: InputChannelConfig {
+                mouse_button: ChannelMode::Stream,
+                keyboard: ChannelMode::Datagram,
+            },
+            ..ClientConfig::default()
+        };
+        let s = serde_json::to_string(&cfg).unwrap();
+        let back: ClientConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.input_channels, cfg.input_channels);
     }
 }
 
@@ -338,6 +391,10 @@ pub enum FrontendRequest {
     RemoveAuthorizedKey(String),
     /// change the hook command
     UpdateEnterHook(u64, Option<String>),
+    /// Per-input-event transport selection for the given outgoing
+    /// client (see [`InputChannelConfig`] on [`ClientConfig`]).
+    /// Sender-side only; the receiver side never sees this preference.
+    SetClientInputChannels(ClientHandle, InputChannelConfig),
     /// save config file
     SaveConfiguration,
 }

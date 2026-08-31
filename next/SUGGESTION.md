@@ -215,3 +215,98 @@ struct Default = fieldwise(field1.default(), field2.default(), ...)
 
 **待 Leader 决策**：决定是否将本条目合入工程内规（"凡涉及多个字段有业务
 关联规则的 config struct，必须手写 Default + 单测覆盖"），纳入 README / AGENTS.md。
+
+---
+
+## #S-12 🟠 高：STEP-4.5 前置 IPC 链路缺失 —— GTK 下拉框无处可写（**流程性问题，已停工待决策**）
+
+**触发**：STEP-4.5（执行前闸 1 调研阶段发现，**未写任何代码**）
+
+**现象**：
+STEP-4.5 要求"打开已有 peer 时回填下拉值；保存写回 `ClientConfig`"。但
+主仓 `lan_mouse_ipc::ClientConfig`（lib.rs:132-143）**没有** `input_channels`
+字段，`FrontendRequest`（lib.rs:308-343）**没有** `SetClientInputChannels`
+变体。GTK 侧拿不到值也送不出值。
+
+**关键区分**（易混淆，STEP-4.2 归档也没点破）：
+
+| 类型 | 位置 | 有 `input_channels`？ |
+|---|---|---|
+| `config::ConfigClient` | `src/config.rs:277` | ✅ STEP-4.2 已加（**磁盘/内存 config**） |
+| `ipc::ClientConfig` | `lan-mouse-ipc/src/lib.rs:132` | ❌ **缺** —— GTK 实际读的是这个 |
+
+`src/client.rs:30 add_with_config()` 把 `ConfigClient` 转成 `ClientConfig`
+时，`input_channels` 字段直接被丢弃（转换体里没这一行）。所以 STEP-4.2 落
+的 schema 目前是"只进磁盘、不进运行时"的半条链路。
+
+**根因**：
+STEP-4.1 按 PLAN §4.1 字面只加了 `ChannelMode` + `InputChannelConfig` 两个
+裸类型，PLAN 未把"IPC 传输链路"单列成小步。bak 的对应实现需要 3 件（见下），
+其中 2 件落在 `lan-mouse-ipc`，1 件落在 `src/service.rs`。
+
+**bak 对位（已验证可搬）**：
+- `mousehop-ipc/src/lib.rs:453` `pub input_channels: InputChannelConfig` +
+  `#[serde(default)]`（后兼容：旧 daemon 配置反序列化不丢字段）
+- `mousehop-ipc/src/lib.rs:770` `FrontendRequest::SetClientInputChannels(ClientHandle, InputChannelConfig)`
+- `mousehop/src/service.rs:411-413` 处理臂 → `update_input_channels(handle, cfg)`
+- GTK 侧：`client_row.ui` 两个 `AdwComboRow` + `imp.rs` block/unblock 信号 +
+  `window.rs:330-352` 单信号 `request-input-channels-change`（**两个下拉合并
+  发一次 IPC**，避免 daemon 侧 split-brain）
+
+**建议处置（三选一，待 Leader 定）**：
+- **方案 A（推荐）**：把 STEP-4.5 拆 `4.5a`（IPC 链路 3 件 + client.rs 透传）
+  / `4.5b`（GTK 两个 AdwComboRow + 回填/写回）。每子步 ≤ 35min，端到端可用。
+  跨 crate 但完全落在 PLAN §0.1 "鼠标 button/键盘 stream-or-datagram 可切换"
+  验收项内，**不触碰 §9 任一条**（尤其不加 `TransportEvent`）。
+- **方案 B**：只做 GTK 控件（哑控件，回填恒 default、改动不落盘），IPC 留后。
+  风险：交付一个用户可见但无效的控件，且 STEP-4.6 文档会描述不存在的行为。
+- **方案 C**：Leader 在 PLAN-M1.md 新增小步 `STEP-4.1b`（IPC 链路），先执行
+  4.1b 再回 4.5。步子最干净，但需 Leader 改 PLAN（只读文档）。
+
+**优先级**：🟠 高（阻塞 STEP-4.5 + 影响 STEP-4.6 文档措辞，共 ≥2 STEP）
+
+---
+
+**STEP-4.5a 闭环（2026-08-31）—— 方案 A 已落实 4.5a 部分**：
+
+- `lan-mouse-ipc/src/lib.rs:131-156` `ClientConfig.input_channels` + `#[serde(default)]` ✅
+- `lan-mouse-ipc/src/lib.rs:341-345` `FrontendRequest::SetClientInputChannels` ✅
+- `lan-mouse/src/service.rs` `update_input_channels` + 处理臂 ✅
+- `lan-mouse/src/client.rs:30-50 add_with_config()` 透传 `input_channels` ✅（半条链路 bug 修复）
+- `lan-mouse/src/service.rs save_config()` 反向透传 ✅（闭合 loop）
+- 2 个 ipc 测试（向后兼容 + round-trip）✅
+- 2 个 client 测试（透传 + setter 契约）✅ — 待 STEP-6.x 跑通
+
+剩余：GTK 控件层（`client_row.ui` 两个 AdwComboRow + 回填/写回）→ STEP-4.5b。
+本条目进入"待 Leader 评审后删除"状态（建议 4.5b 完成后一起删）。
+
+---
+
+## #S-13 🟡 中：PLAN §4.5 的文件名与控件类型与实际代码不符
+
+**触发**：STEP-4.5
+
+**现象**：
+PLAN §4.5 / §2 TR-5 / §6 搬运矩阵均写 `lan-mouse-gtk/src/ui/client_editor.rs`
++ `ComboBoxText`。实际：
+
+- **主仓与 bak 都没有** `src/ui/` 目录，也没有 `client_editor.rs`
+- peer 编辑 UI 实际是 `resources/client_row.ui`（`AdwExpanderRow` 模板）
+  + `src/client_row/imp.rs`（`CompositeTemplate`）+ `src/client_row.rs`
+- 既有 `position` 下拉用的是 **`AdwComboRow`**（client_row.ui:58），
+  bak 的两个 channel 下拉同样用 `AdwComboRow`（bak client_row.ui:98/112）
+
+**根因**：PLAN §4.5 的文件名/控件名疑似沿用更早期草稿或凭印象所写，未与
+实际 GTK 架构对位。
+
+**建议处置**：按实际架构走 `client_row` + `AdwComboRow`——
+1. 与既有 `position` 下拉风格一致（同一个 AdwExpanderRow 内的行内下拉）
+2. 与 bak 参考实现 100% 对位，可直接搬运
+3. `GtkComboBoxText` 在 libadwaita 场景已 deprecated，且不适合放进
+   `AdwExpanderRow` 的行式布局
+
+Leader 确认后由我在 STEP-4.5.md 记为 PLAN-M1 偏差归档；建议 Leader 同步
+修正 PLAN-M1.md §4.5 / §2 TR-5 / §6 三处文件名。
+
+**优先级**：🟡 中（不影响功能，但 PLAN 与代码不一致会误导后续 STEP-7.5
+"GUI 移除 active_lock 控件"——那一步同样写的是 `client_editor.rs`）

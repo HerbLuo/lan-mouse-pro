@@ -7,7 +7,7 @@ use std::{
 
 use slab::Slab;
 
-use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, Position};
+use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, InputChannelConfig, Position};
 
 use crate::config::ConfigClient;
 
@@ -33,6 +33,15 @@ impl ClientManager {
             port: config_client.port,
             pos: config_client.pos,
             cmd: config_client.enter_hook,
+            // STEP-4.5a: forward the per-handle input-channel
+            // selection. Without this line the `ConfigClient` →
+            // `ClientConfig` conversion silently drops the field, so
+            // whatever the user wrote in `config.toml`
+            // (`input_channels = { ... }`) never reaches the GTK
+            // editor / runtime. Half-link bug introduced by STEP-4.2
+            // (which only stored the field on disk). Mirrored from
+            // bak `mousehop/src/client.rs:1-50 add_with_config`.
+            input_channels: config_client.input_channels,
         };
         let state = ClientState {
             active: config_client.active,
@@ -236,6 +245,25 @@ impl ClientManager {
         }
     }
 
+    /// Update the per-input-event transport selection (datagram vs
+    /// reliable stream) for the given client. Returns `true` only
+    /// when the value changed. Sender-side preference; the receiver
+    /// has no parallel concept. Mirrors the `set_enter_hook` flow:
+    /// return-bool-on-change → broadcast → save_config.
+    pub(crate) fn set_input_channels(
+        &self,
+        handle: ClientHandle,
+        cfg: InputChannelConfig,
+    ) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((c, _)) if c.input_channels != cfg => {
+                c.input_channels = cfg;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// set resolving status of the client
     pub(crate) fn set_resolving(&self, handle: ClientHandle, status: bool) {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
@@ -315,5 +343,65 @@ impl ClientManager {
             .borrow()
             .get(handle as usize)
             .map(|(_, s)| s.ips.clone())
+    }
+}
+
+#[cfg(test)]
+mod client_input_channels_tests {
+    use super::*;
+    use lan_mouse_ipc::{ChannelMode, DEFAULT_PORT};
+
+    /// STEP-4.5a: regression test for the half-link bug STEP-4.2 left
+    /// behind. `ConfigClient` was carrying `input_channels` on disk
+    /// (STEP-4.2), but `add_with_config` was discarding the field on
+    /// the way into `ClientConfig`. This test asserts the field now
+    /// survives the conversion. Will fail (compile or assert) if
+    /// `add_with_config` reverts to dropping `input_channels`.
+    #[test]
+    fn add_with_config_preserves_input_channels() {
+        let cm = ClientManager::default();
+        let cfg_client = ConfigClient {
+            ips: HashSet::new(),
+            hostname: Some("peer-east".into()),
+            port: DEFAULT_PORT,
+            pos: Position::Right,
+            active: false,
+            enter_hook: None,
+            input_channels: InputChannelConfig {
+                mouse_button: ChannelMode::Stream,
+                keyboard: ChannelMode::Datagram,
+            },
+        };
+        let handle = cm.add_with_config(cfg_client);
+        let (c, _) = cm.get_state(handle).unwrap();
+        assert_eq!(c.input_channels.mouse_button, ChannelMode::Stream);
+        assert_eq!(c.input_channels.keyboard, ChannelMode::Datagram);
+    }
+
+    /// STEP-4.5a: setter on `ClientManager`. Returns `true` only when
+    /// the value actually changed — used by the service.rs handler to
+    /// skip the `broadcast_client` + `save_config` round-trip on no-op
+    /// writes (matches the bak mousehop `set_input_channels` contract
+    /// and the project-wide `set_*` family pattern).
+    #[test]
+    fn set_input_channels_returns_true_only_on_change() {
+        let cm = ClientManager::default();
+        let handle = cm.add_client();
+        let gaming = InputChannelConfig {
+            mouse_button: ChannelMode::Datagram,
+            keyboard: ChannelMode::Stream,
+        };
+        // first write: default -> gaming → changed
+        assert!(cm.set_input_channels(handle, gaming));
+        // second write: gaming -> gaming → no change
+        assert!(!cm.set_input_channels(handle, gaming));
+        // third write: gaming -> office → changed
+        let office = InputChannelConfig {
+            mouse_button: ChannelMode::Stream,
+            keyboard: ChannelMode::Datagram,
+        };
+        assert!(cm.set_input_channels(handle, office));
+        let (c, _) = cm.get_state(handle).unwrap();
+        assert_eq!(c.input_channels, office);
     }
 }
