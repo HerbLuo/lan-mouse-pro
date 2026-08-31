@@ -59,6 +59,75 @@
 
 ---
 
+## #S-23 🟡 中：lib 单测 `spawn_local` 全局架构与 `#[tokio::test]` runtime 不匹配 —— **拆 STEP-7.3a**
+
+**触发**：STEP-7.3 调研阶段发现（lib fixture 修复阶段）
+
+**现象**：
+- STEP-7.3 计划 "把 17 个 lib fixture failures 全部修通"
+- 实际分类：
+  - **11 个 STEP-7.3 已修**（Category A 并行 /tmp 隔离 ×3 / Category B spawn_local→tokio::spawn ×2 / Category C 算法/fixture 错位 ×2 / 无效 cargo tree guard 测试改写）
+  - **5 个剩**（Category D — `spawn_local` 全局架构）：
+    - `dial_any_prefers_primary` / `dial_any_all_unreachable_returns_err` —— `dial_any` 内 `joinset.spawn_local` 在 `#[tokio::test(flavor = "current_thread")]` 跑不通
+    - `hello_wrong_magic_closes_connection` —— server `tokio::spawn` 异步路径与 client `client_hello` 同步等待竞争（HELLO_TIMEOUT=3s 短）
+    - `peer_session_round_trip_motion_keyboard` —— `HELLO_TIMEOUT` 在 in-process 慢机时不够
+    - `stream_c_take_releases_quinn_recv_stream` —— timing 同样
+- 这 5 个测试**全部因同一根因**：`spawn_local` 需要 `LocalSet` runtime，`current_thread` flavor 不带 LocalSet
+- 生产路径 `spawn_local` 在 `LocalSet::block_on`（daemon 主循环）里跑没问题；测试 helper 复用 quic_transport 生产代码时 runtime 不一致
+
+**根因**：
+- STEP-6.2 / 6.4 / 6.5 引入 `spawn_local` 时假设测试即生产 runtime（错！）
+- 5 个测试零散分布，多种症状实际同因
+- 修起来不是 "改 fixture" 级别 —— 是 runtime 架构调整
+
+**建议处置（拆 STEP-7.3a）**：
+- **方案 A（推荐，30 min）**：在 test mod 顶层统一 `LocalSet::block_on` 包裹（用 `tokio::task::LocalSet::block_on` + `tokio::runtime::Builder::new_current_thread().enable_all().build()`），或 `#[tokio::test(flavor = "current_thread")]` 后 `LocalSet::enter()` 进 `tokio::task::with_runtime`
+- **方案 B（备选，~1h）**：production 代码 `spawn_local` 全部换 `tokio::spawn`（要求所有 `async fn` Send —— 影响面大）
+- 当前 M1 阶段集成测试 `tests/quic_smoke.rs` 已覆盖核心 supervisor + reconnect 路径（STEP-7.2 验收）；
+  lib 单测失败不阻塞 M1 DoD 第 2 条
+
+**优先级**：🟡 中（实质 M1 验收不被阻塞，但 lib 单测 5 个不绿 — 影响工程整洁度）
+
+---
+
+## #S-24 🟠 高：clippy / fmt 30+ pre-existing errors 累计债务
+
+**触发**：STEP-7.3 验证阶段发现（`cargo clippy --workspace --all-targets -- -D warnings` 报 30 errors）
+
+**现象**：
+- STEP-7.3 改动相关文件（`src/crypto.rs` / `connect.rs` / `quic_transport.rs`）**0 errors**（STEP-7.3 引入 0 clippy 问题）
+- 但 workspace 累计 30 errors 全部 pre-existing：
+  - `src/quic_transport.rs` doc list indentation 11 处（pre-existing）
+  - `src/{client,listen,config,connect}.rs` dead-code 6 处（pre-existing，#S-3 剩余项）
+  - 其它：redundant reference in `info!` argument 2 处 + 其它小 lint
+
+**根因**：M1 STEP-1.x ~ STEP-6.x 全程未跑过 `cargo clippy --workspace --all-targets -- -D warnings` —— 单 crate 测试只跑 `cargo test` / `cargo build`，严格 clippy 门是 PLAN §4 DoD 第 3 条的**收尾**门，由 STEP-7.x 集中跑；STEP-7.1 / 7.2 已落地时未触发此验证（都标 "闸 3 STEP 收尾" ⏸ 跳过，仅 STEP-7.3 集中处理）。
+
+**建议处置**：
+- **方案 A（推荐，~30 min）**：本步 Leader 决策是否在 STEP-7.3 顺手统一清（会触动 ~5 个文件的多处小块改动）
+- **方案 B**：列为 M2 起手 / Plan-M1.1 新增"STEP-7.7b：workspace clippy 累计清理" 微步
+- 本步"进度报告 ⏸"标记为**已知债务已盘点**，具体修复决策由 Leader
+
+**优先级**：🟠 高（直接影响 M1 DoD 第 3 条 — 但不属于 STEP-7.3 范围）
+
+---
+
+## #S-25 🟢 低：`cargo fmt --check` 累计 drift 30+ 处
+
+**触发**：STEP-7.3 验证阶段发现
+
+**现象**：
+- STEP-7.3 编辑的位置（crypto.rs guard 测试 / connect.rs 2 处 fixture 修复 / quic_transport.rs ephemeral_cert + spawn_local）**0 fmt drift**
+- 但 workspace 全仓 fmt drift 30+ 处，分布在 `src/{client,config,connect,listen,quic_transport,crypto}.rs` 等多个 pre-existing 文件
+
+**根因**：fmt check 全程未跑（与 #S-24 同模式）
+
+**建议处置**：方案 A 紧随 #S-24 顺手修，或方案 B 列 M2 起手。
+
+**优先级**：🟢 低（机械问题；非功能阻塞）
+
+---
+
 ## #S-5 🟡 中：`endpoint()` 测试无法在 STEP-1.4 端到端执行
 
 **触发**：STEP-1.4

@@ -2887,13 +2887,25 @@ mod tests {
     use rustls::client::danger::ServerCertVerifier;
     use std::net::{Ipv4Addr, SocketAddrV4};
 
-    /// 测试用临时自签 cert —— 落盘到 `/tmp` 下 ephemeral 子目录（PID 隔离），
-    /// 避免污染用户 cert 路径（`crypto::cert_path()` / `key_path()`）。
+    /// 测试用临时自签 cert —— 落盘到 `/tmp` 下 ephemeral 子目录（PID + nanos
+    /// + 全局 counter 三重隔离），避免污染用户 cert 路径（`crypto::cert_path()`
+    /// / `key_path()`），并让并行跑的多个 test 互不踩同一目录。
     /// 返回 `(cert_chain, key)`，DER 字节直接喂给 `endpoint_with_cert` /
     /// `build_quic_client_config`。
     fn ephemeral_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-        let dir = std::env::temp_dir().join(format!("lan-mouse-quic-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "lan-mouse-quic-test-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            n
+        ));
         let cp = dir.join("cert.pem");
         let kp = dir.join("key.pem");
         crypto::generate_self_signed("lan-mouse-test", &cp, &kp).expect("test cert 自签")
@@ -4319,7 +4331,7 @@ mod tests {
         let (mut write_half, read_half) = tokio::io::duplex(4096);
 
         let (tx, mut rx) = tokio_mpsc::channel::<StreamEvent>(READ_STREAM_BUFFER_CAP);
-        let join_b = spawn_local(read_stream_b_loop(read_half, tx));
+        let join_b = tokio::spawn(read_stream_b_loop(read_half, tx));
 
         // (2) 写一帧 Keyboard Key 事件到 duplex 写半边
         let event = key_event();
@@ -4376,7 +4388,7 @@ mod tests {
         let (mut write_half, read_half) = tokio::io::duplex(4096);
 
         let (tx, mut rx) = tokio_mpsc::channel::<StreamEvent>(2);
-        let join_b = spawn_local(read_stream_b_loop(read_half, tx));
+        let join_b = tokio::spawn(read_stream_b_loop(read_half, tx));
 
         // (2) 写 5 帧
         let events: Vec<ProtoEvent> = (0..5).map(|_| key_event()).collect();

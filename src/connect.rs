@@ -515,18 +515,23 @@ mod tests {
         assert_eq!(entry.backoff, INITIAL_RETRY_BACKOFF * 16);
         assert_eq!(entry.failure_count, 4);
 
-        // 第五次失败：触发熔断阈值 —— backoff 翻到 32x INITIAL，但 cap 在
-        // MAX_RETRY_BACKOFF (30s)；failure_count=5
+        // 第五次失败：触发熔断阈值 —— backoff 翻到 32x INITIAL (16s)；count=5
+        record_retry_failure(&retry_state, handle);
+        let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
+        assert_eq!(entry.backoff, INITIAL_RETRY_BACKOFF * 32, "第五次失败后 backoff 应为 32x INITIAL = 16s");
+        assert_eq!(entry.failure_count, 5, "failure_count 应累加到 5（熔断阈值）");
+
+        // 第六次失败：backoff 翻到 32x INITIAL，但被 cap 在 MAX_RETRY_BACKOFF (30s)；count=6
         record_retry_failure(&retry_state, handle);
         let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
         assert_eq!(entry.backoff, MAX_RETRY_BACKOFF, "backoff 应被 cap 在 MAX_RETRY_BACKOFF");
-        assert_eq!(entry.failure_count, 5, "failure_count 应累加到 5（熔断阈值）");
+        assert_eq!(entry.failure_count, 6, "failure_count 应累加到 6");
 
-        // 第六次失败：backoff 已 cap 不变；failure_count=6
+        // 第七次失败：backoff 已 cap 不变；failure_count=7
         record_retry_failure(&retry_state, handle);
         let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
         assert_eq!(entry.backoff, MAX_RETRY_BACKOFF);
-        assert_eq!(entry.failure_count, 6, "failure_count 应累加到 6");
+        assert_eq!(entry.failure_count, 7, "failure_count 应累加到 7");
     }
 
     /// **STEP-6.5 验收 (2/2) `reconnect_on_peer_close` —— retry gate + clear**：
@@ -573,10 +578,12 @@ mod tests {
         );
 
         // (4) 模拟"再次失败 → 再清"循环 —— 验证 entry 反复创建/清除 OK
+        //     注意：拨号成功 → retry_state.remove() 后再次失败，count 从 1
+        //     重新累加（remove() 即重置语义 —— 与 connect_to_handle 一致）。
         record_retry_failure(&retry_state, handle);
         record_retry_failure(&retry_state, handle);
         let entry = retry_state.borrow().get(&handle).cloned().unwrap();
-        assert_eq!(entry.failure_count, 3, "累加到 3（1 + 2）");
+        assert_eq!(entry.failure_count, 2, "拨号成功清空后再次失败 → count 从 1 重新累加到 2");
         retry_state.borrow_mut().remove(&handle);
         assert!(!retry_state.borrow().contains_key(&handle));
     }

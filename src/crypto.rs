@@ -169,9 +169,8 @@ pub fn load_or_create_server_cert()
     load_or_generate_key_and_cert_der(&cert_path(), &key_path())
 }
 
-/// 自签生成。返回 `(cert_chain, key)`；落盘拆为 `cert_path`（cert PEM）
-/// + `key_path`（key PEM）两个文件（STEP-2.4 / #S-4）；key 文件 0o400
-/// （Unix）权限保持。
+/// 自签生成。返回 `(cert_chain, key)`。落盘拆为 `cert_path` (cert PEM) +
+/// `key_path` (key PEM) 两个文件（STEP-2.4 / #S-4）；key 文件 Unix 权限 0o400。
 pub fn generate_self_signed(
     common_name: &str,
     cert_path: &Path,
@@ -264,6 +263,13 @@ pub fn rustls_server_config_with_verifier(
 ///
 /// server cert 校验下沉到 `quic_transport::TofuVerifier`（STEP-2.6），本函数
 /// 只负责 root cert store + 默认 chain 校验 + 无 client auth。
+///
+/// **STEP-7.3 守护**：虽然 `build_quic_client_config` 不再调本函数（生产路径
+/// 已用 TofuVerifier），但 `crypto::tests::round_trip_generate_and_load` 仍用
+/// 本函数做"ClientConfig 可构造" 单测契约 —— 证明 cert/key DER 同时能作为
+/// server cert 和 client root。保留 + `#[allow(dead_code)]` 让 lib build
+/// 不报 dead warning（test build 会用上）。
+#[allow(dead_code)]
 pub fn rustls_client_config(
     root_cert_der: Vec<CertificateDer<'static>>,
 ) -> Result<Arc<ClientConfig>, Error> {
@@ -279,13 +285,6 @@ pub fn rustls_client_config(
         .with_no_client_auth();
     Ok(Arc::new(cfg))
 }
-
-// === 类型别名 ================================================================
-//
-// `(chain, key)` 透传便利别名，给上层（service.rs / 未来 quic_transport.rs）
-// 一并使用。
-pub type CertificateChain = Vec<CertificateDer<'static>>;
-pub type CertKeyPair = (CertificateChain, PrivateKeyDer<'static>);
 
 // === 单元测试 ================================================================
 
@@ -405,11 +404,18 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 钉契约：M1 STEP-7.3 时整个 workspace 不应再依赖 webrtc-dtls/util。
+    /// 钉契约：M1 STEP-7.3 起整个 workspace **不应** 再依赖 webrtc-dtls / webrtc-util。
+    /// 任何后续 PR 加回这俩依赖时该测试立即红。
     #[test]
-    fn workspace_may_still_depend_on_webrtc_dtls_until_step_7_3() {
+    fn workspace_has_no_webrtc_dtls_or_webrtc_util() {
         const ROOT_TOML: &str = include_str!("../Cargo.toml");
-        // STEP-1.1 / 1.2 仍允许 webrtc-dtls 在；步骤 1.2 才删。
-        let _ = ROOT_TOML.contains("webrtc-dtls");
+        assert!(
+            !ROOT_TOML.contains("webrtc-dtls"),
+            "workspace Cargo.toml 不应出现 webrtc-dtls（M1 STEP-7.3 已下线 DTLS）"
+        );
+        assert!(
+            !ROOT_TOML.contains("webrtc-util"),
+            "workspace Cargo.toml 不应出现 webrtc-util（M1 STEP-7.3 已下线）"
+        );
     }
 }
