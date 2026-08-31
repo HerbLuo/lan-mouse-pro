@@ -411,6 +411,14 @@ hostname = "thorium"
 ips = ["192.168.178.189", "192.168.178.172"]
 # optional port
 port = 4242
+# optional per-client input channel modes.
+# mouse_button and keyboard each accept "datagram" (low latency, may drop
+# on packet loss) or "stream" (reliable and ordered). Mouse motion always
+# uses datagram regardless of this setting.
+# Omitting the key keeps the defaults, which are:
+# input_channels = { mouse_button = "datagram", keyboard = "stream" }
+# For the lowest possible input latency, at the risk of dropped keys:
+# input_channels = { mouse_button = "datagram", keyboard = "datagram" }
 ```
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.

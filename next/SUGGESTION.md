@@ -70,6 +70,18 @@
 
 **优先级**：🟡 中（属"验收机制与 STEP 进度解耦"的记录，无功能阻塞）
 
+**STEP-4.3 补充（2026-08-31）—— 通用绕行手段**：
+本条已连续阻塞 STEP-1.4 / 4.2 / 4.3 的验收命令。STEP-4.3 验证"config.toml
+示例与新 schema 一致"时，改用**不依赖 `lan-mouse` lib** 的手段：临时建
+`/tmp` 一次性 crate，只依赖能编译的 `lan-mouse-ipc` + `toml`，把文档里的
+示例行原样喂给真实类型反序列化，验完 `rm -rf`（不落文件进仓库、不进
+workspace、0 依赖变更）。
+
+建议后续被本条阻塞的 STEP 复用该模式，而不是把"测试跑不通"直接记为遗留 ——
+凡验收目标只涉及 `lan-mouse-ipc` / `lan-mouse-proto` 等**可编译 crate** 的
+类型，都能这样实证。仅当验收目标真的落在 `lan-mouse` lib 内部（如
+`quic_transport` 的 tokio 测试）才需等 STEP-6.x。
+
 ---
 
 ## #S-8 🟢 低：`quic_transport.rs::tests` 引用 `crate::crypto::generate_self_signed` —— 跨模块依赖
