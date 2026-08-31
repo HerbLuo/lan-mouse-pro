@@ -1,4 +1,4 @@
-# STEP-M1.md — M1：用 QUIC 替换 webrtc-dtls + UDP
+# PLAN-M1.md — M1：用 QUIC 替换 webrtc-dtls + UDP
 
 > **M 范围**：仅完成 **传输层** 从 `webrtc-dtls + UDP` 迁移到 `QUIC`。**不含任何剪贴板 / 跨设备文件同步 / h3 / HTTP/3 路径** —— 这些属 M2。
 >
@@ -8,7 +8,7 @@
 > - `max_datagram_size` 随握手生命周期变化（1162 → 1414 字节），**不可缓存**
 > - `quinn::Connection` `Send + Clone`，与 `LocalSet + spawn_local` 完全相容
 >
-> **搬运基线**：`lan-mouse-pro-bak/` M1 + M2 全部已 in-process smoke 全绿；约 18 个文件 ~14000 行 `cp` 即可。**真活清单 ≈ 6 项**（下面"BS 概览"中标 🔧）。
+> **搬运基线**：`lan-mouse-pro-bak/` M1 + M2 全部已 in-process smoke 全绿；约 18 个文件 ~14000 行 `cp` 即可。**真活清单 ≈ 6 项**（下面"STEP 概览"中标 🔧）。
 
 ---
 
@@ -20,11 +20,11 @@
 | ---------------------------------------------------------- | ------------------------------------------------------------ | ------------------ | ------ |
 | 鼠标 / 键盘 / Enter-Leave / Ping-Pong / Hello 握手等价工作 | `src/connect.rs`, `src/listen.rs`                            | 走新 QUIC 通道     |
 | 自签证书 + 指纹白名单持久对端认证                          | `src/crypto.rs` + 新 `src/quic_transport.rs`                 | bak 已有 mTLS 实现 |
-| 探活超时 8s → ≥30s                                         | 由 QUIC `keep_alive_interval` + `max_idle_timeout` 替代      | 见 BS-7.1          |
-| Happy-eyeballs 支持 QUIC                                   | `dial_any()`                                                 | 见 BS-6.4          |
-| 鼠标 button / 键盘 stream-or-datagram 可切换               | `lan-mouse-ipc::ChannelMode` + `route_input`                 | 见 BS-4            |
-| 现有 IPC / CLI / GTK 公共 API 不变                         | `lan-mouse-ipc`, `lan-mouse-cli`, `lan-mouse-gtk/src/lib.rs` | 见 BS-7 末尾确认   |
-| `cargo tree                                                | grep webrtc-dtls` **无输出**                                 | 依赖完全下线       | BS-7.3 |
+| 探活超时 8s → ≥30s                                         | 由 QUIC `keep_alive_interval` + `max_idle_timeout` 替代      | 见 STEP-7.1          |
+| Happy-eyeballs 支持 QUIC                                   | `dial_any()`                                                 | 见 STEP-6.4          |
+| 鼠标 button / 键盘 stream-or-datagram 可切换               | `lan-mouse-ipc::ChannelMode` + `route_input`                 | 见 STEP-4            |
+| 现有 IPC / CLI / GTK 公共 API 不变                         | `lan-mouse-ipc`, `lan-mouse-cli`, `lan-mouse-gtk/src/lib.rs` | 见 STEP-7 末尾确认   |
+| `cargo tree                                                | grep webrtc-dtls` **无输出**                                 | 依赖完全下线       | STEP-7.3 |
 
 ### 0.2 Out of scope（推迟到 M2）
 
@@ -43,20 +43,20 @@
 
 ---
 
-## 1. 大步骤（BS）概览
+## 1. 大步骤（STEP）概览
 
 | #        | 大步骤                              | 小步数 | 估时       | 主真活                                   | 关键文件                                         |
 | -------- | ----------------------------------- | ------ | ---------- | ---------------------------------------- | ------------------------------------------------ |
-| BS-1     | 基础设施 & 传输抽象层               | 4      | 1h45       | 🔧 crypto 抽象                           | `crypto.rs` / `Cargo.toml` / `quic_transport.rs` |
-| BS-2     | 认证 & TLS（mTLS + 信任模型）       | 7      | 3h45       | 🔧 TofuVerifier / AuthorizedKeysVerifier | `quic_transport.rs` / `listen.rs`                |
-| BS-3     | 应用协议握手（PROTOCOL_MAGIC）      | 2      | 1h         | 🔧 proto + Hello.magic                   | `lan-mouse-proto` / `quic_transport.rs`          |
-| BS-4     | 输入通道路由（ChannelMode）         | 6      | 2h45       | 🔧 ipc + config + route + GTK 下拉框     | `lan-mouse-ipc` / `config.rs` / `lan-mouse-gtk`  |
-| BS-5     | 数据通道（Datagram + 3 Stream）     | 4      | 2h45       | ✅ 全搬运                                | `quic_transport.rs`                              |
-| BS-6     | 出入站集成（connect / listen 改写） | 5      | 3h         | ✅ 全搬运                                | `connect.rs` / `listen.rs` / `service.rs`        |
-| BS-7     | 收尾 & 验证（DTLS 下线 + smoke）    | 7      | 3h15       | ✅ 删依赖                                | `Cargo.toml` / `tests/` / `firewall.rs` / 文档   |
+| STEP-1     | 基础设施 & 传输抽象层               | 4      | 1h45       | 🔧 crypto 抽象                           | `crypto.rs` / `Cargo.toml` / `quic_transport.rs` |
+| STEP-2     | 认证 & TLS（mTLS + 信任模型）       | 7      | 3h45       | 🔧 TofuVerifier / AuthorizedKeysVerifier | `quic_transport.rs` / `listen.rs`                |
+| STEP-3     | 应用协议握手（PROTOCOL_MAGIC）      | 2      | 1h         | 🔧 proto + Hello.magic                   | `lan-mouse-proto` / `quic_transport.rs`          |
+| STEP-4     | 输入通道路由（ChannelMode）         | 6      | 2h45       | 🔧 ipc + config + route + GTK 下拉框     | `lan-mouse-ipc` / `config.rs` / `lan-mouse-gtk`  |
+| STEP-5     | 数据通道（Datagram + 3 Stream）     | 4      | 2h45       | ✅ 全搬运                                | `quic_transport.rs`                              |
+| STEP-6     | 出入站集成（connect / listen 改写） | 5      | 3h         | ✅ 全搬运                                | `connect.rs` / `listen.rs` / `service.rs`        |
+| STEP-7     | 收尾 & 验证（DTLS 下线 + smoke）    | 7      | 3h15       | ✅ 删依赖                                | `Cargo.toml` / `tests/` / `firewall.rs` / 文档   |
 | **合计** |                                     | **35** | **~18h15** | 6 项真活                                 |                                                  |
 
-> ⏱ 估时策略：每小步 **20–30 min** 目标值；若某小步突破 **1h**（"其它角色介入"红线），立即**就地拆步**并重新提交本 STEP-M1.md，**不要**继续推进。
+> ⏱ 估时策略：每小步 **20–30 min** 目标值；若某小步突破 **1h**（"其它角色介入"红线），立即**就地拆步**并重新提交本 PLAN-M1.md，**不要**继续推进。
 
 ---
 
@@ -79,13 +79,13 @@
 
 ---
 
-### BS-1 基础设施 & 传输抽象层
+### STEP-1 基础设施 & 传输抽象层
 
-**背景**：M1 的起点是把当前 `src/connect.rs` / `src/listen.rs` / `src/crypto.rs` 直接调用 `webrtc_dtls::*` 与 `webrtc_util::Conn` 的紧耦合剥离。本 BS 不引入 QUIC 行为，仅做"地基 + 抽象层"。
+**背景**：M1 的起点是把当前 `src/connect.rs` / `src/listen.rs` / `src/crypto.rs` 直接调用 `webrtc_dtls::*` 与 `webrtc_util::Conn` 的紧耦合剥离。本 STEP 不引入 QUIC 行为，仅做"地基 + 抽象层"。
 
 ---
 
-#### BS-1.1 `crypto.rs` 与 webrtc-dtls 解耦（Phase 0.2 前置，~30 min） 🔧 TR-1
+#### STEP-1.1 `crypto.rs` 与 webrtc-dtls 解耦（Phase 0.2 前置，~30 min） 🔧 TR-1
 
 **目标**：把 `crypto::load_or_generate_key_and_cert(cert) -> Certificate` 的返回类型从 `webrtc_dtls::crypto::Certificate` 换为 `Vec<rustls::pki_types::CertificateDer<'static>>` + `PrivateKeyDer<'static>`。后续所有步骤不再依赖 `webrtc-dtls`。
 
@@ -117,11 +117,11 @@ ls ~/.local/share/lan-mouse/key.pem    # key 分离持久（与 bak 一致）
 预期：单测通过；key/cert 文件首次生成、再次启动复用同一指纹。
 
 **依赖**：无
-**回退方案**：若现有 `service.rs::new()` 因类型替换破坏超过 5 处，保留 `webrtc_dtls::crypto::Certificate` 类型别名兼容 24h，下一 BS-2 步骤再彻底切。
+**回退方案**：若现有 `service.rs::new()` 因类型替换破坏超过 5 处，保留 `webrtc_dtls::crypto::Certificate` 类型别名兼容 24h，下一 STEP-2 步骤再彻底切。
 
 ---
 
-#### BS-1.2 workspace 加 `quinn` + `rustls` 依赖（~15 min）
+#### STEP-1.2 workspace 加 `quinn` + `rustls` 依赖（~15 min）
 
 **目标**：把 `quinn 0.11` 写入 workspace `[workspace.dependencies]`，并把现有的 `rustls 0.23`（已存在于 `lan-mouse/Cargo.toml`）提升到 workspace 级共享。
 
@@ -144,12 +144,12 @@ grep -nE "webrtc-dtls|webrtc-util" Cargo.toml lan-mouse/Cargo.toml   # 期望：
 
 预期：依赖树出现 `quinn 0.11.x`、`rustls 0.23.x`；workspace 中已无 `webrtc-dtls / webrtc-util`。`lan-mouse` 构建**预期失败**（DTLS 引用仍在 `connect.rs` / `listen.rs`）。
 
-**依赖**：BS-1.1
+**依赖**：STEP-1.1
 **警告**：本步结束**故意让 `lan-mouse` 编译失败** —— 这是为下一步铺路。不要把这一步标注为 "完成 build"。
 
 ---
 
-#### BS-1.3 新建 `quic_transport.rs` 骨架 + lib.rs 注册（~20 min）
+#### STEP-1.3 新建 `quic_transport.rs` 骨架 + lib.rs 注册（~20 min）
 
 **目标**：空 `PeerSession` 模块能编译挂上；不引入任何 QUIC 行为。
 
@@ -161,12 +161,12 @@ grep -nE "webrtc-dtls|webrtc-util" Cargo.toml lan-mouse/Cargo.toml   # 期望：
 **变更要点**：
 
 ```rust
-// 仅占位，BS-1.4 起逐步填实
+// 仅占位，STEP-1.4 起逐步填实
 pub struct PeerSession { /* TODO */ }
 pub enum Error { #[error("not implemented")] NotImplemented }
 ```
 
-不要在这一步定义任何 `pub fn endpoint` / `pub async fn dial` —— 见 BS-1.4。
+不要在这一步定义任何 `pub fn endpoint` / `pub async fn dial` —— 见 STEP-1.4。
 
 **验证**：
 
@@ -175,21 +175,21 @@ cargo check -p lan-mouse
 cargo clippy -p lan-mouse --all-targets -- -D warnings
 ```
 
-预期：**编译通过**（之前 BS-1.2 留下的 `webrtc-dtls` 调用错误本步骤还不修，因为 `quic_transport.rs` 还没替代它；本步只确保新增模块本身不引入错）。
+预期：**编译通过**（之前 STEP-1.2 留下的 `webrtc-dtls` 调用错误本步骤还不修，因为 `quic_transport.rs` 还没替代它；本步只确保新增模块本身不引入错）。
 
-**依赖**：BS-1.2
+**依赖**：STEP-1.2
 **注意**：本步完成意味着 `lan-mouse` 可注册 `pub mod quic_transport;`，但 `connect.rs` 仍调旧 DTLS API，编译仍失败 —— 正常。
 
 ---
 
-#### BS-1.4 `endpoint()` —— UDP socket 包装成 quinn::Endpoint（~30 min）
+#### STEP-1.4 `endpoint()` —— UDP socket 包装成 quinn::Endpoint（~30 min）
 
 **目标**：`pub fn endpoint(addr: SocketAddr) -> Result<Endpoint, Error>` 单测通过；UDP 套接字绑定 + `quinn::Endpoint::new()` + 多 CID + keepalive 配置就位。
 
 **文件**：
 
 - `lan-mouse/src/quic_transport.rs`
-- `lan-mouse/src/listen.rs`（**最小桥接**：暂时禁用 listen 主循环调用 `listen(...)` 改为"占位返回 dummy"，留 BS-6 改造；这一步先不接）
+- `lan-mouse/src/listen.rs`（**最小桥接**：暂时禁用 listen 主循环调用 `listen(...)` 改为"占位返回 dummy"，留 STEP-6 改造；这一步先不接）
 
 **变更要点**：
 
@@ -197,7 +197,7 @@ cargo clippy -p lan-mouse --all-targets -- -D warnings
 - 内部用 `tokio::net::UdpSocket::bind(addr)` → `quinn::Endpoint::new(EndpointConfig, server_cfg, socket)`
 - 配置 `EndpointConfig::default()`（启用 `connection_id_generator` 支持连接迁移）
 - 配置 `TransportConfig`：`max_idle_timeout = Duration::from_secs(30)`（QUIC keepalive 替代 8s 应用层 idle 检测） + `keep_alive_interval = Duration::from_secs(5)`
-- 用**占位** `ServerConfig` / `ClientConfig`（仅 token，无 cert） —— BS-2 填实
+- 用**占位** `ServerConfig` / `ClientConfig`（仅 token，无 cert） —— STEP-2 填实
 - `pub use quinn::Endpoint;`
 
 **验证**：
@@ -216,31 +216,31 @@ cargo test -p lan-mouse quic_transport::endpoint_binds_ipv4_localhost
 
 预期：单测通过。
 
-**依赖**：BS-1.3
+**依赖**：STEP-1.3
 
 ---
 
-### BS-2 认证 & TLS（mTLS + 信任模型）
+### STEP-2 认证 & TLS（mTLS + 信任模型）
 
 **背景**：QUIC 握手复用现有自签证书 + 指纹白名单。M1 在两端都出证书（**mTLS**），客户端加 TOFU 缓存，服务端沿用 `authorized_keys` 显式 allowlist。
 
 ---
 
-#### BS-2.1 `rustls::ClientConfig` 构造 + crypto provider（~30 min）
+#### STEP-2.1 `rustls::ClientConfig` 构造 + crypto provider（~30 min）
 
 **目标**：从 `crypto::rustls_client_config(cert_der, key_der, None)` 拿到 `Arc<rustls::ClientConfig>` 并装载到 `quinn::ClientConfig`；进程启动时 `ring` provider 已 `install_default()`。
 
 **文件**：
 
 - `lan-mouse/src/quic_transport.rs`
-- `lan-mouse/src/crypto.rs`（暴露 `rustls_client_config`，从 BS-1.1 已实现）
+- `lan-mouse/src/crypto.rs`（暴露 `rustls_client_config`，从 STEP-1.1 已实现）
 - `lan-mouse/src/main.rs`（**启动时** `rustls::crypto::ring::default_provider().install_default()`，早于任何 `ClientConfig::builder()`）
 
 **变更要点**：
 
 - `pub fn build_quic_client_config(cert: CertificateDer, key: PrivateKeyDer) -> Result<quinn::ClientConfig>`
 - Provider 必须在 `main()` 顶层安装，否则运行期 panic
-- 不带 verifier 占位（BS-2.6 TofuVerifier）
+- 不带 verifier 占位（STEP-2.6 TofuVerifier）
 
 **验证**：
 
@@ -255,11 +255,11 @@ fn quinn_client_config_loads_rustls_provider() {
 
 预期：单测通过；进程启动后 CLI / GTK / daemon 三种入口都能成功出 dial。
 
-**依赖**：BS-1.4
+**依赖**：STEP-1.4
 
 ---
 
-#### BS-2.2 `dial()` 完成 QUIC TLS 握手（占位 verifier，~30 min）
+#### STEP-2.2 `dial()` 完成 QUIC TLS 握手（占位 verifier，~30 min）
 
 **目标**：连到对端 endpoint 完成 TLS 1.3，返回 `Connection`。
 
@@ -268,7 +268,7 @@ fn quinn_client_config_loads_rustls_provider() {
 **变更要点**：
 
 - `pub async fn dial(ep: &Endpoint, addr: SocketAddr, cert: CertificateDer, key: PrivateKeyDer) -> Result<Connection>`
-- 用 `crypto::rustls_client_config(cert, key, None)` —— `None` 即"Dangerous / 不做 verifier"，**BS-2.6 替换为 TofuVerifier**
+- 用 `crypto::rustls_client_config(cert, key, None)` —— `None` 即"Dangerous / 不做 verifier"，**STEP-2.6 替换为 TofuVerifier**
 - `ep.connect_with(cfg, addr, "lan-mouse")?.await?`
 
 **验证**：
@@ -289,11 +289,11 @@ async fn dial_completes_handshake_against_local_listener() {
 
 预期：`peer_identity()` 非空。
 
-**依赖**：BS-2.1
+**依赖**：STEP-2.1
 
 ---
 
-#### BS-2.3 `accept()` 接受 QUIC 连接（占位 ServerConfig，~30 min）
+#### STEP-2.3 `accept()` 接受 QUIC 连接（占位 ServerConfig，~30 min）
 
 **目标**：服务端接受 QUIC 连接并返回原始 `Connection`。
 
@@ -302,31 +302,31 @@ async fn dial_completes_handshake_against_local_listener() {
 **变更要点**：
 
 - `pub async fn accept(ep: &Endpoint) -> Result<Connection>`
-- `endpoint()` 的 ServerConfig 占位 token（无 cert 出示）—— 满足 BS-2.5 之前 smoke 可跑即可
+- `endpoint()` 的 ServerConfig 占位 token（无 cert 出示）—— 满足 STEP-2.5 之前 smoke 可跑即可
 
 **验证**：
 
-- 跑通 BS-2.2 的 in-process 测试即代表 accept 路径 OK；本步不再单独加测试。
+- 跑通 STEP-2.2 的 in-process 测试即代表 accept 路径 OK；本步不再单独加测试。
 
-**依赖**：BS-2.2
+**依赖**：STEP-2.2
 
 ---
 
-#### BS-2.4 服务端证书持久化身份（~30 min）
+#### STEP-2.4 服务端证书持久化身份（~30 min）
 
 **目标**：`~/.local/share/lan-mouse/cert.pem` + `key.pem` 启动加载；指纹稳定。
 
 **文件**：
 
-- `lan-mouse/src/crypto.rs`（`load_or_create_server_cert()`，已在 BS-1.1 实现；本步补 `cert_path()` 路径计算）
+- `lan-mouse/src/crypto.rs`（`load_or_create_server_cert()`，已在 STEP-1.1 实现；本步补 `cert_path()` 路径计算）
 - `lan-mouse/src/quic_transport.rs`（新 `pub fn endpoint_with_cert(addr, cert, key)` 调用 `crypto` 拼装 ServerConfig）
 - `lan-mouse/src/service.rs`（在 `Service::new()` 用 `endpoint_with_cert(...)` 替换原 `LanMouseListener::new(...)` 中 DTLS 配置）
 
 **变更要点**：
 
-- 证书路径已由 `crypto::cert_path()` 在 BS-1.1 解析
+- 证书路径已由 `crypto::cert_path()` 在 STEP-1.1 解析
 - key 必须 0o400（Unix）/`...` ICACL（Windows）权限
-- **server 端** + **client 端** 都出证书（mTLS：BS-2.5 启用 client 强制校验）
+- **server 端** + **client 端** 都出证书（mTLS：STEP-2.5 启用 client 强制校验）
 
 **验证**：
 
@@ -338,13 +338,13 @@ diff <(cat ~/.local/share/lan-mouse/cert.pem) <(cat /tmp/first_cert.pem)   # 期
 
 预期：cert 稳态持久。
 
-**依赖**：BS-2.3
+**依赖**：STEP-2.3
 
 ---
 
-#### BS-2.5 mTLS：dial 出示 client cert / server 强制 client cert（~30 min）
+#### STEP-2.5 mTLS：dial 出示 client cert / server 强制 client cert（~30 min）
 
-**目标**：服务端的 `rustls::ServerConfig` 装配 `client_cert_verifier`（占位 AuthorizedKeysVerifier；BS-2.7 换真）；客户端的 `rustls::ClientConfig` 出示 client cert chain。
+**目标**：服务端的 `rustls::ServerConfig` 装配 `client_cert_verifier`（占位 AuthorizedKeysVerifier；STEP-2.7 换真）；客户端的 `rustls::ClientConfig` 出示 client cert chain。
 
 **文件**：`lan-mouse/src/quic_transport.rs`
 
@@ -366,11 +366,11 @@ async fn mtls_rejects_no_client_cert() {
 
 预期：单测通过。
 
-**依赖**：BS-2.4
+**依赖**：STEP-2.4
 
 ---
 
-#### BS-2.6 客户端 `TofuVerifier`（fingerprint pinning，~45 min） 🔧 部分
+#### STEP-2.6 客户端 `TofuVerifier`（fingerprint pinning，~45 min） 🔧 部分
 
 **目标**：客户端 TOFU 缓存到 `$XDG_DATA_HOME/lan-mouse/known_peers/<fp>.pin`；二次连接 fingerprint 不匹配 → 拒绝。
 
@@ -399,11 +399,11 @@ async fn tofu_disallows_swap() { ... }
 
 预期：两个测试通过。
 
-**依赖**：BS-2.5
+**依赖**：STEP-2.5
 
 ---
 
-#### BS-2.7 服务端 `AuthorizedKeysVerifier`（显式 allowlist，~30 min） 🔧 部分
+#### STEP-2.7 服务端 `AuthorizedKeysVerifier`（显式 allowlist，~30 min） 🔧 部分
 
 **目标**：server 端用现有 `Arc<RwLock<HashMap<String, IncomingPeerConfig>>>` 做 allowlist；未授权 fingerprint → mTLS 拒绝握手。
 
@@ -428,17 +428,17 @@ bash scripts/trust_neg_test.sh
 
 预期：脚本里伪造 fingerprint 的对端被服务端拒握手。
 
-**依赖**：BS-2.6
+**依赖**：STEP-2.6
 
 ---
 
-### BS-3 应用协议握手（PROTOCOL_MAGIC）
+### STEP-3 应用协议握手（PROTOCOL_MAGIC）
 
 **背景**：QUIC TLS 完成 + 信任模型通过后，立刻在 **Stream A（控制面）** 上做 Hello 握手，魔数错即拒连（**M1 新设计**，bak 已验证）。
 
 ---
 
-#### BS-3.1 `ProtoEvent::Hello` 加 `magic` 字段 + `PROTOCOL_MAGIC` 常量（~30 min） 🔧 TR-2
+#### STEP-3.1 `ProtoEvent::Hello` 加 `magic` 字段 + `PROTOCOL_MAGIC` 常量（~30 min） 🔧 TR-2
 
 **目标**：`Hello` 在现有 `commit: [u8;8]` 之上增加 `magic: [u8;8]`，并在 `lan-mouse-proto/src/lib.rs` 顶部加 `pub const PROTOCOL_MAGIC: [u8;8] = *b"LANMOUSE";`。
 
@@ -469,17 +469,17 @@ fn hello_wrong_magic_decodes_but_typed() {
     let h = ProtoEvent::Hello { magic: *b"WRONGMAG", commit: *b"deadbeef" };
     let (buf, len) = h.into();
     let back: ProtoEvent = buf.try_into().unwrap();
-    // 类型层 decode 依然成功；语义层由 BS-3.2 校验 magic
+    // 类型层 decode 依然成功；语义层由 STEP-3.2 校验 magic
 }
 ```
 
 预期：两单测通过。
 
-**依赖**：BS-2.7
+**依赖**：STEP-2.7
 
 ---
 
-#### BS-3.2 `client_hello` / `server_hello` 实现 + 魔数校验 + 超时（~30 min）
+#### STEP-3.2 `client_hello` / `server_hello` 实现 + 魔数校验 + 超时（~30 min）
 
 **目标**：建连后**第一条**双向 stream 视为 **Stream A（control）**，先做 Hello 握手；magic / commit 不匹配立即 `conn.close(VarInt(0), "hello failed")`。
 
@@ -513,17 +513,17 @@ async fn hello_timeout_aborts_session() {
 
 预期：两个测试通过。
 
-**依赖**：BS-3.1
+**依赖**：STEP-3.1
 
 ---
 
-### BS-4 输入通道路由（ChannelMode）
+### STEP-4 输入通道路由（ChannelMode）
 
-**背景**：M1 保留现有"鼠标 button 走 datagram / 键盘走 stream"的**默认**，但允许用户在 config 切换。本 BS 落地 ChannelMode 的 4 类真活与一份文档。
+**背景**：M1 保留现有"鼠标 button 走 datagram / 键盘走 stream"的**默认**，但允许用户在 config 切换。本 STEP 落地 ChannelMode 的 4 类真活与一份文档。
 
 ---
 
-#### BS-4.1 `lan-mouse-ipc` 加 `ChannelMode` + `InputChannelConfig`（~15 min） 🔧 TR-3
+#### STEP-4.1 `lan-mouse-ipc` 加 `ChannelMode` + `InputChannelConfig`（~15 min） 🔧 TR-3
 
 **目标**：新增 IPC 类型供 config 与 quic_transport 共享。
 
@@ -548,11 +548,11 @@ fn channel_mode_default() {
 
 预期：通过。
 
-**依赖**：BS-3.2
+**依赖**：STEP-3.2
 
 ---
 
-#### BS-4.2 `config.rs` 加 `input_channels` schema（~15 min） 🔧 TR-4
+#### STEP-4.2 `config.rs` 加 `input_channels` schema（~15 min） 🔧 TR-4
 
 **目标**：per-handle 结构 `ConfigClient` 加 `input_channels: InputChannelConfig`（不再 Optional —— 内部统一 default 化）。
 
@@ -575,11 +575,11 @@ fn config_defaults_when_input_channels_missing() { ... }
 
 预期：两单测通过。
 
-**依赖**：BS-4.1
+**依赖**：STEP-4.1
 
 ---
 
-#### BS-4.3 `config.toml` 示例更新（~15 min）
+#### STEP-4.3 `config.toml` 示例更新（~15 min）
 
 **目标**：仓库根 `config.toml` + DOC.md 示例同步。
 
@@ -605,11 +605,11 @@ grep -A 1 input_channels config.toml
 
 预期：单测通过；示例与新 schema 一致。
 
-**依赖**：BS-4.2
+**依赖**：STEP-4.2
 
 ---
 
-#### BS-4.4 `route_input()` 纯函数 + 四个组合测试（~30 min）
+#### STEP-4.4 `route_input()` 纯函数 + 四个组合测试（~30 min）
 
 **目标**：`PeerSession::route_input(&self, &ProtoEvent) -> Channel` 按 per-handle config 分派；纯函数版本 `route_input(cfg: &InputChannelConfig, event: &ProtoEvent) -> Channel` 同步暴露给单测。
 
@@ -628,11 +628,11 @@ grep -A 1 input_channels config.toml
 
 - 四组合单测（与 PLAN-v4.md Step 1.7c 完全一致），不再赘述。
 
-**依赖**：BS-4.3
+**依赖**：STEP-4.3
 
 ---
 
-#### BS-4.5 GTK `client_editor.rs` 加两个 `ComboBoxText`（~45 min） 🔧 TR-5
+#### STEP-4.5 GTK `client_editor.rs` 加两个 `ComboBoxText`（~45 min） 🔧 TR-5
 
 **目标**：peer 编辑对话框暴露 `Mouse button channel` / `Keyboard channel` 两个下拉框。
 
@@ -649,11 +649,11 @@ grep -A 1 input_channels config.toml
 **搬运参考**：`bak/mousehop-gtk/src/ui/client_editor.rs`（GTK 加两下拉框段）
 
 **验证**：手动 GUI 测试：编辑 → 切换 → 保存 → 重开确认持久。
-**依赖**：BS-4.4
+**依赖**：STEP-4.4
 
 ---
 
-#### BS-4.6 README / DOC.md 文档更新（~15 min）
+#### STEP-4.6 README / DOC.md 文档更新（~15 min）
 
 **目标**：用户能看懂两种模式取舍。
 
@@ -662,17 +662,17 @@ grep -A 1 input_channels config.toml
 **变更要点**：抄 `PLAN-v4.md §3.1.6` 原文。
 
 **验证**：人工 review；grep "Stream 模式不丢操作" / "Datagram 模式丢操作"。
-**依赖**：BS-4.5
+**依赖**：STEP-4.5
 
 ---
 
-### BS-5 数据通道（Datagram + 3 Stream 帧协议）
+### STEP-5 数据通道（Datagram + 3 Stream 帧协议）
 
-**背景**：所有 QUIC 应用层 IO 落地。BS-5 不动 connect.rs / listen.rs，只在 `quic_transport.rs` 内自洽能跑通 4 条并发通道（1 datagram + 3 stream）。
+**背景**：所有 QUIC 应用层 IO 落地。STEP-5 不动 connect.rs / listen.rs，只在 `quic_transport.rs` 内自洽能跑通 4 条并发通道（1 datagram + 3 stream）。
 
 ---
 
-#### BS-5.1 `PeerSession::send_motion` 走 `send_datagram` + 降级 stream（~30 min）
+#### STEP-5.1 `PeerSession::send_motion` 走 `send_datagram` + 降级 stream（~30 min）
 
 **目标**：Motion 优先 `send_datagram`，超 `max_datagram_size` 时降级 stream。**每次读 `max_datagram_size()`，不缓存**（PLAN-v4 Step 0.1 结论 D）。
 
@@ -694,11 +694,11 @@ async fn motion_datagram_round_trip() {
 
 预期：通过。
 
-**依赖**：BS-4.4
+**依赖**：STEP-4.4
 
 ---
 
-#### BS-5.2 `StreamBunch` struct + 长度前缀帧 codec（~30 min）
+#### STEP-5.2 `StreamBunch` struct + 长度前缀帧 codec（~30 min）
 
 **目标**：定义 `StreamBunch { a, b, c }` 结构 + 帧 `write_frame` / `read_frame`，单元测试覆盖 codec 正确性。
 
@@ -725,11 +725,11 @@ async fn frame_truncated_rejected() { ... }
 
 预期：两个测试通过。
 
-**依赖**：BS-5.1
+**依赖**：STEP-5.1
 
 ---
 
-#### BS-5.3 3 条 stream 独立读 task + 路由分派（~45 min）
+#### STEP-5.3 3 条 stream 独立读 task + 路由分派（~45 min）
 
 **目标**：每条 stream 一个独立 `spawn_local` 读 task，事件经由 `local_channel::mpsc` 队列；`select!` 合并对外暴露。
 
@@ -754,11 +754,11 @@ async fn stream_frame_round_trip() { ... }
 
 预期：两个测试通过；`streams_are_independent` 显式证明 B 不被 C 阻塞。
 
-**依赖**：BS-5.2
+**依赖**：STEP-5.2
 
 ---
 
-#### BS-5.4 hello_watchdog + datagram_reader + 端到端本地 IO（~30 min）
+#### STEP-5.4 hello_watchdog + datagram_reader + 端到端本地 IO（~30 min）
 
 **目标**：把 `PeerSession::run()` 主干拼起来：连接建立 → 三 stream 打开 + datagram 开始 → hello_watchdog 启 → select! 主循环出事件。
 
@@ -787,17 +787,17 @@ async fn peer_session_round_trip_motion_keyboard() {
 
 预期：通过。
 
-**依赖**：BS-5.3
+**依赖**：STEP-5.3
 
 ---
 
-### BS-6 出入站集成（connect.rs / listen.rs 改造）
+### STEP-6 出入站集成（connect.rs / listen.rs 改造）
 
 **背景**：把 `connect.rs::LanMouseConnection` 与 `listen.rs::LanMouseListener` 整体切到 `PeerSession`。
 
 ---
 
-#### BS-6.1 `connect.rs::LanMouseConnection` 持有 `Rc<PeerSession>`，`send()` 走新通道（~45 min）
+#### STEP-6.1 `connect.rs::LanMouseConnection` 持有 `Rc<PeerSession>`，`send()` 走新通道（~45 min）
 
 **目标**：替换 `connect.rs:46-167` 整段 DTLSConn 路径为 PeerSession 路径；`send()` 调用 `peer.route_input(event)` 决定通道。
 
@@ -823,11 +823,11 @@ cargo test -p lan-mouse connect::tests
 
 预期：通过；旧的 connect::tests 改造不依赖 DTLS 的部分要继续跑通。
 
-**依赖**：BS-5.4
+**依赖**：STEP-5.4
 
 ---
 
-#### BS-6.2 `listen.rs::read_loop` 切到 `PeerSession` + `read_any_frame`（~45 min）
+#### STEP-6.2 `listen.rs::read_loop` 切到 `PeerSession` + `read_any_frame`（~45 min）
 
 **目标**：替换 `listen.rs:248-283` `read_loop` 的 DTLSConn 路径为 PeerSession。
 
@@ -850,11 +850,11 @@ bash scripts/quic_smoke.sh    # 上一步先抄 bak，但这一步确认 listen 
 
 预期：脚本退出码 0。
 
-**依赖**：BS-6.1
+**依赖**：STEP-6.1
 
 ---
 
-#### BS-6.3 `listen.rs`：supervisor 清理 + macOS wake 整合（~30 min）
+#### STEP-6.3 `listen.rs`：supervisor 清理 + macOS wake 整合（~30 min）
 
 **目标**：保留现有 macOS 唤醒后 force-close 行为，与新 PeerSession 路径整合。
 
@@ -870,13 +870,13 @@ bash scripts/quic_smoke.sh    # 上一步先抄 bak，但这一步确认 listen 
 
 **验证**：
 
-- 在 macOS / Linux 各做一次手动 smoke（与 BS-6.2 共用脚本）
+- 在 macOS / Linux 各做一次手动 smoke（与 STEP-6.2 共用脚本）
 
-**依赖**：BS-6.2
+**依赖**：STEP-6.2
 
 ---
 
-#### BS-6.4 `dial_any()` happy-eyeballs 适配 QUIC（~30 min）
+#### STEP-6.4 `dial_any()` happy-eyeballs 适配 QUIC（~30 min）
 
 **目标**：先拨 primary IP，200ms 内不通则并发所有候选。
 
@@ -899,11 +899,11 @@ async fn dial_any_prefers_primary() { ... }
 
 预期：通过。
 
-**依赖**：BS-6.1
+**依赖**：STEP-6.1
 
 ---
 
-#### BS-6.5 `Connection::closed()` → 重连触发（~30 min）
+#### STEP-6.5 `Connection::closed()` → 重连触发（~30 min）
 
 **目标**：连接中断时复用现有 retry 框架自动重连；`RetryState` 接 `ConnectionEvent::Lost(handle, reason)`。
 
@@ -929,17 +929,17 @@ async fn backoff_doubles_on_each_failure() { ... }
 
 预期：与 §7 重连恢复 < 2s 预算吻合。
 
-**依赖**：BS-6.4
+**依赖**：STEP-6.4
 
 ---
 
-### BS-7 收尾 & 验证（DTLS 下线 + smoke）
+### STEP-7 收尾 & 验证（DTLS 下线 + smoke）
 
 **背景**：所有链路绿后，最后一步彻底删 `webrtc-dtls` 与应用层 idle 检测；跑端到端 smoke。
 
 ---
 
-#### BS-7.1 移除 `RECV_IDLE_TIMEOUT`（~15 min）
+#### STEP-7.1 移除 `RECV_IDLE_TIMEOUT`（~15 min）
 
 **目标**：QUIC 自带 keepalive，不再需要应用层 idle 检测。
 
@@ -960,11 +960,11 @@ cargo build -p lan-mouse
 
 预期：5s 静默不触发关闭。
 
-**依赖**：BS-6.5
+**依赖**：STEP-6.5
 
 ---
 
-#### BS-7.2 端到端 QUIC smoke 测试（~45 min）
+#### STEP-7.2 端到端 QUIC smoke 测试（~45 min）
 
 **目标**：两实例通过 QUIC 交换基本事件。
 
@@ -992,11 +992,11 @@ bash scripts/quic_smoke.sh
 
 预期：cargo 测试通过；脚本退出码 0。
 
-**依赖**：BS-7.1
+**依赖**：STEP-7.1
 
 ---
 
-#### BS-7.3 删 `webrtc-dtls` / `webrtc-util` 依赖（~30 min）
+#### STEP-7.3 删 `webrtc-dtls` / `webrtc-util` 依赖（~30 min）
 
 **目标**：workspace 依赖干净。
 
@@ -1007,7 +1007,7 @@ bash scripts/quic_smoke.sh
 
 **变更要点**：
 
-- workspace `Cargo.toml` 删 `webrtc-dtls = "0.12.0"` 与 `webrtc-util = "0.11.0"`（BS-1.2 已经删过；本步二次确认）
+- workspace `Cargo.toml` 删 `webrtc-dtls = "0.12.0"` 与 `webrtc-util = "0.11.0"`（STEP-1.2 已经删过；本步二次确认）
 - 加 `cargo tree | grep -E "webrtc-dtls|webrtc-util"` 自动 guard 测试（与 bak crypto.rs:412 一致）
 
 **验证**：
@@ -1021,11 +1021,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 预期：依赖树干净；workspace 全部测试通过；clippy 无警告。
 
-**依赖**：BS-7.2
+**依赖**：STEP-7.2
 
 ---
 
-#### BS-7.4 `connect.rs` 移除 `active_lock` + `ClientManager::probe_targets`（~30 min）
+#### STEP-7.4 `connect.rs` 移除 `active_lock` + `ClientManager::probe_targets`（~30 min）
 
 **目标**：删除 active_lock 锁定接口机制与多 IP 探测支持（bak 已删；本步搬运）。
 
@@ -1046,11 +1046,11 @@ cargo test -p lan-mouse connect::tests client::tests
 
 预期：通过。
 
-**依赖**：BS-7.3
+**依赖**：STEP-7.3
 
 ---
 
-#### BS-7.5 GUI 移除 `active_lock` 控件（~30 min）
+#### STEP-7.5 GUI 移除 `active_lock` 控件（~30 min）
 
 **目标**：GTK 客户端编辑对话框删除 `active_lock` 相关下拉框。
 
@@ -1059,11 +1059,11 @@ cargo test -p lan-mouse connect::tests client::tests
 **变更要点**：删 "锁定到特定接口" 下拉框 + "探测所有接口延迟" 开关（如果有）。
 
 **验证**：手动 GUI：打开 peer 编辑对话框，断言无 active_lock 控件。
-**依赖**：BS-7.4
+**依赖**：STEP-7.4
 
 ---
 
-#### BS-7.6 `firewall.rs` / `service.rs` 头注释清理（~15 min）
+#### STEP-7.6 `firewall.rs` / `service.rs` 头注释清理（~15 min）
 
 **目标**：旧 `DTLS over UDP` → `QUIC over UDP`，grep 复查。
 
@@ -1081,11 +1081,11 @@ grep -rnE "DTLS|webrtc-dtls|webrtc-util|RECV_IDLE_TIMEOUT" lan-mouse/src lan-mou
 
 预期：无 live code 残留。
 
-**依赖**：BS-7.5
+**依赖**：STEP-7.5
 
 ---
 
-#### BS-7.7 README / DOC.md / CHANGELOG.md 同步（~30 min）
+#### STEP-7.7 README / DOC.md / CHANGELOG.md 同步（~30 min）
 
 **目标**：用户能看出 v4 起的传输层变化。
 
@@ -1098,7 +1098,7 @@ grep -rnE "DTLS|webrtc-dtls|webrtc-util|RECV_IDLE_TIMEOUT" lan-mouse/src lan-mou
 - CHANGELOG `Unreleased` 加条目
 
 **验证**：人工 review。
-**依赖**：BS-7.6
+**依赖**：STEP-7.6
 
 ---
 
@@ -1142,24 +1142,24 @@ M1 全部 35 个小步骤完成 + 下列条件全部成立：
 | 文件                                    | 处理  | 改动点                                                 |
 | --------------------------------------- | ----- | ------------------------------------------------------ |
 | `quic_transport.rs` (新建, ~6009 行)    | ✅    | `Mousehop*` → `LanMouse*`                              |
-| `connect.rs`                            | 🔧    | 替换 DTLSConn 路径为 PeerSession（BS-6.1）             |
-| `listen.rs`                             | 🔧    | 同上（BS-6.2/6.3）                                     |
-| `crypto.rs`                             | 🔧    | BS-1.1：返回类型改 rustls                              |
+| `connect.rs`                            | 🔧    | 替换 DTLSConn 路径为 PeerSession（STEP-6.1）             |
+| `listen.rs`                             | 🔧    | 同上（STEP-6.2/6.3）                                     |
+| `crypto.rs`                             | 🔧    | STEP-1.1：返回类型改 rustls                              |
 | `service.rs`                            | ✅+🔧 | 适配 `Certificate` 类型替换 + if_watch 改造            |
-| `client.rs`                             | 🔧    | 删 `active_lock` / `probe_targets`（BS-7.4）           |
-| `config.rs`                             | 🔧    | `input_channels` 字段 + 默认值（BS-4.2）               |
-| `firewall.rs`                           | 🔧    | 头部注释 `DTLS → QUIC`（BS-7.6）                       |
+| `client.rs`                             | 🔧    | 删 `active_lock` / `probe_targets`（STEP-7.4）           |
+| `config.rs`                             | 🔧    | `input_channels` 字段 + 默认值（STEP-4.2）               |
+| `firewall.rs`                           | 🔧    | 头部注释 `DTLS → QUIC`（STEP-7.6）                       |
 | `lan-mouse/src/main.rs`                 | 🔧    | `ring` provider `install_default`                      |
 | `lan-mouse/src/lib.rs`                  | 🔧    | `mod quic_transport;` 注册                             |
-| `lan-mouse-proto/src/lib.rs`            | 🔧    | `PROTOCOL_MAGIC` + `Hello.magic`（BS-3.1）             |
-| `lan-mouse-ipc/src/lib.rs`              | 🔧    | `ChannelMode` + `InputChannelConfig`（BS-4.1）         |
-| `lan-mouse-gtk/src/ui/client_editor.rs` | 🔧    | 2 个 ComboBox（BS-4.5）+ 删 active_lock 控件（BS-7.5） |
-| `Cargo.toml`（workspace）               | 🔧    | `quinn 0.11`；删 `webrtc-dtls/util`（BS-1.2 + BS-7.3） |
-| `config.toml`（根）                     | 🔧    | `input_channels` 示例（BS-4.3）                        |
-| 文档：README / DOC.md / CHANGELOG.md    | 🔧    | BS-4.6 / BS-7.7                                        |
-| `tests/quic_smoke.rs`                   | ✅    | 抄 bak（BS-7.2）                                       |
-| `tests/input_channel_routing.rs`        | ✅    | 抄 bak（BS-7.2）                                       |
-| `scripts/quic_smoke.sh`                 | ✅    | 抄 bak（BS-7.2）                                       |
+| `lan-mouse-proto/src/lib.rs`            | 🔧    | `PROTOCOL_MAGIC` + `Hello.magic`（STEP-3.1）             |
+| `lan-mouse-ipc/src/lib.rs`              | 🔧    | `ChannelMode` + `InputChannelConfig`（STEP-4.1）         |
+| `lan-mouse-gtk/src/ui/client_editor.rs` | 🔧    | 2 个 ComboBox（STEP-4.5）+ 删 active_lock 控件（STEP-7.5） |
+| `Cargo.toml`（workspace）               | 🔧    | `quinn 0.11`；删 `webrtc-dtls/util`（STEP-1.2 + STEP-7.3） |
+| `config.toml`（根）                     | 🔧    | `input_channels` 示例（STEP-4.3）                        |
+| 文档：README / DOC.md / CHANGELOG.md    | 🔧    | STEP-4.6 / STEP-7.7                                        |
+| `tests/quic_smoke.rs`                   | ✅    | 抄 bak（STEP-7.2）                                       |
+| `tests/input_channel_routing.rs`        | ✅    | 抄 bak（STEP-7.2）                                       |
+| `scripts/quic_smoke.sh`                 | ✅    | 抄 bak（STEP-7.2）                                       |
 
 ---
 
@@ -1167,12 +1167,12 @@ M1 全部 35 个小步骤完成 + 下列条件全部成立：
 
 | 风险                                              | 触发场景                           | 缓解                                                                                |
 | ------------------------------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------- | -------------- |
-| BS-1.1 后 service.rs 多处类型替换连锁编译错误     | 同时改 `Certificate` 类型 + 调用方 | 若失败 > 5 处，BS-1.1 回退方案启用 `Certificate` 类型别名 24h                       |
+| STEP-1.1 后 service.rs 多处类型替换连锁编译错误     | 同时改 `Certificate` 类型 + 调用方 | 若失败 > 5 处，STEP-1.1 回退方案启用 `Certificate` 类型别名 24h                       |
 | `max_datagram_size` 缓存导致 MTU 探测后仍用旧值   | 抖动手抖                           | 严格遵守 PLAN Step 0.1 结论 D，每次发送前读                                         |
 | Windows MSVC `aws_lc_rs` 构建失败                 | 选了错误的 crypto provider         | 已硬编码 `ring` 唯一选项；防退化用 CI `/all-targets` 兜底                           |
 | `libc` / `tokio` 版本升级连带破坏                 | 依赖新增 quinn 触发的关联升级      | 锁 version 至与 bak 一致；升级前先跑 bak `mousehop-spike/`                          |
-| GTK ComboBox 与现有 client_editor 控件 ID 冲突    | 同时改两处                         | BS-4.5 单独步，先 `cargo build -p lan-mouse-gtk` 验证控件树                         |
-| `cargo tree` 显示包了 `webrtc-*`（如 transitive） | 误删某 transitive 依赖             | BS-7.3 加 `cargo tree                                                               | grep` 测试固化 |
+| GTK ComboBox 与现有 client_editor 控件 ID 冲突    | 同时改两处                         | STEP-4.5 单独步，先 `cargo build -p lan-mouse-gtk` 验证控件树                         |
+| `cargo tree` 显示包了 `webrtc-*`（如 transitive） | 误删某 transitive 依赖             | STEP-7.3 加 `cargo tree                                                               | grep` 测试固化 |
 | happy-eyeballs 200ms 阈值太小被防火墙丢弃         | 某些企业网络                       | 调整为 200ms (bak 默认)；后续 milestone 评估                                        |
 | Hello magic 校验失败 silent 丢连接                | 跨版本互通                         | magic 校验失败时警告日志 + IPC 推 `PeerUntrusted`（**M1 推：日志**，IPC 推送延 M2） |
 
@@ -1180,18 +1180,18 @@ M1 全部 35 个小步骤完成 + 下列条件全部成立：
 
 ## 8. 时间表
 
-| 段               | BS         | 估时 | 累计       |
+| 段               | STEP       | 估时 | 累计       |
 | ---------------- | ---------- | ---- | ---------- |
-| 第 1 段          | BS-1 (1-4) | 1h45 | 1h45       |
-| 第 2 段          | BS-2 (1-7) | 3h45 | 5h30       |
-| 第 3 段          | BS-3 (1-2) | 1h   | 6h30       |
-| 第 4 段          | BS-4 (1-6) | 2h45 | 9h15       |
-| 第 5 段          | BS-5 (1-4) | 2h45 | 12h        |
-| 第 6 段          | BS-6 (1-5) | 3h   | 15h        |
-| 第 7 段          | BS-7 (1-7) | 3h15 | 18h15      |
+| 第 1 段          | STEP-1 (1-4) | 1h45 | 1h45       |
+| 第 2 段          | STEP-2 (1-7) | 3h45 | 5h30       |
+| 第 3 段          | STEP-3 (1-2) | 1h   | 6h30       |
+| 第 4 段          | STEP-4 (1-6) | 2h45 | 9h15       |
+| 第 5 段          | STEP-5 (1-4) | 2h45 | 12h        |
+| 第 6 段          | STEP-6 (1-5) | 3h   | 15h        |
+| 第 7 段          | STEP-7 (1-7) | 3h15 | 18h15      |
 | **完成 M1 累计** |            |      | **~18h15** |
 
-> 估算基线：PLAN-v4 Phase 1（~10-12h）+ 当前主仓差异补回（crypto.rs 抽象、Hello.magic、proto 同步等），主要在 BS-1 + BS-3 上。
+> 估算基线：PLAN-v4 Phase 1（~10-12h）+ 当前主仓差异补回（crypto.rs 抽象、Hello.magic、proto 同步等），主要在 STEP-1 + STEP-3 上。
 
 ---
 
@@ -1218,5 +1218,5 @@ M1 全部 35 个小步骤完成 + 下列条件全部成立：
 
 - 每小步完成 → 在本文件 `STEP x.x.md` 单独落地，**不要在本文档里塞过程日志**
 - 跨小步发现的小问题写 SUGGESTION.md，重大问题汇报 LEADER
-- 每 BS 完成同步本表"累计时间"
+- 每 STEP 完成同步本表"累计时间"
 - M1 全部完成后：从 SUGGESTION.md 删除 M1 期间 solved 的项

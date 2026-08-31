@@ -83,9 +83,17 @@ impl Service {
             client_manager.add_with_config(client);
         }
 
-        // load certificate
-        let cert = crypto::load_or_generate_key_and_cert(config.cert_path())?;
-        let public_key_fingerprint = crypto::certificate_fingerprint(&cert);
+        // load certificate (STEP-1.1)
+        // crypto.rs 已经切换到返回 rustls 元组 `(Vec<CertificateDer>, PrivateKeyDer)`.
+        // 当前 service.rs 仍把 listener / connection 的 `cert` 字段置以
+        // `webrtc_dtls::crypto::Certificate` 类型；为避免本步骤连锁改动
+        // listen.rs / connect.rs，本处临时构造旧 `Certificate`（仍走旧路径
+        // 的 `load_or_generate_key_and_cert` 等价物）。
+        //
+        // ⚠️ 见 SUGGESTION #S-1：这是 STEP-1.1 唯一保留旧 API 的地方。
+        // STEP-6.x 切到 PeerSession 时彻底删除。
+        let cert = crypto::load_certificate_compat(config.cert_path())?;
+        let public_key_fingerprint = crypto::certificate_fingerprint_compat(&cert);
 
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;
