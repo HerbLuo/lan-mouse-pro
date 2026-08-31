@@ -6,7 +6,8 @@
 //!
 //! - STEP-1.4（已）：[`endpoint`] —— UDP socket bind + 占位 client-mode Endpoint
 //! - STEP-2.1（已）：[`build_quic_client_config`] + [`install_crypto_provider`]
-//! - STEP-2.2 / 2.3：`dial()` / `accept()`
+//! - STEP-2.2（已）：[`dial`] —— QUIC TLS 1.3 握手完成（占位 verifier）
+//! - STEP-2.3 / 2.4：`accept()` / `endpoint_with_cert()`
 //! - STEP-2.4：`endpoint_with_cert()` 持久化 cert 注入
 //! - STEP-2.6 / 2.7：`TofuVerifier` / `AuthorizedKeysVerifier`
 //! - STEP-3.2：`client_hello` / `server_hello` 握手
@@ -18,14 +19,15 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-// `Endpoint` intentionally excluded from the `use` below — `pub use quinn::Endpoint`
-// at line 26 re-exports it for main-code (Step 6.x's `LanMouseListener::new`),
-// matching the bak quic_transport.rs:84 pattern to avoid name collision.
+// `Endpoint` / `Connection` intentionally excluded from the `use` below —
+// `pub use quinn::Endpoint` / `pub use quinn::Connection` re-export them
+// for main-code (Step 6.x's `LanMouseListener::new`), matching the bak
+// quic_transport.rs:84 pattern to avoid name collision.
 use quinn::{ClientConfig as QuinnClientConfig, EndpointConfig, IdleTimeout, ServerConfig, TransportConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
 
-pub use quinn::Endpoint;
+pub use quinn::{Connection, Endpoint};
 
 /// ALPN 协议标识：QUIC TLS 握手时互换的协议名。
 ///
@@ -62,6 +64,17 @@ pub enum Error {
     EndpointSetup(String),
     #[error("rustls / quic client config failed: {0}")]
     ClientConfig(String),
+    /// `Endpoint::connect_with(...)` 同步失败 —— endpoint 关闭 / 远端地址非法 /
+    /// 当前 endpoint 未配 client config（PLAN §2.2）。
+    #[error("connect_with failed: {0}")]
+    Connect(#[from] quinn::ConnectError),
+    /// QUIC TLS 1.3 握手失败 —— 证书校验不通过 / ALPN 不匹配 / 中断等
+    /// （PLAN §2.2）。`ConnectionError` 含 LocallyClosed / RemoteClosed /
+    /// TransportError / ApplicationClosed 等子类；STEP-2.6 TofuVerifier 替
+    /// 换占位 verifier 后，`rustls::Error::General("untrusted peer ...")`
+    /// 会以 `ConnectionError::TransportError(...)` 形态冒到这里。
+    #[error("handshake failed: {0}")]
+    Handshake(#[from] quinn::ConnectionError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -235,6 +248,62 @@ pub fn build_quic_client_config(
     Ok(client_cfg)
 }
 
+/// 主动拨号到对端 endpoint，完成 QUIC TLS 1.3 握手后返回 [`Connection`]。
+///
+/// **STEP-2.2 占位 verifier**：本函数复用 STEP-2.1 已实现的
+/// [`build_quic_client_config`] —— 当前形态走 `WebPkiServerVerifier` 做
+/// 占位 chain 校验（信任对端的自签 cert 即放行；PLAN §2.1 已说明）。
+/// STEP-2.6 由 `TofuVerifier`（`with_custom_certificate_verifier`）替换
+/// `WebPkiServerVerifier` 路径，调用栈不变。
+///
+/// **参数顺序**：`(ep, addr, cert, key)` —— 与 PLAN §2.2 文字描述一致；
+/// `cert` / `key` 是**对端** server 的 trust anchor 输入（在
+/// `WebPkiServerVerifier::builder(roots, ...)` 链路上用作 root）——
+/// STEP-2.5 起这两个参数同时作为 mTLS **client** 端出示的 cert /
+/// key（`with_client_auth_cert(cert_chain, key)`），签名不变。
+///
+/// **ALPN**：TLS 1.3 握手时声明 `b"lan-mouse"`（在 `build_quic_client_config`
+/// 内设 `rustls_client.alpn_protocols`）。server 端 STEP-2.4 必须对称设
+/// `rustls_server.alpn_protocols = vec![ALPN_LAN_MOUSE.to_vec()]`，否则
+/// ALPN mismatch 直接拒连（SUGGESTION #S-9）。
+///
+/// **`server_name`**：`ep.connect_with(cfg, addr, "lan-mouse")` 的第三个
+/// 参数用于 SNI（Server Name Indication）和 rustls 0.23 的
+/// `ServerCertVerifier::verify_server_cert(..., server_name, ...)` 入参。
+/// 当前 `WebPkiServerVerifier` 不读 server_name（链校验只看 cert）；
+/// STEP-2.6 TofuVerifier 也不读 server_name（只看 fingerprint）。硬编
+/// 码 `"lan-mouse"` 与 ALPN 协议名一致；与 bak `mousehop/src/quic_transport.rs:1855`
+/// 的 `dial_one(... "mousehop")` 对称。
+///
+/// **错误归一**：
+/// - `Endpoint::connect_with` 同步失败（endpoint 关闭 / 地址非法 / 无 client
+///   config）→ [`Error::Connect`]（`#[from] quinn::ConnectError`）
+/// - `.await` 后握手失败（证书 / ALPN / 中断）→ [`Error::Handshake`]
+///   （`#[from] quinn::ConnectionError`）
+///
+/// **不**主动 `install_crypto_provider`：与 `build_quic_client_config` 对称，
+/// 由 `main.rs` / 测试首句显式守护。
+///
+/// **`#[allow(dead_code)]`**：STEP-2.2 仅被测试调用；STEP-6.1
+/// `connect.rs::connect_to_handle` 接入 `MousehopConnection` 路径时一并移除。
+#[allow(dead_code)]
+pub async fn dial(
+    ep: &Endpoint,
+    addr: SocketAddr,
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> Result<Connection> {
+    // 幂等守护：与 build_quic_client_config 对称 —— 即使 caller 已在 main 启
+    // 动期调过一次，测试路径多次进入同一函数依然安全。
+    install_crypto_provider();
+
+    let cfg = build_quic_client_config(cert, key)?;
+    let conn = ep
+        .connect_with(cfg, addr, "lan-mouse")?
+        .await?;
+    Ok(conn)
+}
+
 // === 单元测试 ================================================================
 
 #[cfg(test)]
@@ -242,6 +311,55 @@ mod tests {
     use super::*;
     use crate::crypto;
     use std::net::{Ipv4Addr, SocketAddrV4};
+
+    /// 测试用临时自签 cert（不落盘，避免污染用户 cert 路径）。
+    /// 后续 STEP-2.4 / 2.6 起 `endpoint()` / `dial()` 切到持久化后，
+    /// 单测必须用 `ephemeral_cert()` 隔离用户路径。
+    fn ephemeral_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        crypto::generate_self_signed("lan-mouse-test", None).expect("test cert 自签")
+    }
+
+    /// 测试用 server endpoint 装配：cert + ALPN + ServerConfig + Endpoint。
+    ///
+    /// STEP-2.3 / 2.4 暂未提供 `endpoint_with_cert()` 公共函数；本测试
+    /// 助手**仅**在 `mod tests` 内可见，把 quinn ServerConfig 的最小装配
+    /// 内联起来 —— 与 STEP-2.4 即将引入的 `endpoint_with_cert()` 形态
+    /// 完全对称（rustls::ServerConfig + QuicServerConfig + transport_config
+    /// + Endpoint::new）。STEP-2.4 上线后这个 helper 由公共函数替代。
+    ///
+    /// **no client auth** —— 与 STEP-2.2 当前 `WebPkiServerVerifier` 占位
+    /// 形态对齐（client 端不出 cert）；STEP-2.5 mTLS 启用后这个 helper
+    /// 改为 `with_client_cert_verifier` 形态（同一文件内小改即可）。
+    fn endpoint_with_test_cert(
+        addr: SocketAddr,
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> Result<Endpoint> {
+        use rustls::ServerConfig as RustlsServerConfig;
+
+        // rustls::ServerConfig with ring + no client auth + 单 cert
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut rustls_server = RustlsServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error::ClientConfig(format!("server protocol versions: {e}")))?
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .map_err(|e| Error::ClientConfig(format!("server single_cert: {e}")))?;
+        rustls_server.alpn_protocols = vec![ALPN_LAN_MOUSE.to_vec()];
+
+        let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_server))
+            .map_err(|e| Error::ClientConfig(format!("QuicServerConfig::try_from: {e}")))?;
+        let mut server_cfg = ServerConfig::with_crypto(Arc::new(quic_server));
+        server_cfg.transport_config(default_transport_config());
+
+        let endpoint_cfg = EndpointConfig::default();
+        let socket = UdpSocket::bind(addr).map_err(|source| Error::Bind { addr, source })?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| Error::EndpointSetup("no tokio runtime available".into()))?;
+        let ep = Endpoint::new(endpoint_cfg, Some(server_cfg), socket, runtime)
+            .map_err(|e| Error::EndpointSetup(format!("server Endpoint::new: {e}")))?;
+        Ok(ep)
+    }
 
     /// PLAN §1.4 验收：bind 临时端口、Drop 不 panic。
     #[tokio::test]
@@ -277,5 +395,68 @@ mod tests {
         // ALPN 已被设上 `lan-mouse`（dial 时握手会用到）
         // 注：ClientConfig 的 alpn_protocols 字段是 quinn-proto 私有的；这
         // 里只能断言构造成功，不读内部字段
+    }
+
+    /// PLAN §2.2 验收：同进程内 server endpoint + client endpoint dial，断言
+    /// TLS 1.3 握手完成（`peer_identity()` 非空）。
+    ///
+    /// **测试布局**：
+    /// 1. server 端用 `endpoint_with_test_cert()` + `ephemeral_cert()` 起
+    ///    server endpoint（不污染用户 cert 路径）
+    /// 2. 后台 `tokio::spawn` 跑 `accept()` 拿到 `Connection` 后立即 drop
+    ///    —— STEP-2.3 `accept()` 公共函数尚不存在，但 `Endpoint::accept()`
+    ///    是 quinn 原生 API（`endpoint.accept().await.await` 即拿到 Connection）
+    /// 3. client 端用 `endpoint()` 绑本地 + 调 `dial(...)`，5s 兜底
+    /// 4. 断言 `peer_identity().is_some()` —— TLS 1.3 走通才会到这里
+    ///
+    /// **与 STEP-1.4 同路径的 `cargo test` 跑不通**（lib 因 14 DTLS errors
+    /// 编不过），测试代码就位即可；STEP-6.x 修复后由 Leader 手动跑一次确认
+    /// 通过（SUGGESTION #S-5）。
+    #[tokio::test]
+    async fn dial_completes_handshake_against_local_listener() {
+        install_crypto_provider();
+
+        // (1) server endpoint —— 临时 cert，不落盘
+        let (server_cert_chain, server_key) = ephemeral_cert();
+        let server_ep = endpoint_with_test_cert(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+            server_cert_chain,
+            server_key,
+        )
+        .expect("server endpoint bind 不应失败");
+        let server_addr = server_ep
+            .local_addr()
+            .expect("server endpoint 必须有 local_addr");
+
+        // (2) 后台 accept task：拿 Connection 后立即 drop（不消费业务）
+        //     drop(conn) 触发对端 ConnectionError::LocallyClosed（quinn 0.11 正常断开）。
+        let server_task = tokio::spawn(async move {
+            let incoming = server_ep.accept().await.expect("server accept 不应失败");
+            let conn = incoming.await.expect("server handshake 不应失败");
+            drop(conn);
+        });
+
+        // (3) client endpoint + dial —— 5s 兜底防止永久挂死
+        let (client_cert, client_key) = ephemeral_cert();
+        let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .expect("client endpoint bind 不应失败");
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dial(&client_ep, server_addr, client_cert[0].clone(), client_key),
+        )
+        .await
+        .expect("端到端 TLS 1.3 握手超时")
+        .expect("dial 不应失败");
+
+        // (4) 断言 peer_identity() 非空 —— TLS 1.3 实际走通才会到这里
+        assert!(
+            conn.peer_identity().is_some(),
+            "peer_identity 应非空（TLS 1.3 握手完成）"
+        );
+
+        // (5) 清理：drop conn → server 端 ConnectionError::LocallyClosed
+        drop(conn);
+        server_task.await.expect("server task 不应 panic");
+        client_ep.wait_idle().await;
     }
 }
