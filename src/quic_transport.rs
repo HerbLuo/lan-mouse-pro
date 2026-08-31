@@ -25,7 +25,12 @@
 //! - STEP-4.4（已）：[`Channel`] enum + [`route_input`] 纯函数 —— 按
 //!   `InputChannelConfig` 分派 ProtoEvent → Datagram / StreamA / StreamB；
 //!   StreamC 是 M2 clipboard 元数据预留枚举变体（本步不开 reader task）
-//! - STEP-5.x：数据通道（datagram + 3 stream 实际 IO）
+//! - STEP-5.1（已）：[`PeerSession::send_motion`] —— Motion 走
+//!   `send_datagram`，超 [`MAX_SAFE_DATAGRAM`] / 对端不支持 datagram 时
+//!   降级 inline uni stream；`Error::Datagram(#[from] quinn::SendDatagramError)`
+//!   + `Error::DatagramFallback(String)` 变体承载
+//! - STEP-5.x：数据通道 stream B / C 的 length-prefix frame codec +
+//!   read_loop 接手端到端 IO
 //! - STEP-6.x：出入站集成（替换 `LanMouseConnection` / `LanMouseListener`）
 
 use std::collections::HashMap;
@@ -72,6 +77,19 @@ pub(crate) const ALPN_LAN_MOUSE: &[u8] = b"lan-mouse";
 /// **与 QUIC idle timeout 的关系**：`HELLO_TIMEOUT` 仅在 Hello 阶段生效；
 /// 之后由 `max_idle_timeout = 30s`（[`default_transport_config`]）接管。
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 单个 datagram 的"安全上限"（STEP-5.1 引入）。
+///
+/// 取 STEP-0.1 spike 实测的 QUIC 握手初期下限 `1162` 字节 —— MTU 探测完成前
+/// `max_datagram_size()` 可能先报这个保守值，避免在此期间误用更大的
+/// `max_datagram_size()` 触发 `SendDatagramError::TooLarge`。SPIKE 后值
+/// 可升到 `1414`（路径 MTU 探测完成）但**不缓存**——本常量仅作为
+/// `max_datagram_size().map(|m| m.min(MAX_SAFE_DATAGRAM))` 的取 min 边界，
+/// 防止上层用任何"陈旧的更大值"绕过 cap。
+///
+/// 与 bak `mousehop/src/quic_transport.rs:121-123 MAX_SAFE_DATAGRAM`
+/// 完全对齐（PLAN-v4 Step 0.1 结论 D）。
+const MAX_SAFE_DATAGRAM: usize = 1162;
 
 /// 与对端的一条 QUIC 会话（client / server 共用）—— STEP-5.4 起承担端到端 IO。
 ///
@@ -164,6 +182,31 @@ pub enum Error {
     /// magic 交换）。STEP-3.2 引入。
     #[error("hello handshake timed out after {0:?}")]
     HelloTimeout(Duration),
+    /// QUIC datagram 发送失败（STEP-5.1 引入）。
+    ///
+    /// 包装 [`quinn::SendDatagramError`] —— 包含 `UnsupportedByPeer` /
+    /// `Disabled` / `TooLarge` / `ConnectionLost` 四种。**`ConnectionLost`
+    /// 是连接已死，降级到 stream 也救不回来**，调用方需要据此决策是否上报
+    /// `Error::Handshake`（TODO M2 接入 connect.rs 时细化）；其他三种
+    /// 是"这条路走不通"，由 `send_datagram_or_stream_b` 内部兜底到
+    /// stream B 路径，不冒到这里。
+    ///
+    /// 当前 main-code 仅由 [`PeerSession::send_motion`] 触发；
+    /// STEP-5.2 `send_stream_b` 会引入独立的 [`Error::StreamB`] 变体
+    /// （stream IO 错误——`open_bi` / `write_u32` / `write_all` 等）。
+    #[error("datagram send failed: {0}")]
+    Datagram(#[from] quinn::SendDatagramError),
+    /// 降级到 stream uni 时的 IO 错误（STEP-5.1 引入，**临时**）。
+    ///
+    /// STEP-5.1 的降级路径是 inline `open_uni() + write_all() + finish()`，
+    /// 不复用 STEP-5.2 才定义的 stream B cache + 长度前缀帧。本变体仅
+    /// 承载降级 IO 错误（含 `open_uni` 的 `ConnectionError` /
+    /// `write_all` 的 `WriteError` / `finish` 的 `ClosedStream`），STEP-5.2
+    /// 落地后会被 [`Error::StreamB`] 替换（与 bak
+    /// `mousehop/src/quic_transport.rs:564 Error::StreamB(format!("open_bi: {e}"))`
+    /// 形态对齐）。
+    #[error("datagram fallback stream io failed: {0}")]
+    DatagramFallback(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -671,6 +714,102 @@ impl PeerSession {
     pub async fn take_stream_a_recv(&self) -> Option<RecvStream> {
         let mut g = self.stream_a_cache.lock().await;
         g.as_mut().and_then(|p| p.recv.take())
+    }
+
+    /// 发送高频 motion 输入事件（STEP-5.1 引入）。
+    ///
+    /// **通道选择** —— 优先 QUIC datagram；超 [`MAX_SAFE_DATAGRAM`] /
+    /// 对端不支持 datagram / datagram 发送失败时降级到 stream B
+    /// （[`Self::send_datagram_or_stream_b`]）。
+    ///
+    /// **前置条件**：`hello_ok == true`（应用层 Hello 握手已完成）。若
+    /// `hello_ok == false`，返回 [`Error::HelloFailed`]，**不**碰
+    /// datagram / stream —— 这是 PLAN §3 "mTLS 通了不等于对端是
+    /// lan-mouse" 信任模型的守护（与 bak
+    /// `mousehop/src/quic_transport.rs:471-486 send_motion` 完全对齐）。
+    ///
+    /// **dead_code chain**：STEP-5.4 `PeerSession::run()` 接管读循环后，
+    /// STEP-6.x `LanMouseConnection::send()` 会消费此函数。当前 main-code
+    /// 无 caller，仅测试 + 即将到来的 STEP-6.x caller。
+    #[allow(dead_code)]
+    pub async fn send_motion(&self, event: &ProtoEvent) -> Result<()> {
+        if !self.hello_ok.load(Ordering::Acquire) {
+            return Err(Error::HelloFailed("hello not complete".into()));
+        }
+        // 定长 codec 编码到 `[u8; MAX_EVENT_SIZE]`（21 字节）—— 与 stream B
+        // 读端的 `read_frame` 走同一个定长 `MAX_EVENT_SIZE` 解码路径（datagram
+        // 自带长度，但解码入口统一在 `ProtoEvent::try_from`）。
+        let (buf, _len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
+        self.send_datagram_or_stream_b(&buf).await
+    }
+
+    /// datagram 优先 + stream B 降级（STEP-5.1 引入）。
+    ///
+    /// **判定顺序**：
+    /// 1. `conn.max_datagram_size()` **每次重读**（STEP-0.1 结论 D：值随
+    ///    路径 MTU 探测变化，缓存会导致要么白白降级、要么超限发送失败）。
+    ///    返回 `None` 表示对端不支持 / 本端禁用 datagram → 直接降级。
+    /// 2. 与 [`MAX_SAFE_DATAGRAM`] 取 `min` 作为实际上限 —— 防止 MTU
+    ///    探测完成后 `max_datagram_size()` 报告一个**陈旧**的更大值（quinn
+    ///    内部 path validation 完成后才会扩到 1414，但本端只能读到
+    ///    `Some(>1162)` 时仍应保守地 cap 在 1162 以避免 TooLarge）。
+    /// 3. `conn.send_datagram(...)` —— quinn 0.11 的这个方法本身是
+    ///    **非阻塞**的（拥塞时丢最旧排队 datagram，正是 motion 语义
+    ///    想要的）。返回 `Err` 只有四种：`TooLarge` / `Disabled` /
+    ///    `UnsupportedByPeer` / `ConnectionLost`。前三种是"这条路走不通"
+    ///    → 降级到 stream B；`ConnectionLost` 是连接已死 → 直接上报
+    ///    （降级也救不回来，stream B 上再失败一次也没意义）。
+    ///
+    /// **签名 `&[u8]` 而不是 `&ProtoEvent`**：STEP-5.2 `send_stream_b`
+    /// 收到"已编码字节"时复用同一份 buffer（datagram 失败后复用 buf），
+    /// 且未来 `motion_oversize_falls_back_to_stream` 测试要构造超限裸
+    /// 字节验证降级管道本身（与 bak
+    /// `mousehop/src/quic_transport.rs:507` 签名完全一致）。
+    ///
+    /// **`bytes.to_vec().into()`**：`send_datagram` 收 `bytes::Bytes`，
+    /// `Vec<u8> → Bytes` 零拷贝（接管 Vec 的堆分配）。无需在主仓加
+    /// `bytes` crate 依赖 —— 类型由 quinn 0.11 的 `send_datagram` 签名
+    /// 反向推断。
+    async fn send_datagram_or_stream_b(&self, bytes: &[u8]) -> Result<()> {
+        // 每次重读 max_datagram_size —— 严格遵守 STEP-0.1 结论 D。
+        let limit = self
+            .conn
+            .max_datagram_size()
+            .map(|m| m.min(MAX_SAFE_DATAGRAM));
+
+        if let Some(limit) = limit {
+            if bytes.len() <= limit {
+                match self.conn.send_datagram(bytes.to_vec().into()) {
+                    Ok(()) => return Ok(()),
+                    // 连接已死：降级也救不回来，直接上报
+                    Err(e @ quinn::SendDatagramError::ConnectionLost(_)) => {
+                        return Err(Error::Datagram(e));
+                    }
+                    // TooLarge / Disabled / UnsupportedByPeer：这条路走不通 → 降级
+                    Err(e) => {
+                        log::debug!("datagram 发送失败（{e}），降级到 stream B");
+                    }
+                }
+            }
+        }
+
+        // 降级路径 —— STEP-5.2 才实现 stream B cache + 长度前缀帧；本步
+        // 暂用 inline `open_uni() + write_all() + finish()`（单条 uni
+        // stream，无 cache；定长 MAX_EVENT_SIZE 字节裸写，不带长度前缀）。
+        // STEP-5.2 会替换此段。
+        let mut stream = self
+            .conn
+            .open_uni()
+            .await
+            .map_err(|e| Error::DatagramFallback(format!("open_uni: {e}")))?;
+        stream
+            .write_all(bytes)
+            .await
+            .map_err(|e| Error::DatagramFallback(format!("stream write_all: {e}")))?;
+        stream
+            .finish()
+            .map_err(|e| Error::DatagramFallback(format!("stream finish: {e}")))?;
+        Ok(())
     }
 }
 
@@ -2522,5 +2661,161 @@ mod tests {
         assert_eq!(route_input(&cfg, &hello()), Channel::StreamA);
         assert_eq!(route_input(&cfg, &ping()), Channel::StreamA);
         assert_eq!(route_input(&cfg, &pong()), Channel::StreamA);
+    }
+
+    // === STEP-5.1 `send_motion` 走 datagram 单元测试 =====================
+    //
+    // 端到端构造：server endpoint（ephemeral cert）+ client dial + 两端 hello，
+    // 然后 client 端 `send_motion(...)`，server 端从 `conn.read_datagram()`
+    // 收到事件。验证：
+    // 1. `max_datagram_size()` 握手后是 `Some(_)` 且足以塞下 21 字节定长
+    //    codec（前置：datagram 路径真的走通，不是降级）
+    // 2. server 收到的 datagram 长度 = `MAX_EVENT_SIZE`（21 字节）
+    // 3. server 解码结果字段与发送端一致（time/dx/dy 三字段精确比对）
+    //
+    // **为什么用 `#[tokio::test]` 而不是 `#[test]`**：本测试需要
+    // `tokio::spawn` 后台 server task + 客户端 `await` —— 必须 tokio runtime。
+    //
+    // **与 STEP-1.4 / 2.6 同路径的"cargo test 跑不通"问题**：lan-mouse lib
+    // 因 14 DTLS errors 编不过（STEP-1.2 留下；STEP-6.x 修复），test target
+    // 与 lib 同编译单位。测试代码就位即可，STEP-6.x 修 14 errors 后 Leader
+    // 手动跑一次确认通过（SUGGESTION #S-5）。
+
+    /// 测试用 Motion 事件（STEP-5.1 引入）。
+    ///
+    /// 字段值固定为 `(time=4242, dx=12.5, dy=-7.25)`，便于 round-trip
+    /// 比对。Motion 是 STEP-4.4 `route_input` 第一支（恒定 Datagram）的
+    /// 代表事件 —— 用它验证 send_motion datagram 路径即可覆盖所有
+    /// "高频指针事件"的发送逻辑（Axis / AxisDiscrete120 与 Motion 走同
+    /// 一支；与 bak `mousehop/src/quic_transport.rs:4057 motion_event`
+    /// 字段值完全对齐）。
+    fn motion_event() -> ProtoEvent {
+        ProtoEvent::Input(input_event::Event::Pointer(
+            input_event::PointerEvent::Motion {
+                time: 4242,
+                dx: 12.5,
+                dy: -7.25,
+            },
+        ))
+    }
+
+    /// 测试用 server endpoint 装配 helper（STEP-5.1 引入）。
+    ///
+    /// 直接调公共 [`endpoint_with_cert`]（STEP-2.4 起不再内联；测试
+    /// helper 与生产路径共用一条代码路径）。
+    fn motion_test_server(
+        cert: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+    ) -> (Endpoint, SocketAddr) {
+        let ep = endpoint_with_cert(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(), cert, key)
+            .expect("server endpoint bind");
+        let addr = ep.local_addr().expect("server addr");
+        (ep, addr)
+    }
+
+    /// STEP-5.1 验收 (1/1)：端到端 send_motion 走 datagram 路径，对端
+    /// recv_datagram 收到事件并解码回原字段。
+    ///
+    /// 同时验证 STEP-0.1 结论 D 的前提：握手完成后 `max_datagram_size()`
+    /// 是 `Some(_)` 且足够装下 21 字节事件（否则本测试会走降级路径、
+    /// `read_datagram` 超时失败 —— 即"datagram 路径没走通"会被本测试抓住）。
+    #[tokio::test]
+    async fn motion_datagram_round_trip() {
+        install_crypto_provider();
+
+        let (server_cert, server_key) = ephemeral_cert();
+        let (server_ep, server_addr) = motion_test_server(server_cert, server_key);
+
+        // server task：accept + server_hello + 读一个 datagram
+        let server_task = tokio::spawn(async move {
+            let session = tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
+                .await
+                .expect("server accept timeout")
+                .expect("server accept");
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), server_hello(&session))
+                .await
+                .expect("server hello timeout")
+                .expect("server hello");
+
+            let datagram = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                session.connection().read_datagram(),
+            )
+            .await
+            .expect("read_datagram 超时（datagram 路径没走通？）")
+            .expect("read_datagram");
+
+            // 定长 codec：datagram 长度应恰好是 MAX_EVENT_SIZE
+            assert_eq!(
+                datagram.len(),
+                MAX_EVENT_SIZE,
+                "send_motion 写满定长缓冲，对端应收到 {MAX_EVENT_SIZE} 字节"
+            );
+            let buf: [u8; MAX_EVENT_SIZE] =
+                datagram.as_ref().try_into().expect("datagram 长度应匹配");
+            let decoded = ProtoEvent::try_from(buf).expect("datagram 应解码为 ProtoEvent");
+            match decoded {
+                ProtoEvent::Input(input_event::Event::Pointer(
+                    input_event::PointerEvent::Motion { time, dx, dy },
+                )) => {
+                    assert_eq!(time, 4242, "Motion.time round-trip 一致");
+                    assert_eq!(dx, 12.5, "Motion.dx round-trip 一致");
+                    assert_eq!(dy, -7.25, "Motion.dy round-trip 一致");
+                }
+                other => panic!("解码结果应为 Motion，实际：{other:?}"),
+            }
+        });
+
+        // client：dial + client_hello + send_motion
+        // 临时 pins_dir —— 用 PID + nanos 隔离（与 STEP-2.6 `tmp_pins_dir` 同模式），
+        // 不引入 `tempfile` dev-dep（与其它 STEP 已落地测试 helper 对齐）。
+        let pins_dir = std::env::temp_dir().join(format!(
+            "lan-mouse-motion-roundtrip-pins-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&pins_dir);
+        let (client_cert, client_key) = ephemeral_cert();
+        let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .expect("client endpoint bind");
+        let conn = dial(
+            &client_ep,
+            server_addr,
+            client_cert[0].clone(),
+            client_key,
+            &pins_dir,
+        )
+        .await
+        .expect("dial");
+        let client_session = PeerSession::from_connection(conn);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_hello(&client_session),
+        )
+        .await
+        .expect("client hello timeout")
+        .expect("client hello");
+
+        // 前置：握手完成后 datagram 可用
+        assert!(
+            client_session.connection().max_datagram_size().is_some(),
+            "握手完成后 max_datagram_size() 应为 Some（quinn 默认启用 datagram）"
+        );
+
+        client_session
+            .send_motion(&motion_event())
+            .await
+            .expect("send_motion 应走 datagram 成功");
+
+        // 等 server 读到并断言完成后再 drop client（drop 会关连接）
+        server_task.await.expect("server task");
+        drop(client_session);
+        client_ep.wait_idle().await;
+        let _ = std::fs::remove_dir_all(&pins_dir);
     }
 }

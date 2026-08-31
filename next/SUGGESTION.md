@@ -280,6 +280,19 @@ STEP-4.1 按 PLAN §4.1 字面只加了 `ChannelMode` + `InputChannelConfig` 两
 剩余：GTK 控件层（`client_row.ui` 两个 AdwComboRow + 回填/写回）→ STEP-4.5b。
 本条目进入"待 Leader 评审后删除"状态（建议 4.5b 完成后一起删）。
 
+**STEP-4.5b 闭环（2026-08-31）—— 方案 A 完整落实**：
+
+GTK 控件层落地（见 `next/STEP-4.5b.md`）：
+
+- `lan-mouse-gtk/resources/client_row.ui` 加 2 个 AdwComboRow（id=`input_channels_mouse_button` / `input_channels_keyboard`）
+- `lan-mouse-gtk/src/client_row/imp.rs` 加 2 个 TemplateChild + 2 个 SignalHandlerId + `set_input_channels()` + `emit_input_channels_change()`
+- `lan-mouse-gtk/src/client_row.rs` 加 4 个 mode↔index helper（与 bak mousehop-gtk 100% 对位）+ `pub fn set_input_channels()`
+- `lan-mouse-gtk/src/window.rs` 接 `request-input-channels-change` 合并信号 → 单次 `FrontendRequest::SetClientInputChannels`；`update_client_config` 加 `row.set_input_channels(client.input_channels)` 回填
+- `cargo build -p lan-mouse-gtk` ✅ / `cargo check --all-targets` ✅ / `cargo clippy -D warnings` ✅
+- 合并 IPC 信号设计避免 daemon split-brain + 回填 block/unblock signals 避免 GTK 端死循环
+
+**#S-12 完全解决**（建议 Leader 评审后删除本条目）。
+
 ---
 
 ## #S-13 🟡 中：PLAN §4.5 的文件名与控件类型与实际代码不符
@@ -310,3 +323,63 @@ Leader 确认后由我在 STEP-4.5.md 记为 PLAN-M1 偏差归档；建议 Leade
 
 **优先级**：🟡 中（不影响功能，但 PLAN 与代码不一致会误导后续 STEP-7.5
 "GUI 移除 active_lock 控件"——那一步同样写的是 `client_editor.rs`）
+
+**STEP-4.5b 闭环（2026-08-31）**：
+
+本步已按实际架构走（`client_row.ui` + `client_row/imp.rs` + `client_row.rs` + `window.rs` 4 文件）+ `AdwComboRow`（非 GtkComboBoxText）。已记为 `PLAN-M1 偏差 #N-6`，并建议 Leader 同步修 PLAN §4.5 / §2 TR-5 / §6 文件名。
+
+**#S-13 完全解决**（建议 Leader 评审后删除本条目）。
+
+---
+
+## #S-14 🟢 低：`send_motion` 降级路径是 inline uni stream，STEP-5.2 将替换
+
+**触发**：STEP-5.1
+
+**现象**：`send_datagram_or_stream_b` 的降级分支当前是
+inline `open_uni() + write_all() + finish()`（不缓存、不复用、不带
+长度前缀帧）。本步用独立的 `Error::DatagramFallback(String)` 变体
+承载降级 IO 错误。
+
+**根因**：
+- STEP-5.1 范围 = "motion 走 datagram + 降级 stream"，PLAN §5.1
+  文字没强制 stream B 复用（那是 STEP-5.2 的 `StreamBunch` + 长度
+  前缀帧 codec 范畴）
+- STEP-5.1 把 stream B cache + 长度前缀帧写进去会突破 30 min 目标
+  且超出"只做 motion datagram"的本步边界
+- 因此降级路径暂走 inline uni stream —— 本步能跑通即可
+
+**建议处置**：
+- STEP-5.2 实现 `StreamBunch` + `send_stream_b`（与 bak
+  `mousehop/src/quic_transport.rs:557-579` 形态对齐：缓存
+  `Mutex<Option<StreamPair>>` + 长度前缀帧 `[u32 BE len][body]`）
+- 把 `send_datagram_or_stream_b` 的降级分支改调 `send_stream_b`
+- 把 `Error::DatagramFallback(String)` 替换为 `Error::StreamB(String)`
+  （与 bak `mousehop/src/quic_transport.rs:564, 575, 578` 一致）
+
+**优先级**：🟢 低（STEP-5.2 自然消化，无功能阻塞）
+
+---
+
+## #S-15 🟢 低：`MAX_SAFE_DATAGRAM = 1162` 与 PLAN-v4 实测相关 —— 后续 MTU spike 变更需重跑
+
+**触发**：STEP-5.1
+
+**现象**：`MAX_SAFE_DATAGRAM: usize = 1162`（与 bak
+`mousehop/src/quic_transport.rs:121-123` 对齐）取 STEP-0.1 spike
+实测的 QUIC 握手初期下限；MTU 探测完成后 `max_datagram_size()` 可
+达 `1414`，但本常量**不缓存**——仅作 `max_datagram_size().map(|m| m.min(MAX_SAFE_DATAGRAM))` 的取 min 边界。
+
+**根因**：
+- 与 bak 完全对齐
+- 本常量只是"安全上限"哨兵，防止上层绕过 cap 用陈旧更大值触发
+  `TooLarge`
+- 真值始终由 `max_datagram_size()` 每次读
+
+**建议处置**：
+- 若 STEP-5.4 / 6.x 跑端到端时发现 MTU 探测时机与 0.1 spike 假设
+  不一致（比如 LAN 环境下立即达 1414），重跑 spike 调整常量
+- 当前 1162 是保守值 —— 任何路径 MTU 探测完成后的值都会 ≥ 1162，
+  取 min 不会引入退化
+
+**优先级**：🟢 低（防御性常量，无功能阻塞）
