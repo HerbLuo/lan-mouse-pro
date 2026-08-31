@@ -17,7 +17,7 @@ use toml;
 use toml_edit::{self, DocumentMut};
 
 use lan_mouse_cli::CliArgs;
-use lan_mouse_ipc::{DEFAULT_PORT, Position};
+use lan_mouse_ipc::{InputChannelConfig, DEFAULT_PORT, Position};
 
 use input_event::scancode::{
     self,
@@ -80,6 +80,12 @@ struct TomlClient {
     position: Option<Position>,
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
+    /// M1 STEP-4.2: per-peer input-event-class transport preference
+    /// (mouse button / keyboard → stream or datagram). Optional on disk so
+    /// that the default is omitted from the written TOML (back-compat with
+    /// pre-M1 config files). Missing → `InputChannelConfig::default()`.
+    #[serde(default)]
+    input_channels: Option<InputChannelConfig>,
 }
 
 impl ConfigToml {
@@ -275,6 +281,12 @@ pub struct ConfigClient {
     pub pos: Position,
     pub active: bool,
     pub enter_hook: Option<String>,
+    /// M1 STEP-4.2: per-peer choice of stream vs. datagram for
+    /// mouse button / keyboard. Always populated in memory; the on-disk
+    /// `TomlClient` keeps it as `Option<...>` so that the default is
+    /// omitted when writing back (preserves back-compat with pre-M1
+    /// config files).
+    pub input_channels: InputChannelConfig,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -285,6 +297,7 @@ impl From<TomlClient> for ConfigClient {
         let ips = HashSet::from_iter(toml.ips.into_iter().flatten());
         let port = toml.port.unwrap_or(DEFAULT_PORT);
         let pos = toml.position.unwrap_or_default();
+        let input_channels = toml.input_channels.unwrap_or_default();
         Self {
             ips,
             hostname,
@@ -292,6 +305,7 @@ impl From<TomlClient> for ConfigClient {
             pos,
             active,
             enter_hook,
+            input_channels,
         }
     }
 }
@@ -311,6 +325,14 @@ impl From<ConfigClient> for TomlClient {
         let position = Some(client.pos);
         let activate_on_startup = if client.active { Some(true) } else { None };
         let enter_hook = client.enter_hook;
+        // Omit the field when it equals the default: keeps pre-M1 config
+        // files untouched on save (no spurious new field appears), and
+        // round-trips a non-default choice back to disk verbatim.
+        let input_channels = if client.input_channels == InputChannelConfig::default() {
+            None
+        } else {
+            Some(client.input_channels)
+        };
         Self {
             hostname,
             host_name,
@@ -319,6 +341,7 @@ impl From<ConfigClient> for TomlClient {
             position,
             activate_on_startup,
             enter_hook,
+            input_channels,
         }
     }
 }
@@ -576,5 +599,47 @@ impl Config {
         let _ = self.watch();
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod config_input_channels_tests {
+    use super::*;
+    use lan_mouse_ipc::ChannelMode;
+
+    #[test]
+    fn config_parses_input_channels_field() {
+        let toml = r#"
+            [[clients]]
+            hostname = "test"
+            input_channels = { mouse_button = "stream", keyboard = "datagram" }
+        "#;
+        let cfg: ConfigToml = toml::from_str(toml).unwrap();
+        let clients: Vec<ConfigClient> = cfg
+            .clients
+            .unwrap_or_default()
+            .into_iter()
+            .map(From::<TomlClient>::from)
+            .collect();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].input_channels.mouse_button, ChannelMode::Stream);
+        assert_eq!(clients[0].input_channels.keyboard, ChannelMode::Datagram);
+    }
+
+    #[test]
+    fn config_defaults_when_input_channels_missing() {
+        let toml = r#"
+            [[clients]]
+            hostname = "test"
+        "#;
+        let cfg: ConfigToml = toml::from_str(toml).unwrap();
+        let clients: Vec<ConfigClient> = cfg
+            .clients
+            .unwrap_or_default()
+            .into_iter()
+            .map(From::<TomlClient>::from)
+            .collect();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].input_channels, InputChannelConfig::default());
     }
 }
