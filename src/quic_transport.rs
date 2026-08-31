@@ -21,7 +21,9 @@
 //! - STEP-5.x：数据通道（datagram + 3 stream）
 //! - STEP-6.x：出入站集成（替换 `LanMouseConnection` / `LanMouseListener`）
 
+use std::fs;
 use std::net::{SocketAddr, UdpSocket};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -31,7 +33,9 @@ use crate::crypto;
 // for main-code (Step 6.x's `LanMouseListener::new`), matching the bak
 // quic_transport.rs:84 pattern to avoid name collision.
 use quinn::{ClientConfig as QuinnClientConfig, EndpointConfig, IdleTimeout, ServerConfig, TransportConfig};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::SignatureScheme;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use thiserror::Error;
 
 pub use quinn::{Connection, Endpoint};
@@ -311,80 +315,77 @@ pub fn install_crypto_provider() {
     });
 }
 
-/// 装配 `quinn::ClientConfig`：rustls + ring + 客户端自签 cert 当 root +
-/// 不带 verifier（**STEP-2.6 由 TofuVerifier 替换**）+ mTLS 出示 client cert
-/// chain + ALPN `lan-mouse`。
+/// 装配 `quinn::ClientConfig`：rustls + ring + TofuVerifier（**STEP-2.6
+/// 替换 WebPkiServerVerifier**）+ mTLS 出示 client cert chain + ALPN
+/// `lan-mouse`。
 ///
-/// 当前形态（STEP-2.5）：
+/// 当前形态（STEP-2.6）：
 /// - `crypto_provider = ring` —— 由 [`install_crypto_provider`] 早于
 ///   本调用预装（本函数不主动 install，main 启动期唯一入口在 main.rs）
-/// - root cert store：把**对端** server cert 当 trust anchor 装入（仅
-///   STEP-2.1 自测用；正式运行靠 STEP-2.6 TofuVerifier 做 fingerprint
-///   pinning；本形态仅做 chain 校验到 root）
+/// - **TofuVerifier server cert 校验**（STEP-2.6 起）：`.dangerous().with_
+///   custom_certificate_verifier(Arc::new(TofuVerifier::new(pins_dir)))`
+///   替代 STEP-2.5 的 `WebPkiServerVerifier` 占位 verifier；`TofuVerifier`
+///   按 server cert SHA-256 fingerprint + `$pins_dir/<sanitized_fp>.pin`
+///   文件系统缓存做"首次见到自动 pin / 已知 mismatch 拒绝"的三态判定（与
+///   bak `mousehop/src/quic_transport.rs:1799` 路径完全对齐；#S-6 已解）
 /// - **mTLS 出示 client cert chain**（STEP-2.5 起）：`with_client_auth_cert(
 ///   cert_chain, key)` 同步装上；与 server [`endpoint_with_verifier`] 的
-///   `with_client_cert_verifier(...)` 对称 —— server 端 `CertificateRequest`
-///   要求 client cert，client 通过本函数装配即可出示。`key` 字段不再是
-///   占位 —— #S-7 已解。
+///   `with_client_cert_verifier(...)` 对称。`key` 字段不再是占位
+///   —— #S-7 已解
 /// - ALPN：`b"lan-mouse"` —— 与对端 server 协商协议；STEP-3.2 之上
 ///   另有应用层 `PROTOCOL_MAGIC` 二次握手（PLAN §3.1）
 /// - transport：`default_transport_config()` 5s keepalive + 30s idle
 ///
-/// **`cert_chain` 语义扩为双用**：既是 root store 信任 anchor，又是 mTLS 出示
-/// 链。M1 双方都跑在同一台主机的同一进程，用同一私钥自签（生产路径
-/// `dial()` 内部调 `crypto::load_or_create_server_cert()` 拿持久化 cert），
-/// 双用同一 chain 不引安全风险。STEP-6.x 接入 connect.rs 时若需要 server
-/// trust anchor 与本端 client cert 不同，再拆参数（暂不拆 —— §9 M1 边界）。
+/// **`cert_chain` 语义扩为双用**：mTLS 出示链；不再作为 root store 信任
+/// anchor（自定义 verifier 全权负责 server cert 校验）。M1 双方都跑在同一
+/// 台主机的同一进程，用同一私钥自签（生产路径 `dial()` 内部调
+/// `crypto::load_or_create_server_cert()` 拿持久化 cert），双用同一 chain 不
+/// 引安全风险。STEP-6.x 接入 connect.rs 时若需要 server trust anchor 与
+/// 本端 client cert 不同，再拆参数（暂不拆 —— §9 M1 边界）。
+///
+/// **`pins_dir` 注入**（STEP-2.6 新增参数）：生产路径走 `crypto::known_peers_dir()`
+/// （待 STEP-7.1 引入）；测试用 `tempfile::tempdir().path()` 隔离避免污染用户
+/// 路径。TOFU 落盘逻辑由 `TofuVerifier` 全权负责 —— 本函数只构造 verifier
+/// 注入 rustls builder。
 ///
 /// **不**主动 install crypto provider：本函数被 [`install_crypto_provider`]
-/// 调用者（main.rs）守护；`#[test]` 单测则在第一句调一次 install
-/// （`#[test]` 自身在主线程跑，但 cargo test 的多线程 harness 仍可能在别的
-/// 线程触发 install —— 一次 `OnceLock` 守护足够）。
+/// 调用者（main.rs）守护；`#[test]` 单测则在第一句调一次 install。
 ///
-/// **错误归一**：所有 rustls / quinn 装配错误统一包到
-/// [`Error::ClientConfig`]（带底层 `Display`）；不引入 `From<rustls::Error>`
-/// / `From<quinn_proto::Error>` —— 后者不是 `pub` 路径且 STEP-6.x 之前
-/// 没有别的 caller 会触发这些类型，盲目引入 `From` 反倒污染 `Error` 枚举。
+/// **错误归一**：所有 rustls / quinn 装配错误统一包到 [`Error::ClientConfig`]
+/// （带底层 `Display`）；不引入 `From<rustls::Error>` / `From<quinn_proto::Error>`。
 pub fn build_quic_client_config(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
+    pins_dir: &Path,
 ) -> Result<QuinnClientConfig> {
     use rustls::ClientConfig as RustlsClientConfig;
-    use rustls::client::WebPkiServerVerifier;
-
-    // 1. 构造 root cert store：把对端 server cert 当 trust anchor。
-    //    STEP-2.6 TofuVerifier 走 .dangerous().with_custom_certificate_verifier
-    //    替换 WebPkiServerVerifier；当前形态仅做标准 chain 校验。
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in &cert_chain {
-        roots
-            .add(cert.clone())
-            .map_err(|e| Error::ClientConfig(format!("add root cert: {e}")))?;
-    }
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = RustlsClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::ClientConfig(format!("protocol versions: {e}")))?;
-    // 占位 server verifier —— STEP-2.6 切到 TofuVerifier；本步保持 WebPkiServerVerifier
-    // 标准 chain 校验，与 STEP-2.1 一致（#S-6 治理纪律：占位即正确，等替换）
-    let verifier = WebPkiServerVerifier::builder(Arc::new(roots), provider)
-        .build()
-        .map_err(|e| Error::ClientConfig(format!("build webpki verifier: {e}")))?;
 
-    // 2. STEP-2.5 起 mTLS 出示 client cert chain —— `with_client_auth_cert`
-    //    是 terminal builder（返回 `Result<ClientConfig, Error>`，不像
-    //    `with_no_client_auth` 是中间 builder），出错走 `?` 经 `crypto::Error::Rustls`
-    //    收口到 `Error::ClientConfig`（`.map_err` 避免引入 From impl）
+    // STEP-2.6：TofuVerifier 替换 STEP-2.5 占位的 WebPkiServerVerifier。
+    // custom verifier 全权负责 server cert 校验 —— 不再装 root store（与
+    // bak `mousehop/src/quic_transport.rs:1822-1829 build_quic_client_config`
+    // 完全对齐）。
+    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+        Arc::new(TofuVerifier::new(pins_dir));
+
+    // STEP-2.5 起 mTLS 出示 client cert chain —— `with_client_auth_cert`
+    // 是 terminal builder（返回 `Result<ClientConfig, Error>`，不像
+    // `with_no_client_auth` 是中间 builder），出错走 `?` 经 `crypto::Error::Rustls`
+    // 收口到 `Error::ClientConfig`（`.map_err` 避免引入 From impl）
     let mut rustls_client = builder
-        .with_webpki_verifier(verifier)
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(cert_chain, key)
         .map_err(|e| Error::ClientConfig(format!("with_client_auth_cert: {e}")))?;
     rustls_client.alpn_protocols = vec![ALPN_LAN_MOUSE.to_vec()];
 
-    // 3. wrap 进 quinn::ClientConfig —— quinn 0.11 通过 `quinn::crypto::rustls`
-    //    re-export 暴露 `QuicClientConfig`（顶层 `quinn_proto::*` 不是稳定
-    //    公开路径，避免直接依赖 `quinn_proto` crate）
+    // wrap 进 quinn::ClientConfig —— quinn 0.11 通过 `quinn::crypto::rustls`
+    // re-export 暴露 `QuicClientConfig`（顶层 `quinn_proto::*` 不是稳定
+    // 公开路径，避免直接依赖 `quinn_proto` crate）
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client))
         .map_err(|e| Error::ClientConfig(format!("QuicClientConfig::try_from: {e}")))?;
     let mut client_cfg = QuinnClientConfig::new(Arc::new(quic_client));
@@ -398,22 +399,23 @@ pub fn build_quic_client_config(
 /// **STEP-2.5 mTLS**：本函数复用 [`build_quic_client_config`]，后者已通过
 /// `with_client_auth_cert(cert_chain, key)` 装上 mTLS 出示。`cert` / `key`
 /// 参数在 STEP-2.5 起**双用**：
-/// 1. 作为**对端** server 的 trust anchor 输入（`WebPkiServerVerifier` 链路；
-///    STEP-2.6 由 `TofuVerifier` 替换 —— 调用栈不变）
+/// 1. 作为**对端** server 的 trust anchor 输入（STEP-2.6 起由 `TofuVerifier`
+///    替换 `WebPkiServerVerifier`；调用栈不变）
 /// 2. 作为**本端** client 的 mTLS 出示（`with_client_auth_cert(cert_chain, key)`）
 ///
 /// M1 双方都跑在同一进程（生产路径） / 测试用 `ephemeral_cert()` 两套独立 cert；
 /// 双用同一 chain 不引安全风险 —— M1 范围内合理。
 ///
-/// **STEP-2.2 占位 verifier**：server cert 校验走 `WebPkiServerVerifier`
-/// 占位（信任对端自签 cert 即放行；PLAN §2.1 已说明）。STEP-2.6 由
-/// `TofuVerifier`（`with_custom_certificate_verifier`）替换 `WebPkiServerVerifier`
-/// 路径，调用栈不变。
+/// **STEP-2.6 TofuVerifier**：server cert 校验走 `TofuVerifier::new(pins_dir)`
+/// —— `pins_dir` 由 caller 通过 `dial` 的新参数传入（生产路径留 STEP-6.1
+/// 接入 `crypto::known_peers_dir()`；测试用 `tempfile::tempdir().path()`
+/// 隔离避免污染用户路径）。`TofuVerifier` 内部三态判定 Known Match /
+/// Known Mismatch / First Connect（与 bak `mousehop/src/quic_transport.rs:
+/// 1799 dial_with_client_cert_tofu` 完全对齐；#S-6 已解）。
 ///
-/// **参数顺序**：`(ep, addr, cert, key)` —— 与 PLAN §2.2 文字描述一致；
-/// `cert` 是**单张** `CertificateDer`，本函数内部 `vec![cert]` 转 chain 后
-/// 喂给 [`build_quic_client_config`]（后者要 `Vec<CertificateDer>` 才能调
-/// `with_client_auth_cert`）。
+/// **参数顺序**：`(ep, addr, cert, key, pins_dir)` —— STEP-2.6 加 `pins_dir`
+/// 在末尾；`cert` 是**单张** `CertificateDer`，本函数内部 `vec![cert]` 转
+/// chain 后喂给 [`build_quic_client_config`]。
 ///
 /// **ALPN**：TLS 1.3 握手时声明 `b"lan-mouse"`（在 `build_quic_client_config`
 /// 内设 `rustls_client.alpn_protocols`）。server 端 STEP-2.4 必须对称设
@@ -423,21 +425,25 @@ pub fn build_quic_client_config(
 /// **`server_name`**：`ep.connect_with(cfg, addr, "lan-mouse")` 的第三个
 /// 参数用于 SNI（Server Name Indication）和 rustls 0.23 的
 /// `ServerCertVerifier::verify_server_cert(..., server_name, ...)` 入参。
-/// 当前 `WebPkiServerVerifier` 不读 server_name（链校验只看 cert）；
-/// STEP-2.6 TofuVerifier 也不读 server_name（只看 fingerprint）。硬编
-/// 码 `"lan-mouse"` 与 ALPN 协议名一致；与 bak `mousehop/src/quic_transport.rs:1855`
-/// 的 `dial_one(... "mousehop")` 对称。
+/// 当前 `TofuVerifier` 不读 server_name（只看 fingerprint）。硬编码
+/// `"lan-mouse"` 与 ALPN 协议名一致；与 bak `mousehop/src/quic_transport.rs:
+/// 1855` 的 `dial_one(... "mousehop")` 对称。
 ///
 /// **错误归一**：
 /// - `Endpoint::connect_with` 同步失败（endpoint 关闭 / 地址非法 / 无 client
 ///   config）→ [`Error::Connect`]（`#[from] quinn::ConnectError`）
-/// - `.await` 后握手失败（证书 / ALPN / mTLS 不通过 / 中断）→ [`Error::Handshake`]
-///   （`#[from] quinn::ConnectionError`）
+/// - `.await` 后握手失败（证书 / ALPN / mTLS 不通过 / TofuVerifier mismatch
+///   / 中断）→ [`Error::Handshake`]（`#[from] quinn::ConnectionError`）；
+///   TofuVerifier mismatch 会以 `ConnectionError::TransportError(rustls::
+///   Error::General("TOFU mismatch: ..."))` 形态冒到这里（§2.6 误差：PLAN
+/// 文字写 "untrusted peer {fp}"，实际 bak 字符串是 "TOFU mismatch: peer
+/// fingerprint {fp} not in known peers"，本步采用 bak 字符串以便与已落地
+/// 的 SUGGESTION 治理纪律对齐）。
 ///
 /// **不**主动 `install_crypto_provider`：与 `build_quic_client_config` 对称，
 /// 由 `main.rs` / 测试首句显式守护。
 ///
-/// **`#[allow(dead_code)]`**：STEP-2.5 仅被测试调用；STEP-6.1
+/// **`#[allow(dead_code)]`**：STEP-2.6 仅被测试调用；STEP-6.1
 /// `connect.rs::connect_to_handle` 接入 `LanMouseConnection` 路径时一并移除。
 #[allow(dead_code)]
 pub async fn dial(
@@ -445,16 +451,15 @@ pub async fn dial(
     addr: SocketAddr,
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
+    pins_dir: &Path,
 ) -> Result<Connection> {
     // 幂等守护：与 build_quic_client_config 对称 —— 即使 caller 已在 main 启
     // 动期调过一次，测试路径多次进入同一函数依然安全。
     install_crypto_provider();
 
-    // STEP-2.5：`build_quic_client_config` 改收 `Vec<CertificateDer>`（`with_client_auth_cert`
-    // 要求 chain 形态；`vec![cert]` 是单张 chain 的标准包装 —— 与 bak
-    // `mousehop/src/quic_transport.rs:1756` `dial_with_client_cert(..., cert_chain, key)`
-    // 路径形态一致）。
-    let cfg = build_quic_client_config(vec![cert], key)?;
+    // STEP-2.6：`build_quic_client_config` 签名加 `pins_dir`（TofuVerifier 替
+    // 换 WebPkiServerVerifier；构造由 `TofuVerifier::new(pins_dir)` 全权负责）。
+    let cfg = build_quic_client_config(vec![cert], key, pins_dir)?;
     let conn = ep
         .connect_with(cfg, addr, "lan-mouse")?
         .await?;
@@ -506,6 +511,170 @@ pub async fn accept(ep: &Endpoint) -> Result<Connection> {
         .ok_or_else(|| Error::EndpointSetup("endpoint closed (accept returned None)".into()))?;
     let conn = incoming.await?;
     Ok(conn)
+}
+
+/// **STEP-2.6 客户端 TOFU（Trust On First Use）fingerprint pinning verifier**。
+///
+/// 把 server cert 的 SHA-256 fingerprint 与 `$pins_dir/<sanitized_fp>.pin`
+/// 文件系统缓存做比对：
+///
+/// | 判定 | 触发 | 行为 |
+/// |---|---|---|
+/// | **Known Match** | pin 文件存在 | `Ok(ServerCertVerified::assertion())` |
+/// | **Known Mismatch** | `pins_dir` 内存在任意 `.pin` 文件但当前 fingerprint 的 pin 不存在 | `Err(rustls::Error::General("TOFU mismatch: ..."))` |
+/// | **First Connect** | `pins_dir` 不存在 / 不含任何 `.pin` | 落盘占位 `b"trusted\n"` + `log::info!("paired with {fp}")` + `Ok(ServerCertVerified::assertion())` |
+///
+/// **三态判定的语义**：区分"首次见到" vs "已知对端换了 cert"。前者是 TOFU
+/// 合法路径（LAN 上第一次连新对端），后者是攻击信号（有人伪造了对端）。
+/// `pins_dir` 空时走 First Connect（任何对端都接受）；`pins_dir` 非空但当前
+/// fingerprint 未 pin 时拒绝 —— 这是 LAN 攻击防护的核心约束。
+///
+/// **`pins_dir` 跨平台兼容**：把 `aa:bb:cc:...` 替换为 `aa_bb_cc_...`（`:` 在
+/// Windows 上不是合法文件名字符）后拼 `<sanitized_fp>.pin`。与 bak
+/// `mousehop/src/quic_transport.rs:1384-1442 TofuVerifier` 完全对齐；差异仅
+/// 在 `known_peers` 子目录 vs 直用 `pins_dir`（PLAN §2.6 直接传 `pins_dir`，
+/// 不再嵌子目录 —— 测试路径 tempdir 已隔离）。
+///
+/// **`Send + Sync + 'static`**：rustls 0.23 trait 约束 —— `TofuVerifier` 持有
+/// `PathBuf` + `Arc<CryptoProvider>`，自动满足。
+///
+/// **`provider` 字段**：`verify_tls12_signature` / `verify_tls13_signature`
+/// 转发到 `rustls::crypto::verify_*_signature` 需要 `signature_verification_algorithms`
+/// 列表 —— 必须持有 provider 引用。与 bak `TofuVerifier` 对称。
+///
+/// **dead_code chain**：本类型被 `build_quic_client_config`（接收 `pins_dir`）
+/// 消费 → 再被 `dial()` 间接消费 → 测试也直接调 `verify_server_cert`。
+/// main-code 路径在 STEP-6.1 `connect.rs::connect_to_handle` 接入时一并消化。
+pub struct TofuVerifier {
+    pins_dir: PathBuf,
+    /// 签名验签需要的 provider（`verify_tls12_signature` / `verify_tls13_signature`
+    /// 转发到 `rustls::crypto::verify_*_signature` 时拿它的 `signature_verification_algorithms`）。
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl TofuVerifier {
+    /// 构造：首次连接状态。
+    ///
+    /// `pins_dir` 可以不存在 —— `verify_server_cert` 在 First Connect 分支会
+    /// 先 `create_dir_all` 再 `fs::write`。
+    pub fn new(pins_dir: &Path) -> Self {
+        Self {
+            pins_dir: pins_dir.to_path_buf(),
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+        }
+    }
+
+    /// 构造：已知 peer 状态（预落盘 `<known_fp>.pin`，让后续 verify 走
+    /// "已知匹配"分支）。
+    ///
+    /// **预落盘是 best-effort**：失败时构造仍返回 Self，后续 verify 走 mismatch
+    /// 路径返回 `rustls::Error` —— 故意不静默吞 IO 错误，因为这通常意味着 fs
+    /// 权限 / 磁盘已满等运维问题。
+    #[allow(dead_code)] // 测试 only（生产 `dial()` 走 `.new()`）
+    pub fn with_known(pins_dir: &Path, known_fp: &str) -> Self {
+        let v = Self::new(pins_dir);
+        let _ = fs::create_dir_all(&v.pins_dir);
+        let _ = fs::write(v.pin_path(known_fp), b"trusted\n");
+        v
+    }
+
+    /// fingerprint → pin 文件路径。`:` 替换为 `_` 跨平台兼容。
+    fn pin_path(&self, fp: &str) -> PathBuf {
+        let safe = fp.replace(':', "_");
+        self.pins_dir.join(format!("{safe}.pin"))
+    }
+
+    /// `pins_dir` 下是否存在任意 `.pin` 文件（用于区分 First Connect vs
+    /// Known Mismatch）。
+    fn has_any_pins(&self) -> bool {
+        if !self.pins_dir.exists() {
+            return false;
+        }
+        fs::read_dir(&self.pins_dir)
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .any(|e| e.path().extension().is_some_and(|ext| ext == "pin"))
+            })
+            .unwrap_or(false)
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        // (1) 拿 server cert 算 SHA-256 fingerprint（与 `crypto::generate_fingerprint`
+        //     输出格式一致：hex 用 `:` 分隔，小写）
+        let fp = crypto::generate_fingerprint(end_entity.as_ref());
+
+        // (2) ensure pins_dir 存在（First Connect 时也需要）
+        fs::create_dir_all(&self.pins_dir).map_err(|e| {
+            rustls::Error::General(format!(
+                "TOFU: create_dir_all({:?}) failed: {e}",
+                self.pins_dir
+            ))
+        })?;
+
+        // (3) 三态判定
+        let pin = self.pin_path(&fp);
+
+        if pin.exists() {
+            // Known Match —— pin 文件已存在，接受
+            Ok(ServerCertVerified::assertion())
+        } else if self.has_any_pins() {
+            // Known Mismatch —— 其他 fp 的 pin 存在但当前 fp 没有，拒绝
+            log::warn!("TOFU: rejected untrusted peer {fp}");
+            Err(rustls::Error::General(format!(
+                "TOFU mismatch: peer fingerprint {fp} not in known peers"
+            )))
+        } else {
+            // First Connect —— 落盘占位 + 接受
+            fs::write(&pin, b"trusted\n").map_err(|e| {
+                rustls::Error::General(format!("TOFU: write pin {:?} failed: {e}", pin))
+            })?;
+            log::info!("TOFU: paired with {fp}");
+            Ok(ServerCertVerified::assertion())
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 /// **STEP-2.5 占位 verifier**：server 端 mTLS 强制要求 client 出示（`offer
@@ -634,9 +803,21 @@ mod tests {
         let (client_cert, client_key) = ephemeral_cert();
         let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
             .expect("client endpoint bind 不应失败");
+        // STEP-2.6：dial 加 pins_dir 参数；测试用临时 pins_dir 隔离。
+        let pins_dir = std::env::temp_dir().join(format!(
+            "lan-mouse-quic-test-pins-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&pins_dir);
         let conn = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            dial(&client_ep, server_addr, client_cert[0].clone(), client_key),
+            dial(
+                &client_ep,
+                server_addr,
+                client_cert[0].clone(),
+                client_key,
+                &pins_dir,
+            ),
         )
         .await
         .expect("端到端 TLS 1.3 握手超时")
@@ -679,9 +860,16 @@ mod tests {
         // 用 STEP-1.1 + STEP-2.4 已实现的 `crypto::generate_self_signed`
         // 拿测试 cert（落盘到 `/tmp` ephemeral，EPH 测试 helper）
         let (cert_chain, key) = ephemeral_cert();
+        // STEP-2.6：`build_quic_client_config` 加 `pins_dir` 参数（TofuVerifier
+        // 替换 WebPkiServerVerifier；构造由 `TofuVerifier::new(pins_dir)` 全权负责）。
+        let pins_dir = std::env::temp_dir().join(format!(
+            "lan-mouse-quic-test-pins-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&pins_dir);
         // STEP-2.5 起：`build_quic_client_config` 收 `Vec<CertificateDer>`（`with_client_auth_cert`
         // 要求 chain 形态）—— 单张 cert 包成 `vec![cert]` 即可
-        let cfg = build_quic_client_config(vec![cert_chain[0].clone()], key)
+        let cfg = build_quic_client_config(vec![cert_chain[0].clone()], key, &pins_dir)
             .expect("ClientConfig 装配不应失败");
         // 关键断言：构造成功 + Clone（PLAN §2.2 dial_any 多候选复用要求）
         let _clone: QuinnClientConfig = cfg.clone();
@@ -733,9 +921,21 @@ mod tests {
         let (client_cert, client_key) = ephemeral_cert();
         let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
             .expect("client endpoint bind 不应失败");
+        // STEP-2.6：dial 加 pins_dir 参数；测试用临时 pins_dir 隔离。
+        let pins_dir = std::env::temp_dir().join(format!(
+            "lan-mouse-quic-test-pins-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&pins_dir);
         let conn = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            dial(&client_ep, server_addr, client_cert[0].clone(), client_key),
+            dial(
+                &client_ep,
+                server_addr,
+                client_cert[0].clone(),
+                client_key,
+                &pins_dir,
+            ),
         )
         .await
         .expect("端到端 TLS 1.3 握手超时")
@@ -868,5 +1068,144 @@ mod tests {
         // (5) 清理：drop endpoint + 等 server task 完成
         drop(client_ep);
         let _ = server_task.await;
+    }
+
+    // === STEP-2.6 TofuVerifier 单元测试 =====================================
+
+    /// 构造 ServerName 用于 verifier 测试。localhost 在所有平台都是合法 DNS name。
+    fn test_server_name() -> ServerName<'static> {
+        ServerName::try_from("localhost").expect("localhost is a valid DNS name")
+    }
+
+    /// 临时 pins_dir helper（与 `ephemeral_cert()` 风格对称）。返回
+    /// `(dir, owned_path)` —— `dir` 在 test 期间自动清理。
+    fn tmp_pins_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lan-mouse-tofu-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create pins dir");
+        dir
+    }
+
+    /// STEP-2.6 验收 (1/2)：新 fingerprint 被接受并写入 known_peers。
+    ///
+    /// 直接调 `TofuVerifier::verify_server_cert()`（不经过 QUIC），断言：
+    /// - 返回 `Ok(ServerCertVerified::assertion())`
+    /// - `pins_dir/<sanitized_fp>.pin` 文件存在（`:` 替换为 `_` 跨平台兼容）
+    /// - pin 文件内容是 `b"trusted\n"`（占位文件，作为"已知"标记）
+    ///
+    /// 与 bak `mousehop/src/quic_transport.rs:2966-3001 tofu_first_connect_saves_fingerprint`
+    /// 对齐（PLAN §2.6 验收清单要求 `tofu_first_run_pins`）。
+    #[test]
+    fn tofu_first_run_pins() {
+        install_crypto_provider();
+
+        let pins_dir = tmp_pins_dir("first");
+        let verifier = TofuVerifier::new(&pins_dir);
+
+        let (cert_chain, _key) = ephemeral_cert();
+        let cert_der = cert_chain[0].clone();
+        let fp = crypto::generate_fingerprint(cert_der.as_ref());
+
+        let server_name = test_server_name();
+        let now = UnixTime::now();
+        let result = verifier.verify_server_cert(&cert_der, &[], &server_name, &[], now);
+
+        // (1) 接受
+        assert!(
+            result.is_ok(),
+            "first connect should be accepted (Ok), got {:?}",
+            result
+        );
+
+        // (2) pin 文件存在（文件名 sanitize：`:` → `_`）
+        let expected_pin = pins_dir.join(format!("{}.pin", fp.replace(':', "_")));
+        assert!(
+            expected_pin.exists(),
+            "pin file should exist at {:?}",
+            expected_pin
+        );
+
+        // (3) pin 文件内容是 b"trusted\n"（占位标记）
+        let content = std::fs::read(&expected_pin).expect("read pin");
+        assert_eq!(
+            content, b"trusted\n",
+            "pin file content should be 'trusted\\n'"
+        );
+
+        let _ = std::fs::remove_dir_all(&pins_dir);
+    }
+
+    /// STEP-2.6 验收 (2/2)：不同 fingerprint 被拒绝
+    /// （`rustls::Error::General("TOFU mismatch: ...")`）。
+    ///
+    /// **直接调 verifier**：用 `TofuVerifier::with_known` 预落盘 cert1 的
+    /// pin → 用 cert2（完全不同 fingerprint）的 `verify_server_cert` 走
+    /// Known Mismatch 分支，断言返回 `Err(rustls::Error)`，且错误消息含
+    /// "TOFU mismatch"。
+    ///
+    /// 与 bak `mousehop/src/quic_transport.rs:3047+ tofu_mismatch_rejects_different_fingerprint`
+    /// 对齐（PLAN §2.6 验收清单要求 `tofu_disallows_swap`）。
+    #[test]
+    fn tofu_disallows_swap() {
+        install_crypto_provider();
+
+        let pins_dir = tmp_pins_dir("swap");
+
+        // (1) 准备 cert1 → 计算 fp1 → 用 with_known 预落盘 fp1 的 pin
+        let (cert1_chain, _key1) = ephemeral_cert();
+        let cert1_der = cert1_chain[0].clone();
+        let fp1 = crypto::generate_fingerprint(cert1_der.as_ref());
+        let verifier = TofuVerifier::with_known(&pins_dir, &fp1);
+
+        // (2) 准备 cert2（不同 cert → 不同 fp）
+        let (cert2_chain, _key2) = ephemeral_cert();
+        let cert2_der = cert2_chain[0].clone();
+        let fp2 = crypto::generate_fingerprint(cert2_der.as_ref());
+        assert_ne!(
+            fp1, fp2,
+            "两个 ephemeral_cert 必须有不同的指纹（rcgen 每次随机）"
+        );
+
+        // (3) verify_server_cert 应返回 Err（Known Mismatch 分支）
+        let server_name = test_server_name();
+        let now = UnixTime::now();
+        let result = verifier.verify_server_cert(&cert2_der, &[], &server_name, &[], now);
+
+        match result {
+            Err(rustls::Error::General(msg)) => {
+                assert!(
+                    msg.contains("TOFU mismatch") || msg.contains("untrusted peer"),
+                    "错误消息应含 TOFU mismatch / untrusted peer，实际: {msg}"
+                );
+            }
+            other => panic!(
+                "TOFU mismatch should return Err(rustls::Error::General), got: {:?}",
+                other
+            ),
+        }
+
+        // (4) fp1 的 pin 文件**不应**被改写 / 删（mismatch 不动现有 pin）
+        let fp1_pin = pins_dir.join(format!("{}.pin", fp1.replace(':', "_")));
+        assert!(
+            fp1_pin.exists(),
+            "mismatch 不应删除已存在的 fp1 pin 文件（pin 应保留）"
+        );
+
+        // (5) fp2 的 pin 文件**不**应被落盘（mismatch 不自动 pin 陌生 cert）
+        let fp2_pin = pins_dir.join(format!("{}.pin", fp2.replace(':', "_")));
+        assert!(
+            !fp2_pin.exists(),
+            "mismatch 不应自动 pin fp2（陌生 cert 必须保持陌生）"
+        );
+
+        let _ = std::fs::remove_dir_all(&pins_dir);
     }
 }

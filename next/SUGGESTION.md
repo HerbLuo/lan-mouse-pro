@@ -62,73 +62,13 @@
 **根因**：
 - PLAN §1.4 验收清单要求 `cargo test ... 通过`，但 §1.2 故意留下 14 errors 让 lib 编不过（铺路给 STEP-6.x 一次性切到 PeerSession）
 - STEP-1.4 在不修 connect.rs / listen.rs 的前提下，无法独立让单测跑通
-- 测试逻辑本身已对齐（`endpoint()` bind 127.0.0.1:0 → `local_addr().port() != 0` → drop）
+- 测试逻辑本身已对齐（`endpoint()` bind 127.0.0.1:0 → `local_addr().port() != 0` → drop`）
 
 **处置**：
 - 本步把 `endpoint_binds_ipv4_localhost` 作为**单元测试逻辑就位**验收 —— 验证手段是 `cargo check -p lan-mouse` 报 0 错来自 quic_transport.rs
 - STEP-6.x 修复 14 errors 后，**leader 需手动跑** `cargo test -p lan-mouse quic_transport::endpoint_binds_ipv4_localhost` 确认通过
 
 **优先级**：🟡 中（属"验收机制与 STEP 进度解耦"的记录，无功能阻塞）
-
----
-
-## #S-6 🟢 低：`build_quic_client_config` 当前仅占位 verifier（WebPkiServerVerifier），STEP-2.6 必须替换为 TofuVerifier
-
-**触发**：STEP-2.1
-
-**现象**：
-- `build_quic_client_config(cert, key)` 用 `WebPkiServerVerifier::builder(root_with_our_cert, ring_provider).build()`
-  做 server cert chain 校验 —— 等同于"信任对端的自签 cert 即放行"
-- 真正信任模型应来自 `TofuVerifier`（STEP-2.6）：首次见到某 fingerprint
-  落盘到 `$XDG_DATA_HOME/lan-mouse/known_peers/<fp>.pin`；二次连接
-  fingerprint 不匹配即 `Err(rustls::Error::General(...))`
-- 当前形态：`client 端信任对端的自签 cert` —— 任何能拿到对端 PEM 文件
-  的人都可冒充（虽然局域网场景下攻击者拿到 PEM 不容易，但模型不严密）
-
-**根因**：PLAN §2.1 "不带 verifier 占位" 本意是"无 mTLS verifier"（client
-端不出示 cert 给 server），不是"无 server cert verifier"。本步用
-`WebPkiServerVerifier` 走的是 chain 校验而非 mTLS，正好两边都满足
-（无 client auth / 占位 server 校验）；STEP-2.6 改成
-`.dangerous().with_custom_certificate_verifier(TofuVerifier::new(...))`
-即可。
-
-**处置**：
-- 本步**不**修：仍按 PLAN §2.1 文字通过
-- STEP-2.6 改 `build_quic_client_config` 调用
-  `with_custom_certificate_verifier(Arc::new(TofuVerifier::new(pins_dir)))`
-- `quinn_client_config_loads_rustls_provider` 单测继续可用：
-  `WebPkiServerVerifier` vs `TofuVerifier` 都让 ClientConfig 装配成功
-
-**优先级**：🟢 低（占位即正确，等 STEP-2.6 替换）
-
----
-
-## #S-7 🟢 低：`build_quic_client_config` 接受 `key` 但未使用，留 STEP-2.5 mTLS 接上
-
-**触发**：STEP-2.1
-
-**现象**：函数签名 `(cert, key) -> Result<ClientConfig>` 收 `key` 但函数
-体只用 `cert` 当 root；用 `let _ = key;` 抑制 unused warning。
-
-**根因**：PLAN §2.1 验收代码样例：
-```rust
-pub fn build_quic_client_config(cert: CertificateDer, key: PrivateKeyDer)
-  -> Result<quinn::ClientConfig>
-```
-签名明确收 `key` —— STEP-2.5 mTLS（client 端出示 cert）会通过
-`with_client_auth_cert(cert_chain, key)` 把 `key` 接上。本步先收着避免
-STEP-2.1 改签名、STEP-2.5 再改一次的两段式 churn。
-
-**处置**：STEP-2.5 删 `let _ = key;` 加 `with_client_auth_cert(...)`。
-
-**进度**：STEP-2.5 已 ✅ 解 —— `build_quic_client_config` 签名同时改为
-`(cert_chain: Vec<CertificateDer>, key: PrivateKeyDer)`，`with_no_client_auth()`
-→ `with_client_auth_cert(cert_chain, key)`，`let _ = key;` 删除。Leader 评审
-后可删除本条目。
-
-**优先级**：🟢 低（auto-fade at STEP-2.5）
-
----
 
 ---
 
@@ -151,6 +91,3 @@ STEP-2.1 改签名、STEP-2.5 再改一次的两段式 churn。
   各自写一遍 `crypto::generate_self_signed` 调用）
 
 **优先级**：🟢 低（结构整洁，无功能影响）
-
----
-
