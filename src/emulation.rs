@@ -193,6 +193,14 @@ impl ListenTask {
                                 self.event_tx.send(EmulationEvent::ConnectionAttempt { fingerprint }).expect("channel closed");
                             }
                     }
+                    Some(ListenEvent::Disconnected { addr }) => {
+                        // STEP-6.2b：supervisor 在 stream A EOF / conn close 时推 Disconnected。
+                        // 与 timeout 清理路径保持一致：移除 proxy handle + 上报 service。
+                        log::info!("peer {addr} disconnected (supervisor)");
+                        last_response.remove(&addr);
+                        self.emulation_proxy.remove(addr);
+                        self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
+                    }
                     None => break
                 }}
                 event = self.emulation_proxy.event() => {
