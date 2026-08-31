@@ -72,23 +72,6 @@
 
 ---
 
-## #S-4 🟡 中：cert.pem + key.pem 当前合并为同一文件，STEP-2.4 必须拆开
-
-**触发**：STEP-1.1（Leader 评审补充）
-
-**状态**：✅ **STEP-2.4 已解**（详见 `next/STEP-2.4.md` §4）
-
-**处置**：
-- ✅ STEP-2.4 引入 `key_path()`，与 `cert_path()` 对应返回 `key.pem`
-- ✅ `generate_self_signed` 落盘拆为：cert → `cert.pem`（0o600），key → `key.pem`（0o400）
-- ✅ `load_or_generate_key_and_cert_der` 签名扩为 `(cert_path, key_path)`
-- ✅ key 文件 0o400 权限保持
-- ✅ `load_or_create_server_cert()` 零参数别名作为 PLAN §1.1 caller 一致性入口
-
-**待 Leader 评审后删除本条目**。
-
----
-
 ## #S-6 🟢 低：`build_quic_client_config` 当前仅占位 verifier（WebPkiServerVerifier），STEP-2.6 必须替换为 TofuVerifier
 
 **触发**：STEP-2.1
@@ -164,16 +147,3 @@ STEP-2.1 改签名、STEP-2.5 再改一次的两段式 churn。
 
 ---
 
-## #S-9 🟡 中：STEP-2.4 server 端 `rustls::ServerConfig.alpn_protocols` 必须设 `b"lan-mouse"`，与 client 对称
-
-**触发**：STEP-2.1（Leader 评审补充）
-
-**状态**：✅ **STEP-2.4 已解**（详见 `next/STEP-2.4.md` §4）
-
-**处置**：
-- ✅ STEP-2.4 在 `endpoint_with_cert` 装配 rustls::ServerConfig 时设
-  `rustls_server.alpn_protocols = vec![ALPN_LAN_MOUSE.to_vec()]`
-- ✅ 复用 STEP-2.1 已声明的 `quic_transport::ALPN_LAN_MOUSE` 常量（避免字符串漂移）
-- ✅ 与 client `build_quic_client_config` 的 `rustls_client.alpn_protocols = vec![ALPN_LAN_MOUSE.to_vec()];` 完全对称
-
-**待 Leader 评审后删除本条目**。
