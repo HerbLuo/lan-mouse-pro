@@ -1,3 +1,25 @@
+//! QUIC server listener（**M1 阶段 STEP-2.7 暂不接入**）—— 本文件**仍**走
+//! `webrtc-dtls` DTLS 路径（14 errors 由 STEP-6.x 一次性切到 PeerSession 时
+//! 修复，本步不触）。
+//!
+//! **STEP-2.7 接入点（留 STEP-6.2 整段重写时实际接入）**：
+//! - 现有 `authorized_keys: Arc<RwLock<HashMap<String, String>>>` 字段（line 70）
+//!   直接喂给 [`crate::quic_transport::AuthorizedKeysVerifier::new`] 作为
+//!   `allowlist` 共享所有权
+//! - 生产路径 caller 应改为：
+//!   ```ignore
+//!   let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
+//!       Arc::new(AuthorizedKeysVerifier::new(authorized_keys.clone()));
+//!   let endpoint = quic_transport::endpoint_with_verifier(
+//!       addr, cert_chain, key, verifier)?;
+//!   ```
+//! - 本步**仅**保证 `quic_transport::AuthorizedKeysVerifier` 公共 API + 单测
+//!   就位；listen.rs 主循环的 DTLS → QUIC 切换留 STEP-6.2（supervisor 整段重写）
+//!
+//! **#S-9 治理**：allowlist value 类型目前是 `String`（M1 范围）；M2
+//! `IncomingPeerConfig` 引入 `lan-mouse-ipc` 后同步改 `HashMap<String,
+//! IncomingPeerConfig>`（与 bak `mousehop/src/quic_transport.rs:1577-1754
+//! AuthorizedKeysVerifier` 对齐）。
 use futures::{Stream, StreamExt};
 use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
@@ -23,6 +45,13 @@ use webrtc_dtls::{
 use webrtc_util::{Conn, Error, conn::Listener};
 
 use crate::crypto;
+// STEP-2.7 引入（保留供 STEP-6.2 整段重写时实际接入）；当前 DTLS 路径不消费
+// 它 —— 仅作 `endpoint_with_verifier` 装配位点的导入锚点。
+//
+// M1 范围内不修 14 DTLS errors（PLAN §9 守卫），不调该 verifier；编译期如因
+// unused import 报 warning，加 `#[allow(unused_imports)]`。
+#[allow(unused_imports)]
+use crate::quic_transport::AuthorizedKeysVerifier;
 
 #[derive(Error, Debug)]
 pub enum ListenerCreationError {

@@ -15,16 +15,22 @@
 //!   + [`PermissiveClientCertVerifier`] 占位 verifier（STEP-2.7 替换为
 //!   `AuthorizedKeysVerifier`）；client 端 [`build_quic_client_config`]
 //!   出示 client cert chain（#S-7 已解：`let _ = key` 去掉）
-//! - STEP-2.6 / 2.7：`TofuVerifier` / `AuthorizedKeysVerifier`
+//! - STEP-2.6（已）：[`TofuVerifier`] —— 客户端 fingerprint pinning（首次
+//!   见到自动 pin / 已知 mismatch 拒绝 / 已知 match 接受）；接 [`build_quic_client_config`]
+//!   替换 STEP-2.5 的 `WebPkiServerVerifier` 占位（#S-6 已解）
+//! - STEP-2.7（已）：[`AuthorizedKeysVerifier`] —— server 端显式 allowlist，
+//!   命中 → `Ok`；未命中 → `Err`。复用 [`endpoint_with_verifier`]，零新增接
+//!   口；listen.rs 装配点留 STEP-6.2 整段重写时接入
 //! - STEP-3.2：`client_hello` / `server_hello` 握手
 //! - STEP-4.4：`route_input()` ChannelMode 分派
 //! - STEP-5.x：数据通道（datagram + 3 stream）
 //! - STEP-6.x：出入站集成（替换 `LanMouseConnection` / `LanMouseListener`）
 
+use std::collections::HashMap;
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use crate::crypto;
@@ -727,6 +733,194 @@ impl rustls::server::danger::ClientCertVerifier for PermissiveClientCertVerifier
     }
 }
 
+/// **STEP-2.7 server 端授权指纹 allowlist verifier** —— mTLS 双层防御的核心
+/// 约束：client cert 即使通过了 TLS 1.3 内置链校验（自签根信任），还要看
+/// `allowlist` 里有没有这个 fingerprint 才放行。
+///
+/// **#S-9（治理）**：allowlist 的 value 类型用 `String` 而**非**
+/// `lan_mouse_ipc::IncomingPeerConfig` —— `IncomingPeerConfig` 是 M2 范围
+/// （带 `clipboard_receive` / `description` 等字段）；当前 M1
+/// `config::authorized_fingerprints: HashMap<String, String>` 也是 String，
+/// 自然对齐。STEP-7 / M2 把 `IncomingPeerConfig` 引入 `lan_mouse-ipc` 后，
+/// 同步把本结构 + caller 一起改成 `HashMap<String, IncomingPeerConfig>`
+/// （与 bak `mousehop/src/quic_transport.rs:1577-1754 AuthorizedKeysVerifier`
+/// 形态完全对齐；值类型用 `IncomingPeerConfig::default()` 表示"已授权但
+/// 还没填配置"）。
+///
+/// **`allowlist` 跨平台语义**：`String` 是 fingerprint（小写 hex + `:` 分隔，
+/// 与 `crypto::generate_fingerprint` 输出格式一致）。运行时增 / 删 allowlist
+/// 条目通过 `Arc<RwLock<HashMap<...>>>` 共享所有权 —— listen.rs supervisor
+/// 或后续 IPC 推 `authorized_fingerprints` 变更时，可直接写本结构内部的
+/// RwLock 看到变更（`RwLock::read()` 不阻塞 reader；`RwLock::write()` 仅
+/// 阻塞 writer）。M1 阶段 caller 仅有测试 + 未来 STEP-6.2 listen.rs
+/// supervisor；运行时增删 allowlist 路径 STEP-6.x 接入。
+///
+/// **`Send + Sync + 'static`**：rustls 0.23 trait 约束 —— `allowlist: Arc<
+/// RwLock<HashMap<...>>>` 自动 `Send + Sync`，`provider: Arc<CryptoProvider>`
+/// 也自动满足。
+///
+/// **`provider` 字段**：`verify_tls12_signature` / `verify_tls13_signature`
+/// 转发到 `rustls::crypto::verify_*_signature` 需要
+/// `signature_verification_algorithms` —— 必须持有 provider 引用（与 STEP-2.6
+/// `TofuVerifier` 同模式）。
+///
+/// **`verify_client_cert` 二态判定**：
+/// - 命中（allowlist.contains_key(&fp)）→ `Ok(ClientCertVerified::assertion())` + `log::info!`
+/// - 未命中 → `Err(rustls::Error::General(format!("unauthorized peer {fp}")))`
+///   + `log::warn!`（PLAN §2.7 验收文本，与 STEP-2.6 "untrusted peer" 对齐）
+///
+/// **dead_code chain**：本结构被 [`endpoint_with_verifier`] 的 verifier 参数
+/// 消费 → 由 `endpoint_with_verifier` 间接消费 → 单测直接调
+/// `verify_client_cert`。main-code 接入路径留 STEP-6.2 `listen.rs` supervisor
+/// 整段重写时一并消化（listen.rs 当前仍调 DTLS 路径，14 errors 不在本步范围）。
+pub struct AuthorizedKeysVerifier {
+    /// 授权指纹表：键 = client cert SHA-256 fingerprint（`crypto::generate_fingerprint` 格式），
+    /// 值 = 占位 `String`（M2 接 `lan_mouse_ipc::IncomingPeerConfig::default()`）。
+    allowlist: Arc<RwLock<HashMap<String, String>>>,
+    /// 签名验签需要的 provider（`verify_tls12_signature` / `verify_tls13_signature`
+    /// 转发到 `rustls::crypto::verify_*_signature` 时拿它的
+    /// `signature_verification_algorithms`）。
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl AuthorizedKeysVerifier {
+    /// 构造：allowlist 由 caller 持有（生产 `Config::authorized_fingerprints()`，
+    /// 测试 `Arc::new(RwLock::new(HashMap::new()))`）。
+    ///
+    /// `allowlist` 必须 `Send + Sync + 'static`（rustls 要求 verifier
+    /// `Send + Sync + 'static`；`Arc<RwLock<HashMap<...>>>` 自动满足）。
+    #[allow(dead_code)]
+    pub fn new(allowlist: Arc<RwLock<HashMap<String, String>>>) -> Self {
+        Self {
+            allowlist,
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+        }
+    }
+
+    /// 构造：已知 peer 状态（预填 `allowlist` 让后续 verify 走 Authorized 分支）。
+    ///
+    /// **预填是 best-effort**：失败时构造仍返回 Self，后续 verify 走
+    /// Unauthorized 路径返回 `rustls::Error` —— 故意不静默吞
+    /// `RwLock::write()` 的 poison 错误，因为这通常意味着上游 panic。
+    ///
+    /// 测试用：直接调 `verify_client_cert(cert)` → 应 `Ok`（不需要端到端
+    /// QUIC 握手）。生产路径不用（生产走 listen.rs supervisor / service.rs
+    /// 写 allowlist，verifier 通过 `new()` 拿到 Arc 引用）。
+    #[allow(dead_code)]
+    pub fn with_known(
+        allowlist: Arc<RwLock<HashMap<String, String>>>,
+        known_fp: &str,
+    ) -> Self {
+        let v = Self::new(allowlist);
+        v.allowlist
+            .write()
+            .expect("RwLock poisoned")
+            .insert(known_fp.to_owned(), String::new());
+        v
+    }
+
+    /// 暴露 `allowlist`（测试用：断言 allowlist 内容 + 模拟运行时增删）。
+    #[allow(dead_code)]
+    pub fn allowlist(&self) -> &Arc<RwLock<HashMap<String, String>>> {
+        &self.allowlist
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for AuthorizedKeysVerifier {
+    fn offer_client_auth(&self) -> bool {
+        // server 端 mTLS 强制 client cert 出示（与 `PermissiveClientCertVerifier`
+        // 对称 —— 不出 cert 就走 TLS 1.3 `NoCertificatesPresented` 拒握）。
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        // 不出 cert → 直接拒（与 `offer_client_auth` 一致）
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        // 不提供 root hints —— 任意自签 cert 都尝试接入（fingerprint 校验由
+        // `verify_client_cert` 自己做）
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        // (1) 拿 client cert 算 SHA-256 fingerprint（与
+        //     `crypto::generate_fingerprint` 输出格式一致：hex 用 `:` 分隔，小写）
+        let fp = crypto::generate_fingerprint(end_entity.as_ref());
+
+        // (2) allowlist 查询（注意：与模块顶层 `Result<T>` 别名冲突 —— `verify_client_cert`
+        //     是 trait method，必须显式写 `std::result::Result<_, rustls::Error>` 才能
+        //     与 rustls 期望类型对齐；与 STEP-2.6 `TofuVerifier` 偏差 #1 同模式）
+        let allowed = self
+            .allowlist
+            .read()
+            .expect("RwLock poisoned")
+            .contains_key(&fp);
+
+        if allowed {
+            // Authorized —— 命中 allowlist
+            log::info!("AuthorizedKeysVerifier: authorized peer {fp}");
+            Ok(rustls::server::danger::ClientCertVerified::assertion())
+        } else {
+            // Unauthorized —— allowlist 不命中
+            //
+            // 注意：本步不触发 IPC 推送（IPC 集成属于 STEP-6.x 接入 listen.rs supervisor
+            // 时一并处理），仅 log::warn 留下审计线索。错误消息含 fingerprint 方便
+            // 上层诊断（用户对照"信任的 peer 列表"判定）。
+            log::warn!("AuthorizedKeysVerifier: rejected unauthorized peer {fp}");
+            Err(rustls::Error::General(format!(
+                "unauthorized peer {fp}"
+            )))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<
+        rustls::client::danger::HandshakeSignatureValid,
+        rustls::Error,
+    > {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<
+        rustls::client::danger::HandshakeSignatureValid,
+        rustls::Error,
+    > {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 // === 单元测试 ================================================================
 
 #[cfg(test)]
@@ -1207,5 +1401,107 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&pins_dir);
+    }
+
+    // === STEP-2.7 AuthorizedKeysVerifier 单元测试 =============================
+
+    /// 临时 allowlist helper（与 `tmp_pins_dir` 风格对称）。
+    fn tmp_allowlist(tag: &str) -> Arc<RwLock<HashMap<String, String>>> {
+        let dir = std::env::temp_dir().join(format!(
+            "lan-mouse-allowlist-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create allowlist dir");
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    /// STEP-2.7 验收 (1/2)：allowlist 预填某 fingerprint → `verify_client_cert`
+    /// 用对应 cert → `Ok`。
+    ///
+    /// 直接调 [`AuthorizedKeysVerifier::verify_client_cert`]（不经过 QUIC），
+    /// 避免 lib 因 14 DTLS errors 编不过 —— 测试代码逻辑就位即可，
+    /// STEP-6.x 修 14 errors 后 Leader 手动跑一次确认（与 `mtls_rejects_no_client_cert`
+    /// / `tofu_first_run_pins` 同路径，见 SUGGESTION #S-5）。
+    #[test]
+    fn authorized_keys_accepts_known() {
+        let allowlist = tmp_allowlist("accepts");
+
+        // (1) 自签一个测试 cert 拿 cert_der
+        let (cert_chain, _key) = ephemeral_cert();
+        let cert_der = cert_chain[0].clone();
+
+        // (2) 预计算 fp，allowlist 预填
+        let fp = crypto::generate_fingerprint(cert_der.as_ref());
+        let verifier = AuthorizedKeysVerifier::with_known(allowlist.clone(), &fp);
+
+        // (3) verify_client_cert 应 Ok
+        let result = <AuthorizedKeysVerifier as rustls::server::danger::ClientCertVerifier>::verify_client_cert(
+            &verifier,
+            &cert_der,
+            &[], // intermediates（自签没有 intermediates）
+            rustls::pki_types::UnixTime::now(),
+        );
+        assert!(
+            result.is_ok(),
+            "allowlist 预填的 fingerprint 应被接受，实际: {result:?}"
+        );
+
+        // (4) 二次断言：allowlist 内容确实包含预填 fp（防止"路径走通但 allowlist 空"的假阳性）
+        assert!(
+            verifier.allowlist().read().unwrap().contains_key(&fp),
+            "allowlist 应包含预填 fp"
+        );
+    }
+
+    /// STEP-2.7 验收 (2/2)：allowlist 不含某 fingerprint → `verify_client_cert`
+    /// 用对应 cert → `Err(rustls::Error::General("unauthorized peer {fp}"))`。
+    ///
+    /// 与 `tofu_disallows_swap` 对称 —— 都是"显式校验允许未授权对端被拒"的
+    /// 负面测试；`AuthorizedKeysVerifier` 与 `TofuVerifier` 形成 mTLS 双层
+    /// 防御（client 端 TOFU 拒 + server 端 allowlist 拒）。
+    #[test]
+    fn authorized_keys_rejects_unknown() {
+        let allowlist = tmp_allowlist("rejects");
+
+        // (1) 自签一个测试 cert，allowlist **不预填**
+        let (cert_chain, _key) = ephemeral_cert();
+        let cert_der = cert_chain[0].clone();
+        let fp = crypto::generate_fingerprint(cert_der.as_ref());
+        let verifier = AuthorizedKeysVerifier::new(allowlist.clone());
+
+        // (2) verify_client_cert 应 Err
+        let result = <AuthorizedKeysVerifier as rustls::server::danger::ClientCertVerifier>::verify_client_cert(
+            &verifier,
+            &cert_der,
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        );
+        assert!(
+            result.is_err(),
+            "allowlist 不含的 fingerprint 应被拒绝，实际: {result:?}"
+        );
+
+        // (3) 错误消息应含 fingerprint（便于上层诊断）
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains(&fp),
+            "Err 消息应包含 fingerprint `{fp}`，实际: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("unauthorized"),
+            "Err 消息应包含 'unauthorized' 关键字，实际: {err_msg}"
+        );
+
+        // (4) 二次断言：allowlist 确实不包含 cert_der 的 fp（防"allowlist 巧合预填"的假阴性）
+        assert!(
+            !verifier.allowlist().read().unwrap().contains_key(&fp),
+            "allowlist 应不含 cert_der 的 fp"
+        );
     }
 }

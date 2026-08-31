@@ -91,3 +91,36 @@
   各自写一遍 `crypto::generate_self_signed` 调用）
 
 **优先级**：🟢 低（结构整洁，无功能影响）
+
+---
+
+## #S-9 🟢 低：`AuthorizedKeysVerifier` 的 allowlist value 类型用 `String` 而非 `lan_mouse_ipc::IncomingPeerConfig`
+
+**触发**：STEP-2.7
+
+**现象**：
+- `quic_transport.rs::AuthorizedKeysVerifier` 的 `allowlist` 字段类型：
+  `Arc<RwLock<HashMap<String, String>>>` —— value 是 `String`（空串即可，
+  表示"已授权但无 peer 配置"）
+- 现有 `config.rs::authorized_fingerprints: HashMap<String, String>` 也是
+  同形态，自然对齐
+- bak `mousehop/src/quic_transport.rs:1577-1754 AuthorizedKeysVerifier`
+  用的是 `Arc<RwLock<HashMap<String, IncomingPeerConfig>>>`
+
+**根因**：
+- `lan_mouse_ipc::IncomingPeerConfig` **尚未**引入 `lan-mouse-ipc/src/lib.rs`
+  —— 该类型带 `clipboard_receive` / `description` 等字段，**M2 范围**
+  （PLAN §0.2 推迟项）
+- STEP-2.7 仅落 server 端 cert 验证骨架，**不**触及 clipboard receiver 配置
+  → 用 `String` 当占位 value 最自然（与现有 `config.rs` 一致）
+
+**建议处置**：
+- M2 阶段把 `IncomingPeerConfig` 引入 `lan-mouse-ipc`（带 `clipboard_receive` 等）
+- 同步把本结构 + caller + `config.rs::authorized_fingerprints` 类型签名改成
+  `HashMap<String, IncomingPeerConfig>`（与 bak 对齐）
+- M2 同步改 `AuthorizedKeysVerifier::with_known(allowlist, fp)`：
+  `insert(known_fp.to_owned(), IncomingPeerConfig::default())`
+- listen.rs supervisor 也同步切到 `IncomingPeerConfig`（生产路径拿 peer
+  description 推 IPC）
+
+**优先级**：🟢 低（M1 阶段 `String` 占位完全够用；M2 clipboard 同步改一次即可）
