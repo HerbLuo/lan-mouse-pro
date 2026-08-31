@@ -89,7 +89,8 @@ impl Service {
         // 形式，内部解析 `crypto::cert_path()` / `key_path()` 双文件路径
         // 并自签 + 落盘到 `$XDG_DATA_HOME/lan-mouse/{cert,key}.pem`（#S-4
         // 已解）。`public_key_fingerprint` 仍按 SHA-256 over cert DER 算
-        // 出，与旧 webrtc-dtls 路径指纹算法一致（同一 DER 字节 → 同一指纹）。
+        // 出，与历史 webrtc-dtls 路径指纹算法一致（同一 DER 字节 → 同一指纹，
+        // 保证存量 `authorized_keys` 条目在 v4 切到 QUIC 后仍可被对端复用）。
         //
         // STEP-6.2 落实：listener 路径也切到 rustls 元组 —— 同一份
         // `(cert_chain, key)` 既喂 listener 也喂 connection；旧的

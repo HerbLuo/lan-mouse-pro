@@ -175,9 +175,9 @@ impl ListenTask {
                             // the peer is in fact happily talking to us.
                             ProtoEvent::Hello { magic: _, commit } => {
                                 // The magic check happens in quic_transport.rs
-                                // (STEP-3.2). At this DTLS-shaped receive
-                                // site we only echo the commit back so the
-                                // peer can populate its peer_commit field.
+                                // (STEP-3.2). At this receive site we only
+                                // echo the commit back so the peer can
+                                // populate its peer_commit field.
                                 self.listener.reply(addr, ProtoEvent::Hello { magic: PROTOCOL_MAGIC, commit: local_commit() }).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }

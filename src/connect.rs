@@ -43,7 +43,7 @@ pub(crate) enum LanMouseConnectionError {
     /// `dial()` 的失败经由本变体透传给上层。
     ///
     /// 删除的 `Dtls` / `Webrtc` 变体（已无 caller，留着只会持续警告）；
-    /// 完整 DTLS 依赖清理待 STEP-7.3。
+    /// DTLS 依赖下线由 STEP-7.3 完成。
     #[error(transparent)]
     Quic(#[from] quic_transport::Error),
     #[error("not connected")]

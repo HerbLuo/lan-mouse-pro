@@ -385,7 +385,7 @@ impl CaptureTask {
             // flips to passthrough and never reach the peer. The peer
             // then runs every subsequent keystroke through those held
             // mods until its watchdog times out (1+ s) or our Leave
-            // arrives — and Leave can be lost over UDP/DTLS.
+            // arrives — and Leave can be lost over UDP.
             for key in capture.take_pressed_keys() {
                 let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                     time: 0,
