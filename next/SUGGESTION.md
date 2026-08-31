@@ -159,3 +159,47 @@
 
 **待 Leader 决策**：本步按方案 A 实现。若选方案 B，回退本步加变体；后续
 STEP 不受影响（两边都能配合 STEP-3.2 工作）。
+
+**STEP-3.2 闭环**：方案 A 已落实 —— `client_hello` / `server_hello` 内
+match arm 显式分支处理 `magic != PROTOCOL_MAGIC`，返
+`Error::HelloFailed("wrong magic: ...")` + 调
+`conn.close(VarInt(0), b"hello failed (wrong magic)")`。本条目进入
+"待 Leader 评审后删除"状态。
+
+---
+
+## #S-11 🟡 中：`#[derive(Default)]` 对"业务默认值"语义不够用 —— STEP-4.1 已踩坑
+
+**触发**：STEP-4.1
+
+**现象**：
+- PLAN §4.1 要求 `InputChannelConfig::default() = { mouse: Datagram, keyboard: Stream }`
+- 第一次实现套 `#[derive(Default)]` + `ChannelMode::#[default] Datagram`
+- 单测 `channel_mode_default` 立刻红：`keyboard` 拿到 `Datagram`（不是 `Stream`）
+
+**根因**：
+Rust `Default` derive 对 struct 是"逐字段 default AND" —— 每个字段各
+调一次 `Default::default()`，**完全**忽略外层"业务规则"。enum 的
+`#[default]` 标注也无法跨 struct 嵌套形成"business default"。
+
+```
+struct Default = fieldwise(field1.default(), field2.default(), ...)
+            ≠ 业务默认（mouse=Datagram & keyboard=Stream 是独立规则）
+```
+
+**本步修正**：
+1. 撤 enum `#[default] Datagram`
+2. 撤 struct `#[derive(Default)]`
+3. 手写 `impl Default for InputChannelConfig { ... }` 硬编码两个字段
+
+**未来影响**：
+- STEP-4.2 `ConfigClient` 加 `input_channels` 字段时若想给 `ConfigClient`
+  自身 derive Default，**必须手写**而不是依赖 `InputChannelConfig::default()`
+  的语意外传 —— 但因为已经实现正确，derive 可用。
+- M2 引入 `IncomingPeerConfig`（含 `clipboard_receive`）时若其字段有"业务默认"
+  与"字段默认"差异，需同样规则。
+
+**优先级**：🟡 中（API 表面教训；STEP-4.1 一次自检到位，无功能遗留）
+
+**待 Leader 决策**：决定是否将本条目合入工程内规（"凡涉及多个字段有业务
+关联规则的 config struct，必须手写 Default + 单测覆盖"），纳入 README / AGENTS.md。

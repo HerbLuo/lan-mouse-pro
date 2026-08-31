@@ -156,6 +156,85 @@ impl Default for ClientConfig {
 
 pub type ClientHandle = u64;
 
+/// Per-event-class transport preference. Used by [`InputChannelConfig`] to tell
+/// the QUIC transport which events should travel over reliable streams vs.
+/// datagrams.
+///
+/// - `Stream` — reliable, ordered (QUIC bidi stream). Suited for keyboard /
+///   modifiers where a dropped button-release would leave the peer in a stuck
+///   state.
+/// - `Datagram` — unreliable, no ordering (QUIC datagram). Suited for
+///   button-down events and motion, where low latency matters more than
+///   per-event delivery.
+///
+/// M1: this enum is only the *configuration* surface. The actual routing is
+/// implemented in `crate::quic_transport::route_input` (STEP-4.4). M2 will
+/// introduce a `TransportEvent` enum on this crate — out of scope here.
+#[derive(Debug, Eq, Hash, PartialEq, Copy, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChannelMode {
+    /// Reliable ordered QUIC bidi stream.
+    Stream,
+    /// Unreliable unordered QUIC datagram.
+    Datagram,
+}
+
+/// Per-peer choice of which input-event classes travel over a reliable stream
+/// versus a datagram.
+///
+/// The defaults match the long-standing behavior of `lan-mouse` (mouse button
+/// → datagram for low latency; keyboard → stream so modifier releases
+/// cannot be dropped). Users can switch either field via `config.toml` /
+/// the GTK client editor; see STEP-4.3 / STEP-4.5.
+#[derive(Debug, Eq, PartialEq, Copy, Clone, Serialize, Deserialize)]
+pub struct InputChannelConfig {
+    /// Channel used for mouse button press / release events.
+    pub mouse_button: ChannelMode,
+    /// Channel used for keyboard and modifier events.
+    pub keyboard: ChannelMode,
+}
+
+impl Default for InputChannelConfig {
+    fn default() -> Self {
+        Self {
+            mouse_button: ChannelMode::Datagram,
+            keyboard: ChannelMode::Stream,
+        }
+    }
+}
+
+#[cfg(test)]
+mod input_channel_tests {
+    use super::*;
+
+    #[test]
+    fn channel_mode_default() {
+        let cfg = InputChannelConfig::default();
+        assert_eq!(cfg.mouse_button, ChannelMode::Datagram);
+        assert_eq!(cfg.keyboard, ChannelMode::Stream);
+    }
+
+    #[test]
+    fn channel_mode_serializes_lowercase() {
+        // The TOML / IPC wire format uses lowercase tags.
+        let stream = serde_json::to_string(&ChannelMode::Stream).unwrap();
+        let datagram = serde_json::to_string(&ChannelMode::Datagram).unwrap();
+        assert_eq!(stream, "\"stream\"");
+        assert_eq!(datagram, "\"datagram\"");
+    }
+
+    #[test]
+    fn input_channel_config_round_trip() {
+        let cfg = InputChannelConfig {
+            mouse_button: ChannelMode::Stream,
+            keyboard: ChannelMode::Datagram,
+        };
+        let s = serde_json::to_string(&cfg).unwrap();
+        let back: InputChannelConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, cfg);
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ClientState {
     /// events should be sent to and received from the client
