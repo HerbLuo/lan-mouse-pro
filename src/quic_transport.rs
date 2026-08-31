@@ -2166,6 +2166,11 @@ pub fn should_retry_after_close(reason: &quinn::ConnectionError) -> bool {
 /// `peer_session_round_trip_motion_keyboard` 直接调；STEP-6.1
 /// `connect.rs::connect_to_handle` 接入时一并移除 `#[allow]`。
 ///
+/// **STEP-6.5 改造**：主循环退出时取 `conn.close_reason()` 转成
+/// `Err(Error::Handshake(reason))` —— [`should_retry_after_close`] 由
+/// `connect.rs::spawn_peer_supervisor` 评估，决定是否触发 RetryState
+/// 退避重连。`#[allow(dead_code)]` 移除（main-code 接入后消费）。
+///
 /// **为什么 `Arc<Self>` 而非 `&self`**：内部 spawn 两个 reader task
 /// （`datagram_reader_task` / `read_loop` 内的 stream B reader）都需要
 /// `'static + Send` 借用 —— 必须有 `'static` 生命周期（不能是临时
@@ -2182,7 +2187,7 @@ pub fn should_retry_after_close(reason: &quinn::ConnectionError) -> bool {
 ///   不致命；与 STEP-5.3 `read_stream_b_loop` 的"skip-frame"语义对称）
 /// - `conn.closed()` → 返 `Ok(())`（正常关连）
 impl PeerSession {
-    #[allow(dead_code)] // STEP-6.1 / 6.2 接入 main-code 时移除
+    /// PeerSession 主循环（STEP-5.4 引入 + STEP-6.5 改造 close reason 返回）。
     pub async fn run(self: std::sync::Arc<Self>, role: PeerRole) -> std::result::Result<(), Error> {
     // (1) 启 hello_watchdog —— 3s 超时兜底；对端不发起 stream A 时主动关连
     hello_watchdog(self.clone());
@@ -2334,9 +2339,26 @@ impl PeerSession {
         }
     }
 
-    // (8) 退出主循环 —— 评估是否值得重连
+    // (8) 退出主循环 —— 取 close reason 并转成 `Error::Handshake(reason)`
+    //
+    // **STEP-6.5 改造**：原返回 `Ok(())` —— caller 看不到"为什么关"的语义。
+    // 现取 `conn.close_reason()` (quinn 0.11 公开 API)：peer 主动 close 时
+    // 返 `Some(ConnectionError::ApplicationClosed(_))`；网络层断连时返
+    // `Some(ConnectionError::ConnectionLost(_))` / `TimedOut` 等；本地主动
+    // close 时返 `Some(ConnectionError::LocallyClosed)`；从未关闭过则
+    // 返 `None` —— 这种情形极少（说明主循环是别的原因 break 的，比如
+    // stream A/B/D 异常），此时返回 `Error::Handshake(LocallyClosed)`
+    // 让 caller 走 `should_retry_after_close` 判定（保守不重试）。
+    //
+    // **为什么用 `Error::Handshake(ConnectionError)` 复用现有变体**：
+    // `Error::Handshake` 在 STEP-2.2 已定义成 `#[from] quinn::ConnectionError`，
+    // 复用零成本。`Error::Closed` 是 bak 命名，本仓不引入（保持现有变体集
+    // 最小）。`should_retry_after_close(&reason)` 是 free function，caller
+    // 自己判 retry 决策。
     log::debug!("run: main loop exited");
-    Ok(())
+    let reason = self.conn.close_reason();
+    let reason = reason.unwrap_or(quinn::ConnectionError::LocallyClosed);
+    Err(Error::Handshake(reason))
 }
 }
 
