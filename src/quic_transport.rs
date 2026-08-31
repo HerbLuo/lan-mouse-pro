@@ -356,6 +356,11 @@ pub enum Error {
     /// "skip frame" 续读（与 bak `frame_truncated_rejected` 测试一致）。
     #[error("frame body truncated")]
     Truncated,
+    /// crypto.rs 错误透传 —— 主要由 `crypto::rustls_server_config` /
+    /// `rustls_server_config_with_verifier` 失败冒上来（证书解析 / 链构
+    /// 建失败 / rcgen 自签 cert 失败等）。STEP-6.2 引入。
+    #[error("crypto: {0}")]
+    Crypto(#[from] crate::crypto::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -539,7 +544,10 @@ pub fn endpoint_with_verifier(
 /// （同样的 `Arc::try_unwrap` + ALPN + `QuicServerConfig::try_from` +
 /// transport_config + bind + `Endpoint::new`）；ALPN 字符串由 `b"mousehop"`
 /// 改 `b"lan-mouse"`（PLAN §5 D1）。
-fn endpoint_inner(addr: SocketAddr, rustls_server_arc: Arc<ServerConfig>) -> Result<Endpoint> {
+fn endpoint_inner(
+    addr: SocketAddr,
+    rustls_server_arc: Arc<rustls::ServerConfig>,
+) -> Result<Endpoint> {
     // `alpn_protocols` 是 `rustls::ServerConfig` 的字段（不在 quinn 的
     // `ServerConfig` 上），所以要在 wrap 进 `QuicServerConfig` 之前设置。
     let mut rustls_server = Arc::try_unwrap(rustls_server_arc)
@@ -990,7 +998,7 @@ impl PeerSession {
         // `PeerSession.stream_bunch: Arc<Mutex<Option<StreamBunch>>>`。
         // —— 本步范围严格守住 PLAN §5.2 文字"Bidi / StreamBunch 类型 +
         // write_frame / read_frame codec + 单测"。
-        let mut guard = self.stream_a_cache.lock().await;
+        let guard = self.stream_a_cache.lock().await;
         // 当前 STEP-5.2 仅用作降级路径 —— cache 实际存的是 stream B 的
         // send 半边（HELLO 完成后 stream A 已被 server_hello / client_hello
         // 缓存，**会**与本缓存冲突 —— 见下方临时方案说明）。
@@ -1028,7 +1036,6 @@ impl PeerSession {
             .await
             .map_err(|e| Error::StreamB(format!("write frame body: {e}")))?;
         send.finish()
-            .await
             .map_err(|e| Error::StreamB(format!("finish: {e}")))?;
         Ok(())
     }
@@ -1130,7 +1137,6 @@ impl PeerSession {
             .await
             .map_err(|e| Error::HelloFailed(format!("send_stream_a body: {e}")))?;
         send.finish()
-            .await
             .map_err(|e| Error::HelloFailed(format!("send_stream_a finish: {e}")))?;
         Ok(())
     }
@@ -1616,7 +1622,7 @@ where
     }
     let mut buf = [0u8; MAX_EVENT_SIZE];
     match recv.read_exact(&mut buf[..len]).await {
-        Ok(()) => {}
+        Ok(_bytes_read) => {}
         // 对端半途关流 → 截断（区别于"解码失败 HelloFailed"）
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
             return Err(Error::Truncated);
@@ -1798,7 +1804,7 @@ pub struct ReadStreams {
 async fn read_stream_b_loop(
     mut recv: RecvStream,
     tx: tokio_mpsc::Sender<StreamEvent>,
-) -> Result<(), Error> {
+) -> std::result::Result<(), Error> {
     loop {
         match read_frame(&mut recv).await {
             Ok(event) => {
@@ -1879,6 +1885,7 @@ async fn read_stream_b_loop(
 /// **dead_code chain**：本方法由 STEP-5.4 `PeerSession::run()` 装配
 /// 入口消费；本步 `#[allow(dead_code)]` 守护（与 STEP-3.x / 4.x 同模式）。
 #[allow(dead_code)]
+#[allow(unused_variables)] // recv_a reserved for STEP-6.3 stream A reader integration
 pub async fn read_loop(
     peer: &PeerSession,
     recv_a: &mut RecvStream,
@@ -1968,14 +1975,17 @@ pub enum PeerRole {
 pub fn should_retry_after_close(reason: &quinn::ConnectionError) -> bool {
     use quinn::ConnectionError;
     match reason {
-        ConnectionError::ConnectionLost(_) | ConnectionError::TimedOut => true,
+        // 网络层断连 / 超时 —— 重试
+        ConnectionError::TimedOut => true,
+        // quinn 0.11 实际变体：协议级 / 本端错误 / peer 主动 close / CID 耗尽
+        // —— 都不重试（保守）。
         ConnectionError::ApplicationClosed(_)
         | ConnectionError::TransportError(_)
+        | ConnectionError::ConnectionClosed(_)
         | ConnectionError::Reset
         | ConnectionError::VersionMismatch
-        | ConnectionError::LocalError(_) => false,
-        // quinn 0.11 实际变体就是上述 6 个；`_` 兜底为"不重试"（保守）。
-        _ => false,
+        | ConnectionError::LocallyClosed
+        | ConnectionError::CidsExhausted => false,
     }
 }
 
@@ -2074,15 +2084,22 @@ impl PeerSession {
     //                   recv，是 redundant dup；无害 drop 即可）
     // pairs[1] = stream B
     // pairs[2] = stream C（read_loop 立即 drop —— 守 §9）
+    let mut pairs_iter = pairs.into_iter();
+    let (s_a, r_a_dup) = pairs_iter.next().expect("pairs[0]");
+    let (s_b, r_b) = pairs_iter.next().expect("pairs[1]");
+    let (s_c, r_c_dup) = pairs_iter.next().expect("pairs[2]");
+    // stream A recv half 已被 take_stream_a_recv 拿走 —— r_a_dup 是
+    // redundant dup，交给 StreamBunch.a.recv 占位（read_loop 不读它）
+    // stream C recv 也不被 M1 reader task 读（守 §9）—— 同上 r_c_dup 占位
     let bunch = StreamBunch {
-        a: Bidi::new(pairs[0].0, pairs[0].1),
-        b: Bidi::new(pairs[1].0, pairs[1].1),
-        c: Bidi::new(pairs[2].0, pairs[2].1),
+        a: Bidi::new(s_a, r_a_dup),
+        b: Bidi::new(s_b, r_b),
+        c: Bidi::new(s_c, r_c_dup),
     };
     self.set_stream_bunch(bunch).await;
 
     // (6) read_loop 装配 stream B reader task；stream C 在 read_loop 内 drop
-    let mut read_streams = self.read_loop(&mut recv_a).await?;
+    let mut read_streams = read_loop(&self, &mut recv_a).await?;
 
     // (7) 主循环 select! —— 4 路 reader + conn.closed() 超时
     let closed = self.conn.closed();
@@ -2229,45 +2246,23 @@ async fn datagram_reader_task(
                     }
                 };
 
-                // SUGGESTION #S-16 背压：队列满 → 丢最旧
+                // SUGGESTION #S-16 背压：队列满 → 丢当前帧
                 //
-                // 流程：
-                //   1. 试 try_send（队列满 → 返 FullErr）
-                //   2. try_recv 拿最旧一帧（丢弃）
-                //   3. 再 try_send；若仍满 → 再 try_recv（最多 8 次循环防活锁）
-                //   4. 极端情况仍失败 → log::warn + skip（接受这一帧丢）
-                let mut dropped = 0u32;
-                let mut send_result = tx.try_send(StreamEvent::Datagram(event));
-                while let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = &send_result {
-                    // 丢最旧一帧腾位置
-                    match tx.try_recv() {
-                        Ok(_dropped) => {
-                            dropped += 1;
-                        }
-                        Err(_) => {
-                            // 队列状态在 try_recv 与 try_send 之间变化（极端 race）
-                            // —— 不常见；继续下一轮循环
-                        }
+                // tokio mpsc Sender 不支持从 send 端 drain；Drop-oldest 语义要
+                // 在 Receiver 端实现（M1 简化：接受当前帧丢，caller 慢就让 datagram
+                // 走丢 —— 与高频 Motion 事件 user-noticeable drop 的取舍一致）。
+                // 真正 Drop-oldest 留 STEP-7.x 接本地输入代理时按需细化。
+                match tx.try_send(StreamEvent::Datagram(event)) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        // 队列满 → 丢当前帧（高频指针事件，单帧丢失不可见）
+                        log::trace!("datagram_reader: queue full, dropping current frame");
                     }
-                    send_result = tx.try_send(
-                        // 重新构造（已被上一步 take 走）
-                        StreamEvent::Datagram(match ProtoEvent::try_from(buf) {
-                            Ok(e) => e,
-                            Err(_) => break,
-                        }),
-                    );
-                    if dropped > 8 {
-                        // 极端：丢 8 帧仍塞不进 → 接受丢当前帧
-                        log::warn!(
-                            "datagram_reader: 队列严重拥塞，丢当前 datagram 帧（已丢旧 {dropped} 帧）"
-                        );
-                        break;
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        // 主循环已退出（rx_d 被 drop），干净退出
+                        log::info!("datagram_reader: mpsc receiver dropped, exiting");
+                        return;
                     }
-                }
-                if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) = send_result {
-                    // 主循环已退出（rx_d 被 drop），干净退出
-                    log::info!("datagram_reader: mpsc receiver dropped, exiting");
-                    return;
                 }
             }
             Err(e) => {
@@ -2319,6 +2314,7 @@ async fn datagram_reader_task(
 /// **dead_code chain**：本类型被 `build_quic_client_config`（接收 `pins_dir`）
 /// 消费 → 再被 `dial()` 间接消费 → 测试也直接调 `verify_server_cert`。
 /// main-code 路径在 STEP-6.1 `connect.rs::connect_to_handle` 接入时一并消化。
+#[derive(Debug)]
 pub struct TofuVerifier {
     pins_dir: PathBuf,
     /// 签名验签需要的 provider（`verify_tls12_signature` / `verify_tls13_signature`
@@ -2366,7 +2362,7 @@ impl TofuVerifier {
         }
         fs::read_dir(&self.pins_dir)
             .map(|d| {
-                d.filter_map(Result::ok)
+                d.filter_map(std::io::Result::ok)
                     .any(|e| e.path().extension().is_some_and(|ext| ext == "pin"))
             })
             .unwrap_or(false)
@@ -2473,6 +2469,7 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
 /// 已经 `with_client_cert_verifier(...)` 装上 verifier，且 `client_auth_mandatory()`
 /// 为 true，client **必须**出示 cert 才能到这一步；client 不出示 → TLS 1.3
 /// 内置流程直接 `rustls::Error::NoCertificatesPresented` 拒握（见测试）。
+#[derive(Debug)]
 pub struct PermissiveClientCertVerifier;
 
 impl rustls::server::danger::ClientCertVerifier for PermissiveClientCertVerifier {
@@ -2494,10 +2491,37 @@ impl rustls::server::danger::ClientCertVerifier for PermissiveClientCertVerifier
         end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+    ) -> std::result::Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         let fp = crate::crypto::generate_fingerprint(end_entity.as_ref());
         log::debug!("[STEP-2.5 占位 verifier] accept client cert fp={fp}");
         Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        // STEP-2.5 占位 verifier —— TLS 1.2 路径无签名需求（client cert
+        // 通过 TLS 1.3 内置链校验即可）。签名验签实现在 STEP-2.7
+        // `AuthorizedKeysVerifier` 中（持 provider + 转发到 ring provider）。
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        // 同上 —— TLS 1.3 路径下 STEP-2.5 占位 verifier 不做签名验签
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        // 占位 verifier 不校验签名 schema —— 返回空 vec 即可
+        Vec::new()
     }
 }
 
@@ -2541,6 +2565,7 @@ impl rustls::server::danger::ClientCertVerifier for PermissiveClientCertVerifier
 /// 消费 → 由 `endpoint_with_verifier` 间接消费 → 单测直接调
 /// `verify_client_cert`。main-code 接入路径留 STEP-6.2 `listen.rs` supervisor
 /// 整段重写时一并消化（listen.rs 当前仍调 DTLS 路径，14 errors 不在本步范围）。
+#[derive(Debug)]
 pub struct AuthorizedKeysVerifier {
     /// 授权指纹表：键 = client cert SHA-256 fingerprint（`crypto::generate_fingerprint` 格式），
     /// 值 = 占位 `String`（M2 接 `lan_mouse_ipc::IncomingPeerConfig::default()`）。

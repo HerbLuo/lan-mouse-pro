@@ -31,6 +31,14 @@
 
 **优先级**：🟠 高（阻碍最终依赖清理）
 
+**STEP-6.2 闭环（2026-08-31）**：
+- `crypto.rs:28 use webrtc_dtls::crypto::Certificate;` 顶部 import **已删**
+- `crypto::load_certificate_compat` / `generate_dtls_cert_compat` / `certificate_fingerprint_compat` **3 个函数全删**
+- `service.rs::new()` 调用从 `crypto::load_certificate_compat(&cert_path)` 切到 `cert_der.0.clone()` + `cert_der.1.clone_key()`（与 `LanMouseConnection::new` 同一份 rustls 元组）
+- `LanMouseListener::new(...)` 签名从 `cert: Certificate` 改为 `(cert_chain, key)` 元组
+- `lan-mouse/Cargo.toml` 的 `webrtc-dtls` / `webrtc-util` 依赖**在 STEP-1.2 已删除** —— #S-1 的最后一项已自动满足
+- 本条目进入"待 Leader 评审后删除"状态
+
 ---
 
 ## #S-3 🟢 低：dead-code warning 9 处
@@ -432,3 +440,32 @@ inline `open_uni() + write_all() + finish()`（不缓存、不复用、不带
 - 本条目进入"待 Leader 评审后删除"状态（建议 Leader 评审后删）
 
 **优先级**：🟡 中（SUGGESTION #28 治理部分消化，STEP-5.4 续治）
+
+---
+
+## #S-17 🟡 中：datagram_reader 背压从 drop-oldest 改为 drop-current（tokio mpsc API 约束）
+
+**触发**：STEP-6.2a
+
+**现象**：原 STEP-5.4 实现 + SUGGESTION #S-16 设计的 `datagram_reader_task` 试图在 queue 满时调 `tx.try_recv()` 丢最旧帧 —— 但 `tokio::sync::mpsc::Sender` 没有 `try_recv()` 方法（drain 只能在 Receiver 侧做）。原方案需要把 Receiver 也传给 reader task，但 Receiver 又被 `run()` 主循环的 `tokio::select!` 持有 —— 单 Receiver 不能被两个 task 同时持有（MPSC 语义）。
+
+**本步修复**：把"丢最旧"改为"丢当前帧"（高频 Motion 事件，单帧丢失 user-noticeable drop 可接受；与 bak 取舍一致）。reader task 仅持 Sender，full 时 `log::trace!` 记录 + 丢弃当前帧 + 继续读下一帧。
+
+**差异**：
+- drop-oldest（SUGGESTION #S-16 原方案）：保留更早的指针位置，丢失最新
+- drop-current（本步实现）：保留更早的指针位置被消费，丢失当前
+
+对高频 Motion 事件：
+- 旧位置（最近一次成功 send）通常已经在 consumer 端（如本地 OS 鼠标位置）应用
+- 当前帧位置如果是 user-noticeable 状态突变（如突然加速）会丢这一帧
+- 整体视觉差：差异极小（毫秒级 Motion 帧率下，1-2 帧丢失肉眼不可见）
+
+**严重程度**：轻（功能等价；高频指针事件丢 1 帧无视觉异常）。SUGGESTION.md #S-16 需 Leader 评审后改语义描述或删除 #S-16 + 把本条目作为唯一背压策略说明。
+
+**建议处置**：
+- STEP-6.x 接本地输入代理时若发现丢帧率过高，改造为 `tokio::sync::watch`（overwrite-on-send）或 `Arc<Mutex<VecDeque>>`（caller 端 drain）实现真正 drop-oldest
+- 当前 M1 阶段 drop-current 完全够用（与 bak 同取舍）
+
+**优先级**：🟡 中（工程取舍记录；不影响 STEP-6.x）
+
+---
