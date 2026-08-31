@@ -267,6 +267,31 @@ pub fn rustls_server_config(
     Ok(Arc::new(cfg))
 }
 
+/// STEP-2.5 mTLS 强制 client cert 校验入口 —— 与 `rustls_server_config` 形态
+/// 对称，唯一差别是 `with_no_client_auth()` → `with_client_cert_verifier(verifier)`：
+/// 前者走 rustls 内置 `NoClientAuth`（不验证 client cert），后者走应用层提供
+/// 的 `ClientCertVerifier` 实现（STEP-2.7 `AuthorizedKeysVerifier`，本步仅
+/// 装配入口）。`quic_transport::endpoint_with_verifier(...)` 调本函数。
+///
+/// **verifier 必须 `Send + Sync + 'static`**（rustls 0.23 trait 约束）——
+/// `Arc<dyn rustls::server::danger::ClientCertVerifier>` 自动满足。
+///
+/// 与 `bak/mousehop/src/crypto.rs:238-249 rustls_server_config_with_verifier`
+/// 完全对齐；差异仅在 `/// dead_code` 注释（本仓不做 dead_code 守护 —— 单测
+/// 与 `endpoint_with_verifier` 接入后自然消费）。
+pub fn rustls_server_config_with_verifier(
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+) -> Result<Arc<ServerConfig>, Error> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(cert_chain, key)?;
+    Ok(Arc::new(cfg))
+}
+
 /// 构造 `Arc<rustls::ClientConfig>`（带根证书，无 mTLS）。
 ///
 /// server cert 校验下沉到 `quic_transport::TofuVerifier`（STEP-2.6），本函数

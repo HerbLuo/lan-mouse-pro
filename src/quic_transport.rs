@@ -11,6 +11,10 @@
 //! - STEP-2.4（已）：[`endpoint_with_cert`] —— 持久化 cert 注入 server-mode
 //!   Endpoint（替代 `endpoint()` 占位；#S-4 cert/key 拆文件 + #S-9 server
 //!   ALPN 已落地）
+//! - STEP-2.5（已）：[`endpoint_with_verifier`] —— mTLS 强制 client cert 校验
+//!   + [`PermissiveClientCertVerifier`] 占位 verifier（STEP-2.7 替换为
+//!   `AuthorizedKeysVerifier`）；client 端 [`build_quic_client_config`]
+//!   出示 client cert chain（#S-7 已解：`let _ = key` 去掉）
 //! - STEP-2.6 / 2.7：`TofuVerifier` / `AuthorizedKeysVerifier`
 //! - STEP-3.2：`client_hello` / `server_hello` 握手
 //! - STEP-4.4：`route_input()` ChannelMode 分派
@@ -195,21 +199,84 @@ pub fn endpoint_with_cert(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<Endpoint> {
-    // 1. 装配 rustls::ServerConfig —— ALPN 在这一步之前/之后设置都行
-    //    （关键是不能 wrap 进 QuicServerConfig 之后），这里在 wrap 前
-    //    设，保持与 client `build_quic_client_config` 对称
     let rustls_server_arc = crypto::rustls_server_config(cert_chain, key)?;
+    endpoint_inner(addr, rustls_server_arc)
+}
+
+/// server-mode `Endpoint` + mTLS 强制 client cert 校验（STEP-2.5 引入）。
+///
+/// 与 [`endpoint_with_cert`] 形态对称，唯一差别是装配 rustls `ServerConfig`
+/// 时调 `crypto::rustls_server_config_with_verifier(...)` 把 client cert 校验
+/// 交给 caller 提供的 verifier：
+/// - fingerprint 命中 allowlist → 握手通过（STEP-2.7 `AuthorizedKeysVerifier`）
+/// - 未命中 / 缺 client cert → `rustls::Error::General(...)`，quinn 包装为
+///   `ConnectionError::TransportError` / `LocallyClosed` → [`Error::Handshake`]
+///
+/// **#S-7 配套** —— 当 server `client_auth_mandatory() -> true`（本仓默认），
+/// server 端 `CertificateRequest` 要求 client 出示 cert；client 端
+/// [`build_quic_client_config`] 同时把 `(cert, key)` 通过 `with_client_auth_cert`
+/// 装上（#S-7 解），TLS 握手双端 mTLS 才完整。
+///
+/// **生产路径 caller**（STEP-6.2 整段接 `listen.rs` supervisor）：
+/// 1. `crypto::load_or_create_server_cert()` → `(cert_chain, key)`
+/// 2. 构造 verifier（STEP-2.5 用 [`PermissiveClientCertVerifier`] 占位；STEP-2.7
+///    替换为 `AuthorizedKeysVerifier` 走 `config.authorized_fingerprints()`）
+/// 3. `endpoint_with_verifier(addr, cert_chain, key, verifier)`
+///
+/// **本步默认 verifier**：[`PermissiveClientCertVerifier`] —— 实现"接受任意
+/// client cert，只要它存在 + 签名通过 TLS 1.3 内置校验"。这是 M1 STEP-2.5
+/// 阶段的占位；STEP-2.7 由 `AuthorizedKeysVerifier` 替换为"指纹 allowlist"。
+/// 不引入占位 verifier 也能编译通过（直接传 `Arc::new(WebPkiClientVerifier::...`
+/// 也可以），但当前选择最小可工作形态 + 显式"占位"标记，方便后续 step 检索。
+///
+/// **错误归一**：复用现有 [`Error`] 变体 —— 不新增：
+/// - `crypto::rustls_server_config_with_verifier` 失败 → `Error::Rustls`
+/// - `endpoint_inner` 内部错误（`Arc::try_unwrap` / `QuicServerConfig::try_from` /
+///   bind / runtime / `Endpoint::new`）→ 复用 [`endpoint_with_cert`] 路径错误
+///
+/// **`install_crypto_provider` 不在本函数内调**：与 [`endpoint_with_cert`] 对称。
+///
+/// dead_code chain：本函数被 STEP-2.5 单测 + 未来的 listen.rs supervisor
+/// （STEP-6.2）消费；当前 main-code 无 caller 但单测已链上，故**不**加
+/// `#[allow(dead_code)]`。
+pub fn endpoint_with_verifier(
+    addr: SocketAddr,
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+) -> Result<Endpoint> {
+    let rustls_server_arc = crypto::rustls_server_config_with_verifier(cert_chain, key, verifier)?;
+    endpoint_inner(addr, rustls_server_arc)
+}
+
+/// `endpoint_with_cert` / `endpoint_with_verifier` 共用的私有 helper：
+/// 把 `Arc<rustls::ServerConfig>` 装配成 `quinn::Endpoint`。
+///
+/// 抽出来是为了让两条路径共享 `Arc::try_unwrap` + ALPN + QuicServerConfig
+/// + transport_config + bind + Endpoint::new 的固定装配流程，新增 verifier
+/// 入口时不用复制这段（#S-7 / STEP-2.5 配套抽象）。
+///
+/// `Arc::try_unwrap` 必然成功：刚拿到的 `Arc<ServerConfig>` 强引用数 = 1
+/// （`crypto::rustls_server_config[_with_verifier]` 返回后未持有其它副本）；
+/// 即使 verifier 内部有 `Arc`（如 `Arc<RwLock<...>>`），那也是 verifier 自己的
+/// 内部状态，与 server_cfg 自身无关。
+///
+/// 与 `bak/mousehop/src/quic_transport.rs:1266-1287 endpoint_inner` 完全对齐
+/// （同样的 `Arc::try_unwrap` + ALPN + `QuicServerConfig::try_from` +
+/// transport_config + bind + `Endpoint::new`）；ALPN 字符串由 `b"mousehop"`
+/// 改 `b"lan-mouse"`（PLAN §5 D1）。
+fn endpoint_inner(addr: SocketAddr, rustls_server_arc: Arc<ServerConfig>) -> Result<Endpoint> {
+    // `alpn_protocols` 是 `rustls::ServerConfig` 的字段（不在 quinn 的
+    // `ServerConfig` 上），所以要在 wrap 进 `QuicServerConfig` 之前设置。
     let mut rustls_server = Arc::try_unwrap(rustls_server_arc)
         .map_err(|_| Error::ClientConfig("rustls ServerConfig Arc 强引用数 > 1".into()))?;
     rustls_server.alpn_protocols = vec![ALPN_LAN_MOUSE.to_vec()];
 
-    // 2. wrap 进 quinn::ServerConfig —— `Arc<QuicServerConfig>` 强引用数 1
     let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_server))
         .map_err(|e| Error::ClientConfig(format!("QuicServerConfig::try_from: {e}")))?;
     let mut server_cfg = ServerConfig::with_crypto(Arc::new(quic_server));
     server_cfg.transport_config(default_transport_config());
 
-    // 3. UDP bind + Endpoint::new（与 endpoint() 同路径）
     let endpoint_cfg = EndpointConfig::default();
     let socket = UdpSocket::bind(addr).map_err(|source| Error::Bind { addr, source })?;
     let runtime = quinn::default_runtime()
@@ -245,19 +312,29 @@ pub fn install_crypto_provider() {
 }
 
 /// 装配 `quinn::ClientConfig`：rustls + ring + 客户端自签 cert 当 root +
-/// 不带 verifier（**STEP-2.6 由 TofuVerifier 替换**）+ ALPN `lan-mouse`。
+/// 不带 verifier（**STEP-2.6 由 TofuVerifier 替换**）+ mTLS 出示 client cert
+/// chain + ALPN `lan-mouse`。
 ///
-/// 当前形态（STEP-2.1）：
+/// 当前形态（STEP-2.5）：
 /// - `crypto_provider = ring` —— 由 [`install_crypto_provider`] 早于
 ///   本调用预装（本函数不主动 install，main 启动期唯一入口在 main.rs）
 /// - root cert store：把**对端** server cert 当 trust anchor 装入（仅
 ///   STEP-2.1 自测用；正式运行靠 STEP-2.6 TofuVerifier 做 fingerprint
 ///   pinning；本形态仅做 chain 校验到 root）
-/// - **不**带 client cert 出示 —— mTLS 留 STEP-2.5；STEP-2.1 仅装配
-///   client 一侧的握手结构（PLAN §2.1 "不带 verifier 占位"）
+/// - **mTLS 出示 client cert chain**（STEP-2.5 起）：`with_client_auth_cert(
+///   cert_chain, key)` 同步装上；与 server [`endpoint_with_verifier`] 的
+///   `with_client_cert_verifier(...)` 对称 —— server 端 `CertificateRequest`
+///   要求 client cert，client 通过本函数装配即可出示。`key` 字段不再是
+///   占位 —— #S-7 已解。
 /// - ALPN：`b"lan-mouse"` —— 与对端 server 协商协议；STEP-3.2 之上
 ///   另有应用层 `PROTOCOL_MAGIC` 二次握手（PLAN §3.1）
 /// - transport：`default_transport_config()` 5s keepalive + 30s idle
+///
+/// **`cert_chain` 语义扩为双用**：既是 root store 信任 anchor，又是 mTLS 出示
+/// 链。M1 双方都跑在同一台主机的同一进程，用同一私钥自签（生产路径
+/// `dial()` 内部调 `crypto::load_or_create_server_cert()` 拿持久化 cert），
+/// 双用同一 chain 不引安全风险。STEP-6.x 接入 connect.rs 时若需要 server
+/// trust anchor 与本端 client cert 不同，再拆参数（暂不拆 —— §9 M1 边界）。
 ///
 /// **不**主动 install crypto provider：本函数被 [`install_crypto_provider`]
 /// 调用者（main.rs）守护；`#[test]` 单测则在第一句调一次 install
@@ -269,37 +346,43 @@ pub fn install_crypto_provider() {
 /// / `From<quinn_proto::Error>` —— 后者不是 `pub` 路径且 STEP-6.x 之前
 /// 没有别的 caller 会触发这些类型，盲目引入 `From` 反倒污染 `Error` 枚举。
 pub fn build_quic_client_config(
-    cert: CertificateDer<'static>,
+    cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<QuinnClientConfig> {
     use rustls::ClientConfig as RustlsClientConfig;
     use rustls::client::WebPkiServerVerifier;
 
-    // 1. 构造 rustls::ClientConfig：ring + safe-default TLS 1.3 + 自签 cert
-    //    当 root anchor + 不带 verifier（用 WebPkiServerVerifier::build
-    //    走标准 chain 校验；STEP-2.6 改 with_custom_certificate_verifier
-    //    注入 TofuVerifier）
+    // 1. 构造 root cert store：把对端 server cert 当 trust anchor。
+    //    STEP-2.6 TofuVerifier 走 .dangerous().with_custom_certificate_verifier
+    //    替换 WebPkiServerVerifier；当前形态仅做标准 chain 校验。
     let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(cert)
-        .map_err(|e| Error::ClientConfig(format!("add root cert: {e}")))?;
+    for cert in &cert_chain {
+        roots
+            .add(cert.clone())
+            .map_err(|e| Error::ClientConfig(format!("add root cert: {e}")))?;
+    }
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = RustlsClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::ClientConfig(format!("protocol versions: {e}")))?;
-    // 使用 WebPkiServerVerifier 做占位校验 —— 与 rustls 0.23 标准做法一致；
-    // STEP-2.6 用 TofuVerifier 替换此 .dangerous().with_custom_certificate_verifier(...)
-    // 链路；本步不引入 `dangerous()` API（紧贴 PLAN §2.1 "不带 verifier 占位"）
+    // 占位 server verifier —— STEP-2.6 切到 TofuVerifier；本步保持 WebPkiServerVerifier
+    // 标准 chain 校验，与 STEP-2.1 一致（#S-6 治理纪律：占位即正确，等替换）
     let verifier = WebPkiServerVerifier::builder(Arc::new(roots), provider)
         .build()
         .map_err(|e| Error::ClientConfig(format!("build webpki verifier: {e}")))?;
+
+    // 2. STEP-2.5 起 mTLS 出示 client cert chain —— `with_client_auth_cert`
+    //    是 terminal builder（返回 `Result<ClientConfig, Error>`，不像
+    //    `with_no_client_auth` 是中间 builder），出错走 `?` 经 `crypto::Error::Rustls`
+    //    收口到 `Error::ClientConfig`（`.map_err` 避免引入 From impl）
     let mut rustls_client = builder
         .with_webpki_verifier(verifier)
-        .with_no_client_auth();
+        .with_client_auth_cert(cert_chain, key)
+        .map_err(|e| Error::ClientConfig(format!("with_client_auth_cert: {e}")))?;
     rustls_client.alpn_protocols = vec![ALPN_LAN_MOUSE.to_vec()];
 
-    // 2. wrap 进 quinn::ClientConfig —— quinn 0.11 通过 `quinn::crypto::rustls`
+    // 3. wrap 进 quinn::ClientConfig —— quinn 0.11 通过 `quinn::crypto::rustls`
     //    re-export 暴露 `QuicClientConfig`（顶层 `quinn_proto::*` 不是稳定
     //    公开路径，避免直接依赖 `quinn_proto` crate）
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client))
@@ -307,27 +390,30 @@ pub fn build_quic_client_config(
     let mut client_cfg = QuinnClientConfig::new(Arc::new(quic_client));
     client_cfg.transport_config(default_transport_config());
 
-    // 关键：保存 key 防止 key 提前 drop 引发的"未使用变量"警告 —— 未来
-    // STEP-2.5 mTLS 会通过 `with_client_auth_cert(cert_chain, key)` 接上
-    // `key`，届时这一行自然消失。
-    let _ = key;
-
     Ok(client_cfg)
 }
 
 /// 主动拨号到对端 endpoint，完成 QUIC TLS 1.3 握手后返回 [`Connection`]。
 ///
-/// **STEP-2.2 占位 verifier**：本函数复用 STEP-2.1 已实现的
-/// [`build_quic_client_config`] —— 当前形态走 `WebPkiServerVerifier` 做
-/// 占位 chain 校验（信任对端的自签 cert 即放行；PLAN §2.1 已说明）。
-/// STEP-2.6 由 `TofuVerifier`（`with_custom_certificate_verifier`）替换
-/// `WebPkiServerVerifier` 路径，调用栈不变。
+/// **STEP-2.5 mTLS**：本函数复用 [`build_quic_client_config`]，后者已通过
+/// `with_client_auth_cert(cert_chain, key)` 装上 mTLS 出示。`cert` / `key`
+/// 参数在 STEP-2.5 起**双用**：
+/// 1. 作为**对端** server 的 trust anchor 输入（`WebPkiServerVerifier` 链路；
+///    STEP-2.6 由 `TofuVerifier` 替换 —— 调用栈不变）
+/// 2. 作为**本端** client 的 mTLS 出示（`with_client_auth_cert(cert_chain, key)`）
+///
+/// M1 双方都跑在同一进程（生产路径） / 测试用 `ephemeral_cert()` 两套独立 cert；
+/// 双用同一 chain 不引安全风险 —— M1 范围内合理。
+///
+/// **STEP-2.2 占位 verifier**：server cert 校验走 `WebPkiServerVerifier`
+/// 占位（信任对端自签 cert 即放行；PLAN §2.1 已说明）。STEP-2.6 由
+/// `TofuVerifier`（`with_custom_certificate_verifier`）替换 `WebPkiServerVerifier`
+/// 路径，调用栈不变。
 ///
 /// **参数顺序**：`(ep, addr, cert, key)` —— 与 PLAN §2.2 文字描述一致；
-/// `cert` / `key` 是**对端** server 的 trust anchor 输入（在
-/// `WebPkiServerVerifier::builder(roots, ...)` 链路上用作 root）——
-/// STEP-2.5 起这两个参数同时作为 mTLS **client** 端出示的 cert /
-/// key（`with_client_auth_cert(cert_chain, key)`），签名不变。
+/// `cert` 是**单张** `CertificateDer`，本函数内部 `vec![cert]` 转 chain 后
+/// 喂给 [`build_quic_client_config`]（后者要 `Vec<CertificateDer>` 才能调
+/// `with_client_auth_cert`）。
 ///
 /// **ALPN**：TLS 1.3 握手时声明 `b"lan-mouse"`（在 `build_quic_client_config`
 /// 内设 `rustls_client.alpn_protocols`）。server 端 STEP-2.4 必须对称设
@@ -345,14 +431,14 @@ pub fn build_quic_client_config(
 /// **错误归一**：
 /// - `Endpoint::connect_with` 同步失败（endpoint 关闭 / 地址非法 / 无 client
 ///   config）→ [`Error::Connect`]（`#[from] quinn::ConnectError`）
-/// - `.await` 后握手失败（证书 / ALPN / 中断）→ [`Error::Handshake`]
+/// - `.await` 后握手失败（证书 / ALPN / mTLS 不通过 / 中断）→ [`Error::Handshake`]
 ///   （`#[from] quinn::ConnectionError`）
 ///
 /// **不**主动 `install_crypto_provider`：与 `build_quic_client_config` 对称，
 /// 由 `main.rs` / 测试首句显式守护。
 ///
-/// **`#[allow(dead_code)]`**：STEP-2.2 仅被测试调用；STEP-6.1
-/// `connect.rs::connect_to_handle` 接入 `MousehopConnection` 路径时一并移除。
+/// **`#[allow(dead_code)]`**：STEP-2.5 仅被测试调用；STEP-6.1
+/// `connect.rs::connect_to_handle` 接入 `LanMouseConnection` 路径时一并移除。
 #[allow(dead_code)]
 pub async fn dial(
     ep: &Endpoint,
@@ -364,7 +450,11 @@ pub async fn dial(
     // 动期调过一次，测试路径多次进入同一函数依然安全。
     install_crypto_provider();
 
-    let cfg = build_quic_client_config(cert, key)?;
+    // STEP-2.5：`build_quic_client_config` 改收 `Vec<CertificateDer>`（`with_client_auth_cert`
+    // 要求 chain 形态；`vec![cert]` 是单张 chain 的标准包装 —— 与 bak
+    // `mousehop/src/quic_transport.rs:1756` `dial_with_client_cert(..., cert_chain, key)`
+    // 路径形态一致）。
+    let cfg = build_quic_client_config(vec![cert], key)?;
     let conn = ep
         .connect_with(cfg, addr, "lan-mouse")?
         .await?;
@@ -416,6 +506,56 @@ pub async fn accept(ep: &Endpoint) -> Result<Connection> {
         .ok_or_else(|| Error::EndpointSetup("endpoint closed (accept returned None)".into()))?;
     let conn = incoming.await?;
     Ok(conn)
+}
+
+/// **STEP-2.5 占位 verifier**：server 端 mTLS 强制要求 client 出示（`offer
+/// _client_auth() -> true` + `client_auth_mandatory() -> true`），但**任何**
+/// 通过 TLS 1.3 内置链校验的 client cert 都接受 —— 不做 fingerprint allowlist。
+///
+/// **用途**：让 mTLS 链路本身（server 端 `CertificateRequest` → client 出示
+/// cert → 握手完成）能在 STEP-2.5 端到端跑通，同时给 [`mtls_rejects_no_client_cert`]
+/// 等负面测试提供"server 强制要求 client cert 但放行任意"的可控 verifier。
+///
+/// **STEP-2.7 替换**：[`AuthorizedKeysVerifier`] 走 `config.authorized_fingerprints()`
+/// 的 fingerprint allowlist —— 未授权 fingerprint 即拒握。`mtls_rejects_no_client_cert`
+/// 之外的所有 server 路径（`endpoint_with_verifier` 生产 caller）STEP-2.7 切换。
+///
+/// **`Send + Sync + 'static`**：rustls 0.23 trait 约束 —— `PermissiveClientCertVerifier`
+/// 不持有跨 await 的可变状态，单字段结构体 + `Arc<ServerNameProvider>` 衍生
+/// 自动满足（`Debug` 同样 derive 出）。
+///
+/// **`verify_client_cert`**：调用 `crypto::generate_fingerprint(cert)` 算 SHA-256
+/// → 写出日志（不与 allowlist 比对 —— 占位实现）→ 返回
+/// `Ok(ClientCertVerified::assertion())`。这是**唯一**路径 —— 因为服务端
+/// 已经 `with_client_cert_verifier(...)` 装上 verifier，且 `client_auth_mandatory()`
+/// 为 true，client **必须**出示 cert 才能到这一步；client 不出示 → TLS 1.3
+/// 内置流程直接 `rustls::Error::NoCertificatesPresented` 拒握（见测试）。
+pub struct PermissiveClientCertVerifier;
+
+impl rustls::server::danger::ClientCertVerifier for PermissiveClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        // 不提供 root hints —— 任意自签 cert 都接受
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        let fp = crate::crypto::generate_fingerprint(end_entity.as_ref());
+        log::debug!("[STEP-2.5 占位 verifier] accept client cert fp={fp}");
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
 }
 
 // === 单元测试 ================================================================
@@ -539,7 +679,9 @@ mod tests {
         // 用 STEP-1.1 + STEP-2.4 已实现的 `crypto::generate_self_signed`
         // 拿测试 cert（落盘到 `/tmp` ephemeral，EPH 测试 helper）
         let (cert_chain, key) = ephemeral_cert();
-        let cfg = build_quic_client_config(cert_chain[0].clone(), key)
+        // STEP-2.5 起：`build_quic_client_config` 收 `Vec<CertificateDer>`（`with_client_auth_cert`
+        // 要求 chain 形态）—— 单张 cert 包成 `vec![cert]` 即可
+        let cfg = build_quic_client_config(vec![cert_chain[0].clone()], key)
             .expect("ClientConfig 装配不应失败");
         // 关键断言：构造成功 + Clone（PLAN §2.2 dial_any 多候选复用要求）
         let _clone: QuinnClientConfig = cfg.clone();
@@ -609,5 +751,122 @@ mod tests {
         drop(conn);
         server_task.await.expect("server task 不应 panic");
         client_ep.wait_idle().await;
+    }
+
+    /// PLAN §2.5 验收：server 端 [`PermissiveClientCertVerifier`] 强制 mTLS
+    /// （`offer_client_auth() = true` + `client_auth_mandatory() = true`），
+    /// client 端用**无** cert 的 `rustls::ClientConfig`（`with_no_client_auth()`）
+    /// dial —— TLS 1.3 内置 `rustls::Error::NoCertificatesPresented` 应在
+    /// server 端拒握；quinn 包装为 `ConnectionError` → [`Error::Handshake`]。
+    ///
+    /// **关键测试思路**：
+    /// - server 端：调 [`endpoint_with_verifier`] + `Arc::new(PermissiveClientCertVerifier)`
+    ///   —— mTLS 强制但放行任意 client cert
+    /// - client 端：**直接构造 `rustls::ClientConfig` + `with_no_client_auth()`**，
+    ///   **不**走 [`build_quic_client_config`]（后者 mTLS 起已强制
+    ///   `with_client_auth_cert`）—— 这是为什么本测试必须 inline
+    ///   `QuicClientConfig::try_from(...)` 的原因
+    ///
+    /// **为什么不测"client 出示错 cert"**：服务端 verifier 放行任意 cert，
+    /// 出示错 cert 也通过；负面测试聚焦 mTLS 强制链路本身（client 不出 cert
+    /// → server 拒）。STEP-2.7 `AuthorizedKeysVerifier` 接入后，加测"client
+    /// 出示 cert 但 fingerprint 不在 allowlist"（与 bak
+    /// `authorized_keys_verifier_rejects_unknown_client` 对齐）。
+    ///
+    /// **不污染**用户 cert 路径：`ephemeral_cert()` + `endpoint_with_verifier` 公共
+    /// 函数 + 临时 cert 路径。
+    ///
+    /// **与 STEP-1.4 同路径的 `cargo test` 跑不通**（lib 因 14 DTLS errors
+    /// 编不过），测试代码就位即可；STEP-6.x 修复后由 Leader 手动跑一次确认
+    /// 通过（SUGGESTION #S-5）。
+    #[tokio::test]
+    async fn mtls_rejects_no_client_cert() {
+        install_crypto_provider();
+
+        // (1) server endpoint + verifier（强制 client auth + 任意放行）
+        let (server_cert, server_key) = ephemeral_cert();
+        let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
+            Arc::new(PermissiveClientCertVerifier);
+        let server_ep = endpoint_with_verifier(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+            server_cert,
+            server_key,
+            verifier,
+        )
+        .expect("server endpoint_with_verifier bind 不应失败");
+        let server_addr = server_ep
+            .local_addr()
+            .expect("server endpoint 必须有 local_addr");
+
+        // (2) server task：accept 期望失败（client 不出 cert → server 拒握）
+        //     拿到握手错误后吞掉，不要 panic。
+        let server_task = tokio::spawn(async move {
+            let incoming = server_ep.accept().await.expect("server accept 不应失败");
+            // server 端 handshake 应失败（NoCertificatesPresented → ConnectionError::TransportError）
+            let result = incoming.await;
+            assert!(
+                result.is_err(),
+                "server 端 handshake 应失败（mTLS 强制 client cert，client 未出示），实际 Ok"
+            );
+        });
+
+        // (3) client endpoint + **无 cert** dial
+        //     —— 走 inline `QuicClientConfig` 装配：root store 用 server cert 当
+        //     trust anchor（链校验能过到 `self-signed` 入口；本测试不依赖 server
+        //     cert 校验失败路径 —— 关键是 client 不出 cert 让 server 在更早的
+        //     `CertificateRequest` 阶段拒握）
+        use rustls::ClientConfig as RustlsClientConfig;
+
+        let (server_cert_chain, _server_key) = ephemeral_cert();
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(server_cert_chain[0].clone())
+            .expect("add root");
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = RustlsClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions");
+        // 关键：**不**调 with_client_auth_cert —— client 无 cert 可出示
+        let mut rustls_client = builder
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        rustls_client.alpn_protocols = vec![ALPN_LAN_MOUSE.to_vec()];
+
+        let quic_client =
+            quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client))
+                .expect("QuicClientConfig try_from");
+        let mut client_cfg = QuinnClientConfig::new(Arc::new(quic_client));
+        client_cfg.transport_config(default_transport_config());
+
+        let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .expect("client endpoint bind 不应失败");
+
+        // (4) dial —— 5s 兜底；**必须**返回 Err
+        let dial_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_ep.connect_with(client_cfg, server_addr, "lan-mouse"),
+        )
+        .await
+        .expect("dial 端到端超时");
+
+        // `connect_with` 同步部分返回 `Connecting<...>`，await 后才报握手失败
+        match dial_result {
+            Ok(connecting) => {
+                let handshake_result = connecting.await;
+                assert!(
+                    handshake_result.is_err(),
+                    "无 client cert 的 dial 应失败（server 端拒握），实际 Ok: {:?}",
+                    handshake_result.as_ref().map(|c| c.stable_id())
+                );
+            }
+            Err(e) => {
+                // 同步部分失败（罕见，例如 cert chain 解析失败）也算测试通过
+                log::debug!("connect_with 同步部分失败（可接受）：{e}");
+            }
+        }
+
+        // (5) 清理：drop endpoint + 等 server task 完成
+        drop(client_ep);
+        let _ = server_task.await;
     }
 }

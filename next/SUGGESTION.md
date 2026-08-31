@@ -121,7 +121,14 @@ STEP-2.1 改签名、STEP-2.5 再改一次的两段式 churn。
 
 **处置**：STEP-2.5 删 `let _ = key;` 加 `with_client_auth_cert(...)`。
 
+**进度**：STEP-2.5 已 ✅ 解 —— `build_quic_client_config` 签名同时改为
+`(cert_chain: Vec<CertificateDer>, key: PrivateKeyDer)`，`with_no_client_auth()`
+→ `with_client_auth_cert(cert_chain, key)`，`let _ = key;` 删除。Leader 评审
+后可删除本条目。
+
 **优先级**：🟢 低（auto-fade at STEP-2.5）
+
+---
 
 ---
 
