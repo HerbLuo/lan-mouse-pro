@@ -8,4 +8,5 @@ mod dns;
 mod emulation;
 pub mod emulation_test;
 mod listen;
+pub mod quic_transport;
 pub mod service;
