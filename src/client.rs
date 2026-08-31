@@ -344,6 +344,26 @@ impl ClientManager {
             .get(handle as usize)
             .map(|(_, s)| s.ips.clone())
     }
+
+    /// STEP-6.1: per-handle 输入通道配置（mouse_button / keyboard 各选
+    /// datagram 或 stream）。`None` 仅出现在 handle 越界（无效）；正常
+    /// handle 总是 `Some(InputChannelConfig)`（STEP-4.5a 已落实
+    /// `ConfigClient.input_channels` 透传到 `ClientConfig`）。
+    ///
+    /// **`LanMouseConnection::send` 消费** —— 拿到本返回值后传给
+    /// [`crate::quic_transport::PeerSession::send_input`] 作为
+    /// `route_input` 分派的 key。`None` 在 caller 处走
+    /// `unwrap_or_default()` 兜底（与 STEP-4.1 `InputChannelConfig::default()`
+    /// 一致）。
+    pub(crate) fn input_channels(
+        &self,
+        handle: ClientHandle,
+    ) -> Option<InputChannelConfig> {
+        self.clients
+            .borrow()
+            .get(handle as usize)
+            .map(|(c, _)| c.input_channels)
+    }
 }
 
 #[cfg(test)]

@@ -978,7 +978,10 @@ impl PeerSession {
     /// dead_code chain：本方法当前仅被 [`Self::send_datagram_or_stream_b`]
     /// 降级路径消费；STEP-5.3 接入后由 [`Self::send`] 路由层
     /// `Channel::StreamB` 直接消费（不经过 datagram 试探）。
-    async fn send_stream_b(&self, bytes: &[u8]) -> Result<()> {
+    ///
+    /// STEP-6.1 升级为 `pub`：供 [`Self::send_input`] 在 `Channel::StreamB`
+    /// 分派时直接消费（不经过 datagram 试探）。
+    pub async fn send_stream_b(&self, bytes: &[u8]) -> Result<()> {
         // NOTE：STEP-5.2 临时借用 `stream_a_cache` 字段作为 stream B 的
         // 缓存位置（两半边 take 模式一致）。STEP-5.3 read_loop 接入时整
         // 体重构：`stream_b` / `stream_c` 各自独立缓存，最终合并到
@@ -1025,6 +1028,108 @@ impl PeerSession {
         send.finish()
             .await
             .map_err(|e| Error::StreamB(format!("finish: {e}")))?;
+        Ok(())
+    }
+
+    /// 通道分发入口（STEP-6.1 引入）—— 按 per-handle [`InputChannelConfig`]
+    /// 把 [`ProtoEvent`] 派到 [`Channel`] 对应的底层通道。
+    ///
+    /// **调用方**：`src/connect.rs::LanMouseConnection::send()`。
+    /// LanMouseConnection 不持有 cfg（cfg 在 `ClientManager` 里 per-handle
+    /// 存），所以 caller 通过本方法签名把 cfg 传进来；本方法**不**缓存 cfg，
+    /// 也不改 peer 状态。
+    ///
+    /// **分派**（与 STEP-4.4 [`route_input`] 完全对齐）：
+    /// | Channel | 底层调用 |
+    /// |---|---|
+    /// | `Datagram` | [`Self::send_motion`]（datagram 优先 + 超限降级 stream B） |
+    /// | `StreamA`  | [`Self::send_stream_a`]（开新 bidi + write_frame + finish） |
+    /// | `StreamB`  | [`Self::send_stream_b`]（开新 bidi + write_frame + finish） |
+    /// | `StreamC`  | `Err(Error::HelloFailed("stream C is M2-only".into()))` |
+    ///
+    /// **M2 守门**：`ProtoEvent` 在主仓不含 `Clipboard` 变体（PLAN §9），
+    /// 所以 `route_input` 永远不会返 `Channel::StreamC`；但本方法显式判
+    /// `StreamC` 返 `Err` 防止 `unreachable!()` 在 ProtoEvent 加 M2 变体
+    /// 时意外落入（编译期 + 运行期双护栏）。
+    ///
+    /// **前置门禁**：复用 `send_motion` 内部的 `hello_ok` 检查；`StreamA`
+    /// / `StreamB` 路径不显式检查（`hello_ok == false` 时 `send_motion`
+    /// 返 `HelloFailed`，其它通道理论上不应被调用 —— LanMouseConnection
+    /// 拨号流程是 "dial → client_hello → register_peer → 后续 send"，所
+    /// 以 peers 表里的 peer 都已过 hello）。
+    ///
+    /// **dead_code chain**：STEP-6.1 `LanMouseConnection::send()` 接入
+    /// 后立刻消费；STEP-6.2 listen.rs 同模式复用。
+    #[allow(dead_code)]
+    pub async fn send_input(
+        &self,
+        event: &ProtoEvent,
+        cfg: &InputChannelConfig,
+    ) -> Result<()> {
+        match route_input(cfg, event) {
+            Channel::Datagram => self.send_motion(event).await,
+            Channel::StreamA => {
+                let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
+                self.send_stream_a(&buf[..len]).await
+            }
+            Channel::StreamB => {
+                let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
+                self.send_stream_b(&buf[..len]).await
+            }
+            Channel::StreamC => Err(Error::HelloFailed(
+                "stream C is M2-only (clipboard metadata not in M1 ProtoEvent)".into(),
+            )),
+        }
+    }
+
+    /// 发送控制流事件（Enter / Leave / Hello / Ping / Pong），开新 bidi
+    /// stream 写一帧后 finish（STEP-6.1 引入）。
+    ///
+    /// **为什么不复用 `stream_a_cache`**：
+    /// - `client_hello` / `server_hello` 已经把 stream A 的 send/recv 双半
+    ///   边缓存进 `peer.stream_a_cache`（cache 设计意图是 hello 用过的
+    ///   stream 给后续控制帧复用）
+    /// - 但 LanMouseConnection 当前**未**持 receiver task 来读 recv 半边
+    ///   —— 缓存的 recv 半边 drop 才是常态，这会拖 `take_stream_a_recv`
+    ///   进入 `None` 分支
+    /// - 本步（STEP-6.1）采取**保守实现**：每条控制事件开一条新 bidi
+    ///   stream，写完 finish（peer 不需要 recv 半边 → drop 即可）。Ping
+    ///   每 500ms × 4 ≈ 2s 流密度的额外 stream 开销在 M1 范围内可接受
+    ///
+    /// **后续优化空间**（STEP-6.x 之外）：
+    /// - 复用 `stream_a_cache.send` 半边：在 `take_stream_a_recv` 拿 recv
+    ///   半边时**不**取 send 半边（已有此形态），让 LanMouseConnection
+    ///   的 send 路径直接持有 cached send 做 in-place write
+    /// - 与 bak `mousehop/src/quic_transport.rs::send_stream_a` 对齐（缓存
+    ///   + in-place write）
+    /// - M1 阶段不做（保持单步范围可控）
+    ///
+    /// **错误归一**：与 [`Self::send_stream_b`] 对称 —— IO 错误归到
+    /// `Error::HelloFailed(...)`（避免新增 `Error::StreamA` 变体；HELLO
+    /// 握手期错误变体也是这个名，语义复用——"stream A 写失败" ≈ "Hello
+    /// 后续帧写失败"，与 M1 阶段语义匹配）。
+    ///
+    /// **dead_code chain**：本步由 [`Self::send_input`] 内部消费；
+    /// `send_input` 又被 STEP-6.1 `LanMouseConnection::send()` 消费。
+    #[allow(dead_code)]
+    async fn send_stream_a(&self, bytes: &[u8]) -> Result<()> {
+        let pair = self
+            .conn
+            .open_bi()
+            .await
+            .map_err(|e| Error::HelloFailed(format!("send_stream_a open_bi: {e}")))?;
+        let (mut send, recv) = (pair.0, pair.1);
+        drop(recv); // 不读 recv 半边 → drop 释放反向流
+
+        send.write_u32(bytes.len() as u32)
+            .await
+            .map_err(|e| Error::HelloFailed(format!("send_stream_a length: {e}")))?;
+        send.write_all(bytes)
+            .await
+            .map_err(|e| Error::HelloFailed(format!("send_stream_a body: {e}")))?;
+        send.finish()
+            .await
+            .map_err(|e| Error::HelloFailed(format!("send_stream_a finish: {e}")))?;
         Ok(())
     }
 

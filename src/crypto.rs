@@ -110,10 +110,7 @@ pub fn load_cert_der(path: &Path) -> Result<Vec<CertificateDer<'static>>, Error>
     let pem = fs::read(path)?;
     let der_bytes = rustls_pemfile::certs(&mut pem.as_slice())
         .map_err(|e| Error::Pem(format!("pem certs parse: {e}")))?;
-    Ok(der_bytes
-        .into_iter()
-        .map(CertificateDer::from)
-        .collect())
+    Ok(der_bytes.into_iter().map(CertificateDer::from).collect())
 }
 
 /// 从 PEM 文件加载 PKCS#8 私钥，返回 `PrivateKeyDer<'static>`。
@@ -144,6 +141,24 @@ pub fn cert_path() -> PathBuf {
 /// [`generate_self_signed`] 在落盘时收紧。
 pub fn key_path() -> PathBuf {
     lan_mouse_data_dir().join("key.pem")
+}
+
+/// QUIC 客户端 TOFU 指纹缓存目录（STEP-6.1 引入，与 bak
+/// `mousehop/src/crypto.rs:264-272 cert_pins_dir` 对齐）。
+///
+/// - Unix：`$XDG_DATA_HOME/lan-mouse/known_peers/`
+/// - Windows：`%APPDATA%\lan-mouse\known_peers\`
+///
+/// **不**在此函数内 `create_dir_all` —— 由 caller（quic_transport 的
+/// `TofuVerifier::new`）按需创建。本函数只返回路径。
+///
+/// **为什么独立于 `cert_path` / `key_path`**：
+/// - TOFU 缓存是 *per-peer* 持久化（每个对端一个 `<fp>.pin` 文件），
+///   与 server 自身的 cert/key 生命周期独立
+/// - 用户清掉 `known_peers/` 只触发"重新信任对端"语义（首次连接会
+///   落新的 pin），不会丢 server 自身的 cert
+pub fn cert_pins_dir() -> PathBuf {
+    lan_mouse_data_dir().join("known_peers")
 }
 
 /// 共享的"应用数据目录"OS 解析逻辑（[`cert_path`] / [`key_path`] 共用）。
@@ -326,11 +341,8 @@ mod tests {
     use super::*;
 
     fn tmp_subdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "lan-mouse-crypto-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("lan-mouse-crypto-{}-{}", tag, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -435,11 +447,7 @@ mod tests {
 
         assert_eq!(fp1, fp2, "二次加载 fingerprint 应一致");
         assert_eq!(c1[0].as_ref(), c2[0].as_ref(), "二次加载 cert DER 应一致");
-        assert_eq!(
-            k1.secret_der(),
-            k2.secret_der(),
-            "二次加载 key DER 应一致"
-        );
+        assert_eq!(k1.secret_der(), k2.secret_der(), "二次加载 key DER 应一致");
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1,38 +1,46 @@
-use crate::client::ClientManager;
-use crate::config::local_commit;
-use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
-use lan_mouse_proto::{MAX_EVENT_SIZE, PROTOCOL_MAGIC, ProtoEvent};
-use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
-    cell::RefCell,
     collections::{HashMap, HashSet},
     io,
     net::SocketAddr,
+    path::PathBuf,
     rc::Rc,
-    sync::Arc,
-    time::Duration,
 };
+
+use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
+use lan_mouse_proto::ProtoEvent;
+use local_channel::mpsc::{Receiver, Sender, channel};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
-use tokio::{
-    net::UdpSocket,
-    sync::Mutex,
-    task::{JoinSet, spawn_local},
-};
-use webrtc_dtls::{
-    config::{Config, ExtendedMasterSecretType},
-    conn::DTLSConn,
-    crypto::Certificate,
-};
-use webrtc_util::Conn;
+use tokio::{sync::Mutex, task::spawn_local};
+
+use crate::client::ClientManager;
+use crate::quic_transport::{self, Endpoint, PeerSession};
+
+/// mTLS 出示给对端的 client cert + key（STEP-6.1 引入，与 bak
+/// `mousehop/src/connect.rs::QuicDialerCreds` 完全对齐）。
+///
+/// 复用 `crypto::load_or_create_server_cert()` 落盘的同一份 cert/key —
+/// lan-mouse 既是 client 又是 server（PLAN §5 mTLS 双端出示），单端复用
+/// 比维护两份 DER 字节更省事。
+///
+/// `Rc` 包装让 [`LanMouseConnection`] 与本类型的所有 clone 共享同一份
+/// 凭证（避免 `PrivateKeyDer::clone_key()` 每次重 parse DER 字节）。
+pub(crate) struct QuicDialerCreds {
+    pub cert_chain: Vec<CertificateDer<'static>>,
+    pub key: PrivateKeyDer<'static>,
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum LanMouseConnectionError {
     #[error(transparent)]
     Bind(#[from] io::Error),
+    /// QUIC 传输层错误（STEP-6.1 引入）—— `PeerSession::send_input()` /
+    /// `dial()` 的失败经由本变体透传给上层。
+    ///
+    /// 删除的 `Dtls` / `Webrtc` 变体（已无 caller，留着只会持续警告）；
+    /// 完整 DTLS 依赖清理待 STEP-7.3。
     #[error(transparent)]
-    Dtls(#[from] webrtc_dtls::Error),
-    #[error(transparent)]
-    Webrtc(#[from] webrtc_util::Error),
+    Quic(#[from] quic_transport::Error),
     #[error("not connected")]
     NotConnected,
     #[error("emulation is disabled on the target device")]
@@ -41,78 +49,53 @@ pub(crate) enum LanMouseConnectionError {
     Timeout,
 }
 
-const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
-
-async fn connect(
-    addr: SocketAddr,
-    cert: Certificate,
-) -> Result<(Arc<dyn Conn + Sync + Send>, SocketAddr), (SocketAddr, LanMouseConnectionError)> {
-    log::info!("connecting to {addr} ...");
-    let conn = Arc::new(
-        UdpSocket::bind("0.0.0.0:0")
-            .await
-            .map_err(|e| (addr, e.into()))?,
-    );
-    conn.connect(addr).await.map_err(|e| (addr, e.into()))?;
-    let config = Config {
-        certificates: vec![cert],
-        server_name: "ignored".to_owned(),
-        insecure_skip_verify: true,
-        extended_master_secret: ExtendedMasterSecretType::Require,
-        ..Default::default()
-    };
-    let timeout = tokio::time::sleep(DEFAULT_CONNECTION_TIMEOUT);
-    tokio::select! {
-        _ = timeout => Err((addr, LanMouseConnectionError::Timeout)),
-        result = DTLSConn::new(conn, config, true, None) => match result {
-            Ok(dtls_conn) => Ok((Arc::new(dtls_conn), addr)),
-            Err(e) => Err((addr, e.into())),
-        }
-    }
-}
-
-async fn connect_any(
-    addrs: &[SocketAddr],
-    cert: Certificate,
-) -> Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), LanMouseConnectionError> {
-    let mut joinset = JoinSet::new();
-    for &addr in addrs {
-        joinset.spawn_local(connect(addr, cert.clone()));
-    }
-    loop {
-        match joinset.join_next().await {
-            None => return Err(LanMouseConnectionError::NotConnected),
-            Some(r) => match r.expect("join error") {
-                Ok(conn) => return Ok(conn),
-                Err((a, e)) => {
-                    log::warn!("failed to connect to {a}: `{e}`")
-                }
-            },
-        };
-    }
-}
-
+/// 出站 QUIC 连接管理（STEP-6.1 全面切到 QUIC）—— 替换 STEP-1.2 之前的
+/// DTLSConn 路径。
+///
+/// **架构**（与 bak `mousehop/src/connect.rs::MousehopConnection` 对齐）：
+/// - `client_endpoint: Endpoint` —— 单 endpoint 多 peer 复用（quinn
+///   `Endpoint: Clone`，内部 `Arc`）。生产路径绑 `0.0.0.0:0`（v4 任意
+///   本地端口），由 service.rs::new 构造时一次性 bind
+/// - `quic_creds: Rc<QuicDialerCreds>` —— mTLS 拨号凭证，per-connection
+///   复用
+/// - `peers: Rc<Mutex<HashMap<SocketAddr, Rc<PeerSession>>>>` —— QUIC 会
+///   话表；`send()` 查表命中后调 `peer.send_input(&event, &cfg)` 按
+///   [`crate::quic_transport::route_input`] 分派到 datagram / stream A /
+///   stream B
+/// - `connecting: Rc<Mutex<HashSet<ClientHandle>>>` —— 拨号 in-flight 去
+///   重，避免重复 `connect_to_handle` 抢占
+/// - `recv_tx: Sender<(ClientHandle, ProtoEvent)>` —— 占位；未来
+///   STEP-6.2 listen.rs read_loop 接入时的对称 API
 pub(crate) struct LanMouseConnection {
-    cert: Certificate,
+    quic_creds: Rc<QuicDialerCreds>,
+    client_endpoint: Endpoint,
     client_manager: ClientManager,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
+    peers: Rc<Mutex<HashMap<SocketAddr, Rc<PeerSession>>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
+    pins_dir: PathBuf,
     recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
     recv_tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 }
 
 impl LanMouseConnection {
-    pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
+    pub(crate) fn new(
+        client_endpoint: Endpoint,
+        cert_chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        pins_dir: PathBuf,
+        client_manager: ClientManager,
+    ) -> Self {
         let (recv_tx, recv_rx) = channel();
+        let quic_creds = Rc::new(QuicDialerCreds { cert_chain, key });
         Self {
-            cert,
+            quic_creds,
+            client_endpoint,
             client_manager,
-            conns: Default::default(),
+            peers: Default::default(),
             connecting: Default::default(),
+            pins_dir,
             recv_rx,
             recv_tx,
-            ping_response: Default::default(),
         }
     }
 
@@ -120,196 +103,143 @@ impl LanMouseConnection {
         self.recv_rx.recv().await.expect("channel closed")
     }
 
+    /// 发送一个事件到对端（STEP-6.1 切到 QUIC 路径）。
+    ///
+    /// **3 步流程**（与 bak `MousehopConnection::send` 对齐）：
+    /// 1. 查 `client_manager.active_addr(handle)` 拿 socket addr
+    /// 2. 查 `peers` 表拿 QUIC 会话（命中 → 调
+    ///    [`PeerSession::send_input`]；未命中 → 触发拨号）
+    /// 3. alive 守护 + 错误归并（send_input 失败 → 摘 peer + 通知 manager）
+    ///
+    /// **alive 守护**：与 DTLS 路径对称 —— 对端把 emulation 关了（ponged
+    /// 返 `false`），继续注入无意义，先返 `TargetEmulationDisabled`。
+    ///
+    /// **M1 简化**：所有 `send_input` 错误都视为 transport fatal —
+    /// protocol-level 错误（M2 clipboard 才会有 `UnsupportedEvent`）
+    /// 在 M1 阶段不存在。STEP-6.5 重连触发时一并引入 fatal/non-fatal
+    /// 分类。
     pub(crate) async fn send(
         &self,
         event: ProtoEvent,
         handle: ClientHandle,
     ) -> Result<(), LanMouseConnectionError> {
-        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
-        let buf = &buf[..len];
+        let event_display = format!("{event}");
         if let Some(addr) = self.client_manager.active_addr(handle) {
-            let conn = {
-                let conns = self.conns.lock().await;
-                conns.get(&addr).cloned()
+            let peer = {
+                let peers = self.peers.lock().await;
+                peers.get(&addr).cloned()
             };
-            if let Some(conn) = conn {
+            if let Some(peer) = peer {
                 if !self.client_manager.alive(handle) {
                     return Err(LanMouseConnectionError::TargetEmulationDisabled);
                 }
-                match conn.send(buf).await {
-                    Ok(_) => {}
+                let cfg = self
+                    .client_manager
+                    .input_channels(handle)
+                    .unwrap_or_default();
+                match peer.send_input(&event, &cfg).await {
+                    Ok(()) => {
+                        log::trace!("{event_display} >->->->->- {addr} (quic)");
+                        return Ok(());
+                    }
                     Err(e) => {
-                        log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        log::warn!("client {handle} failed to send over QUIC: {e}");
+                        self.peers.lock().await.remove(&addr);
+                        self.client_manager.set_active_addr(handle, None);
+                        return Err(LanMouseConnectionError::Quic(e));
                     }
                 }
-                log::trace!("{event} >->->->->- {addr}");
-                return Ok(());
             }
         }
 
-        // check if we are already trying to connect
+        // 没有现成 QUIC session —— 看是否要触发拨号（spawn_local）。
         let mut connecting = self.connecting.lock().await;
         if !connecting.contains(&handle) {
             connecting.insert(handle);
-            // connect in the background
+            // 拨号后台跑；本步只接通"成功拨号 + register_peer + hello"
+            // 路径，receive_loop 留给 STEP-6.2 listen.rs read_loop 接入。
             spawn_local(connect_to_handle(
                 self.client_manager.clone(),
-                self.cert.clone(),
-                handle,
-                self.conns.clone(),
+                self.client_endpoint.clone(),
+                self.quic_creds.clone(),
+                self.peers.clone(),
                 self.connecting.clone(),
-                self.recv_tx.clone(),
-                self.ping_response.clone(),
+                self.pins_dir.clone(),
+                handle,
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
     }
 }
 
+/// 出站拨号主入口（STEP-6.1）—— 给定一个 peer handle：
+/// 1. 拿候选 IP 列表 + port
+/// 2. 拿 per-handle 输入通道配置（缺失 → `InputChannelConfig::default()`）
+/// 3. 调 `quic_transport::dial()` 走 QUIC TLS + 应用层 `client_hello`
+///    （**单地址** dial；happy-eyeballs 多地址并发留 STEP-6.4）
+/// 4. 成功：`set_active_addr` + `register_peer(addr, peer)` + 摘 `connecting`
+///
+/// **自由函数 vs `&self` 方法的取舍**：`send()` 通过 `spawn_local` 异步跑
+/// 本函数（spawn 要求 future `'static`，`&self` borrow 不能跨 spawn），所以
+/// 显式把 `LanMouseConnection` 的所有字段 clone 出来作参数 —— 与 bak
+/// `mousehop/src/connect.rs::connect_to_handle` 1:1 对齐。
+///
+/// **M1 简化**：bak 有完整 retry gate / 退避 / 熔断，STEP-6.5 才补。本步
+/// 只负责 "成功 → 注册 + 摘 connecting；失败 → 摘 connecting + 返 Err"。
+#[allow(clippy::too_many_arguments)]
 async fn connect_to_handle(
     client_manager: ClientManager,
-    cert: Certificate,
-    handle: ClientHandle,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
+    client_endpoint: Endpoint,
+    quic_creds: Rc<QuicDialerCreds>,
+    peers: Rc<Mutex<HashMap<SocketAddr, Rc<PeerSession>>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    pins_dir: PathBuf,
+    handle: ClientHandle,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
-    // sending did not work, figure out active conn.
-    if let Some(addrs) = client_manager.get_ips(handle) {
-        let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
-        let addrs = addrs
-            .into_iter()
-            .map(|a| SocketAddr::new(a, port))
-            .collect::<Vec<_>>();
-        log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
-        let res = connect_any(&addrs, cert).await;
-        let (conn, addr) = match res {
-            Ok(c) => c,
-            Err(e) => {
-                connecting.lock().await.remove(&handle);
-                return Err(e);
-            }
-        };
-        log::info!("client ({handle}) connected @ {addr}");
-        client_manager.set_active_addr(handle, Some(addr));
-        conns.lock().await.insert(addr, conn.clone());
+    let Some(ips_set) = client_manager.get_ips(handle) else {
         connecting.lock().await.remove(&handle);
+        return Err(LanMouseConnectionError::NotConnected);
+    };
+    let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
+    let addrs: Vec<SocketAddr> = ips_set.iter().map(|a| SocketAddr::new(a, port)).collect();
 
-        // Best-effort version handshake. Send our commit hash once
-        // immediately after the DTLS handshake; the listen side
-        // mirrors a Hello back so the receive loop can populate
-        // `peer_commit`. Old peers will silently skip this event
-        // per the forward-compat handler in [`receive_loop`].
-        let (buf, len) = ProtoEvent::Hello {
-            magic: PROTOCOL_MAGIC,
-            commit: local_commit(),
+    // M1 简化：先拨第一个地址（happy-eyeballs 留 STEP-6.4）。
+    let Some(&addr) = addrs.first() else {
+        connecting.lock().await.remove(&handle);
+        return Err(LanMouseConnectionError::NotConnected);
+    };
+    log::info!("client ({handle}) connecting ... (addr: {addr})");
+
+    let conn = match quic_transport::dial(
+        &client_endpoint,
+        addr,
+        quic_creds.cert_chain[0].clone(),
+        quic_creds.key.clone_key(),
+        &pins_dir,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("client ({handle}) dial {addr} failed: {e}");
+            connecting.lock().await.remove(&handle);
+            return Err(LanMouseConnectionError::Quic(e));
         }
-        .into();
-        if let Err(e) = conn.send(&buf[..len]).await {
-            log::debug!("hello send to {addr} failed: {e}");
-        }
+    };
 
-        // poll connection for active
-        spawn_local(ping_pong(addr, conn.clone(), ping_response.clone()));
-
-        // receiver
-        spawn_local(receive_loop(
-            client_manager,
-            handle,
-            addr,
-            conn,
-            conns,
-            tx,
-            ping_response.clone(),
-        ));
-        return Ok(());
+    let peer = Rc::new(PeerSession::from_connection(conn));
+    // 应用层 Hello 握手 —— 失败立即关连（不摘 peer 表因为还没注册）
+    if let Err(e) = quic_transport::client_hello(&peer).await {
+        log::warn!("client ({handle}) client_hello failed: {e}");
+        connecting.lock().await.remove(&handle);
+        return Err(LanMouseConnectionError::Quic(e));
     }
+
+    let remote = peer.connection().remote_address();
+    log::info!("client ({handle}) connected @ {remote} (quic)");
+    client_manager.set_active_addr(handle, Some(remote));
+    peers.lock().await.insert(remote, peer);
     connecting.lock().await.remove(&handle);
-    Err(LanMouseConnectionError::NotConnected)
-}
-
-async fn ping_pong(
-    addr: SocketAddr,
-    conn: Arc<dyn Conn + Send + Sync>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-) {
-    loop {
-        let (buf, len) = ProtoEvent::Ping.into();
-
-        // send 4 pings, at least one must be answered
-        for _ in 0..4 {
-            if let Err(e) = conn.send(&buf[..len]).await {
-                log::warn!("{addr}: send error `{e}`, closing connection");
-                let _ = conn.close().await;
-                break;
-            }
-            log::trace!("PING >->->->->- {addr}");
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-
-        if !ping_response.borrow_mut().remove(&addr) {
-            log::warn!("{addr} did not respond, closing connection");
-            let _ = conn.close().await;
-            return;
-        }
-    }
-}
-
-async fn receive_loop(
-    client_manager: ClientManager,
-    handle: ClientHandle,
-    addr: SocketAddr,
-    conn: Arc<dyn Conn + Send + Sync>,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-) {
-    let mut buf = [0u8; MAX_EVENT_SIZE];
-    while conn.recv(&mut buf).await.is_ok() {
-        match buf.try_into() {
-            Ok(event) => {
-                log::trace!("{addr} <==<==<== {event}");
-                match event {
-                    ProtoEvent::Pong(b) => {
-                        client_manager.set_active_addr(handle, Some(addr));
-                        client_manager.set_alive(handle, b);
-                        ping_response.borrow_mut().insert(addr);
-                    }
-                    ProtoEvent::Hello { magic: _, commit } => {
-                        // Magic check lives in quic_transport.rs
-                        // (STEP-3.2); here we trust that anything
-                        // that survives to set_peer_commit is a
-                        // real Hello and just store the commit.
-                        client_manager.set_peer_commit(handle, Some(commit));
-                    }
-                    event => tx.send((handle, event)).expect("channel closed"),
-                }
-            }
-            // Skip undecodable datagrams without dropping the
-            // connection. Each DTLS recv is one framed message, so
-            // skipping is safe and keeps us forward-compatible with
-            // peers that send event types we don't yet know about.
-            Err(e) => log::debug!("ignoring undecodable event from {addr}: {e}"),
-        }
-    }
-    log::warn!("recv error");
-    disconnect(&client_manager, handle, addr, &conns).await;
-}
-
-async fn disconnect(
-    client_manager: &ClientManager,
-    handle: ClientHandle,
-    addr: SocketAddr,
-    conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
-) {
-    log::warn!("client ({handle}) @ {addr} connection closed");
-    conns.lock().await.remove(&addr);
-    client_manager.set_active_addr(handle, None);
-    client_manager.set_peer_commit(handle, None);
-    let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
-    log::info!("active connections: {active:?}");
+    Ok(())
 }
