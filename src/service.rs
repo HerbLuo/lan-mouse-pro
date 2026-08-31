@@ -91,25 +91,25 @@ impl Service {
         // 已解）。`public_key_fingerprint` 仍按 SHA-256 over cert DER 算
         // 出，与旧 webrtc-dtls 路径指纹算法一致（同一 DER 字节 → 同一指纹）。
         //
-        // STEP-6.1 拆分：listener 仍走 `webrtc_dtls::crypto::Certificate`
-        // 类型（listen.rs 切到 PeerSession 是 STEP-6.2 / 6.3 的工作），
-        // connection 切到 rustls 元组（喂 mTLS 拨号用）。
-        //
-        // ⚠️ 见 SUGGESTION #S-1：listener 路径 `load_certificate_compat`
-        // 调用在 STEP-7.3 整段删除（与 `webrtc-dtls` 依赖一起下线）。
+        // STEP-6.2 落实：listener 路径也切到 rustls 元组 —— 同一份
+        // `(cert_chain, key)` 既喂 listener 也喂 connection；旧的
+        // `crypto::load_certificate_compat(...)` 调用整段删除（SUGGESTION #S-1
+        // 闭合：listener 路径不再返回 `webrtc_dtls::crypto::Certificate`）。
         let cert_der = crypto::load_or_create_server_cert()?;
         let public_key_fingerprint = crypto::generate_fingerprint(cert_der.0[0].as_ref());
-        // listener 仍用旧类型（STEP-6.2 才切）
-        let cert_path = crypto::cert_path();
-        let cert = crypto::load_certificate_compat(&cert_path)?;
 
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;
 
         let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
-        // listener 仍走旧 DTLS 路径（STEP-6.2 才切）
-        let listener =
-            LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
+        // listener 切到 QUIC PeerSession 路径（STEP-6.2）
+        let listener = LanMouseListener::new(
+            config.port(),
+            cert_der.0.clone(),
+            cert_der.1.clone_key(),
+            authorized_keys.clone(),
+        )
+        .await?;
         // connection 走新 QUIC 路径 —— 复用同一份 rustls 落盘 cert/key + 一个
         // client endpoint（v4 任意本地端口）+ pins_dir（client TOFU 缓存位置）。
         let client_endpoint = crate::quic_transport::endpoint(

@@ -207,22 +207,24 @@ impl StreamPair {
 /// `StreamBunch` 暂未在 main-code 被消费（STEP-5.3 read_loop 接入）。
 /// 当前加 `#[allow(dead_code)]` 守护（与 STEP-1.x / 2.x / 3.x 同模式）。
 #[allow(dead_code)]
-pub struct Bidi<S>
+pub struct Bidi<S, R = S>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
 {
     pub send: S,
-    pub recv: S,
+    pub recv: R,
 }
 
-impl<S>    Bidi<S>
+impl<S, R> Bidi<S, R>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
 {
-    /// 构造：把 quinn `open_bi()` / `accept_bi()` 拿到的 `(send, recv)` 包成
-    /// `Bidi`。`S` 由 caller 推断（生产路径 `S = SendStream`，测试可传
-    /// `tokio::io::DuplexStream`）。
-    pub fn new(send: S, recv: S) -> Self {
+    /// 构造：把 quinn `open_bi()` / `accept_bi()` 拿到的 `(SendStream, RecvStream)`
+    /// 包成 `Bidi`。生产路径 `S = SendStream` / `R = RecvStream`；测试可传
+    /// `tokio::io::DuplexStream`（同一类型，2-arg 默认）。
+    pub fn new(send: S, recv: R) -> Self {
         Self { send, recv }
     }
 }
@@ -246,11 +248,11 @@ where
 #[allow(dead_code)]
 pub struct StreamBunch {
     /// Stream A（control，可靠有序）
-    pub a: Bidi<SendStream>,
+    pub a: Bidi<SendStream, RecvStream>,
     /// Stream B（input，可靠有序）
-    pub b: Bidi<SendStream>,
+    pub b: Bidi<SendStream, RecvStream>,
     /// Stream C（clipboard meta，M2 预留；本步不开 reader task）
-    pub c: Bidi<SendStream>,
+    pub c: Bidi<SendStream, RecvStream>,
 }
 
 /// M1 传输层错误。
@@ -1347,7 +1349,7 @@ pub fn hello_watchdog(peer: std::sync::Arc<PeerSession>) {
 /// **dead_code chain**：STEP-3.2 仅被测试消费；STEP-5.4 接 `run()` /
 /// STEP-6.1 接 `connect.rs::connect_to_handle` 时移除 `#[allow]`。
 #[allow(dead_code)]
-pub async fn client_hello(peer: &PeerSession) -> Result<(), Error> {
+pub async fn client_hello(peer: &PeerSession) -> std::result::Result<(), Error> {
     let (mut send, mut recv) = peer.conn.open_bi().await.map_err(Error::Handshake)?;
     let outgoing = ProtoEvent::hello(crate::config::local_commit());
 
@@ -1412,7 +1414,7 @@ pub async fn client_hello(peer: &PeerSession) -> Result<(), Error> {
 /// **dead_code chain**：STEP-3.2 仅被测试消费；STEP-5.4 接 `run()` /
 /// STEP-6.2 接 `listen.rs::read_loop` 时移除 `#[allow]`。
 #[allow(dead_code)]
-pub async fn server_hello(peer: &PeerSession) -> Result<(), Error> {
+pub async fn server_hello(peer: &PeerSession) -> std::result::Result<(), Error> {
     let (mut send, mut recv) = peer
         .conn
         .accept_bi()
@@ -1628,6 +1630,28 @@ where
     ProtoEvent::try_from(buf).map_err(|e| Error::HelloFailed(format!("decode frame: {e}")))
 }
 
+/// 单帧读取的公开别名（STEP-6.2 引入）。
+///
+/// **与 [`read_frame`] 区别**：类型签名固定为 `&mut RecvStream`，让
+/// `listen.rs` supervisor 的 accept_bi 子 task 不需要带泛型参数；
+/// `quinn::RecvStream` 实现 `tokio::io::AsyncRead + Unpin`，可直接复用
+/// [`read_frame`] 的所有逻辑。
+///
+/// **使用场景**：server 端 `accept_bi()` 接 client 主动开出的 stream B/C
+/// bidi 后，子 task 循环调 `read_any_frame(&mut recv)` 解码帧 +
+/// 转译为 `ListenEvent::Msg`。
+///
+/// 与 bak `mousehop/src/quic_transport.rs:2301 read_any_frame` 形态对齐；
+/// 本仓 `read_frame` 是泛型 + 本函数是 `RecvStream` 特化版（避免每次
+/// 调用点重复标注 `<RecvStream>`）。
+///
+/// **dead_code chain**：本函数由 STEP-6.2 `listen.rs::spawn_quic_accept_tasks`
+/// 的子 task 消费；main-code 接入后自然消化。
+#[allow(dead_code)]
+pub async fn read_any_frame(recv: &mut RecvStream) -> std::result::Result<ProtoEvent, Error> {
+    read_frame(recv).await
+}
+
 // === STEP-5.3 3 stream 独立读 task + 路由分派 =============================
 //
 // PLAN §5.3：每条 stream 一个独立 `spawn_local` 读 task，事件经由
@@ -1741,7 +1765,7 @@ pub struct ReadStreams {
     /// Stream B 读出事件 Receiver（Reliable 类）
     pub b: tokio_mpsc::Receiver<StreamEvent>,
     /// Stream B reader task 的 JoinHandle
-    pub join_b: JoinHandle<Result<(), Error>>,
+    pub join_b: JoinHandle<std::result::Result<(), Error>>,
 }
 
 /// Stream B 读 task（STEP-5.3 引入）。
@@ -1858,7 +1882,7 @@ async fn read_stream_b_loop(
 pub async fn read_loop(
     peer: &PeerSession,
     recv_a: &mut RecvStream,
-) -> Result<ReadStreams, Error> {
+) -> std::result::Result<ReadStreams, Error> {
     // (1) 取 stream_bunch 所有权 —— 一次性 take，调用后该字段回 None
     let bunch = peer
         .take_stream_bunch()
@@ -2001,7 +2025,7 @@ pub fn should_retry_after_close(reason: &quinn::ConnectionError) -> bool {
 /// - `conn.closed()` → 返 `Ok(())`（正常关连）
 impl PeerSession {
     #[allow(dead_code)] // STEP-6.1 / 6.2 接入 main-code 时移除
-    pub async fn run(self: std::sync::Arc<Self>, role: PeerRole) -> Result<(), Error> {
+    pub async fn run(self: std::sync::Arc<Self>, role: PeerRole) -> std::result::Result<(), Error> {
     // (1) 启 hello_watchdog —— 3s 超时兜底；对端不发起 stream A 时主动关连
     hello_watchdog(self.clone());
 

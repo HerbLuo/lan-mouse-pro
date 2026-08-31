@@ -25,53 +25,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ClientConfig, ServerConfig};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use webrtc_dtls::crypto::Certificate;
-
-// === 兼容过桥（STEP-7.3 整体下线）==========================================
-//
-// 现有 `service.rs::new()` → `LanMouseListener::new(port, cert: Certificate, ...)`
-// 链路上，`cert: Certificate` 是 `webrtc_dtls::crypto::Certificate`（复杂结构，
-// 不可由 `Vec<CertificateDer>` 直接 zero-cost 转换）。STEP-6.x 切到
-// `PeerSession` 时整段删除这两条兼容入口。
-//
-// 本步骤保留这两个函数让 `cargo build -p lan-mouse` 通过；它们的内部
-// 仍然走 `webrtc-dtls` 自签 / PEM 重建，是 deprecated 路径。
-
-#[allow(dead_code)]
-pub(crate) fn load_certificate_compat(path: &Path) -> Result<Certificate, Error> {
-    if path.exists() && path.is_file() {
-        let pem = fs::read_to_string(path)?;
-        Certificate::from_pem(&pem).map_err(|e| Error::Pem(format!("dtls from_pem: {e}")))
-    } else {
-        generate_dtls_cert_compat(path)
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn generate_dtls_cert_compat(path: &Path) -> Result<Certificate, Error> {
-    let cert = Certificate::generate_self_signed(["ignored".to_owned()])
-        .map_err(|e| Error::Pem(format!("dtls self-sign: {e}")))?;
-    let pem = cert.serialize_pem();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let f = fs::File::create(path)?;
-    #[cfg(unix)]
-    {
-        let mut perm = f.metadata()?.permissions();
-        perm.set_mode(0o400);
-        f.set_permissions(perm)?;
-    }
-    let mut writer = std::io::BufWriter::new(f);
-    std::io::Write::write_all(&mut writer, pem.as_bytes())?;
-    Ok(cert)
-}
-
-#[allow(dead_code)]
-pub(crate) fn certificate_fingerprint_compat(cert: &Certificate) -> String {
-    let c = cert.certificate.first().expect("certificate missing");
-    generate_fingerprint(c)
-}
 
 #[derive(Debug, Error)]
 pub enum Error {
