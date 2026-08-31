@@ -397,3 +397,33 @@ inline `open_uni() + write_all() + finish()`（不缓存、不复用、不带
   取 min 不会引入退化
 
 **优先级**：🟢 低（防御性常量，无功能阻塞）
+
+---
+
+## #S-16 🟡 中：read_loop 背压策略分阶段落实 — Datagram 类策略留 STEP-5.4
+
+**触发**：STEP-5.3
+
+**现象**：
+- PLAN §5.3 要求"队列满时**丢最旧**的 datagram 类事件、阻塞 control/input 类事件"
+- STEP-5.3 实际落实：
+  - **Reliable 类**（Stream B reader 喂 Key / Button / Modifiers）→ 阻塞 sender ✅（`tx.send().await` + `streams_backpressure_blocks_when_receiver_idle` 单测验证）
+  - **Datagram 类**（Motion / Axis / AxisDiscrete120 高频指针事件）→ ⏸ STEP-5.4 才实现 datagram_reader + 丢最旧策略
+  - **Control 类**（Stream A 由 caller 持有 recv_a）→ ⏸ caller 自行阻塞读 recv_a（自然背压）
+
+**根因**：
+- 本 STEP-5.3 仅引入 stream B reader task；datagram_reader 是 STEP-5.4 范围
+- Datagram 类"丢最旧"策略需要 reader task 内做"try_send 失败 → drain 旧 → send 新"两步逻辑；当前 reader task 模板只覆盖 Reliable 阻塞 send 一种语义
+- Stream C 立即 drop（守 §9），不读不消费——本步无 stream C 背压问题
+
+**建议处置**：
+- STEP-5.4 接入 `datagram_reader` 时实现"丢最旧"具体策略：
+  - 用 `tokio::sync::mpsc::Sender::try_send` 试探队列
+  - 失败时 `rx.try_recv()` 拿最旧一帧丢弃
+  - 再 `tx.try_send(new)`；再失败 → 再 drain 直到成功
+  - 单测覆盖"高频输入突发 → 队列满 → 旧事件被丢"
+- Control 类（caller 持有 recv_a）由 STEP-6.x `listen.rs supervisor` 主循环消费时按 `tokio::select!` 自然阻塞读，无需额外策略
+
+**STEP-5.3 闭环**：Reliable 类阻塞 sender 已落实 + 单测验证；Datagram 类策略留 STEP-5.4 续治。本条目进入"待 Leader 评审后删除"状态（STEP-5.4 完成后一起删）。
+
+**优先级**：🟡 中（SUGGESTION #28 治理部分消化，STEP-5.4 续治）

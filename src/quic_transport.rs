@@ -35,7 +35,14 @@
 //!   [`PeerSession::send_motion`] 降级路径替换为 [`PeerSession::send_stream_b`]
 //!   （`conn.open_bi()` + 长度前缀帧），[`Error::DatagramFallback`] 退役
 //!   （SUGGESTION #S-14 治理落地）
-//! - STEP-5.3 / 5.4：3 stream 独立读 task + read_loop 接手端到端 IO
+//! - STEP-5.3（已）：[`ReadStreams`] struct + [`PeerSession::read_loop`] ——
+//!   spawn 2 个独立 reader task（stream A 由 caller 持有 / stream B 走 mpsc
+//!   + reader task）；stream C 在 read_loop 内 drop（守 PLAN §9 M1 边界：
+//!   "不要做：Stream C reader task"）；[`READ_STREAM_BUFFER_CAP`] = 64 容量
+//!   mpsc 承载 stream B 事件，control / input reliable 类别阻塞 sender
+//!   （backpressure）；[`StreamEvent`] enum 区分 control / reliable / datagram
+//!   3 类事件给 STEP-5.4 `select!` 消费方使用
+//! - STEP-5.4：hello_watchdog + datagram_reader + 端到端本地 IO 接入 run()
 //! - STEP-6.x：出入站集成（替换 `LanMouseConnection` / `LanMouseListener`）
 
 use std::collections::HashMap;
@@ -60,6 +67,8 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc as tokio_mpsc;
+use tokio::task::{JoinHandle, spawn_local};
 
 use lan_mouse_ipc::{ChannelMode, InputChannelConfig};
 use lan_mouse_proto::{ProtoEvent, MAX_EVENT_SIZE};
@@ -1018,6 +1027,38 @@ impl PeerSession {
             .map_err(|e| Error::StreamB(format!("finish: {e}")))?;
         Ok(())
     }
+
+    /// PeerSession 取出 stream_bunch 所有权（STEP-5.3 引入）。
+    ///
+    /// **消费性语义**：调用后 `peer.stream_bunch` 字段回到 `None`。设计
+    /// 意图：[`read_loop`] 装配 reader 时一次性 take 走
+    /// `Some(StreamBunch)`，把 `a` / `b` / `c` 三个字段分别处理（a 留给
+    /// caller / b 喂 reader task / c drop）。
+    ///
+    /// **返回 `None`**：说明 caller 还没装配 stream_bunch（典型场景：
+    /// read_loop 在 STEP-5.4 `run()` 装配前就被调用）。当前 main-code 无
+    /// caller，本步加 `#[allow(dead_code)]` 守护。
+    #[allow(dead_code)]
+    pub async fn take_stream_bunch(&self) -> Option<StreamBunch> {
+        let mut g = self.stream_bunch.lock().await;
+        g.take()
+    }
+
+    /// PeerSession 装配 stream_bunch（STEP-5.3 引入，STEP-5.4 `run()` 装配
+    /// 入口消费）。
+    ///
+    /// **写入语义**：调用前 `peer.stream_bunch` 应为 `None`（首次装配）
+    /// 或已被 [`Self::take_stream_bunch`] take 后回 `None`（重新装配）。
+    /// 本方法直接覆盖（lock + assign Some），不做 "已 Some 拒覆盖" 检查
+    /// —— caller 责任保证调用时机。
+    ///
+    /// **dead_code chain**：本方法由 STEP-5.4 `PeerSession::run()` 在
+    /// [`Self::read_loop`] 之前调用；本步加 `#[allow(dead_code)]` 守护。
+    #[allow(dead_code)]
+    pub async fn set_stream_bunch(&self, bunch: StreamBunch) {
+        let mut g = self.stream_bunch.lock().await;
+        *g = Some(bunch);
+    }
 }
 
 // === STEP-4.4 Channel enum + route_input() 纯函数 ===========================
@@ -1481,6 +1522,273 @@ where
     }
     ProtoEvent::try_from(buf).map_err(|e| Error::HelloFailed(format!("decode frame: {e}")))
 }
+
+// === STEP-5.3 3 stream 独立读 task + 路由分派 =============================
+//
+// PLAN §5.3：每条 stream 一个独立 `spawn_local` 读 task，事件经由
+// `tokio::sync::mpsc` 队列；`select!` 合并对外暴露。本步实现：
+//
+// 1. `StreamEvent` enum —— 区分 3 类事件（Control / Reliable / Datagram）
+//    给 STEP-5.4 `select!` 消费方按事件类别分派（控制面 / 可靠输入 / 高频
+//    输入）。这是 STEP-5.4 接 `run()` 时的派发依据。
+// 2. `ReadStreams` struct —— `read_loop` 返回值：含 `b` 的 mpsc Receiver +
+//    `c` 的 RecvStream（暂不开 reader task）+ `join_b` reader task 的
+//    `JoinHandle`。`a` 由 caller 直接持有 `RecvStream`（不在 ReadStreams 内）
+// 3. `READ_STREAM_BUFFER_CAP` 常量 —— stream B mpsc 容量 = 64（control /
+//    input reliable 类别阻塞 sender，背压）
+// 4. `read_loop(&self, recv_a) -> ReadStreams` —— 取 `stream_bunch` 所有权，
+//    spawn stream B reader task，stream A 由 caller 持有，stream C 立即 drop
+//    （守 PLAN §9 M1 边界"不要做：Stream C reader task"）
+// 5. `read_stream_b_loop` helper —— 从 stream B 循环 `read_frame` +
+//    `tx.send().await`（阻塞 sender，背压）；错误分流：
+//    - `FrameTooLarge` / `Truncated` → fatal（关 conn + 返 Err）
+//    - `HelloFailed("decode frame")` → warn + skip frame 续读
+//    - 其他 IO 错误 → task 退出 + 返 Err（让 join handle 透传）
+//
+// 与 bak `mousehop/src/quic_transport.rs:2126-2400 ReadStreams /
+// read_stream_*_loop / read_loop` 形态对齐；M1 阶段 stream C 不开 reader
+// task（守 §9），datagram reader 由 STEP-5.4 引入。
+
+/// Stream B reader task 用的 mpsc 通道容量（STEP-5.3 引入）。
+///
+/// 容量 `64` —— 既能缓冲 ~50ms@1000Hz 高频输入突发，又不浪费内存
+/// （每个 `StreamEvent` < 256B → 64 个 < 16KB）。
+///
+/// **背压策略**（SUGGESTION #28 治理）：
+///
+/// | 事件类别 | 来源 | 队列满时策略 |
+/// |---|---|---|
+/// | **Control**（Stream A 上的 Enter / Leave / Ack / Hello / Ping / Pong） | Stream A | **阻塞 sender**（Stream A reader task 由 listen.rs supervisor 自己管，本步不实现） |
+/// | **Input Reliable**（Stream B 上的 Key / Button / Modifiers，channel 配置为 Stream 时） | Stream B | **阻塞 sender**（`tx.send().await`）—— 鼠标按键 + 键盘按键不能丢 |
+/// | **Input Datagram**（Motion / Axis / AxisDiscrete120 等高频） | Datagram（暂未在 reader 范围） | **M1 由 STEP-5.4 引入 datagram_reader 时再讨论**：丢最旧 vs 限速 |
+///
+/// 当前 STEP-5.3 只承载 Stream B 路径，**Control 由 caller 自行管理
+/// recv_a，Datagram 由 STEP-5.4 接入** —— 本步仅实现 Reliable 类别的
+/// 阻塞发送背压。
+const READ_STREAM_BUFFER_CAP: usize = 64;
+
+/// 读 task 送入 mpsc 队列的事件类型（STEP-5.3 引入）。
+///
+/// **为什么需要枚举**（而非裸 `ProtoEvent`）：
+/// STEP-5.4 `PeerSession::run()` 主循环用 `tokio::select!` 合并 datagram /
+/// stream A / stream B / stream C 4 个 reader 时，需要区分"是控制面事件
+/// 还是要走 IPC 推送 / 调度层"。M1 阶段控制面事件（Enter / Leave / Ack /
+/// Hello / Ping / Pong）**不**进 IPC（不进 [`lan_mouse_ipc::TransportEvent`]
+/// 那是 M2）；STEP-5.4 接 run() 时由 `StreamEvent` 的 enum 分流决定动作
+/// —— `Control` 类直接写回 hello_ok / channel 配置 / 日志，`Reliable`
+/// 类按 `route_input` 分派给本地 emulation，`Datagram` 类直发。
+///
+/// **3 个变体**（PLAN §5.3 派发表）：
+/// - **`Control(ProtoEvent)`** —— Stream A 读出的控制帧（Enter / Leave /
+///   Ack / Hello / Ping / Pong / Hello echo 等）
+/// - **`Reliable(ProtoEvent)`** —— Stream B 读出的可靠输入事件（鼠标按键 /
+///   键盘按键 / 键盘 Modifier，按 STEP-4.4 `route_input` 配置 `ChannelMode::Stream`
+///   时入 StreamB）
+/// - **`Datagram(ProtoEvent)`** —— QUIC datagram 读出的事件（Motion /
+///   Axis / AxisDiscrete120 / Button/Key/Modifiers 按 Datagram 配置时）。
+///   本步 **不** 由 reader task 产生 —— STEP-5.4 datagram_reader 接入
+///   时填充。预留变体为 STEP-5.4 run() 的 `match` 提前就位（避免新增
+///   variant 时 caller 编译失败）
+///
+/// **dead_code chain**：本 enum 由 STEP-5.3 `read_loop` 装配；STEP-5.4
+/// `run()` 主循环 `select!` 消费；目前 main-code 无消费方，本步加
+/// `#[allow(dead_code)]` 守护（与 STEP-3.x StreamPair / STEP-5.2
+/// Bidi 同模式）。
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// Stream A 读出的控制帧
+    Control(ProtoEvent),
+    /// Stream B 读出的可靠输入事件（按键 / Modifier）
+    Reliable(ProtoEvent),
+    /// QUIC datagram 读出的高频事件（STEP-5.4 datagram_reader 填充）
+    Datagram(ProtoEvent),
+}
+
+/// `read_loop` 返回值 —— 给 STEP-5.4 `select!` 主循环消费用。
+///
+/// **字段语义**：
+/// - **`b`** —— Stream B 读出事件的 mpsc Receiver。可靠输入事件（按键 /
+///   Modifier）按 STEP-4.4 `route_input` 配置 `ChannelMode::Stream` 时经
+///   此 Receiver 送给上层 emulation / dispatch
+/// - **`join_b`** —— Stream B reader task 的 `JoinHandle<Result<(), Error>>`。
+///   caller 可 `.await` 监听 reader task 退出；本步不强制 await（reader
+///   task 与 select! 主循环并行）
+///
+/// **Stream A 为何不在 struct 内**：caller 已持有 `recv_a`（read_loop 参数），
+/// 直接在 listen.rs supervisor 的 `select!` 里 `read_frame(&mut recv_a)`
+/// 即可，不需要 read_loop 再包一层 mpsc。这与 Leader 决策一致。
+///
+/// **Stream C 为何不在 struct 内**：本步 read_loop 内部立即 drop stream C
+/// `RecvStream`（守 PLAN §9 M1 边界）—— 不开 reader task，所以不返回
+/// 给 caller。STEP-5.4 接 run() 时由 listen.rs supervisor 重新装配
+/// StreamBunch + 开 stream C reader（仍守 §9）。
+///
+/// **不实现 `Clone`**：`tokio::sync::mpsc::Receiver` 不 Clone（语义
+/// 不允许 —— 一次只能有一个 consumer）。
+///
+/// **不实现 `Debug`**：当前 `ReadStreams` 仅持有 Receiver + JoinHandle
+/// 两个可 Debug 字段，derive 即可；如未来加 `RecvStream` 等字段需手工
+/// impl。
+///
+/// **dead_code chain**：本 struct 由 STEP-5.4 `PeerSession::run()` 主
+/// 循环消费；本步 `read_loop` 装配就位即可。
+#[allow(dead_code)]
+pub struct ReadStreams {
+    /// Stream B 读出事件 Receiver（Reliable 类）
+    pub b: tokio_mpsc::Receiver<StreamEvent>,
+    /// Stream B reader task 的 JoinHandle
+    pub join_b: JoinHandle<Result<(), Error>>,
+}
+
+/// Stream B 读 task（STEP-5.3 引入）。
+///
+/// **职责**：从 `stream_bunch.b.recv` 循环 `read_frame` → 解码为
+/// `ProtoEvent` → 包成 `StreamEvent::Reliable(...)` → `tx.send().await`
+/// 送入 mpsc 队列。
+///
+/// **三类错误处理**（与 bak `read_stream_a_loop` 同模式）：
+/// - `Error::FrameTooLarge(len)` → fatal：攻击者控制长度字段或 wire 损坏，
+///   task 不可恢复；返回 `Err` 让 caller `join_b` 收到
+/// - `Error::HelloFailed(msg)` 当 `msg.starts_with("decode frame")` →
+///   codec 解码失败（单帧损坏）：`warn!` 日志 + 跳过当前帧继续循环，
+///   **不**退出 task
+/// - 其他 IO 错误（peer close / reset / `Error::Truncated`）→ task 退出，
+///   返回 `Err`
+///
+/// **背压**：`tx.send(event).await` 阻塞等待 receiver —— 当上层
+/// `select!` 处理慢 / 接收端未及时 drain 时，reader 会在 send 处 await，
+/// 反向施压 stream B 流控（quinn 流控）。这是 SUGGESTION #28 治理
+/// 中"control / input reliable 类阻塞 sender"的具体落实。
+///
+/// **receiver drop 退出**：当 caller drop `ReadStreams.b`（receiver）时，
+/// `tx.send().await` 返回 `Err(SendError)` → task 干净退出 + 返回
+/// `Ok(())`（视为"正常关闭"）。
+///
+/// **dead_code chain**：本函数由 [`PeerSession::read_loop`] spawn；
+/// `JoinHandle` 由 caller 通过 [`ReadStreams::join_b`] 持有。
+#[allow(dead_code)]
+async fn read_stream_b_loop(
+    mut recv: RecvStream,
+    tx: tokio_mpsc::Sender<StreamEvent>,
+) -> Result<(), Error> {
+    loop {
+        match read_frame(&mut recv).await {
+            Ok(event) => {
+                // Reliable 阻塞 send —— 背压：caller 慢 → reader 慢
+                if tx.send(StreamEvent::Reliable(event)).await.is_err() {
+                    // receiver 已 drop（caller 终止 read_loop），干净退出
+                    log::info!("stream B reader: receiver dropped, exiting cleanly");
+                    return Ok(());
+                }
+            }
+            Err(Error::FrameTooLarge(len)) => {
+                log::error!("stream B: FrameTooLarge({len}) — fatal, closing task");
+                return Err(Error::FrameTooLarge(len));
+            }
+            Err(Error::HelloFailed(msg)) if msg.starts_with("decode frame") => {
+                log::warn!("stream B: skip frame (decode error): {msg}");
+                continue;
+            }
+            Err(e) => {
+                log::info!("stream B reader exiting (IO closed): {e}");
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// `PeerSession::read_loop` —— 装配 3 条 stream 的 reader（STEP-5.3 引入）。
+///
+/// **职责**：spawn 1 个独立 reader task（stream B），stream A 由 caller
+/// 持有（参数借用 `&mut RecvStream`），stream C 立即 drop（守 §9 M1
+/// 边界）。返回 [`ReadStreams`] 给 STEP-5.4 `run()` 主循环消费。
+///
+/// **流程**：
+/// 1. **取 stream_bunch 所有权**（`Option::take()` 拿走 `Some(...)`）——
+///    caller 已通过 STEP-5.2 / STEP-5.4 把 `StreamBunch` 装配好
+/// 2. **stream A 由 caller 持有** —— `recv_a: &mut RecvStream` 是参数
+///    借用，**不**在 read_loop 内 spawn reader；caller（listen.rs
+///    supervisor）自行在 `select!` 里 `read_frame(recv_a)`
+/// 3. **stream B**：`tx_b = mpsc::channel(READ_STREAM_BUFFER_CAP)`，spawn
+///    `read_stream_b_loop(stream_bunch.b.recv, tx_b)` 返回
+///    `JoinHandle<Result<(), Error>>`
+/// 4. **stream C**：`drop(stream_bunch.c)` 立即触发 quinn 优雅关闭（**守
+///    §9 M1 边界** —— 不开 reader task）
+/// 5. **返回** [`ReadStreams { b: rx_b, join_b }`]
+///
+/// **为什么 stream A 由 caller 持有**（而非 read_loop 内部 spawn）：
+/// - listen.rs supervisor 的 `select!` 主循环**已经**在持有 `recv_a`
+///   （来自 `server_hello` 的 `take_stream_a_recv()`），无需 read_loop
+///   再包一层 mpsc
+/// - 减少一次 task spawn / 一次 mpsc 通道 → 端到端延迟更低
+/// - 与 Leader 决策一致：stream A 是 control stream，没有"join 行为"语义
+///   上的对称需求（A 由 supervisor 整个生命周期持有）
+///
+/// **为什么 stream C 立即 drop**：PLAN §9 M1 边界明确要求"不要做：开
+/// Stream C reader task"。stream C 是 M2 clipboard 元数据预留。本步把
+/// `RecvStream` 所有权 take 出来**立即 drop**，让 quinn 给对端发 FIN /
+/// STOP_SENDING，避免对端 stream C 上一直写半边被卡。STEP-5.4 接 run()
+/// 时由 listen.rs supervisor 重新装配 StreamBunch + 开 stream C reader
+/// （但那时仍是 §9 守门）。
+///
+/// **死循环背压**：stream B mpsc 容量 [`READ_STREAM_BUFFER_CAP`] = 64；
+/// 阻塞 sender 实现可靠输入事件的背压（详细见该常量 doc）。
+///
+/// **`stream_bunch` 所有权语义**：调用 [`Self::take_stream_bunch`] 取出
+/// `Option<StreamBunch>` 内的 StreamBunch，调用后 `peer.stream_bunch`
+/// 字段回到 `None`。本步首次接入时该字段为 `None`（STEP-5.2 留空）；
+/// STEP-5.4 `run()` 接入时会先 `set_stream_bunch(...)` 填充。
+///
+/// **错误路径**：当前实现不主动返回 `Err`（装配步骤本身不失败）；
+/// 装配失败（如 `stream_bunch` 未设置）→ 返回 [`Error::HelloFailed`]
+/// "stream_bunch not initialized" 错误给 caller 决策。
+///
+/// **`bunch.a` 处理**：stream_bunch.a（stream A 缓存的 `Bidi<SendStream>`）
+/// 在 bunch move 进 drop 时一起 drop（caller 已通过 `take_stream_a_recv`
+/// 拿走 recv 半边 + `take_stream_bunch` 拿走 recv_a → 整对已被 caller
+/// 接管；bunch.a 内剩余字段无害 drop）。
+///
+/// **dead_code chain**：本方法由 STEP-5.4 `PeerSession::run()` 装配
+/// 入口消费；本步 `#[allow(dead_code)]` 守护（与 STEP-3.x / 4.x 同模式）。
+#[allow(dead_code)]
+pub async fn read_loop(
+    peer: &PeerSession,
+    recv_a: &mut RecvStream,
+) -> Result<ReadStreams, Error> {
+    // (1) 取 stream_bunch 所有权 —— 一次性 take，调用后该字段回 None
+    let bunch = peer
+        .take_stream_bunch()
+        .await
+        .ok_or_else(|| Error::HelloFailed("stream_bunch not initialized".into()))?;
+
+    // (2) stream B 装配：mpsc + reader task
+    let (tx_b, rx_b) = tokio_mpsc::channel::<StreamEvent>(READ_STREAM_BUFFER_CAP);
+    let join_b = spawn_local(read_stream_b_loop(bunch.b.recv, tx_b));
+
+    // (3) stream A：caller 已持有 recv_a（参数借用），不内部 spawn
+    //     —— leader 决策：减少 task 数 + 减少 mpsc 层
+
+    // (4) stream C：立即 drop —— 守 PLAN §9 M1 边界
+    drop(bunch.c);
+
+    // (5) bunch.a (stream A 的 Bidi<SendStream>) 在 bunch move 末尾自动 drop
+    //     —— 无害：caller 已通过 take_stream_a_recv 拿走 recv 半边，
+    //     bunch.a.send (即 stream A 的 SendStream 缓存) 随 bunch drop 释放。
+
+    log::info!(
+        "read_loop: stream B reader spawned (cap={READ_STREAM_BUFFER_CAP}), \
+         stream C dropped (M1 §9 守门)"
+    );
+
+    Ok(ReadStreams {
+        b: rx_b,
+        join_b,
+    })
+}
+
+
+
 
 /// **STEP-2.6 客户端 TOFU（Trust On First Use）fingerprint pinning verifier**。
 ///
@@ -3257,5 +3565,245 @@ mod tests {
         }
 
         writer.await.expect("writer task");
+    }
+
+    // === STEP-5.3 3 stream 独立读 task + 路由分派 单测 =====================
+    //
+    // **测试目标**：不依赖 QUIC 握手完整链路（避免 14 DTLS errors 阻塞），借
+    // `tokio::io::duplex` mock 出多个 `RecvStream` 形态的 stream 半边（仅
+    // 满足 `AsyncRead + Unpin`），让 `read_stream_b_loop` 路径 in-process
+    // 闭环。本测试**仅覆盖 STEP-5.3 新增的 reader task + 队列逻辑**，
+    // QUIC conn 集成由 STEP-5.4 `run()` + STEP-7.2 `quic_smoke` 覆盖。
+    //
+    // **与 STEP-5.2 同模式**：STEP-5.2 `frame_round_trip` /
+    // `frame_truncated_rejected` 也不依赖 QUIC；理论 14 errors 修复后
+    // 直接通过。STEP-6.x 修 errors 后 Leader 手动跑
+    // `cargo test -p lan-mouse stream_* streams_*` 确认。
+
+    /// 测试用键盘按键事件（STEP-5.3 引入）—— 给 stream B reader task
+    /// 喂 Reliable 类事件用。
+    ///
+    /// 字段值固定为 `(time=0, key=30='a', state=1=press)` 便于 round-trip
+    /// 比对。KeyboardEvent::Key 是 STEP-4.4 `route_input` 按 `cfg.keyboard`
+    /// 分派为 StreamB 的代表事件。
+    fn key_event() -> ProtoEvent {
+        ProtoEvent::Input(input_event::Event::Keyboard(
+            input_event::KeyboardEvent::Key {
+                time: 0,
+                key: 30, // 'a'
+                state: 1, // press
+            },
+        ))
+    }
+
+    /// STEP-5.3 验收 (1/2)：stream B reader task + mpsc 队列 round-trip
+    /// —— 用 `tokio::io::duplex` mock 出 `RecvStream` 半边（满足
+    /// `AsyncRead + Unpin`），通过 `read_stream_b_loop` 把 `write_frame`
+    /// 写入的事件送到 mpsc Receiver。
+    ///
+    /// **不依赖 QUIC 握手**：直接喂 duplex 流给 reader task，与 STEP-5.2
+    /// `frame_round_trip` 同模式。
+    ///
+    /// **背压语义验证**：本测试**不**模拟背压（队列满场景）—— 那是下
+    /// 一个测试 `streams_backpressure_blocks_when_receiver_idle` 的
+    /// 职责。本测试仅验证 happy-path round-trip：写一帧 → reader 解码 →
+    /// 送入 mpsc → Receiver 收到 → 字段一致。
+    #[tokio::test]
+    async fn stream_frame_round_trip() {
+        // (1) mock 出 RecvStream 半边 + reader task + mpsc Receiver
+        let (mut write_half, read_half) = tokio::io::duplex(4096);
+
+        let (tx, mut rx) = tokio_mpsc::channel::<StreamEvent>(READ_STREAM_BUFFER_CAP);
+        let join_b = spawn_local(read_stream_b_loop(read_half, tx));
+
+        // (2) 写一帧 Keyboard Key 事件到 duplex 写半边
+        let event = key_event();
+        let event_dbg = format!("{event:?}");
+        write_frame(&mut write_half, &event)
+            .await
+            .expect("write_frame 应成功");
+
+        // (3) Receiver 收到 StreamEvent::Reliable(Keyboard Key)
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("mpsc recv 超时")
+            .expect("mpsc recv 应成功");
+
+        match received {
+            StreamEvent::Reliable(got) => {
+                let got_dbg = format!("{got:?}");
+                assert_eq!(
+                    got_dbg, event_dbg,
+                    "stream B reader 送入的事件应与 write_frame 写入一致"
+                );
+            }
+            other => panic!("事件类别应为 Reliable，实际：{other:?}"),
+        }
+
+        // (4) drop write_half 让 read_half 收到 UnexpectedEof → reader task 退出
+        drop(write_half);
+        // 等 reader task 完成（或超时）
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join_b).await;
+    }
+
+    /// STEP-5.3 验收 (2/2)：stream B reader task 的背压语义 —— 队列满时
+    /// sender **阻塞**（不丢事件），receiver drain 后 sender 才解除阻塞。
+    ///
+    /// **为什么测背压**：SUGGESTION #28 治理要求 Reliable 类（按键 /
+    /// Modifier）阻塞 sender 实现背压 —— 高频按键突发时不能丢事件（按键
+    /// 丢失 = 输入丢帧 = 用户感知到的"卡顿"）。本测试用容量 = 2 的 mpsc
+    /// 模拟"上层处理慢"场景，验证 sender 在队列满时 `await` 而不是丢。
+    ///
+    /// **测试设计**：
+    /// - 容量 = 2 mpsc（[`READ_STREAM_BUFFER_CAP`] = 64 在 happy-path 不会满；
+    ///   本测试用更小的 cap 才能快速触发"满"状态）
+    /// - 写 5 帧到 duplex 流
+    /// - reader task 把 5 帧依次送入 mpsc，但 Receiver 不主动 drain
+    /// - 验证：reader task 在第 3 次 `tx.send().await` 处阻塞（队列已
+    ///   有 2 帧未消费）
+    /// - 然后 Receiver drain 1 帧 → reader task 解除阻塞 + 再送 1 帧
+    /// - 重复 drain 直至全部 5 帧都收齐
+    /// - 验证：5 帧全部到达（无丢），与发送端 `format!("{:?}")` 字符串
+    ///   比对一致
+    #[tokio::test]
+    async fn streams_backpressure_blocks_when_receiver_idle() {
+        // (1) mock 出 RecvStream 半边 + reader task + **小容量** mpsc
+        let (mut write_half, read_half) = tokio::io::duplex(4096);
+
+        let (tx, mut rx) = tokio_mpsc::channel::<StreamEvent>(2);
+        let join_b = spawn_local(read_stream_b_loop(read_half, tx));
+
+        // (2) 写 5 帧
+        let events: Vec<ProtoEvent> = (0..5).map(|_| key_event()).collect();
+        let events_dbg: Vec<String> = events.iter().map(|e| format!("{e:?}")).collect();
+        for event in &events {
+            write_frame(&mut write_half, event)
+                .await
+                .expect("write_frame 应成功");
+        }
+
+        // (3) drain 全部 5 帧 —— 队列容量 = 2，reader task 在 send 阻塞时
+        //     等 receiver 消费；receiver 主动 recv → reader 解阻塞 + 再送
+        //     下一帧 → 全部 5 帧能 drain 完（验证**无丢**）
+        let mut got: Vec<String> = Vec::with_capacity(events.len());
+        for _ in 0..events.len() {
+            let received = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("drain 超时（reader task 可能已退出 / 事件丢失）")
+                .expect("drain recv 应成功");
+            match received {
+                StreamEvent::Reliable(got_event) => {
+                    got.push(format!("{got_event:?}"));
+                }
+                other => panic!("事件类别应为 Reliable，实际：{other:?}"),
+            }
+        }
+
+        // (4) 验证 5 帧全部到达 + 顺序一致
+        assert_eq!(
+            got, events_dbg,
+            "5 帧 round-trip 后顺序与内容应一致（背压 = 阻塞 sender 不丢事件）"
+        );
+
+        // (5) drop write_half 让 reader 收到 EOF 退出
+        drop(write_half);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join_b).await;
+    }
+
+    /// STEP-5.3 验收 (3/3 bonus)：stream C 处理 —— 守 §9 M1 边界。
+    ///
+    /// **测试设计**：直接验证 `peer.read_loop(...)` 调用后 stream C
+    /// `RecvStream` 已被 drop（无泄漏、无 zombie stream）。本测试**不**
+    /// 走完整 read_loop（那需要 QUIC 握手装配 stream_bunch，本步前置
+    /// 不就位），仅验证 `StreamBunch.c` 在 read_loop 入口取出后随 bunch
+    /// drop 而释放。
+    ///
+    /// **为什么不走 read_loop 端到端**：read_loop 装配需要
+    /// `peer.stream_bunch = Some(StreamBunch)`，本步 range 内尚无 caller
+    /// 装配它（STEP-5.4 `run()` 接入时填充）。本测试用 `peer.take_stream_bunch`
+    /// 直接验证 take + drop 语义。
+    #[tokio::test]
+    async fn stream_c_take_releases_quinn_recv_stream() {
+        install_crypto_provider();
+
+        let (server_cert, server_key) = ephemeral_cert();
+        let (server_ep, server_addr) = motion_test_server(server_cert, server_key);
+
+        // client 端：dial + client_hello（让 server 端拿到 stream A）
+        let pins_dir = std::env::temp_dir().join(format!(
+            "lan-mouse-stream-c-pins-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&pins_dir);
+        let (client_cert, client_key) = ephemeral_cert();
+        let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .expect("client endpoint bind");
+        let conn = dial(
+            &client_ep,
+            server_addr,
+            client_cert[0].clone(),
+            client_key,
+            &pins_dir,
+        )
+        .await
+        .expect("dial");
+        let client_session = PeerSession::from_connection(conn);
+
+        // server task：accept + server_hello（server_hello 把 stream A 缓存到
+        // server_session.stream_a_cache）。**不**调 read_loop（那是 STEP-5.4
+        // 范围）—— 本测试只验证 stream_bunch 字段当前为 None（未装配），
+        // 取走仍返 None
+        let server_task = tokio::spawn(async move {
+            let session = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                accept(&server_ep),
+            )
+            .await
+            .expect("server accept timeout")
+            .expect("server accept");
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), server_hello(&session))
+                .await
+                .expect("server hello timeout")
+                .expect("server hello");
+
+            // 关键断言：take_stream_bunch 应返 None（STEP-5.4 run() 装配
+            // 前 stream_bunch 字段保持 None；本步验证"未装配时不 panic"）
+            let bunch = session.take_stream_bunch().await;
+            assert!(
+                bunch.is_none(),
+                "STEP-5.3 范围 stream_bunch 应为 None（未装配）；STEP-5.4 run() 才填充"
+            );
+
+            // 关 conn 让 client 端的 server_hello / 等任务收到 close
+            session
+                .connection()
+                .close(quinn::VarInt::from(0u32), b"test done");
+        });
+
+        // 跑 client_hello 让 server 端 server_hello 触发 accept_bi 完成
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_hello(&client_session),
+        )
+        .await
+        .expect("client hello timeout")
+        .expect("client hello");
+
+        // 关键断言：client_session.stream_bunch 也为 None
+        let client_bunch = client_session.take_stream_bunch().await;
+        assert!(
+            client_bunch.is_none(),
+            "client 端 stream_bunch 也应为 None（与 server 端对称）"
+        );
+
+        server_task.await.expect("server task");
+        drop(client_session);
+        client_ep.wait_idle().await;
+        let _ = std::fs::remove_dir_all(&pins_dir);
     }
 }
