@@ -41,6 +41,11 @@ enum LanMouseError {
 }
 
 fn main() {
+    // STEP-2.1: 早于任何 rustls ClientConfig::builder / ServerConfig::builder
+    // 装配，必须在 main() 顶层第一句（早于 logging / config / service）；
+    // 见 next/STEP-2.1.md。OnceLock 守护，多进程 / 多次 install 均安全。
+    lan_mouse::install_crypto_provider();
+
     // init logging
     let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
     env_logger::init_from_env(env);
