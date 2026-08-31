@@ -662,6 +662,12 @@ SUGGESTION #S-13 已在 GTK 文件名上出现过一次。
 **优先级**：🟡 中（不影响已完成步骤的实际代码质量 —— STEP-7.1 已用正确
 路径复核；但直接影响 STEP-7.6 收尾闸门的有效性）
 
+**STEP-7.6 闭环（2026-08-31）**：本步开干前先 `ls -d src lan-mouse/src`
+核实路径（主仓 crate 在 root，`lan-mouse/src` 不存在），全程按 `src/`
+路径 grep —— 规避了 PLAN §7.6 字面 grep 命令的假阴性。本条目进入
+"待 Leader 评审后决定是否同步修 PLAN §7.6 验证命令路径 + §6 搬运矩阵
+firewall.rs 引用 + §1.2 firewall.rs 头部注释引用"状态。
+
 ---
 
 ## #S-22 🟡 中：STEP-7.2 暴露的 work-pattern 教训 —— "#N-31 模式"成流程纪律
