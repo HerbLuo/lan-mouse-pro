@@ -143,6 +143,20 @@ pub enum EventType {
 }
 
 impl ProtoEvent {
+    /// Construct a [`ProtoEvent::Hello`] stamped with this build's
+    /// [`PROTOCOL_MAGIC`] and the given short commit hash.
+    ///
+    /// STEP-3.2: used by [`crate::quic_transport::client_hello`] /
+    /// [`crate::quic_transport::server_hello`] to emit the magic-bearing
+    /// Hello frame on stream A — `magic` is auto-filled with `PROTOCOL_MAGIC`
+    /// so callers cannot accidentally send a foreign magic on the wire.
+    pub fn hello(commit: [u8; 8]) -> Self {
+        ProtoEvent::Hello {
+            magic: PROTOCOL_MAGIC,
+            commit,
+        }
+    }
+
     fn event_type(&self) -> EventType {
         match self {
             ProtoEvent::Input(e) => match e {
@@ -420,5 +434,22 @@ mod tests {
         // All bytes ASCII, no embedded NUL (would terminate at
         // str::from_utf8 debug paths).
         assert!(PROTOCOL_MAGIC.iter().all(|b| b.is_ascii_graphic()));
+    }
+
+    /// STEP-3.2: `ProtoEvent::hello(commit)` must always stamp
+    /// `PROTOCOL_MAGIC` on the wire regardless of the caller-supplied
+    /// commit. This is the only legal way for quic_transport to build a
+    /// Hello frame, so an off-by-one in the constructor would silently
+    /// ship a foreign magic and break wire compatibility.
+    #[test]
+    fn hello_constructor_stamps_protocol_magic() {
+        let event = ProtoEvent::hello(*b"deadbeef");
+        match event {
+            ProtoEvent::Hello { magic, commit } => {
+                assert_eq!(magic, PROTOCOL_MAGIC);
+                assert_eq!(commit, *b"deadbeef");
+            }
+            other => panic!("ProtoEvent::hello returned non-Hello: {other}"),
+        }
     }
 }

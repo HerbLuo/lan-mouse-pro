@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -38,11 +39,17 @@ use crate::crypto;
 // `pub use quinn::Endpoint` / `pub use quinn::Connection` re-export them
 // for main-code (Step 6.x's `LanMouseListener::new`), matching the bak
 // quic_transport.rs:84 pattern to avoid name collision.
-use quinn::{ClientConfig as QuinnClientConfig, EndpointConfig, IdleTimeout, ServerConfig, TransportConfig};
+use quinn::{
+    ClientConfig as QuinnClientConfig, EndpointConfig, IdleTimeout, RecvStream, SendStream,
+    ServerConfig, TransportConfig, VarInt,
+};
 use rustls::SignatureScheme;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use lan_mouse_proto::{ProtoEvent, MAX_EVENT_SIZE};
 
 pub use quinn::{Connection, Endpoint};
 
@@ -53,18 +60,70 @@ pub use quinn::{Connection, Endpoint};
 /// 复用 bak 的 `mousehop`，与 PLAN §5 D1 对齐）。
 pub(crate) const ALPN_LAN_MOUSE: &[u8] = b"lan-mouse";
 
+/// 应用层 Hello 握手超时（STEP-3.2 引入）。
+///
+/// QUIC mTLS 握手完成之后，对端必须在 `HELLO_TIMEOUT` 内在 stream A 上完成
+/// `PROTOCOL_MAGIC` 交换；超时即视为"对端非 lan-mouse 实例"，关 conn +
+/// `Error::HelloTimeout(HELLO_TIMEOUT)`。3s 是 PLAN §5 D6 决策（抄 bak）。
+///
+/// **与 QUIC idle timeout 的关系**：`HELLO_TIMEOUT` 仅在 Hello 阶段生效；
+/// 之后由 `max_idle_timeout = 30s`（[`default_transport_config`]）接管。
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// 与对端的一条 QUIC 会话（client / server 共用）—— STEP-5.4 起承担端到端 IO。
 ///
-/// STEP-1.4 仅占位；具体字段在 STEP-2 ~ STEP-5 落地（见模块顶部路线图）。
+/// STEP-1.4 占位为单字段 `_private`；STEP-3.2 起扩展为：
+/// - `conn` —— `quinn::Connection`，所有 stream / datagram IO 入口
+/// - `hello_ok: AtomicBool` —— Hello 握手成功标志（`Ordering::Release` 置
+///   / `Acquire` 读）
+/// - `stream_a_cache: Mutex<Option<StreamPair>>` —— `server_hello()` /
+///   `client_hello()` 缓存 Hello 用的那条 stream A 给 STEP-5.x read_loop
+///   接手
+///
+/// `StreamPair` 与 `stream_b` / `stream_c` 缓存字段留 STEP-5.1 / 5.2 落地，
+/// 本步不引入。
 pub struct PeerSession {
-    _private: (),
+    conn: Connection,
+    /// 应用层 Hello 握手成功标志。初始 `false`，`client_hello()` /
+    /// `server_hello()` 任一端成功置 `true`（`Ordering::Release`）。
+    /// 业务路径必须先 `load(Ordering::Acquire)` 确认 `true` 再发事件。
+    hello_ok: AtomicBool,
+    /// Stream A（control 流）缓存：`server_hello()` / `client_hello()` 写入；
+    /// STEP-5.4 `read_loop` 通过 `take_stream_a_recv()` 拿 `RecvStream` 半
+    /// 边给控制帧读循环，`SendStream` 半边留给后续 `send_stream_a()` 复用。
+    ///
+    /// **为什么用 `Mutex<Option<StreamPair>>` 而不是 `OnceCell`**：STEP-5.x
+    /// 接手控制帧循环时需要 take recv 半边但保留 send 半边 —— `Option::take`
+    /// 配合 `StreamPair::recv.take()` 的两步语义最干净。`OnceCell` 无法表达
+    /// "已设置过但 recv 已被 take" 的状态。
+    stream_a_cache: tokio::sync::Mutex<Option<StreamPair>>,
+}
+
+/// Stream A / B / C 缓存结构体：`(send, recv)` 二元组，两半边可独立 take
+/// （STEP-5.x 接 read_loop 时 take recv 半边；send 半边留给写路径复用）。
+///
+/// STEP-3.2 只引入类型；具体 take 方法在 STEP-5.x。
+pub(crate) struct StreamPair {
+    pub(crate) send: Option<SendStream>,
+    pub(crate) recv: Option<RecvStream>,
+}
+
+impl StreamPair {
+    pub(crate) fn new(send: SendStream, recv: RecvStream) -> Self {
+        Self {
+            send: Some(send),
+            recv: Some(recv),
+        }
+    }
 }
 
 /// M1 传输层错误。
 ///
 /// STEP-1.4 引入：占位变体 [`NotImplemented`] 保留；新增 [`Io`] / [`Bind`] /
-/// [`EndpointSetup`] 给 `endpoint()` 路径用。后续 STEP 接入 verifier / IO
-/// 时再补 `Error::Handshake` / `Error::HelloFailed` / `Error::Datagram` 等。
+/// [`EndpointSetup`] 给 `endpoint()` 路径用。
+/// STEP-3.2 新增 [`HelloFailed`] / [`HelloTimeout`] 给应用层 Hello 握手用。
+/// 后续 STEP 接入 verifier / IO 时再补 `Error::Datagram` / `Error::StreamA`
+/// 等（STEP-5.x）。
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("not implemented (STEP-1.3 占位)")]
@@ -92,6 +151,16 @@ pub enum Error {
     /// 会以 `ConnectionError::TransportError(...)` 形态冒到这里。
     #[error("handshake failed: {0}")]
     Handshake(#[from] quinn::ConnectionError),
+    /// 应用层 Hello 握手失败：magic 不匹配 / 协议层错误 / 解码失败 /
+    /// 收到非 Hello 帧等。消息含具体原因（"wrong magic: ..." /
+    /// "non-Hello frame: ..." / "decode frame: ..."）。
+    /// STEP-3.2 引入。
+    #[error("hello handshake failed: {0}")]
+    HelloFailed(String),
+    /// Hello 握手超时（对端在 [`HELLO_TIMEOUT`] 内未完成 stream A 上的
+    /// magic 交换）。STEP-3.2 引入。
+    #[error("hello handshake timed out after {0:?}")]
+    HelloTimeout(Duration),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -466,9 +535,7 @@ pub async fn dial(
     // STEP-2.6：`build_quic_client_config` 签名加 `pins_dir`（TofuVerifier 替
     // 换 WebPkiServerVerifier；构造由 `TofuVerifier::new(pins_dir)` 全权负责）。
     let cfg = build_quic_client_config(vec![cert], key, pins_dir)?;
-    let conn = ep
-        .connect_with(cfg, addr, "lan-mouse")?
-        .await?;
+    let conn = ep.connect_with(cfg, addr, "lan-mouse")?.await?;
     Ok(conn)
 }
 
@@ -517,6 +584,318 @@ pub async fn accept(ep: &Endpoint) -> Result<Connection> {
         .ok_or_else(|| Error::EndpointSetup("endpoint closed (accept returned None)".into()))?;
     let conn = incoming.await?;
     Ok(conn)
+}
+
+// === STEP-3.2 PeerSession + Hello 握手 ==================================
+//
+// QUIC mTLS 握手（STEP-2.x）完成 + 对端 fingerprint 验证（STEP-2.6 /
+// 2.7）通过后，立即在 **stream A**（control 流）上做应用层 Hello 握手：双方
+// 互换 `ProtoEvent::Hello { magic: PROTOCOL_MAGIC, commit: <our> }`，
+// magic 不匹配立即 `conn.close(VarInt(0), "hello failed")` 关连。
+//
+// 与 bak `mousehop/src/quic_transport.rs` 的差异：
+// - `Mousehop` → `LanMouse` 命名约定（PLAN §5 D1）
+// - `mousehop_proto` → `lan_mouse_proto` crate 路径
+// - 本仓不引入 `StreamBunch` / `route_input` / `send_motion` 等 STEP-4 /
+//   STEP-5.x 范畴的字段 / 方法 —— 这些留后续 STEP 落地
+
+impl PeerSession {
+    /// 构造：从 `quinn::Connection` 包成 `PeerSession`（STEP-3.2 引入）。
+    ///
+    /// STEP-3.2 起所有 `PeerSession` 构造都走这个 helper：
+    /// - `accept()` caller → `PeerSession::from_connection(conn)`
+    /// - `dial()` caller → `PeerSession::from_connection(conn)`
+    /// - 测试 → 直接调
+    ///
+    /// 保证 `hello_ok = false` + `stream_a_cache` 空初始这两个不变式集中在
+    /// 一处（与 bak `Mousehop::PeerSession::from_connection` 对齐）。
+    ///
+    /// STEP-5.x 接 `route_input` / `input_channels` 时再加 `with_config`
+    /// builder；本步不引入（M1 不触碰 ChannelMode，STEP-4.1 引入
+    /// `InputChannelConfig` 后再加）。
+    pub fn from_connection(conn: Connection) -> Self {
+        Self {
+            conn,
+            hello_ok: AtomicBool::new(false),
+            stream_a_cache: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// 暴露底层 `quinn::Connection`，给 STEP-5.x 读 `peer_identity()` /
+    /// datagram / stream B/C 用。STEP-6.x 接入 `LanMouseConnection` 后这
+    /// 一步会被 `send()` / `recv()` 高阶方法盖掉。
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Hello 握手是否已完成（STEP-3.2 引入）。
+    ///
+    /// 业务路径（`send_motion()` / 开 stream B / 业务事件循环 —— 这些是
+    /// STEP-5.x 的范畴）必须先调此方法确认 `true` 再发事件；否则 QUIC TLS
+    /// 1.3 之后没有应用层验证过的对端（可能是 LAN spoofing 残余），
+    /// 不允许注入键鼠。
+    #[allow(dead_code)] // 测试 + STEP-5.x / STEP-6.x 接入时移除
+    pub fn hello_ok(&self) -> bool {
+        self.hello_ok.load(Ordering::Acquire)
+    }
+
+    /// 取出 stream A 的 `(SendStream, RecvStream)` **整对**（STEP-3.2 引入）。
+    ///
+    /// **消费性语义**：调用后 `stream_a_cache` 缓存被清空（`Option::take`）。
+    /// 设计意图：STEP-5.4 `read_loop` 启动时拿走 server 端 Hello 时缓存
+    /// 的 stream，转交给控制帧循环的所有权。本步暂无 main-code caller
+    /// （STEP-5.4 才接），仅测试或 STEP-5.x 设计参考。
+    ///
+    /// 返回 `None` 说明 Hello 还没跑过（典型 client 端场景，client_hello
+    /// 完成同样有 cache，server_hello 也一样 —— STEP-3.2 起两端对称缓存）。
+    #[allow(dead_code)]
+    pub async fn take_stream_a_cache(&self) -> Option<(SendStream, RecvStream)> {
+        let mut g = self.stream_a_cache.lock().await;
+        g.take().and_then(|p| match (p.send, p.recv) {
+            (Some(s), Some(r)) => Some((s, r)),
+            // 半边缺失（已被 take_recv）—— 整对无法重建，返 None
+            _ => None,
+        })
+    }
+
+    /// 取出 stream A 的 `RecvStream` 半边，**保留** `SendStream` 半边在
+    /// cache（STEP-5.4 接 read_loop 时用）。
+    ///
+    /// 与 [`Self::take_stream_a_cache`]（整对 take）语义不同：本方法只拿
+    /// recv 半边，让 send 半边留给写路径复用。STEP-3.2 暂未使用，
+    /// STEP-5.4 由 read_loop 接手控制帧循环所有权时消费。
+    #[allow(dead_code)]
+    pub async fn take_stream_a_recv(&self) -> Option<RecvStream> {
+        let mut g = self.stream_a_cache.lock().await;
+        g.as_mut().and_then(|p| p.recv.take())
+    }
+}
+
+/// 应用层 Hello 握手超时 watchdog（STEP-3.2 引入，STEP-5.4 接入 run()）。
+///
+/// **目的**：QUIC mTLS 通了不等于对端是 lan-mouse —— 一个对端可能过了
+/// mTLS（自签根信任 + fingerprint allowlist）但故意不开 stream A，导致
+/// `client_hello()` / `server_hello()` 永远挂在 `open_bi()` /
+/// `accept_bi()`。`HELLO_TIMEOUT` watchdog 在不阻塞主流程的前提下做兜底：
+///
+/// 1. spawn 一个 tokio task，sleep `HELLO_TIMEOUT`
+/// 2. 检查 `peer.hello_ok()` —— 若为 `true`（Hello 已成功）则安静退出
+/// 3. 若仍为 `false` —— 主动 `conn.close(VarInt(0), "hello timeout")` 关
+///    连 + `log::warn`，让对端 `client_hello()` / `server_hello()` 的
+///    `accept_bi().await` / `open_bi().await` 立即以
+///    `ConnectionError::LocallyClosed` 失败退出
+///
+/// **不**阻塞 `client_hello` / `server_hello` 自身 —— 那两个函数内部已有
+/// `tokio::time::timeout(HELLO_TIMEOUT, ...)` 包裹（见下文实现），watchdog
+/// 是"对端不发起 stream"这种**完全不开始 hello**场景的兜底。
+///
+/// **dead_code chain**：STEP-3.2 仅写函数 + 单测（直接 spawn 调用验证）；
+/// STEP-5.4 `PeerSession::run()` 启 hello_watchdog 后此 `#[allow]` 移除。
+#[allow(dead_code)]
+pub fn hello_watchdog(peer: std::sync::Arc<PeerSession>) {
+    tokio::spawn(async move {
+        tokio::time::sleep(HELLO_TIMEOUT).await;
+        if !peer.hello_ok.load(Ordering::Acquire) {
+            log::warn!(
+                "hello watchdog: hello_ok 未在 {HELLO_TIMEOUT:?} 内置位，主动关闭连接"
+            );
+            peer.conn
+                .close(VarInt::from(0u32), b"hello timeout (watchdog)");
+        }
+    });
+}
+
+/// 客户端 Hello 握手（STEP-3.2 引入）。
+///
+/// 1. `peer.conn.open_bi().await` 开 stream A（control 流）
+/// 2. 发 `ProtoEvent::hello(local_commit())` 给对端
+/// 3. 等对端 echo `ProtoEvent::Hello` 回包（`HELLO_TIMEOUT` 内）
+/// 4. 校验 echo magic == `PROTOCOL_MAGIC`：
+///    - 匹配 → 缓存 stream A 到 `peer.stream_a_cache` + 置 `hello_ok = true`
+///    - 不匹配 → `conn.close(VarInt(0), "hello failed (wrong magic)")` + 返
+///      `Err(HelloFailed("wrong magic: ..."))`
+/// 5. 超时 → `conn.close(VarInt(0), "hello failed (timeout)")` + 返
+///    `Err(HelloTimeout(HELLO_TIMEOUT))`
+///
+/// **缓存 stream A**：client_hello 与 server_hello 对称缓存（与 bak
+/// `mousehop/src/quic_transport.rs:2452` Step 1.9a 行为对齐）—— 控制面
+/// 读写都在这条 stream 上，STEP-5.4 read_loop 接手所有权时通过
+/// `take_stream_a_recv()` 拿 recv 半边，send 半边留给 `send_stream_a()`
+/// 复用（避免重开第二条 stream A 破坏 PLAN §3 "A/B/C 各开 1 条长期复用"）。
+///
+/// **错误归一**：所有 magic / 解码 / 超时失败统一归到 [`Error::HelloFailed`]
+/// / [`Error::HelloTimeout`]；`conn.close(...)` 一定先调，确保对端
+/// `accept_bi()` / `open_bi()` 立即以 `ConnectionError::LocallyClosed` 失
+/// 败退出，不留 zombie conn。
+///
+/// **dead_code chain**：STEP-3.2 仅被测试消费；STEP-5.4 接 `run()` /
+/// STEP-6.1 接 `connect.rs::connect_to_handle` 时移除 `#[allow]`。
+#[allow(dead_code)]
+pub async fn client_hello(peer: &PeerSession) -> Result<(), Error> {
+    let (mut send, mut recv) = peer.conn.open_bi().await.map_err(Error::Handshake)?;
+    let outgoing = ProtoEvent::hello(crate::config::local_commit());
+
+    let exchange = async {
+        write_hello_frame(&mut send, &outgoing).await?;
+        read_hello_frame(&mut recv).await
+    };
+    let response = match tokio::time::timeout(HELLO_TIMEOUT, exchange).await {
+        Ok(Ok(event)) => event,
+        Ok(Err(e)) => return Err(e),
+        Err(_elapsed) => {
+            peer.conn
+                .close(VarInt::from(0u32), b"hello failed (timeout)");
+            log::warn!("client hello handshake timed out after {HELLO_TIMEOUT:?}");
+            return Err(Error::HelloTimeout(HELLO_TIMEOUT));
+        }
+    };
+
+    match response {
+        ProtoEvent::Hello { magic, .. } if magic == lan_mouse_proto::PROTOCOL_MAGIC => {
+            *peer.stream_a_cache.lock().await = Some(StreamPair::new(send, recv));
+            peer.hello_ok.store(true, Ordering::Release);
+            Ok(())
+        }
+        ProtoEvent::Hello { magic, .. } => {
+            peer.conn
+                .close(VarInt::from(0u32), b"hello failed (wrong magic)");
+            log::warn!(
+                "client hello rejected: wrong magic {:?}",
+                std::str::from_utf8(&magic).unwrap_or("????????")
+            );
+            Err(Error::HelloFailed(format!(
+                "wrong magic: expected {:?}, got {:?}",
+                std::str::from_utf8(&lan_mouse_proto::PROTOCOL_MAGIC).unwrap_or("????????"),
+                std::str::from_utf8(&magic).unwrap_or("????????"),
+            )))
+        }
+        other => {
+            peer.conn
+                .close(VarInt::from(0u32), b"hello failed (non-hello response)");
+            log::warn!("client hello rejected: non-Hello response: {other}");
+            Err(Error::HelloFailed(format!(
+                "non-Hello response on stream A: {other}"
+            )))
+        }
+    }
+}
+
+/// 服务端 Hello 握手（STEP-3.2 引入）。
+///
+/// 流程与 `client_hello` 对称：
+/// 1. `peer.conn.accept_bi().await` 等 stream A（client 主动 `open_bi`）
+/// 2. 读 client 发来的 Hello
+/// 3. 校验 magic == `PROTOCOL_MAGIC`（不匹配 → close + Err）
+/// 4. echo 自己 Hello 给 client
+/// 5. 缓存 stream A 到 `peer.stream_a_cache` + 置 `hello_ok = true`
+///
+/// **失败语义**：`open_bi` / `accept_bi` 同步失败 → `Err(HelloFailed)`；
+/// `read_hello_frame` 超时 → `Err(HelloTimeout)`。所有失败路径先
+/// `conn.close(...)` 再返 Err。
+///
+/// **dead_code chain**：STEP-3.2 仅被测试消费；STEP-5.4 接 `run()` /
+/// STEP-6.2 接 `listen.rs::read_loop` 时移除 `#[allow]`。
+#[allow(dead_code)]
+pub async fn server_hello(peer: &PeerSession) -> Result<(), Error> {
+    let (mut send, mut recv) = peer
+        .conn
+        .accept_bi()
+        .await
+        .map_err(|e| Error::HelloFailed(format!("accept_bi: {e}")))?;
+
+    let hello = match tokio::time::timeout(HELLO_TIMEOUT, read_hello_frame(&mut recv)).await {
+        Ok(Ok(event)) => event,
+        Ok(Err(e)) => return Err(e),
+        Err(_elapsed) => {
+            peer.conn
+                .close(VarInt::from(0u32), b"hello failed (timeout)");
+            log::warn!("server hello handshake timed out after {HELLO_TIMEOUT:?}");
+            return Err(Error::HelloTimeout(HELLO_TIMEOUT));
+        }
+    };
+
+    match &hello {
+        ProtoEvent::Hello { magic, .. } if *magic == lan_mouse_proto::PROTOCOL_MAGIC => {}
+        ProtoEvent::Hello { magic, .. } => {
+            peer.conn
+                .close(VarInt::from(0u32), b"hello failed (wrong magic)");
+            log::warn!(
+                "server hello rejected: wrong magic {:?}",
+                std::str::from_utf8(magic).unwrap_or("????????")
+            );
+            return Err(Error::HelloFailed(format!(
+                "wrong magic: expected {:?}, got {:?}",
+                std::str::from_utf8(&lan_mouse_proto::PROTOCOL_MAGIC).unwrap_or("????????"),
+                std::str::from_utf8(magic).unwrap_or("????????"),
+            )));
+        }
+        other => {
+            peer.conn
+                .close(VarInt::from(0u32), b"hello failed (non-hello frame)");
+            log::warn!("server hello rejected: non-Hello frame: {other}");
+            return Err(Error::HelloFailed(format!(
+                "non-Hello frame on stream A: {other}"
+            )));
+        }
+    }
+
+    // echo 自己 Hello
+    let outgoing = ProtoEvent::hello(crate::config::local_commit());
+    write_hello_frame(&mut send, &outgoing).await?;
+
+    // 缓存 stream A 给 STEP-5.4 read_loop 接手
+    *peer.stream_a_cache.lock().await = Some(StreamPair::new(send, recv));
+
+    peer.hello_ok.store(true, Ordering::Release);
+    Ok(())
+}
+
+/// 把 `ProtoEvent` 编码成**长度前缀帧**写到 stream（STEP-3.2 引入）。
+///
+/// 帧格式：`[u32 BE length][bytes...]`（与 STEP-5.2 `write_frame` 共用
+/// codec；本步只引入 `hello` 专用路径，避免与 STEP-5.x `write_frame` 一
+/// 起 import 造成循环）。
+///
+/// **失败传播**：写 IO 错误透传为 `Error::HelloFailed("write Hello frame:
+/// ...")`。`ProtoEvent::try_from` / `.into()` 不可能失败（定长 codec +
+/// Hello 只有 17 字节），无解码错误路径。
+async fn write_hello_frame(send: &mut SendStream, event: &ProtoEvent) -> std::result::Result<(), Error> {
+    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
+    send.write_u32(len as u32)
+        .await
+        .map_err(|e| Error::HelloFailed(format!("write Hello frame length: {e}")))?;
+    send.write_all(&buf[..len])
+        .await
+        .map_err(|e| Error::HelloFailed(format!("write Hello frame body: {e}")))?;
+    Ok(())
+}
+
+/// 从 stream 读**长度前缀帧**并解码为 `ProtoEvent`（STEP-3.2 引入）。
+///
+/// 帧格式：`[u32 BE length][bytes...]`。先读 `u32 BE len` → 校验
+/// `len <= MAX_EVENT_SIZE`（防 DoS：攻击者控制长度字段会诱使
+/// `read_exact` 读非常多字节）→ `read_exact(&mut buf[..len])` →
+/// `ProtoEvent::try_from(buf)`。
+///
+/// **失败传播**：
+/// - `read_exact` IO 错误 → `Error::HelloFailed("read Hello frame: ...")`
+/// - `ProtoEvent::try_from` 失败 → `Error::HelloFailed("decode Hello frame: ...")`
+async fn read_hello_frame(recv: &mut RecvStream) -> std::result::Result<ProtoEvent, Error> {
+    let len = recv
+        .read_u32()
+        .await
+        .map_err(|e| Error::HelloFailed(format!("read Hello frame length: {e}")))?
+        as usize;
+    if len > MAX_EVENT_SIZE {
+        return Err(Error::HelloFailed(format!(
+            "Hello frame too large: {len} bytes (max {MAX_EVENT_SIZE})"
+        )));
+    }
+    let mut buf = [0u8; MAX_EVENT_SIZE];
+    recv.read_exact(&mut buf[..len])
+        .await
+        .map_err(|e| Error::HelloFailed(format!("read Hello frame body ({len} bytes): {e}")))?;
+    ProtoEvent::try_from(buf).map_err(|e| Error::HelloFailed(format!("decode Hello frame: {e}")))
 }
 
 /// **STEP-2.6 客户端 TOFU（Trust On First Use）fingerprint pinning verifier**。
@@ -807,10 +1186,7 @@ impl AuthorizedKeysVerifier {
     /// QUIC 握手）。生产路径不用（生产走 listen.rs supervisor / service.rs
     /// 写 allowlist，verifier 通过 `new()` 拿到 Arc 引用）。
     #[allow(dead_code)]
-    pub fn with_known(
-        allowlist: Arc<RwLock<HashMap<String, String>>>,
-        known_fp: &str,
-    ) -> Self {
+    pub fn with_known(allowlist: Arc<RwLock<HashMap<String, String>>>, known_fp: &str) -> Self {
         let v = Self::new(allowlist);
         v.allowlist
             .write()
@@ -874,9 +1250,7 @@ impl rustls::server::danger::ClientCertVerifier for AuthorizedKeysVerifier {
             // 时一并处理），仅 log::warn 留下审计线索。错误消息含 fingerprint 方便
             // 上层诊断（用户对照"信任的 peer 列表"判定）。
             log::warn!("AuthorizedKeysVerifier: rejected unauthorized peer {fp}");
-            Err(rustls::Error::General(format!(
-                "unauthorized peer {fp}"
-            )))
+            Err(rustls::Error::General(format!("unauthorized peer {fp}")))
         }
     }
 
@@ -885,10 +1259,7 @@ impl rustls::server::danger::ClientCertVerifier for AuthorizedKeysVerifier {
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<
-        rustls::client::danger::HandshakeSignatureValid,
-        rustls::Error,
-    > {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls12_signature(
             message,
             cert,
@@ -902,10 +1273,7 @@ impl rustls::server::danger::ClientCertVerifier for AuthorizedKeysVerifier {
         message: &[u8],
         cert: &CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<
-        rustls::client::danger::HandshakeSignatureValid,
-        rustls::Error,
-    > {
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls13_signature(
             message,
             cert,
@@ -938,8 +1306,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let cp = dir.join("cert.pem");
         let kp = dir.join("key.pem");
-        crypto::generate_self_signed("lan-mouse-test", &cp, &kp)
-            .expect("test cert 自签")
+        crypto::generate_self_signed("lan-mouse-test", &cp, &kp).expect("test cert 自签")
     }
 
     /// 测试用 server endpoint 装配 —— 直接调公共 [`endpoint_with_cert`]
@@ -998,10 +1365,8 @@ mod tests {
         let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
             .expect("client endpoint bind 不应失败");
         // STEP-2.6：dial 加 pins_dir 参数；测试用临时 pins_dir 隔离。
-        let pins_dir = std::env::temp_dir().join(format!(
-            "lan-mouse-quic-test-pins-{}",
-            std::process::id()
-        ));
+        let pins_dir =
+            std::env::temp_dir().join(format!("lan-mouse-quic-test-pins-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&pins_dir);
         let conn = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -1056,10 +1421,8 @@ mod tests {
         let (cert_chain, key) = ephemeral_cert();
         // STEP-2.6：`build_quic_client_config` 加 `pins_dir` 参数（TofuVerifier
         // 替换 WebPkiServerVerifier；构造由 `TofuVerifier::new(pins_dir)` 全权负责）。
-        let pins_dir = std::env::temp_dir().join(format!(
-            "lan-mouse-quic-test-pins-{}",
-            std::process::id()
-        ));
+        let pins_dir =
+            std::env::temp_dir().join(format!("lan-mouse-quic-test-pins-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&pins_dir);
         // STEP-2.5 起：`build_quic_client_config` 收 `Vec<CertificateDer>`（`with_client_auth_cert`
         // 要求 chain 形态）—— 单张 cert 包成 `vec![cert]` 即可
@@ -1116,10 +1479,8 @@ mod tests {
         let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
             .expect("client endpoint bind 不应失败");
         // STEP-2.6：dial 加 pins_dir 参数；测试用临时 pins_dir 隔离。
-        let pins_dir = std::env::temp_dir().join(format!(
-            "lan-mouse-quic-test-pins-{}",
-            std::process::id()
-        ));
+        let pins_dir =
+            std::env::temp_dir().join(format!("lan-mouse-quic-test-pins-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&pins_dir);
         let conn = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -1213,17 +1574,13 @@ mod tests {
 
         let (server_cert_chain, _server_key) = ephemeral_cert();
         let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(server_cert_chain[0].clone())
-            .expect("add root");
+        roots.add(server_cert_chain[0].clone()).expect("add root");
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let builder = RustlsClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .expect("protocol versions");
         // 关键：**不**调 with_client_auth_cert —— client 无 cert 可出示
-        let mut rustls_client = builder
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let mut rustls_client = builder.with_root_certificates(roots).with_no_client_auth();
         rustls_client.alpn_protocols = vec![ALPN_LAN_MOUSE.to_vec()];
 
         let quic_client =
@@ -1503,5 +1860,304 @@ mod tests {
             !verifier.allowlist().read().unwrap().contains_key(&fp),
             "allowlist 应不含 cert_der 的 fp"
         );
+    }
+
+    // === STEP-3.2 Hello 握手单元测试 =========================================
+    //
+    // 三个核心验收测试（PLAN §4 Step 1.6 验收清单）：
+    // - `hello_happy_path_exchanges_magic` —— 两端 hello_ok == true + stream
+    //   A 缓存
+    // - `hello_wrong_magic_closes_connection` —— server 发错 magic → client
+    //   `Error::HelloFailed("wrong magic")` + server conn 关
+    // - `hello_timeout_aborts_session` —— 对端不开 stream A → 3s 后
+    //   `Error::HelloTimeout(HELLO_TIMEOUT)` + `hello_ok == false`
+    //
+    // 与 bak `mousehop/src/quic_transport.rs:3481-3773` 完全对齐；差异仅
+    // 在命名 / 测试 helper（用现有 `endpoint_with_test_cert` + `ephemeral_
+    // cert` 不另起新 helper）。
+
+    /// STEP-3.2 验收 (1/3)：Happy path —— server / client 都跑
+    /// `server_hello` / `client_hello`，两端 `peer.hello_ok()` 都返 `true`，
+    /// 且两端 `stream_a_cache` 都有缓存。
+    ///
+    /// 端到端：server_ep + client dial → 两端 spawn 各自 hello task → 5s
+    /// 兜底超时（HELLO_TIMEOUT=3s 留余量）。
+    #[tokio::test]
+    async fn hello_happy_path_exchanges_magic() {
+        install_crypto_provider();
+
+        let (server_cert_chain, server_key) = ephemeral_cert();
+        let server_ep = endpoint_with_test_cert(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+            server_cert_chain,
+            server_key,
+        )
+        .expect("server endpoint bind");
+        let server_addr = server_ep.local_addr().expect("server addr");
+
+        // (1) 后台 server task：accept + server_hello
+        let server_task = tokio::spawn(async move {
+            let session = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                accept(&server_ep),
+            )
+            .await
+            .expect("server accept timeout")
+            .expect("server accept");
+            let session = PeerSession::from_connection(session);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), server_hello(&session))
+                .await
+                .expect("server hello timeout")
+                .expect("server hello should succeed");
+
+            assert!(
+                session.hello_ok(),
+                "server 端 hello_ok 应为 true（server_hello 已置位）"
+            );
+
+            // server 端 stream A 应已缓存
+            let cached = session.take_stream_a_cache().await;
+            assert!(
+                cached.is_some(),
+                "server_hello 后 peer.stream_a_cache 应有缓存"
+            );
+
+            // 留出时间让 client_hello 完成 read
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            drop(session);
+        });
+
+        // (2) client：dial + client_hello
+        let pins_dir =
+            std::env::temp_dir().join(format!("lan-mouse-quic-test-pins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&pins_dir);
+        let (client_cert_chain, client_key) = ephemeral_cert();
+        let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .expect("client endpoint bind");
+        let conn = dial(
+            &client_ep,
+            server_addr,
+            client_cert_chain[0].clone(),
+            client_key,
+            &pins_dir,
+        )
+        .await
+        .expect("dial");
+        let client_session = PeerSession::from_connection(conn);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_hello(&client_session),
+        )
+        .await
+        .expect("client hello timeout")
+        .expect("client hello should succeed");
+
+        assert!(
+            client_session.hello_ok(),
+            "client 端 hello_ok 应为 true（client_hello 已置位）"
+        );
+
+        // (3) client 端 stream A 也应已缓存（client/server 对称缓存）
+        let cached = client_session.take_stream_a_cache().await;
+        assert!(
+            cached.is_some(),
+            "client_hello 后 peer.stream_a_cache 应已缓存 Hello 用的 stream A"
+        );
+
+        // (4) 清理
+        drop(client_session);
+        drop(client_ep);
+        server_task.await.expect("server task");
+        let _ = std::fs::remove_dir_all(&pins_dir);
+    }
+
+    /// STEP-3.2 验收 (2/3)：server 发错 magic → client `Error::HelloFailed`。
+    ///
+    /// 端到端构造：
+    /// - server 端**不**调 `server_hello()`，而是手动 `accept_bi` + 发错
+    ///   magic 的 Hello 给 client（模拟"非 lan-mouse peer"）
+    /// - client 调 `client_hello()` → 读到非 `PROTOCOL_MAGIC` → 关 conn +
+    ///   返 `Err(HelloFailed)`
+    ///
+    /// 验证：错误消息含 "wrong magic" + `hello_ok == false`。
+    #[tokio::test]
+    async fn hello_wrong_magic_closes_connection() {
+        install_crypto_provider();
+
+        let (server_cert_chain, server_key) = ephemeral_cert();
+        let server_ep = endpoint_with_test_cert(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+            server_cert_chain,
+            server_key,
+        )
+        .expect("server endpoint bind");
+        let server_addr = server_ep.local_addr().expect("server addr");
+
+        // (1) 后台 server task：accept + 手动 accept_bi + 发错 magic Hello
+        let server_task = tokio::spawn(async move {
+            let conn = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                accept(&server_ep),
+            )
+            .await
+            .expect("server accept timeout")
+            .expect("server accept");
+
+            let (mut send, _recv) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                conn.open_bi(),
+            )
+            .await
+            .expect("open_bi timeout")
+            .expect("open_bi");
+
+            // 发一个错 magic 的 Hello（不是 PROTOCOL_MAGIC）
+            let wrong = ProtoEvent::Hello {
+                magic: *b"LAN-MOUS",
+                commit: [0u8; 8],
+            };
+            // 走写帧 helper：长度前缀 + 17 字节 body
+            write_hello_frame(&mut send, &wrong)
+                .await
+                .expect("server write wrong hello");
+            send.finish().expect("finish");
+
+            // 等客户端收到错 magic 后会 conn.close()；等连接自然断
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            conn.close(VarInt::from(0u32), b"test done");
+            drop(conn);
+        });
+
+        // (2) client：dial + client_hello → 期望 HelloFailed
+        let pins_dir =
+            std::env::temp_dir().join(format!("lan-mouse-quic-test-pins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&pins_dir);
+        let (client_cert_chain, client_key) = ephemeral_cert();
+        let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .expect("client endpoint bind");
+        let conn = dial(
+            &client_ep,
+            server_addr,
+            client_cert_chain[0].clone(),
+            client_key,
+            &pins_dir,
+        )
+        .await
+        .expect("dial");
+        let client_session = PeerSession::from_connection(conn);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_hello(&client_session),
+        )
+        .await
+        .expect("client hello timeout (5s 兜底)")
+        .expect_err("client_hello 应该返回 Err(HelloFailed)");
+
+        // (3) 断言错误是 HelloFailed + 消息含 "wrong magic"
+        match &result {
+            Error::HelloFailed(msg) => {
+                assert!(
+                    msg.contains("wrong magic"),
+                    "HelloFailed 消息应含 'wrong magic'，实际：{msg}"
+                );
+            }
+            other => panic!("错误应为 Error::HelloFailed(wrong magic...)，实际：{other:?}"),
+        }
+
+        // (4) hello_ok 应仍为 false（握手失败）
+        assert!(!client_session.hello_ok(), "失败路径 hello_ok 应保持 false");
+
+        // (5) 清理
+        drop(client_session);
+        drop(client_ep);
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(&pins_dir);
+    }
+
+    /// STEP-3.2 验收 (3/3)：对端不开 stream A → 3s 后
+    /// `Error::HelloTimeout(HELLO_TIMEOUT)`。
+    ///
+    /// 端到端构造：
+    /// - server 端 accept() 后**不**做任何事（不调 `server_hello` / 不
+    ///   `accept_bi`）
+    /// - client 调 `client_hello()` → `open_bi()` 成功后写自己的 Hello，
+    ///   等 server echo → 3s 内无响应 → `Error::HelloTimeout`
+    ///
+    /// 验证：错误是 `Error::HelloTimeout(HELLO_TIMEOUT)` + `hello_ok` 仍
+    /// 为 false。
+    #[tokio::test]
+    async fn hello_timeout_aborts_session() {
+        install_crypto_provider();
+
+        let (server_cert_chain, server_key) = ephemeral_cert();
+        let server_ep = endpoint_with_test_cert(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+            server_cert_chain,
+            server_key,
+        )
+        .expect("server endpoint bind");
+        let server_addr = server_ep.local_addr().expect("server addr");
+
+        // (1) 后台 server task：accept 后**不**做任何事 → 等客户端超时
+        let server_task = tokio::spawn(async move {
+            let conn = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                accept(&server_ep),
+            )
+            .await
+            .expect("server accept timeout")
+            .expect("server accept");
+
+            // 等 client 端超时（3s）+ 关 conn（client_hello 错误路径内部 close）
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            drop(conn);
+        });
+
+        // (2) client：dial + client_hello → 期望 HelloTimeout(3s)
+        let pins_dir =
+            std::env::temp_dir().join(format!("lan-mouse-quic-test-pins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&pins_dir);
+        let (client_cert_chain, client_key) = ephemeral_cert();
+        let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .expect("client endpoint bind");
+        let conn = dial(
+            &client_ep,
+            server_addr,
+            client_cert_chain[0].clone(),
+            client_key,
+            &pins_dir,
+        )
+        .await
+        .expect("dial");
+        let client_session = PeerSession::from_connection(conn);
+
+        // 用稍大于 HELLO_TIMEOUT 的总超时（5s）兜底
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_hello(&client_session),
+        )
+        .await
+        .expect("client_hello 总超时不应触发（HELLO_TIMEOUT=3s 应先触发）")
+        .expect_err("client_hello 应该返回 Err(HelloTimeout)");
+
+        // (3) 断言错误是 HelloTimeout(HELLO_TIMEOUT)
+        match &result {
+            Error::HelloTimeout(d) => {
+                assert_eq!(*d, HELLO_TIMEOUT, "HelloTimeout 应等于 HELLO_TIMEOUT (3s)");
+            }
+            other => panic!("错误应为 Error::HelloTimeout(HELLO_TIMEOUT)，实际：{other:?}"),
+        }
+
+        // (4) hello_ok 仍 false
+        assert!(!client_session.hello_ok(), "超时路径 hello_ok 应保持 false");
+
+        // (5) 清理
+        drop(client_session);
+        drop(client_ep);
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(&pins_dir);
     }
 }
