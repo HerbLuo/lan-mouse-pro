@@ -69,6 +69,36 @@
 				</property>
 			</object>
 		</child>
+		<!-- input channel: mouse button (Datagram first to match default InputChannelConfig) -->
+		<child>
+			<object class="AdwComboRow" id="input_channels_mouse_button">
+				<property name="title" translatable="yes">Mouse button channel</property>
+				<property name="subtitle" translatable="yes">Datagram is lowest-latency and may drop clicks on a flaky link; Stream is reliable but may add head-of-line delay.</property>
+				<property name="model">
+					<object class="GtkStringList">
+						<items>
+							<item translatable="yes">Datagram (real-time)</item>
+							<item translatable="yes">Stream (reliable)</item>
+						</items>
+					</object>
+				</property>
+			</object>
+		</child>
+		<!-- input channel: keyboard (Stream first to match default InputChannelConfig) -->
+		<child>
+			<object class="AdwComboRow" id="input_channels_keyboard">
+				<property name="title" translatable="yes">Keyboard channel</property>
+				<property name="subtitle" translatable="yes">Stream is reliable (no dropped keys); Datagram is the game-friendly low-latency choice if you tolerate occasional lost keystrokes.</property>
+				<property name="model">
+					<object class="GtkStringList">
+						<items>
+							<item translatable="yes">Stream (reliable)</item>
+							<item translatable="yes">Datagram (real-time)</item>
+						</items>
+					</object>
+				</property>
+			</object>
+		</child>
 		<!-- delete button -->
 		<child>
 			<object class="AdwActionRow" id="delete_row">

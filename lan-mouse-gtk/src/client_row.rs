@@ -4,9 +4,50 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::glib::{self, Object};
 
-use lan_mouse_ipc::{DEFAULT_PORT, Position};
+use lan_mouse_ipc::{ChannelMode, DEFAULT_PORT, InputChannelConfig, Position};
 
 use super::ClientObject;
+
+// Mouse-button dropdown is laid out Datagram-first ("Datagram
+// (real-time)" / "Stream (reliable)" — the project default per
+// `InputChannelConfig::default()`). Keyboard dropdown is laid out
+// Stream-first because Stream is the keyboard default and so leads
+// with the recommended option. The helpers below collapse the two
+// slots into one index/mode pair. Shared with `imp.rs` so the row's
+// writer and the window's reader never disagree on the slot
+// ordering.
+pub(super) const MOUSE_DATAGRAM_INDEX: u32 = 0;
+pub(super) const KEYBOARD_DATAGRAM_INDEX: u32 = 1;
+
+pub(super) fn mode_to_mouse_index(mode: ChannelMode) -> u32 {
+    match mode {
+        ChannelMode::Datagram => MOUSE_DATAGRAM_INDEX,
+        ChannelMode::Stream => 1 - MOUSE_DATAGRAM_INDEX,
+    }
+}
+
+pub(super) fn mode_to_keyboard_index(mode: ChannelMode) -> u32 {
+    match mode {
+        ChannelMode::Datagram => KEYBOARD_DATAGRAM_INDEX,
+        ChannelMode::Stream => 1 - KEYBOARD_DATAGRAM_INDEX,
+    }
+}
+
+pub(super) fn mouse_index_to_mode(index: u32) -> ChannelMode {
+    if index == MOUSE_DATAGRAM_INDEX {
+        ChannelMode::Datagram
+    } else {
+        ChannelMode::Stream
+    }
+}
+
+pub(super) fn keyboard_index_to_mode(index: u32) -> ChannelMode {
+    if index == KEYBOARD_DATAGRAM_INDEX {
+        ChannelMode::Datagram
+    } else {
+        ChannelMode::Stream
+    }
+}
 
 glib::wrapper! {
     pub struct ClientRow(ObjectSubclass<imp::ClientRow>)
@@ -155,6 +196,13 @@ impl ClientRow {
 
     pub fn set_dns_state(&self, resolved: bool) {
         self.imp().set_dns_state(resolved);
+    }
+
+    /// Push a server-originated `input_channels` value into both
+    /// ComboBoxes without retriggering the user-change signal. The
+    /// block/unblock dance mirrors `set_position`.
+    pub fn set_input_channels(&self, cfg: InputChannelConfig) {
+        self.imp().set_input_channels(cfg);
     }
 
     /// Recompute the collapsed subtitle (Pango markup) based on the

@@ -15,6 +15,7 @@ use lan_mouse_ipc::{
     Position,
 };
 
+use crate::client_row::{keyboard_index_to_mode, mouse_index_to_mode};
 use crate::{
     authorization_window::AuthorizationWindow, fingerprint_window::FingerprintWindow,
     key_object::KeyObject, key_row::KeyRow,
@@ -238,6 +239,33 @@ impl Window {
                             }
                         ),
                     );
+                    row.connect_closure(
+                        "request-input-channels-change",
+                        false,
+                        closure_local!(
+                            #[strong]
+                            window,
+                            move |row: ClientRow, mouse_idx: u32, keyboard_idx: u32| {
+                                let Some(client) = window.client_by_idx(row.index() as u32) else {
+                                    return;
+                                };
+                                // The dropdown layouts are fixed (Datagram
+                                // first for mouse, Stream first for
+                                // keyboard) — both helpers live in
+                                // `client_row` so the row's writer and the
+                                // window's reader never disagree on the
+                                // slot ordering.
+                                let cfg = lan_mouse_ipc::InputChannelConfig {
+                                    mouse_button: mouse_index_to_mode(mouse_idx),
+                                    keyboard: keyboard_index_to_mode(keyboard_idx),
+                                };
+                                window.request(FrontendRequest::SetClientInputChannels(
+                                    client.handle(),
+                                    cfg,
+                                ));
+                            }
+                        ),
+                    );
                     row.upcast()
                 }
             ),
@@ -340,6 +368,7 @@ impl Window {
         row.set_hostname(client.hostname);
         row.set_port(client.port);
         row.set_position(client.pos);
+        row.set_input_channels(client.input_channels);
     }
 
     pub(super) fn update_client_state(&self, handle: ClientHandle, state: ClientState) {

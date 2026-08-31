@@ -6,10 +6,11 @@ use glib::{Binding, subclass::InitializingObject};
 use gtk::glib::subclass::Signal;
 use gtk::glib::{SignalHandlerId, clone};
 use gtk::{Button, CompositeTemplate, Entry, Switch, glib};
-use lan_mouse_ipc::Position;
+use lan_mouse_ipc::{InputChannelConfig, Position};
 use std::sync::OnceLock;
 
 use crate::client_object::ClientObject;
+use crate::client_row::{mode_to_keyboard_index, mode_to_mouse_index};
 
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/de/feschber/LanMouse/client_row.ui")]
@@ -25,6 +26,10 @@ pub struct ClientRow {
     #[template_child]
     pub position: TemplateChild<ComboRow>,
     #[template_child]
+    pub input_channels_mouse_button: TemplateChild<ComboRow>,
+    #[template_child]
+    pub input_channels_keyboard: TemplateChild<ComboRow>,
+    #[template_child]
     pub delete_row: TemplateChild<ActionRow>,
     #[template_child]
     pub delete_button: TemplateChild<gtk::Button>,
@@ -34,6 +39,8 @@ pub struct ClientRow {
     hostname_change_handler: RefCell<Option<SignalHandlerId>>,
     port_change_handler: RefCell<Option<SignalHandlerId>>,
     position_change_handler: RefCell<Option<SignalHandlerId>>,
+    input_channels_mouse_button_change_handler: RefCell<Option<SignalHandlerId>>,
+    input_channels_keyboard_change_handler: RefCell<Option<SignalHandlerId>>,
     set_state_handler: RefCell<Option<SignalHandlerId>>,
     pub client_object: RefCell<Option<ClientObject>>,
 }
@@ -91,6 +98,33 @@ impl ObjectImpl for ClientRow {
             }
         ));
         self.position_change_handler.replace(Some(handler));
+        // Per-input-event transport selection. Both handlers emit the
+        // single `request-input-channels-change` signal carrying
+        // `(mouse_idx, keyboard_idx)` — the window rebuilds the full
+        // `InputChannelConfig` from both indices and sends it as one
+        // IPC update. Reading both combos in one handler means a user
+        // touching only one dropdown still emits the unchanged
+        // value for the other.
+        let handler = self
+            .input_channels_mouse_button
+            .connect_selected_notify(clone!(
+                #[weak(rename_to = row)]
+                self,
+                move |_| {
+                    row.emit_input_channels_change();
+                }
+            ));
+        self.input_channels_mouse_button_change_handler
+            .replace(Some(handler));
+        let handler = self.input_channels_keyboard.connect_selected_notify(clone!(
+            #[weak(rename_to = row)]
+            self,
+            move |_| {
+                row.emit_input_channels_change();
+            }
+        ));
+        self.input_channels_keyboard_change_handler
+            .replace(Some(handler));
         let handler = self.enable_switch.connect_state_set(clone!(
             #[weak(rename_to = row)]
             self,
@@ -121,6 +155,14 @@ impl ObjectImpl for ClientRow {
                     .build(),
                 Signal::builder("request-position-change")
                     .param_types([u32::static_type()])
+                    .build(),
+                // Per-input-event transport selection. Carries the
+                // *current* selected indices of both ComboBoxes so the
+                // handler can rebuild the full InputChannelConfig and
+                // send a single atomic IPC update — see
+                // `Self::emit_input_channels_change`.
+                Signal::builder("request-input-channels-change")
+                    .param_types([u32::static_type(), u32::static_type()])
                     .build(),
             ]
         })
@@ -220,6 +262,47 @@ impl ClientRow {
         } else {
             self.dns_button.set_css_classes(&["warning"])
         }
+    }
+
+    /// Push a server-originated `input_channels` value into both
+    /// ComboBoxes without retriggering the user-change signal. Same
+    /// block/unblock pattern as `set_pos` / `set_active`. The cached
+    /// ClientObject field is updated too so subsequent re-emits read
+    /// the freshest value.
+    pub(super) fn set_input_channels(&self, cfg: InputChannelConfig) {
+        let mouse_handler = self.input_channels_mouse_button_change_handler.borrow();
+        let mouse_handler = mouse_handler
+            .as_ref()
+            .expect("input_channels_mouse_button handler");
+        let keyboard_handler = self.input_channels_keyboard_change_handler.borrow();
+        let keyboard_handler = keyboard_handler
+            .as_ref()
+            .expect("input_channels_keyboard handler");
+        self.input_channels_mouse_button.block_signal(mouse_handler);
+        self.input_channels_keyboard.block_signal(keyboard_handler);
+        self.input_channels_mouse_button
+            .set_selected(mode_to_mouse_index(cfg.mouse_button));
+        self.input_channels_keyboard
+            .set_selected(mode_to_keyboard_index(cfg.keyboard));
+        self.input_channels_mouse_button
+            .unblock_signal(mouse_handler);
+        self.input_channels_keyboard
+            .unblock_signal(keyboard_handler);
+    }
+
+    /// Emit `request-input-channels-change` carrying the current
+    /// selected index of *both* ComboBoxes. One signal, regardless
+    /// of which dropdown the user touched — the window builds a
+    /// single `InputChannelConfig` from both indices and sends one
+    /// IPC update, so daemon state can never split-brain between
+    /// the two fields.
+    fn emit_input_channels_change(&self) {
+        let mouse_idx = self.input_channels_mouse_button.selected();
+        let keyboard_idx = self.input_channels_keyboard.selected();
+        self.obj().emit_by_name::<()>(
+            "request-input-channels-change",
+            &[&mouse_idx, &keyboard_idx],
+        );
     }
 }
 
