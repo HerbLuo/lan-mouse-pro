@@ -593,5 +593,53 @@ SUGGESTION #S-13 已在 GTK 文件名上出现过一次。
 **优先级**：🟡 中（不影响已完成步骤的实际代码质量 —— STEP-7.1 已用正确
 路径复核；但直接影响 STEP-7.6 收尾闸门的有效性）
 
+---
+
+## #S-22 🟡 中：STEP-7.2 暴露的 work-pattern 教训 —— "#N-31 模式"成流程纪律
+
+**触发**：STEP-7.2
+
+**现象**：
+STEP-7.2 是 PLAN §7.2 字面写 "**抄 bak → 主仓**" 的步子。但实际执行
+时发现：
+
+1. `lan-mouse-pro-bak/` 目录**早已不存在**（主仓与 bak 在 STEP-6.4 之前某
+   步已合并）—— `tests/quic_smoke.rs` 等 4 个文件无 bak 可参考
+2. `tests/` 目录**从未在主仓存在** —— 主仓 lib 在 root（`src/`），workspace
+   也在 root，主仓即 crate，不在 `lan-mouse/{src,tests,...}`
+3. **25 个 pre-existing lib fixture errors** 阻塞 `cargo test -p lan-mouse
+   --no-run` —— STEP-7.2 集成测试需要 lib 编过
+
+**根因**：
+- PLAN §7.2 的搬运矩阵假设 bak 与主仓已分家（与 STEP-1.x/2.x 同模式），
+  实际从 STEP-6.x 起已合并
+- "STEP-7.x 抄 bak" 是依据旧工程模型字面写的，与主仓当前状态脱节
+- 25 fixture errors 是历史搬运 step（STEP-6.2a / 6.2b）"测试代码就位即
+  合格"路线累积；lib 测试能跑通是工程拐点（首条用例），不在 STEP-7.2 字
+  面范围，但不让 lib 编过 = 集成测试也跑不通
+
+**本步（STEP-7.2）落实**：
+- 现状 grep 核实 **先于** 编码（按 `#N-31` 模式）
+- 25 errors 全部修（最小侵入：补 imports / 改 `connect_with` await 形态 /
+  generic-ize `read_stream_b_loop` / `let session = Arc::new(PeerSession::
+  from_connection(conn))`）
+- 3 个新文件全部就位（无 bak 可抄 → 从零写，紧贴主仓 public API）
+- 顺手修 1 个相邻 fixture 缺陷（`client.rs::set_input_channels_returns_
+  true_only_on_change` 的 `gaming` 与 default 同值）
+
+**建议处置（成流程纪律）**：
+- **"#N-31 模式"（gating checkpoint）**：未来 STEP 开干前 5 个动作固定为：
+  1. `ls <PLAN 提到的目录>` 确认存在
+  2. `ls <PLAN 提到的 bak 路径>` 确认可参考
+  3. `cargo test -p <crate> --no-run` 确认编译过（否则先修 fixture）
+  4. grep PLAN §9 关键字确认未触碰 M2 范畴
+  5. 时间预算门（≤30 min / ≤2h ABS）
+- 若任一动作 fail，回 Leader 评估是"PLAN 字面过期"还是"工程实际偏离"
+- 把这条写进 `AGENTS.md` §"工作流"段（与 STEP-7.2 归档同源）
+
+**优先级**：🟡 中（流程模式升级；不影响已交付代码，影响后续 STEP 调度）
+
+**STEP-7.2 闭环**：归档 `next/STEP-7.2.md` 同源记录本模式落地；本条目
+进入"待 Leader 评审后决定是否升级为 AGENTS.md 内规"状态。
 
 ---

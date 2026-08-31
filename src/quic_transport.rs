@@ -66,7 +66,7 @@ use rustls::SignatureScheme;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::task::{JoinHandle, JoinSet, spawn_local};
 
@@ -1951,10 +1951,13 @@ pub struct ReadStreams {
 /// **dead_code chain**：本函数由 [`PeerSession::read_loop`] spawn；
 /// `JoinHandle` 由 caller 通过 [`ReadStreams::join_b`] 持有。
 #[allow(dead_code)]
-async fn read_stream_b_loop(
-    mut recv: RecvStream,
+async fn read_stream_b_loop<R>(
+    mut recv: R,
     tx: tokio_mpsc::Sender<StreamEvent>,
-) -> std::result::Result<(), Error> {
+) -> std::result::Result<(), Error>
+where
+    R: AsyncRead + Unpin,
+{
     loop {
         match read_frame(&mut recv).await {
             Ok(event) => {
@@ -2881,6 +2884,7 @@ impl rustls::server::danger::ClientCertVerifier for AuthorizedKeysVerifier {
 mod tests {
     use super::*;
     use crate::crypto;
+    use rustls::client::danger::ServerCertVerifier;
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     /// 测试用临时自签 cert —— 落盘到 `/tmp` 下 ephemeral 子目录（PID 隔离），
@@ -3179,28 +3183,30 @@ mod tests {
             .expect("client endpoint bind 不应失败");
 
         // (4) dial —— 5s 兜底；**必须**返回 Err
-        let dial_result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client_ep.connect_with(client_cfg, server_addr, "lan-mouse"),
-        )
-        .await
-        .expect("dial 端到端超时");
+        //
+        // `connect_with` 同步部分返回 `Result<Connecting<...>, ConnectError>`：
+        // - 同步 `Ok(connecting)` 后 `.await` 才报握手失败（mTLS 拒握）
+        // - 同步 `Err(_)` 视为"dial 失败"，也算测试通过
+        // 任一 Err 路径都视为测试通过；Ok(Connection) 则断言失败。
+        let connecting_outcome = client_ep.connect_with(client_cfg, server_addr, "lan-mouse");
+        let handshake_result = match connecting_outcome {
+            Ok(connecting) => tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                connecting,
+            )
+            .await
+            .expect("dial 端到端超时"),
+            Err(_connect_err) => {
+                // 同步失败直接视为测试通过（罕见，例如 cert chain 解析失败）
+                log::debug!("connect_with 同步部分失败（接受）");
+                return; // 跳到清理
+            }
+        };
 
-        // `connect_with` 同步部分返回 `Connecting<...>`，await 后才报握手失败
-        match dial_result {
-            Ok(connecting) => {
-                let handshake_result = connecting.await;
-                assert!(
-                    handshake_result.is_err(),
-                    "无 client cert 的 dial 应失败（server 端拒握），实际 Ok: {:?}",
-                    handshake_result.as_ref().map(|c| c.stable_id())
-                );
-            }
-            Err(e) => {
-                // 同步部分失败（罕见，例如 cert chain 解析失败）也算测试通过
-                log::debug!("connect_with 同步部分失败（可接受）：{e}");
-            }
-        }
+        assert!(
+            handshake_result.is_err(),
+            "无 client cert 的 dial 应失败（server 端拒握），实际 Ok"
+        );
 
         // (5) 清理：drop endpoint + 等 server task 完成
         drop(client_ep);
@@ -3771,6 +3777,10 @@ mod tests {
     /// 构造常用 ProtoEvent 测试 fixture（避免在每个测试里写一遍 match arm）
     mod route_input_fixtures {
         use super::*;
+        use input_event::{
+            Event as InputEvent, KeyboardEvent, PointerEvent,
+        };
+        use lan_mouse_proto::Position;
 
         pub(super) fn motion() -> ProtoEvent {
             ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion {
@@ -4051,10 +4061,11 @@ mod tests {
 
         // server task：accept + server_hello + 读一个 datagram
         let server_task = tokio::spawn(async move {
-            let session = tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
+            let conn = tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
                 .await
                 .expect("server accept timeout")
                 .expect("server accept");
+            let session = Arc::new(PeerSession::from_connection(conn));
 
             tokio::time::timeout(std::time::Duration::from_secs(5), server_hello(&session))
                 .await
@@ -4452,13 +4463,14 @@ mod tests {
         // 范围）—— 本测试只验证 stream_bunch 字段当前为 None（未装配），
         // 取走仍返 None
         let server_task = tokio::spawn(async move {
-            let session = tokio::time::timeout(
+            let conn = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 accept(&server_ep),
             )
             .await
             .expect("server accept timeout")
             .expect("server accept");
+            let session = Arc::new(PeerSession::from_connection(conn));
 
             tokio::time::timeout(std::time::Duration::from_secs(5), server_hello(&session))
                 .await

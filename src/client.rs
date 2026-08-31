@@ -407,19 +407,29 @@ mod client_input_channels_tests {
     fn set_input_channels_returns_true_only_on_change() {
         let cm = ClientManager::default();
         let handle = cm.add_client();
+        // `InputChannelConfig::default()` = { mouse: Datagram, keyboard: Stream }.
+        // To exercise the "changed" branch on the first write, pick a
+        // config that **differs** in at least one field — here both fields.
         let gaming = InputChannelConfig {
-            mouse_button: ChannelMode::Datagram,
-            keyboard: ChannelMode::Stream,
+            mouse_button: ChannelMode::Stream,
+            keyboard: ChannelMode::Datagram,
         };
+        assert_ne!(
+            gaming,
+            InputChannelConfig::default(),
+            "test fixture: gaming must differ from default for this assertion to be meaningful"
+        );
         // first write: default -> gaming → changed
         assert!(cm.set_input_channels(handle, gaming));
         // second write: gaming -> gaming → no change
         assert!(!cm.set_input_channels(handle, gaming));
-        // third write: gaming -> office → changed
+        // third write: gaming -> office (truly different config) → changed
         let office = InputChannelConfig {
-            mouse_button: ChannelMode::Stream,
-            keyboard: ChannelMode::Datagram,
+            mouse_button: ChannelMode::Datagram,
+            keyboard: ChannelMode::Stream,
         };
+        // office differs from gaming in **both** fields (S/M vs D/S), so the
+        // setter must report a change.
         assert!(cm.set_input_channels(handle, office));
         let (c, _) = cm.get_state(handle).unwrap();
         assert_eq!(c.input_channels, office);
