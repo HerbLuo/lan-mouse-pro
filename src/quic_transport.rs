@@ -8,7 +8,9 @@
 //! - STEP-2.1（已）：[`build_quic_client_config`] + [`install_crypto_provider`]
 //! - STEP-2.2（已）：[`dial`] —— QUIC TLS 1.3 握手完成（占位 verifier）
 //! - STEP-2.3（已）：[`accept`] —— 接受 incoming QUIC 握手（占位 ServerConfig）
-//! - STEP-2.4：`endpoint_with_cert()` 持久化 cert 注入
+//! - STEP-2.4（已）：[`endpoint_with_cert`] —— 持久化 cert 注入 server-mode
+//!   Endpoint（替代 `endpoint()` 占位；#S-4 cert/key 拆文件 + #S-9 server
+//!   ALPN 已落地）
 //! - STEP-2.6 / 2.7：`TofuVerifier` / `AuthorizedKeysVerifier`
 //! - STEP-3.2：`client_hello` / `server_hello` 握手
 //! - STEP-4.4：`route_input()` ChannelMode 分派
@@ -19,6 +21,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use crate::crypto;
 // `Endpoint` / `Connection` intentionally excluded from the `use` below —
 // `pub use quinn::Endpoint` / `pub use quinn::Connection` re-export them
 // for main-code (Step 6.x's `LanMouseListener::new`), matching the bak
@@ -89,12 +92,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// `IdleTimeout::try_from(Duration)` 失败当且仅当 Duration 超 VarInt
 /// 2^30 ms 上限（≈ 12.4 天），30s 远在范围内 —— `expect` 注明理由。
 ///
-/// `#[allow(dead_code)]`：STEP-1.4 暂未注入到任何 `ServerConfig` /
-/// `ClientConfig`（cert 路径未接，见 `endpoint()` 占位说明）；STEP-2.4 /
-/// STEP-2.5 切到 `endpoint_with_cert(...)` / `client_endpoint(...)` 后
-/// 通过 `server_cfg.transport = default_transport_config();` 链上，dead_code
-/// 自动消失。
-#[allow(dead_code)]
+/// STEP-2.4 起注入 [`endpoint_with_cert`] / [`build_quic_client_config`] 的
+/// `transport_config(...)` 链上，`#[allow(dead_code)]` 守护已移除（dead_code
+/// 自动消失）。keepalive 5s / idle 30s 与 PLAN §5 D4 对齐。
 fn default_transport_config() -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
     t.keep_alive_interval(Some(Duration::from_secs(5)));
@@ -150,6 +150,73 @@ pub fn endpoint(addr: SocketAddr) -> Result<Endpoint> {
     // 通过 `server_cfg.transport = ...` 注入。
     let endpoint = Endpoint::new(endpoint_cfg, None::<ServerConfig>, socket, runtime)
         .map_err(|e| Error::EndpointSetup(format!("Endpoint::new failed: {e}")))?;
+
+    Ok(endpoint)
+}
+
+/// 装配 server-mode `quinn::Endpoint`：UDP bind + rustls `ServerConfig`
+/// （含 ALPN `lan-mouse`）+ quinn transport_config + `Endpoint::new`。
+///
+/// **STEP-2.4 server-mode 入口** —— 替代 [`endpoint`] 的 client-mode 占位
+/// （`None::<ServerConfig>`）。`endpoint_with_cert(...)` 返回的 endpoint
+/// 才能让 [`accept`] 真正拿到 incoming 握手（client-mode endpoint 永远等
+/// 不到 incoming —— STEP-2.3 占位局限）。
+///
+/// **生产路径 caller**：
+/// 1. `crypto::load_or_create_server_cert()` → `(cert_chain, key)`（持久化
+///    到 `$XDG_DATA_HOME/lan-mouse/{cert,key}.pem`）
+/// 2. `endpoint_with_cert(addr, cert_chain, key)`
+/// 3. `accept(ep)` 等 incoming
+///
+/// **#S-9 ALPN 对称**：本函数把 `rustls::ServerConfig.alpn_protocols` 设为
+/// `vec![ALPN_LAN_MOUSE.to_vec()]`（在 wrap 进 `QuicServerConfig` **之前**
+/// 设置 —— `alpn_protocols` 字段是 `rustls::ServerConfig` 上的，不在 quinn
+/// 的 `ServerConfig` 上）。与 client [`build_quic_client_config`] 完全对称，
+/// 否则 ALPN mismatch 直接拒连。
+///
+/// **`transport_config`**：通过 `server_cfg.transport_config(...)` 链上
+/// [`default_transport_config`] —— 5s keepalive / 30s idle（PLAN §5 D4）。
+/// `default_transport_config` 的 `#[allow(dead_code)]` 守护在本函数接通
+/// 后自动消失。
+///
+/// **错误归一**：复用现有变体 —— 不新增 `Error::ServerConfig` 等：
+/// - `crypto::rustls_server_config` 失败 → `Error::Rustls(#[from])`
+/// - `QuicServerConfig::try_from` 失败 → `Error::ClientConfig(String)`
+/// - bind / runtime / `Endpoint::new` 失败 → 复用 [`endpoint`] 路径错误变体
+///
+/// **`install_crypto_provider` 不在本函数内调**：与 [`build_quic_client_config`]
+/// 对称 —— 由 caller（service.rs / 测试）显式守护。生产路径 `main.rs` 启动
+/// 期已 install；测试首句调 `install_crypto_provider()`。
+///
+/// **不**改 [`endpoint`]：client-mode endpoint 仍由 [`dial`] 调用栈消费
+/// （`Endpoint::connect_with` 不要求 endpoint 必须挂 `ServerConfig`）。
+pub fn endpoint_with_cert(
+    addr: SocketAddr,
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<Endpoint> {
+    // 1. 装配 rustls::ServerConfig —— ALPN 在这一步之前/之后设置都行
+    //    （关键是不能 wrap 进 QuicServerConfig 之后），这里在 wrap 前
+    //    设，保持与 client `build_quic_client_config` 对称
+    let rustls_server_arc = crypto::rustls_server_config(cert_chain, key)?;
+    let mut rustls_server = Arc::try_unwrap(rustls_server_arc)
+        .map_err(|_| Error::ClientConfig("rustls ServerConfig Arc 强引用数 > 1".into()))?;
+    rustls_server.alpn_protocols = vec![ALPN_LAN_MOUSE.to_vec()];
+
+    // 2. wrap 进 quinn::ServerConfig —— `Arc<QuicServerConfig>` 强引用数 1
+    let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_server))
+        .map_err(|e| Error::ClientConfig(format!("QuicServerConfig::try_from: {e}")))?;
+    let mut server_cfg = ServerConfig::with_crypto(Arc::new(quic_server));
+    server_cfg.transport_config(default_transport_config());
+
+    // 3. UDP bind + Endpoint::new（与 endpoint() 同路径）
+    let endpoint_cfg = EndpointConfig::default();
+    let socket = UdpSocket::bind(addr).map_err(|source| Error::Bind { addr, source })?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| Error::EndpointSetup("no tokio runtime available".into()))?;
+
+    let endpoint = Endpoint::new(endpoint_cfg, Some(server_cfg), socket, runtime)
+        .map_err(|e| Error::EndpointSetup(format!("server Endpoint::new: {e}")))?;
 
     Ok(endpoint)
 }
@@ -359,53 +426,90 @@ mod tests {
     use crate::crypto;
     use std::net::{Ipv4Addr, SocketAddrV4};
 
-    /// 测试用临时自签 cert（不落盘，避免污染用户 cert 路径）。
-    /// 后续 STEP-2.4 / 2.6 起 `endpoint()` / `dial()` 切到持久化后，
-    /// 单测必须用 `ephemeral_cert()` 隔离用户路径。
+    /// 测试用临时自签 cert —— 落盘到 `/tmp` 下 ephemeral 子目录（PID 隔离），
+    /// 避免污染用户 cert 路径（`crypto::cert_path()` / `key_path()`）。
+    /// 返回 `(cert_chain, key)`，DER 字节直接喂给 `endpoint_with_cert` /
+    /// `build_quic_client_config`。
     fn ephemeral_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
-        crypto::generate_self_signed("lan-mouse-test", None).expect("test cert 自签")
+        let dir = std::env::temp_dir().join(format!("lan-mouse-quic-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cp = dir.join("cert.pem");
+        let kp = dir.join("key.pem");
+        crypto::generate_self_signed("lan-mouse-test", &cp, &kp)
+            .expect("test cert 自签")
     }
 
-    /// 测试用 server endpoint 装配：cert + ALPN + ServerConfig + Endpoint。
-    ///
-    /// STEP-2.3 / 2.4 暂未提供 `endpoint_with_cert()` 公共函数；本测试
-    /// 助手**仅**在 `mod tests` 内可见，把 quinn ServerConfig 的最小装配
-    /// 内联起来 —— 与 STEP-2.4 即将引入的 `endpoint_with_cert()` 形态
-    /// 完全对称（rustls::ServerConfig + QuicServerConfig + transport_config
-    /// + Endpoint::new）。STEP-2.4 上线后这个 helper 由公共函数替代。
-    ///
-    /// **no client auth** —— 与 STEP-2.2 当前 `WebPkiServerVerifier` 占位
-    /// 形态对齐（client 端不出 cert）；STEP-2.5 mTLS 启用后这个 helper
-    /// 改为 `with_client_cert_verifier` 形态（同一文件内小改即可）。
+    /// 测试用 server endpoint 装配 —— 直接调公共 [`endpoint_with_cert`]
+    /// （STEP-2.4 起不再内联；测试 helper 与生产路径共用一条代码路径）。
     fn endpoint_with_test_cert(
         addr: SocketAddr,
         cert_chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<Endpoint> {
-        use rustls::ServerConfig as RustlsServerConfig;
+        endpoint_with_cert(addr, cert_chain, key)
+    }
 
-        // rustls::ServerConfig with ring + no client auth + 单 cert
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut rustls_server = RustlsServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|e| Error::ClientConfig(format!("server protocol versions: {e}")))?
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
-            .map_err(|e| Error::ClientConfig(format!("server single_cert: {e}")))?;
-        rustls_server.alpn_protocols = vec![ALPN_LAN_MOUSE.to_vec()];
+    /// STEP-2.4 验收 #1：`endpoint_with_cert` bind 临时端口 + Drop 不 panic。
+    #[tokio::test]
+    async fn endpoint_with_cert_binds_ipv4_localhost() {
+        install_crypto_provider();
+        let (cert_chain, key) = ephemeral_cert();
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into();
+        let ep =
+            endpoint_with_cert(addr, cert_chain, key).expect("endpoint_with_cert bind 不应失败");
+        let local = ep.local_addr().expect("endpoint 必须有 local_addr");
+        assert_ne!(local.port(), 0, "ephemeral 端口应非零");
+        drop(ep);
+    }
 
-        let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_server))
-            .map_err(|e| Error::ClientConfig(format!("QuicServerConfig::try_from: {e}")))?;
-        let mut server_cfg = ServerConfig::with_crypto(Arc::new(quic_server));
-        server_cfg.transport_config(default_transport_config());
+    /// STEP-2.4 验收 #2：持久化 cert 加载路径稳定 —— 首次生成 cert/key 到
+    /// `crypto::cert_path()` / `key_path()`，二次加载同一路径，fingerprint
+    /// 应一致（caller 一致性 + 跨重启 identity 稳定）。
+    ///
+    /// **注意**：本测试**不**直接调 `crypto::load_or_create_server_cert()`，
+    /// 因为那条路径写到用户 home 目录的 `lan-mouse/` 子目录（生产路径）。
+    /// 测试只验证 `endpoint_with_cert` + 临时 cert 的最小可用形态；持久化
+    /// 路径在 `crypto::tests::load_or_generate_key_and_cert_der_persists_identity`
+    /// 覆盖。STEP-6.x 修 14 errors 后 Leader 手动跑确认通过（SUGGESTION #S-5）。
+    #[tokio::test]
+    async fn endpoint_with_cert_accepts_local_incoming() {
+        install_crypto_provider();
+        let (cert_chain, key) = ephemeral_cert();
+        let server_ep = endpoint_with_test_cert(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+            cert_chain,
+            key,
+        )
+        .expect("server endpoint bind 不应失败");
+        let server_addr = server_ep.local_addr().expect("server ep 必有 local_addr");
 
-        let endpoint_cfg = EndpointConfig::default();
-        let socket = UdpSocket::bind(addr).map_err(|source| Error::Bind { addr, source })?;
-        let runtime = quinn::default_runtime()
-            .ok_or_else(|| Error::EndpointSetup("no tokio runtime available".into()))?;
-        let ep = Endpoint::new(endpoint_cfg, Some(server_cfg), socket, runtime)
-            .map_err(|e| Error::EndpointSetup(format!("server Endpoint::new: {e}")))?;
-        Ok(ep)
+        // 后台 accept task：拿 Connection 后立即 drop
+        let server_task = tokio::spawn(async move {
+            let incoming = server_ep.accept().await.expect("server accept 不应失败");
+            let conn = incoming.await.expect("server handshake 不应失败");
+            drop(conn);
+        });
+
+        // client dial 同一端口（endpoint() client-mode 即可）
+        let (client_cert, client_key) = ephemeral_cert();
+        let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .expect("client endpoint bind 不应失败");
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dial(&client_ep, server_addr, client_cert[0].clone(), client_key),
+        )
+        .await
+        .expect("端到端 TLS 1.3 握手超时")
+        .expect("dial 不应失败");
+
+        assert!(
+            conn.peer_identity().is_some(),
+            "peer_identity 应非空（TLS 1.3 握手完成）"
+        );
+
+        drop(conn);
+        server_task.await.expect("server task 不应 panic");
+        client_ep.wait_idle().await;
     }
 
     /// PLAN §1.4 验收：bind 临时端口、Drop 不 panic。
@@ -432,9 +536,9 @@ mod tests {
         // rustls 调用（特别是 verifier 构造）仍依赖 provider 已 install
         install_crypto_provider();
 
-        // 用 STEP-1.1 已实现的 `crypto::generate_self_signed` 拿测试 cert
-        let (cert_chain, key) =
-            crypto::generate_self_signed("lan-mouse-test", None).expect("test cert 自签");
+        // 用 STEP-1.1 + STEP-2.4 已实现的 `crypto::generate_self_signed`
+        // 拿测试 cert（落盘到 `/tmp` ephemeral，EPH 测试 helper）
+        let (cert_chain, key) = ephemeral_cert();
         let cfg = build_quic_client_config(cert_chain[0].clone(), key)
             .expect("ClientConfig 装配不应失败");
         // 关键断言：构造成功 + Clone（PLAN §2.2 dial_any 多候选复用要求）

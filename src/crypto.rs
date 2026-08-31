@@ -4,17 +4,14 @@
 //! 解耦：本模块只暴露 rustls 类型 —— `Vec<CertificateDer<'static>>` +
 //! `PrivateKeyDer<'static>`。`Error` 枚举移除 `Dtls(webrtc_dtls::Error)` 变体。
 //!
-//! 仍在 main-code 路径上消费 `webrtc_dtls::crypto::Certificate` 的
-//! `listen.rs` / `connect.rs` 由 STEP-6.x 整段切到 `PeerSession` 时下线。
-//! 本步骤：crypto.rs 范围全部收敛到 rustls；service.rs 调用点同步切换；
-//! listen.rs / connect.rs 仅做必要类型适配（签名 + 函数体不动，DTLS 内部
-//! 调用保留）。STEP-1.2（删 webrtc-dtls 依赖）让整段编译失败是预期的，
-//! 详见 next/SUGGESTION.md。
+//! STEP-2.4 把 `cert.pem` + `key.pem` 拆成两个文件（#S-4 已解）；
+//! `key_path()` 与 `cert_path()` 对称，`load_or_create_server_cert()` 是
+//! 公共别名，内部调 `load_or_generate_key_and_cert_der(cert_path(), key_path())`。
+//! 同时把"plan §1.1 别名"对齐到 `load_or_create_server_cert` 命名。
 //!
-//! cert 路径：与 bak 设计对齐 —— `$XDG_DATA_HOME/lan-mouse/cert.pem`，回退
-//! `$HOME/.local/share/lan-mouse/cert.pem`，Windows 走 `%APPDATA%`。
-//! 本步骤**单文件** PEM（cert + key 同一文件）；bak 拆 `cert.pem` + `key.pem`
-//! 双文件的差异在 STEP-2.4 拆掉，详见 SUGGESTION。
+//! cert 路径：与 bak 设计对齐 —— `$XDG_DATA_HOME/lan-mouse/{cert,key}.pem`，
+//! 回退 `$HOME/.local/share/lan-mouse/{cert,key}.pem`，Windows 走 `%APPDATA%`。
+//! key 文件 0o400（Unix）/`FILE_ATTRIBUTE_READONLY`（Windows）保持。
 
 use std::fs;
 use std::io::{self, Write};
@@ -134,6 +131,26 @@ pub fn load_key_der(path: &Path) -> Result<PrivateKeyDer<'static>, Error> {
 ///   `$HOME/.local/share/lan-mouse/cert.pem`，最后回退到当前目录
 /// - Windows：`%APPDATA%\lan-mouse\cert.pem`，回退到当前目录
 pub fn cert_path() -> PathBuf {
+    lan_mouse_data_dir().join("cert.pem")
+}
+
+/// OS 感知的 server private key 持久化路径（与 [`cert_path`] 对称）。
+///
+/// - Unix：`$XDG_DATA_HOME/lan-mouse/key.pem`
+/// - Windows：`%APPDATA%\lan-mouse\key.pem`
+///
+/// STEP-2.4 拆分 `cert.pem` + `key.pem` 后引入（#S-4）；文件权限
+/// `0o400`（Unix）/`FILE_ATTRIBUTE_READONLY`（Windows）由
+/// [`generate_self_signed`] 在落盘时收紧。
+pub fn key_path() -> PathBuf {
+    lan_mouse_data_dir().join("key.pem")
+}
+
+/// 共享的"应用数据目录"OS 解析逻辑（[`cert_path`] / [`key_path`] 共用）。
+///
+/// - Unix：`$XDG_DATA_HOME`，回退 `$HOME/.local/share`，最后回退当前目录
+/// - Windows：`%APPDATA%`，回退当前目录
+fn lan_mouse_data_dir() -> PathBuf {
     #[cfg(unix)]
     {
         let base = std::env::var_os("XDG_DATA_HOME")
@@ -146,55 +163,86 @@ pub fn cert_path() -> PathBuf {
                 })
             })
             .unwrap_or_else(|| PathBuf::from("."));
-        base.join("lan-mouse").join("cert.pem")
+        base.join("lan-mouse")
     }
     #[cfg(windows)]
     {
         let base = std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        base.join("lan-mouse").join("cert.pem")
+        base.join("lan-mouse")
     }
 }
 
-/// 加载已落盘的 server cert；不存在则自签生成并落盘。
+/// 加载已落盘的 server cert + key（分别从 `cert_path` / `key_path` 读）；
+/// 任一缺失则自签生成并落盘到对应文件。
 ///
-/// 返回 `(cert_chain, key)`，给后续 `quic_transport::endpoint()`（STEP-1.4+）
-/// 调用。本步骤只暴露 API；调用方尚未存在。
+/// 返回 `(cert_chain, key)`，给 `quic_transport::endpoint_with_cert()` 注入
+/// 使用。STEP-2.4 起本函数只接受拆开的双路径（#S-4）；零参数 caller 一律
+/// 改走 [`load_or_create_server_cert`]。
 pub fn load_or_generate_key_and_cert_der(
-    path: &Path,
+    cert_path: &Path,
+    key_path: &Path,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Error> {
-    if path.exists() && path.is_file() {
-        let certs = load_cert_der(path)?;
-        let key = load_key_der(path)?;
+    if cert_path.exists() && key_path.exists() && cert_path.is_file() && key_path.is_file() {
+        let certs = load_cert_der(cert_path)?;
+        let key = load_key_der(key_path)?;
         Ok((certs, key))
     } else {
-        generate_self_signed("lan-mouse", Some(path))
+        generate_self_signed("lan-mouse", cert_path, key_path)
     }
 }
 
-/// 自签生成。返回 `(cert_chain, key)`；可选落盘（path 不为 None 时，
-/// 落 PEM 到 path；Unix 0o400）。
+/// `load_or_generate_key_and_cert_der(cert_path(), key_path())` 的零参数别名
+/// （PLAN §1.1 + STEP-2.4 caller 一致性）。这是 service.rs / quic_transport
+/// 生产路径的入口。
+pub fn load_or_create_server_cert()
+-> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Error> {
+    load_or_generate_key_and_cert_der(&cert_path(), &key_path())
+}
+
+/// 自签生成。返回 `(cert_chain, key)`；落盘拆为 `cert_path`（cert PEM）
+/// + `key_path`（key PEM）两个文件（STEP-2.4 / #S-4）；key 文件 0o400
+/// （Unix）权限保持。
 pub fn generate_self_signed(
     common_name: &str,
-    save_to: Option<&Path>,
+    cert_path: &Path,
+    key_path: &Path,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Error> {
     let cert = rcgen::generate_simple_self_signed(vec![common_name.to_owned()])?;
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
     let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
 
-    if let Some(path) = save_to {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+    // 落 cert PEM
+    if let Some(parent) = cert_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    {
+        let f = fs::File::create(cert_path)?;
+        #[cfg(unix)]
+        {
+            let mut perm = f.metadata()?.permissions();
+            perm.set_mode(0o600);
+            f.set_permissions(perm)?;
         }
-        let f = fs::File::create(path)?;
+        let pem = cert.cert.pem();
+        let mut writer = std::io::BufWriter::new(f);
+        writer.write_all(pem.as_bytes())?;
+    }
+
+    // 落 key PEM（0o400，比 cert 更紧）
+    if let Some(parent) = key_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    {
+        let f = fs::File::create(key_path)?;
         #[cfg(unix)]
         {
             let mut perm = f.metadata()?.permissions();
             perm.set_mode(0o400);
             f.set_permissions(perm)?;
         }
-        let pem = format!("{}\n{}\n", cert.cert.pem(), cert.key_pair.serialize_pem());
+        let pem = cert.key_pair.serialize_pem();
         let mut writer = std::io::BufWriter::new(f);
         writer.write_all(pem.as_bytes())?;
     }
@@ -277,14 +325,15 @@ mod tests {
     #[test]
     fn round_trip_generate_and_load() {
         let dir = tmp_subdir("rt");
-        let path = dir.join("cert.pem");
+        let cp = dir.join("cert.pem");
+        let kp = dir.join("key.pem");
 
-        // 自签 + 落盘
-        let (cert_gen, key_gen) = generate_self_signed("lan-mouse-test", Some(&path)).unwrap();
+        // 自签 + 落盘（双文件）
+        let (cert_gen, key_gen) = generate_self_signed("lan-mouse-test", &cp, &kp).unwrap();
 
         // 落盘后再读，DER 应一致
-        let cert_loaded = load_cert_der(&path).unwrap();
-        let key_loaded = load_key_der(&path).unwrap();
+        let cert_loaded = load_cert_der(&cp).unwrap();
+        let key_loaded = load_key_der(&kp).unwrap();
 
         // 指纹一致
         let fp_gen = generate_fingerprint(cert_gen[0].as_ref());
@@ -330,16 +379,41 @@ mod tests {
     fn generated_cert_is_unix_readonly() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tmp_subdir("perm");
-        let path = dir.join("cert.pem");
+        let cp = dir.join("cert.pem");
+        let kp = dir.join("key.pem");
 
-        let _ = generate_self_signed("lan-mouse-perm-test", Some(&path)).unwrap();
+        let _ = generate_self_signed("lan-mouse-perm-test", &cp, &kp).unwrap();
 
-        let metadata = fs::metadata(&path).unwrap();
-        let perm = metadata.permissions();
-        let mode = perm.mode() & 0o777;
-        assert!(
-            mode == 0o400 || mode == 0o600,
-            "expected 0o400 or 0o600, got {mode:o}"
+        // cert 0o600，key 0o400
+        let cert_mode = fs::metadata(&cp).unwrap().permissions().mode() & 0o777;
+        let key_mode = fs::metadata(&kp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(cert_mode, 0o600, "cert 0o600, got {cert_mode:o}");
+        assert_eq!(key_mode, 0o400, "key 0o400, got {key_mode:o}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// STEP-2.4 验收 #1：首次落盘 → 二次加载 → 指纹一致（持久化 identity 稳定）。
+    #[test]
+    fn load_or_generate_key_and_cert_der_persists_identity() {
+        let dir = tmp_subdir("persist");
+        let cp = dir.join("cert.pem");
+        let kp = dir.join("key.pem");
+
+        // 首次：自签 + 落盘
+        let (c1, k1) = load_or_generate_key_and_cert_der(&cp, &kp).unwrap();
+        let fp1 = generate_fingerprint(c1[0].as_ref());
+
+        // 二次：从磁盘读；不应该重新自签
+        let (c2, k2) = load_or_generate_key_and_cert_der(&cp, &kp).unwrap();
+        let fp2 = generate_fingerprint(c2[0].as_ref());
+
+        assert_eq!(fp1, fp2, "二次加载 fingerprint 应一致");
+        assert_eq!(c1[0].as_ref(), c2[0].as_ref(), "二次加载 cert DER 应一致");
+        assert_eq!(
+            k1.secret_der(),
+            k2.secret_der(),
+            "二次加载 key DER 应一致"
         );
 
         let _ = fs::remove_dir_all(&dir);

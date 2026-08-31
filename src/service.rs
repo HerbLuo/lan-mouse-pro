@@ -83,17 +83,34 @@ impl Service {
             client_manager.add_with_config(client);
         }
 
-        // load certificate (STEP-1.1)
-        // crypto.rs 已经切换到返回 rustls 元组 `(Vec<CertificateDer>, PrivateKeyDer)`.
-        // 当前 service.rs 仍把 listener / connection 的 `cert` 字段置以
-        // `webrtc_dtls::crypto::Certificate` 类型；为避免本步骤连锁改动
-        // listen.rs / connect.rs，本处临时构造旧 `Certificate`（仍走旧路径
-        // 的 `load_or_generate_key_and_cert` 等价物）。
+        // load certificate (STEP-1.1 + STEP-2.4)
         //
-        // ⚠️ 见 SUGGESTION #S-1：这是 STEP-1.1 唯一保留旧 API 的地方。
-        // STEP-6.x 切到 PeerSession 时彻底删除。
-        let cert = crypto::load_certificate_compat(config.cert_path())?;
-        let public_key_fingerprint = crypto::certificate_fingerprint_compat(&cert);
+        // STEP-2.4 起直接调 `crypto::load_or_create_server_cert()` —— 零参数
+        // 形式，内部解析 `crypto::cert_path()` / `key_path()` 双文件路径
+        // 并自签 + 落盘到 `$XDG_DATA_HOME/lan-mouse/{cert,key}.pem`（#S-4
+        // 已解）。`public_key_fingerprint` 仍按 SHA-256 over cert DER 算
+        // 出，与旧 webrtc-dtls 路径指纹算法一致（同一 DER 字节 → 同一指纹）。
+        //
+        // 当前 `cert` 仍是 `webrtc_dtls::crypto::Certificate` 类型，给
+        // `LanMouseListener::new(port, cert, ...)` / `LanMouseConnection::new(cert, ...)`
+        // 用 —— 完整切到 PeerSession 时整段 `cert` 字段替换为
+        // `(Vec<CertificateDer>, PrivateKeyDer)`（STEP-6.x）。
+        //
+        // ⚠️ 见 SUGGESTION #S-1：本次**只**换 cert 加载入口（rustls 路径）
+        // + 指纹算法（同一函数 `generate_fingerprint`）；`cert` 字段类型仍
+        // 保留 `webrtc_dtls::crypto::Certificate` 直到 STEP-6.x。
+        let cert_der = crypto::load_or_create_server_cert()?;
+        let public_key_fingerprint = crypto::generate_fingerprint(cert_der.0[0].as_ref());
+        // 把 rustls 元组转成 `webrtc_dtls::crypto::Certificate` 兼容入口
+        // （内部走 webrtc-dtls 自签 + PEM 重建；STEP-7.3 整段删除）。
+        // 这里**不**走 `load_certificate_compat(...)`（那条路会覆盖
+        // `crypto::cert_path()` 落盘文件，与 `load_or_create_server_cert`
+        // 重复写）。改用更轻量的 PEM 重建路径：
+        //   - 复用 `crypto::load_or_create_server_cert` 已落盘的 cert.pem
+        //     + 同一 fingerprint（已生成）
+        //   - listener / connection 仍用旧类型直到 STEP-6.x
+        let cert_path = crypto::cert_path();
+        let cert = crypto::load_certificate_compat(&cert_path)?;
 
         // create frontend communication adapter, exit if already running
         let frontend_listener = AsyncFrontendListener::new().await?;

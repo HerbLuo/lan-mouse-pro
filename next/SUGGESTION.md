@@ -76,21 +76,16 @@
 
 **触发**：STEP-1.1（Leader 评审补充）
 
-**现象**：`crypto::generate_self_signed(...)` 把 `cert.pem` + `key.pem`
-内容合并落盘到同一个文件；`load_or_generate_key_and_cert_der` 也从同一
-文件读。`cert_path()` 返回 `cert.pem` 单文件路径。
-
-**PLAN §1.1 验收要求**："ls ~/.local/share/lan-mouse/key.pem  # key
-分离持久（与 bak 一致）"。
+**状态**：✅ **STEP-2.4 已解**（详见 `next/STEP-2.4.md` §4）
 
 **处置**：
-- STEP-2.4 引入 `key_path()`，与 `cert_path()` 对应返回 `key.pem`
-- `generate_self_signed` 落盘拆为：cert → `cert.pem`，key → `key.pem`
-- `load_or_generate_key_and_cert_der` 签名扩为
-  `(cert_path, key_path)` 或保留单参数但内部由 `(cert_path, key_path())` 推算
-- key 文件 0o400 权限保持（已在 generate_self_signed 实现）
+- ✅ STEP-2.4 引入 `key_path()`，与 `cert_path()` 对应返回 `key.pem`
+- ✅ `generate_self_signed` 落盘拆为：cert → `cert.pem`（0o600），key → `key.pem`（0o400）
+- ✅ `load_or_generate_key_and_cert_der` 签名扩为 `(cert_path, key_path)`
+- ✅ key 文件 0o400 权限保持
+- ✅ `load_or_create_server_cert()` 零参数别名作为 PLAN §1.1 caller 一致性入口
 
-**优先级**：🟡 中（与 PLAN 验收清单对齐）
+**待 Leader 评审后删除本条目**。
 
 ---
 
@@ -173,15 +168,12 @@ STEP-2.1 改签名、STEP-2.5 再改一次的两段式 churn。
 
 **触发**：STEP-2.1（Leader 评审补充）
 
-**现象**：STEP-2.1 在 `build_quic_client_config` 设了 ALPN `b"lan-mouse"`
-（client 端 TLS 协商时声明"这是 lan-mouse 协议"）。STEP-2.4 装配 server
-端 `rustls::ServerConfig` 时必须设同样 ALPN，否则 ALPN mismatch 拒连。
+**状态**：✅ **STEP-2.4 已解**（详见 `next/STEP-2.4.md` §4）
 
 **处置**：
-- STEP-2.4 在 server `rustls::ServerConfig` 装配时设
-  `alpn_protocols = vec![b"lan-mouse".to_vec()]`
-- 复用 STEP-2.1 已声明的 `quic_transport::ALPN_LAN_MOUSE` 常量（避免字符串漂移）
-- STEP-2.4 验证清单加一条："server `rustls::ServerConfig.alpn_protocols` 包含
-  `b"lan-mouse"`"
+- ✅ STEP-2.4 在 `endpoint_with_cert` 装配 rustls::ServerConfig 时设
+  `rustls_server.alpn_protocols = vec![ALPN_LAN_MOUSE.to_vec()]`
+- ✅ 复用 STEP-2.1 已声明的 `quic_transport::ALPN_LAN_MOUSE` 常量（避免字符串漂移）
+- ✅ 与 client `build_quic_client_config` 的 `rustls_client.alpn_protocols = vec![ALPN_LAN_MOUSE.to_vec()];` 完全对称
 
-**优先级**：🟡 中（TLS 握手必要条件；漏了会导致 mTLS 通过但 ALPN mismatch 拒连）
+**待 Leader 评审后删除本条目**。
