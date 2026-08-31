@@ -33,20 +33,6 @@
 
 ---
 
-## #S-2 🟡 中：`rustls-pemfile` 已加 `lan-mouse/Cargo.toml`，等 STEP-1.2 提升到 workspace
-
-**触发**：STEP-1.1
-
-**现象**：`lan-mouse/Cargo.toml` 新增 `rustls-pemfile = "1.0"`；workspace
-`Cargo.toml` 未动。
-
-**建议**：STEP-1.2 时按 PLAN-M1.md §5 的 SPIKE 共识（D3）顺手提升到
-workspace `[workspace.dependencies]`。
-
-**优先级**：🟡 中
-
----
-
 ## #S-3 🟢 低：dead-code warning 9 处
 
 **触发**：STEP-1.1
