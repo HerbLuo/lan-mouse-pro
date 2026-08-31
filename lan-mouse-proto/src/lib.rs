@@ -12,6 +12,21 @@ use thiserror::Error;
 /// type: u8, time: u32, dx: f64, dy: f64
 pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
 
+/// 8-byte protocol magic identifying a lan-mouse peer, carried in every
+/// [`ProtoEvent::Hello`]. The `Hello` is exchanged right after the QUIC
+/// mTLS handshake authenticates; a peer that fails to present this exact
+/// magic within the handshake window is not a lan-mouse instance and
+/// has its connection refused at the [`crate::quic_transport`] layer
+/// (see STEP-3.2 `client_hello` / `server_hello`). lan-mouse is
+/// deliberately **not** wire-compatible with mousehop or any other
+/// fork — change this magic to force a hard break against a future
+/// divergence.
+///
+/// NOTE: kept as the brand string `LANMOUSE` (8 bytes, no `b' '`)
+/// rather than the tool name `lan-mouse` (which contains a `-` outside
+/// the ASCII short-id alphabet).
+pub const PROTOCOL_MAGIC: [u8; 8] = *b"LANMOUSE";
+
 /// error type for protocol violations
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -64,14 +79,22 @@ pub enum ProtoEvent {
     /// Response to [`ProtoEvent::Ping`], true if emulation is enabled / available
     Pong(bool),
     /// Build identification for the sending peer. Sent by the
-    /// connect side once after the connection authenticates, and
-    /// echoed back by the listen side in reply, so each end can
+    /// connect side once after the mTLS handshake authenticates,
+    /// and echoed back by the listen side in reply, so each end can
     /// display the peer's build hash and warn (soft) on mismatch.
+    ///
+    /// `magic` must equal [`PROTOCOL_MAGIC`]; a peer that does not
+    /// present this magic within the handshake window is not a
+    /// lan-mouse instance and has its connection refused at the
+    /// [`crate::quic_transport`] layer (STEP-3.2). The
+    /// type-level decode here still succeeds for any 8-byte magic —
+    /// the connection layer is what enforces the value.
+    ///
     /// `commit` is the 8-byte ASCII short commit hash from
     /// `shadow_rs`'s `SHORT_COMMIT`. Old peers that don't
     /// recognize the event type silently skip it per the
     /// forward-compat handling in the receive loop.
-    Hello { commit: [u8; 8] },
+    Hello { magic: [u8; 8], commit: [u8; 8] },
 }
 
 impl Display for ProtoEvent {
@@ -89,9 +112,14 @@ impl Display for ProtoEvent {
                     if *alive { "alive" } else { "not available" }
                 )
             }
-            ProtoEvent::Hello { commit } => {
+            ProtoEvent::Hello { magic, commit } => {
                 let s = std::str::from_utf8(commit).unwrap_or("????????");
-                write!(f, "Hello({s})")
+                let valid = *magic == PROTOCOL_MAGIC;
+                write!(
+                    f,
+                    "Hello(magic={}, commit={s})",
+                    if valid { "PROTOCOL_MAGIC" } else { "foreign" }
+                )
             }
         }
     }
@@ -190,11 +218,21 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             EventType::Leave => Ok(Self::Leave(decode_u32(&mut buf)?)),
             EventType::Ack => Ok(Self::Ack(decode_u32(&mut buf)?)),
             EventType::Hello => {
+                let mut magic = [0u8; 8];
+                for b in magic.iter_mut() {
+                    *b = decode_u8(&mut buf)?;
+                }
                 let mut commit = [0u8; 8];
                 for b in commit.iter_mut() {
                     *b = decode_u8(&mut buf)?;
                 }
-                Ok(Self::Hello { commit })
+                // Type-level decode always succeeds: any 8-byte magic
+                // yields a syntactically-valid Hello. The connection
+                // layer (`crate::quic_transport::client_hello` /
+                // `server_hello`, STEP-3.2) is what enforces that
+                // `magic == PROTOCOL_MAGIC` and rejects foreign
+                // peers.
+                Ok(Self::Hello { magic, commit })
             }
         }
     }
@@ -260,7 +298,13 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                 ProtoEvent::Enter(pos) => encode_u8(buf, len, pos as u8),
                 ProtoEvent::Leave(serial) => encode_u32(buf, len, serial),
                 ProtoEvent::Ack(serial) => encode_u32(buf, len, serial),
-                ProtoEvent::Hello { commit } => {
+                ProtoEvent::Hello { magic, commit } => {
+                    // magic precedes commit on the wire so the
+                    // listener can short-circuit-check the magic
+                    // without having to decode the commit.
+                    for b in magic.iter() {
+                        encode_u8(buf, len, *b);
+                    }
                     for b in commit.iter() {
                         encode_u8(buf, len, *b);
                     }
@@ -307,3 +351,74 @@ encode_impl!(u8);
 encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-trip: encode a Hello with the protocol magic and a
+    /// commit hash, then decode it. The decoder must yield the same
+    /// `magic` + `commit` byte-for-byte, and the encoded length must
+    /// fit in the fixed-size [`MAX_EVENT_SIZE`] buffer.
+    #[test]
+    fn hello_encode_decode_round_trip() {
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::Hello {
+            magic: PROTOCOL_MAGIC,
+            commit: *b"deadbeef",
+        }
+        .into();
+        // 1 type byte + 8 magic + 8 commit = 17 bytes
+        assert_eq!(len, 1 + size_of::<[u8; 8]>() * 2);
+        assert!(len <= MAX_EVENT_SIZE);
+        match buf.try_into().expect("decode") {
+            ProtoEvent::Hello { magic, commit } => {
+                assert_eq!(magic, PROTOCOL_MAGIC);
+                assert_eq!(commit, *b"deadbeef");
+            }
+            other => panic!("expected Hello, got {other}"),
+        }
+    }
+
+    /// Foreign / wrong magic must still decode at the type level —
+    /// the connection-layer enforcement of `magic == PROTOCOL_MAGIC`
+    /// is what rejects the peer (see STEP-3.2 `client_hello` /
+    /// `server_hello`).
+    #[test]
+    fn hello_wrong_magic_decodes_but_typed() {
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::Hello {
+            magic: *b"WRONGMAG",
+            commit: *b"deadbeef",
+        }
+        .into();
+        assert!(len <= MAX_EVENT_SIZE);
+        let decoded: ProtoEvent = buf.try_into().expect("decode");
+        match decoded {
+            ProtoEvent::Hello { magic, commit } => {
+                assert_eq!(magic, *b"WRONGMAG");
+                assert_ne!(magic, PROTOCOL_MAGIC);
+                assert_eq!(commit, *b"deadbeef");
+            }
+            other => panic!("expected Hello, got {other}"),
+        }
+    }
+
+    /// Sanity: a non-Hello event must still fit in MAX_EVENT_SIZE and
+    /// round-trip (sanity for the fixed-size buffer path after Hello
+    /// claims 17 of those bytes).
+    #[test]
+    fn ping_keeps_using_short_buffer() {
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::Ping.into();
+        assert_eq!(len, 1); // type byte only
+        assert!(matches!(buf.try_into().expect("decode"), ProtoEvent::Ping));
+    }
+
+    /// Sanity for the magic constant itself: it must be the exact
+    /// 8-byte ASCII brand string and stay stable across versions.
+    #[test]
+    fn protocol_magic_is_lanmouse_ascii() {
+        assert_eq!(PROTOCOL_MAGIC, *b"LANMOUSE");
+        // All bytes ASCII, no embedded NUL (would terminate at
+        // str::from_utf8 debug paths).
+        assert!(PROTOCOL_MAGIC.iter().all(|b| b.is_ascii_graphic()));
+    }
+}

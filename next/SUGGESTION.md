@@ -124,3 +124,38 @@
   description 推 IPC）
 
 **优先级**：🟢 低（M1 阶段 `String` 占位完全够用；M2 clipboard 同步改一次即可）
+
+---
+
+## #S-10 🟡 中：`ProtocolError::HelloMagicMismatch` 变体是否引入
+
+**触发**：STEP-3.1
+
+**现象**：
+- Leader prompt 期望 STEP-3.1 加 `ProtocolError::HelloMagicMismatch` 错误变体
+  并在 type-level decode 路径返回
+- **本步实际未引入**：proto 层 try_from 对任何 8-byte magic 永远成功；
+  magic 校验放 `crate::quic_transport::client_hello` / `server_hello`
+  （STEP-3.2）做，match 拒绝后调 `conn.close(VarInt(0), "hello failed")`
+- 与 bak 设计一致：bak `mousehop-proto/src/lib.rs:48-63`
+  `ProtocolError` 只有 4 个变体（InvalidEventId / InvalidPosition /
+  ClipboardTooLarge / InvalidUtf8 / BufferTooSmall），**没有**
+  HelloMagicMismatch
+
+**根因**：
+- proto crate 设计原则：try_from 只负责 **类型层** 解码（8 byte magic 都
+  是合法字节切片），不接受"语义层"（magic 是否等于 PROTOCOL_MAGIC）
+- 语义层职责属 quic_transport 层（连接级），由 STEP-3.2 落实
+
+**建议处置**：
+- **方案 A（推荐，与 bak 对齐）**：维持本步实现；不加新变体。STEP-3.2
+  在 quic_transport 用 match arm 显式分支处理 `magic != PROTOCOL_MAGIC`
+- **方案 B（与 Leader prompt 对齐）**：proto 层加
+  `ProtocolError::HelloMagicMismatch` 变体，try_from 在 magic 错时返
+  该错误；STEP-3.2 走 `?` 透传到 caller。该方案破坏与 bak 一致性，
+  且 type 层错误与 call-site 处理语义略糊
+
+**优先级**：🟡 中（API 表面问题，无功能阻塞；不影响 STEP-3.2 实现）
+
+**待 Leader 决策**：本步按方案 A 实现。若选方案 B，回退本步加变体；后续
+STEP 不受影响（两边都能配合 STEP-3.2 工作）。

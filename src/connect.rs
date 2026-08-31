@@ -1,7 +1,7 @@
 use crate::client::ClientManager;
 use crate::config::local_commit;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
-use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::{MAX_EVENT_SIZE, PROTOCOL_MAGIC, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::RefCell,
@@ -204,6 +204,7 @@ async fn connect_to_handle(
         // `peer_commit`. Old peers will silently skip this event
         // per the forward-compat handler in [`receive_loop`].
         let (buf, len) = ProtoEvent::Hello {
+            magic: PROTOCOL_MAGIC,
             commit: local_commit(),
         }
         .into();
@@ -278,7 +279,11 @@ async fn receive_loop(
                         client_manager.set_alive(handle, b);
                         ping_response.borrow_mut().insert(addr);
                     }
-                    ProtoEvent::Hello { commit } => {
+                    ProtoEvent::Hello { magic: _, commit } => {
+                        // Magic check lives in quic_transport.rs
+                        // (STEP-3.2); here we trust that anything
+                        // that survives to set_peer_commit is a
+                        // real Hello and just store the commit.
                         client_manager.set_peer_commit(handle, Some(commit));
                     }
                     event => tx.send((handle, event)).expect("channel closed"),
