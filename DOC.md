@@ -12,24 +12,38 @@ graph TD
     B[X11 Backend] -->|X11Event| D{Input}
     C[Windows Backend] -->|WindowsEvent| D{Input}
     D -->|Abstract Event| E[Emitter]
-    E -->|Udp Event| F[Receiver]
+    E -->|QUIC datagram / stream| F[Receiver]
     F -->|Abstract Event| G{Dispatcher}
     G -->|Wayland Event| H[Wayland Backend]
     G -->|X11 Event| I[X11 Backend]
     G -->|Windows Event| J[Windows Backend]
 ```
 
+The wire transport is **QUIC over UDP** (quinn 0.11 + rustls 0.23 with the
+`ring` crypto provider). Mouse motion is sent as a QUIC datagram; keyboard
+events, mouse buttons, control messages, and the application-protocol Hello
+handshake are sent over reliable, ordered QUIC streams. See
+[`README.md` → Encryption & Transport](./README.md#encryption--transport)
+for the full description of the v4 transport switch.
+
 ### Input
 The input component is responsible for translating inputs from a given backend
 to a standardized format and passing them to the event emitter.
 
 ### Emitter
-The event emitter serializes events and sends them over the network
-to the correct client.
+The event emitter serializes events and sends them over the QUIC connection
+to the correct client. Mouse motion goes over the connection's datagram
+channel; the rest go over per-purpose streams (a single control stream plus
+a bidirectional input stream). See
+[Input channels (Stream vs Datagram)](./README.md#input-channels-stream-vs-datagram)
+in the README for the per-client channel-mode configuration that controls
+how mouse buttons and keyboard events are routed.
 
 ### Receiver
-The receiver receives events over the network and deserializes them into
-the standardized event format.
+The receiver reads events from the QUIC connection and deserializes them
+into the standardized event format. Datagrams are read directly via
+`Connection::recv_datagram`; streams are framed with a length-prefixed
+`[u32 BE length][body]` codec.
 
 ### Dispatcher
 The dispatcher component takes events from the event receiver and passes them
@@ -40,10 +54,11 @@ to the correct backend corresponding to the type of client.
 
 // TODO this currently works differently
 
-Aside from events, requests can be sent via a simple protocol.
-For this, a simple tcp server is listening on the same port as the udp
-event receiver and accepts requests for connecting to a device or to
-request the keymap of a device.
+Aside from events, requests can be sent via a simple protocol. With the v4
+transport switch there is no longer a separate TCP control channel —
+connection setup, fingerprint authorization and the application-protocol
+Hello handshake all travel over the same QUIC connection (reliable streams
+on the same UDP port as the event datagrams).
 
 ```mermaid
 sequenceDiagram

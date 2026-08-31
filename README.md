@@ -24,10 +24,47 @@ Focus lies on performance, ease of use and a maintainable implementation that ca
 </picture>
 
 
-## Encryption
+## Encryption & Transport
 
-Lan Mouse encrypts all network traffic using the DTLS implementation provided by [WebRTC.rs](https://github.com/webrtc-rs/webrtc).
-There are currently no mitigations in place for timing side-channel attacks.
+Lan Mouse encrypts all network traffic and authenticates peers using
+[TLS 1.3 over QUIC](https://datatracker.ietf.org/doc/html/rfc9000) via the
+[quinn](https://github.com/quinn-rs/quinn) 0.11 crate (rustls 0.23 with the
+`ring` crypto provider). The wire protocol is QUIC over UDP on the same
+port (default `4242`); there is no separate TCP control channel anymore.
+
+A few things to know about the v4 transport switch:
+
+- **mTLS by default.** Both the server and the client present a self-signed
+  certificate. The server enforces mTLS via an explicit `authorized_keys`
+  allowlist of certificate fingerprints; the client pins the first server
+  fingerprint it sees and rejects any future swap. The `generate_fingerprint`
+  algorithm (SHA-256 of the DER, lower-case hex joined by `:`) is unchanged
+  from v3, so existing `authorized_fingerprints` entries continue to work.
+- **Happy-eyeballs for multi-homed peers.** When a client is configured
+  with several IP addresses (e.g. ethernet + wifi), `dial_any` first dials
+  the primary address and, if it does not respond within ~200 ms,
+  concurrently dials the remaining candidates — the first one to complete
+  the QUIC handshake wins. This makes the connection robust against
+  networks where one interface is reachable but the other is not.
+- **QUIC datagrams for motion.** Mouse motion (pointer movement, scroll
+  wheels, axis ticks) is always carried as a QUIC datagram. Datagrams have
+  the lowest possible latency but, like UDP, can be dropped silently when
+  the path is congested; for frequent pointer events that is preferable to
+  a stale event arriving late.
+- **QUIC streams for everything else.** Keyboard events, mouse buttons,
+  control messages (Enter/Leave/Ack), and the application-protocol Hello
+  handshake all travel over reliable, ordered QUIC streams. Stream frames
+  use a length-prefixed `[u32 BE length][body]` codec.
+- **Per-client channel mode.** The default is `mouse_button = datagram`
+  (low-latency clicks) and `keyboard = stream` (no missed key presses); see
+  [Input channels (Stream vs Datagram)](#input-channels-stream-vs-datagram)
+  below. Mouse motion always uses datagrams regardless of this setting.
+- **QUIC-native keepalive.** `keep_alive_interval = 5s` and
+  `max_idle_timeout = 30s` replace the previous 8-second application-layer
+  idle timer, so a silent peer is detected by the QUIC stack itself.
+
+There are currently no mitigations in place for timing side-channel
+attacks.
 
 ## OS Support
 
