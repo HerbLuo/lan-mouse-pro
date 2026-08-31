@@ -544,3 +544,54 @@ inline `open_uni() + write_all() + finish()`（不缓存、不复用、不带
 **优先级**：🟡 中（功能等价；M1 阶段 LAN 上可达性可接受；后续微步续治）
 
 ---
+
+## #S-21 🟡 中：PLAN §7.6 与各步 prompt 的 grep 路径 `lan-mouse/src` 不存在 —— 收尾验收恒假阴性
+
+**触发**：STEP-7.1
+
+**现象**：
+PLAN §7.6 的收尾验证命令（以及 STEP-7.1 prompt 里的自验命令）写的是：
+
+```bash
+grep -rnE "DTLS|webrtc-dtls|webrtc-util|RECV_IDLE_TIMEOUT" \
+  lan-mouse/src lan-mouse-ipc/src lan-mouse-proto/src lan-mouse-gtk/src
+```
+
+但主 crate 源码实际在**仓库根 `src/`**，**不存在** `lan-mouse/` 目录：
+
+```
+$ ls -d */
+build-aux/ dylibs/ firewall/ input-capture/ input-emulation/ input-event/
+lan-mouse-cli/ lan-mouse-gtk/ lan-mouse-ipc/ lan-mouse-proto/ next/ nix/
+screenshots/ scripts/ service/ src/ target/
+```
+
+`grep` 对不存在的路径只发 warning 到 stderr、正常退出 —— 命令对**主 crate 恒返回空**。
+STEP-7.1 首轮自验就因此拿到假阴性"已无残留"，复核正确路径后才发现
+`src/quic_transport.rs:373` 仍有 1 处命中。
+
+**根因**：
+PLAN 的路径写法疑似沿用"每个 crate 一个同名目录"的惯例（如 bak 的
+`mousehop/src/`），未与主仓实际布局（主 crate 在 root，`Cargo.toml`
+的 `[package] name = "lan-mouse"` + `src/` 同级）对位。同类问题
+SUGGESTION #S-13 已在 GTK 文件名上出现过一次。
+
+**影响面（≥2 STEP）**：
+- **STEP-7.6** 的验收命令就是这一条 —— "无 live code 残留"是 M1 DoD 的
+  清理闸门，假阴性会让 DTLS / RECV_IDLE_TIMEOUT 残留蒙混过关
+- STEP-7.3 `cargo tree | grep webrtc-*` 不受影响（走 cargo 不走路径）
+- 后续任何按 PLAN 字面复制 grep 命令的步骤同样受影响
+
+**建议处置**：
+- Leader 修正 PLAN §7.6 验证命令的路径：`lan-mouse/src` → `src`
+- 同步复核 PLAN 其它位置的 `lan-mouse/src/...` 文件路径写法（§1.1 / §6 搬运
+  矩阵等处写的 `lan-mouse/src/crypto.rs` 等，实际是 `src/crypto.rs`）——
+  这些位置作为"文件定位"表述尚可理解，但作为**可执行命令**必须修正
+- 执行侧纪律：凡 grep 自验返回空，先确认路径存在（`ls -d <path>`）再下
+  "无残留"结论
+
+**优先级**：🟡 中（不影响已完成步骤的实际代码质量 —— STEP-7.1 已用正确
+路径复核；但直接影响 STEP-7.6 收尾闸门的有效性）
+
+
+---

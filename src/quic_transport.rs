@@ -370,7 +370,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// - `keep_alive_interval = 5s` —— QUIC 主动探活，配合 PLAN §7 "Wi-Fi
 ///   切换恢复 < 1s" 预算；与 bak Step 0.1 spike 实测一致。
 /// - `max_idle_timeout = 30s` —— QUIC keepalive 自带；应用层 idle 检测
-///   （`RECV_IDLE_TIMEOUT = 8s`）由 STEP-7.1 删除。
+///   已于 STEP-7.1 下线（原 DTLS 时代 8s 应用层 idle 探测随 STEP-6.2
+///   listen.rs 重写一并消失）。对端静默不再触发本端主动关连：只有 QUIC
+///   自身 30s idle 超时（且 5s keepalive 在健康链路上永远先到）才关。
 ///
 /// `IdleTimeout::try_from(Duration)` 失败当且仅当 Duration 超 VarInt
 /// 2^30 ms 上限（≈ 12.4 天），30s 远在范围内 —— `expect` 注明理由。
