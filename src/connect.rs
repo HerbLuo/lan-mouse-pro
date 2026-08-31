@@ -172,17 +172,23 @@ impl LanMouseConnection {
     }
 }
 
-/// 出站拨号主入口（STEP-6.1）—— 给定一个 peer handle：
+/// 出站拨号主入口（STEP-6.1 / STEP-6.4 升级 happy-eyeballs）——
+/// 给定一个 peer handle：
 /// 1. 拿候选 IP 列表 + port
-/// 2. 拿 per-handle 输入通道配置（缺失 → `InputChannelConfig::default()`）
-/// 3. 调 `quic_transport::dial()` 走 QUIC TLS + 应用层 `client_hello`
-///    （**单地址** dial；happy-eyeballs 多地址并发留 STEP-6.4）
+/// 2. 调 `quic_transport::dial_any(...)` 走 happy-eyeballs 多地址并发
+///    + primary head-start（STEP-6.4 替换 STEP-6.1 的单地址 `dial`）
+/// 3. 应用层 `client_hello` 握手
 /// 4. 成功：`set_active_addr` + `register_peer(addr, peer)` + 摘 `connecting`
 ///
 /// **自由函数 vs `&self` 方法的取舍**：`send()` 通过 `spawn_local` 异步跑
 /// 本函数（spawn 要求 future `'static`，`&self` borrow 不能跨 spawn），所以
 /// 显式把 `LanMouseConnection` 的所有字段 clone 出来作参数 —— 与 bak
 /// `mousehop/src/connect.rs::connect_to_handle` 1:1 对齐。
+///
+/// **STEP-6.4 升级**：happy-eyeballs 多地址并发 + 200ms primary head-start
+/// 替换 STEP-6.1 单地址 `dial`（PLAN §6.4）。`primary` 取自
+/// `addrs.first()` —— mDNS / 候选列表中"最优 IP"由 caller 决定（当前用
+/// `HashSet` 迭代顺序，无 mDNS 时即首选 IP）；剩余候选并发拨。
 ///
 /// **M1 简化**：bak 有完整 retry gate / 退避 / 熔断，STEP-6.5 才补。本步
 /// 只负责 "成功 → 注册 + 摘 connecting；失败 → 摘 connecting + 返 Err"。
@@ -202,18 +208,23 @@ async fn connect_to_handle(
         return Err(LanMouseConnectionError::NotConnected);
     };
     let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
-    let addrs: Vec<SocketAddr> = ips_set.iter().map(|a| SocketAddr::new(a, port)).collect();
+    // STEP-6.4 修 connect.rs:205 E0308：`ips_set.iter()` 返 `&IpAddr`，
+    // `SocketAddr::new` 收 `IpAddr`（owned），`*a` 解引用。
+    let addrs: Vec<SocketAddr> = ips_set.iter().map(|a| SocketAddr::new(*a, port)).collect();
 
-    // M1 简化：先拨第一个地址（happy-eyeballs 留 STEP-6.4）。
-    let Some(&addr) = addrs.first() else {
+    let Some(&primary) = addrs.first() else {
         connecting.lock().await.remove(&handle);
         return Err(LanMouseConnectionError::NotConnected);
     };
-    log::info!("client ({handle}) connecting ... (addr: {addr})");
+    log::info!(
+        "client ({handle}) dial_any ... (primary: {primary}, candidates: {})",
+        addrs.len()
+    );
 
-    let conn = match quic_transport::dial(
+    let conn = match quic_transport::dial_any(
         &client_endpoint,
-        addr,
+        primary,
+        &addrs,
         quic_creds.cert_chain[0].clone(),
         quic_creds.key.clone_key(),
         &pins_dir,
@@ -222,7 +233,7 @@ async fn connect_to_handle(
     {
         Ok(c) => c,
         Err(e) => {
-            log::warn!("client ({handle}) dial {addr} failed: {e}");
+            log::warn!("client ({handle}) dial_any failed: {e}");
             connecting.lock().await.remove(&handle);
             return Err(LanMouseConnectionError::Quic(e));
         }

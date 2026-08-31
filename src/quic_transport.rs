@@ -68,7 +68,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc as tokio_mpsc;
-use tokio::task::{JoinHandle, spawn_local};
+use tokio::task::{JoinHandle, JoinSet, spawn_local};
 
 use lan_mouse_ipc::{ChannelMode, InputChannelConfig};
 use lan_mouse_proto::{ProtoEvent, MAX_EVENT_SIZE};
@@ -741,6 +741,154 @@ pub async fn dial(
     let conn = ep.connect_with(cfg, addr, "lan-mouse")?.await?;
     Ok(conn)
 }
+
+/// Happy-eyeballs 拨号（STEP-6.4 引入）—— 200ms primary head-start + 其余
+/// 候选并发拨；首个 QUIC TLS 1.3 握手成功者赢，返回原始 [`Connection`]。
+///
+/// **happy-eyeballs 算法**（RFC 8305 简化版，PLAN §6.4）：
+/// 1. 一次性构造 `Arc<ClientConfig>`（`build_quic_client_config` + cert/key/
+///    pins_dir 注入；`ClientConfig: Clone` 复用给每条候选 —— 避免
+///    `PrivateKeyDer::clone_key()` 每候选重 parse）
+/// 2. **`primary` 单独 head start** —— spawn 一条 task 拨 primary；`tokio::select!`
+///    race 200ms timer vs `joinset.join_next()`：
+///    - 200ms 内赢（primary 握手成功）→ 立即 `abort_all()` + 返回
+///    - 200ms 内 primary 失败（输在 timer 之前）→ log warn + 等 timer 触发
+/// 3. **head-start 结束 → 剩余候选一齐拨** —— spawn task 给 `all` 中除
+///    primary 外的所有地址
+/// 4. **首个成功 task** → `abort_all()` + 返回 Connection
+/// 5. 全部 dial 失败 → 返**最后**一个错误（与 bak `Mousehop::dial_any`
+///    "覆盖最新错误"语义对齐；SUGGESTION #S-21 治理落地）
+///
+/// **与 bak `mousehop/src/quic_transport.rs:1930 dial_any` 的差异**：
+/// - 返回 [`Connection`] 而**非** `Rc<PeerSession>` —— STEP-6.1 caller
+///   `connect_to_handle` 自己包 `PeerSession` + 跑 `client_hello`（拆开
+///   "happy-eyeballs" 与 "hello 握手"两个关注点；STEP-6.5 重连时 hello
+///   可复用同一路径）。PLAN §6.4 文字明确签名 `Result<Connection>`，本步
+///   与之对齐
+/// - 不带 `InputChannelConfig` 参数 —— `dial_any` 只管"连上"，路由配置
+///   与 hello 是 caller 责任（与 STEP-6.1 拆分一致）
+///
+/// **为什么 200ms**：PLAN §6.4 + connect.rs 现有 DTLS `connect_any` 沿用
+/// 同一常量（见 PLAN §7 风险表"happy-eyeballs 200ms 阈值太小被防火墙丢
+/// 弃" —— bak 默认；本步落地 bak 取舍）。LAN 内 200ms 通常够 primary
+/// 握手完成；超时则并发拨兜底 LAN 多宿主延迟漂移
+///
+/// **`JoinSet` vs `Vec<SpawnLocal>`**：JoinSet 提供 `join_next().await`
+/// + `abort_all()` 一站式 API，与 STEP-0.1 全仓 `spawn_local` 惯例一致。
+/// quinn `Connection` 实现 `Drop` 自动 close（QUIC 相对 DTLS 的简化），
+/// 输家被 abort 时 RAII 自动关连，**不**需要显式 `conn.close(...)`。
+///
+/// **`#[allow(dead_code)]`**：STEP-6.4 仅被 `connect.rs::connect_to_handle`
+/// 接入；dead_code 自动消失。
+#[allow(dead_code)]
+pub async fn dial_any(
+    ep: &Endpoint,
+    primary: SocketAddr,
+    all: &[SocketAddr],
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+    pins_dir: &Path,
+) -> Result<Connection> {
+    install_crypto_provider();
+
+    // (1) 一次性构造 ClientConfig，复用给每条 dial
+    let cfg = build_quic_client_config(vec![cert], key, pins_dir)?;
+
+    // (2) JoinSet 收集 (SocketAddr, Result<Connection, Error>)
+    let mut joinset: JoinSet<(SocketAddr, Result<Connection>)> = JoinSet::new();
+    let mut spawned: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
+
+    // (3) primary 单独 head start spawn
+    {
+        let cfg_ref = cfg.clone();
+        let ep_ref = ep.clone();
+        joinset.spawn_local(async move {
+            let res = ep_ref.connect_with(cfg_ref, primary, "lan-mouse");
+            match res {
+                Ok(connecting) => match connecting.await {
+                    Ok(conn) => (primary, Ok(conn)),
+                    Err(e) => (primary, Err(Error::Handshake(e))),
+                },
+                Err(e) => (primary, Err(Error::Connect(e))),
+            }
+        });
+        spawned.insert(primary);
+    }
+
+    // (4) primary head start race：200ms 内赢 → 立即返回；输 → log warn + 等 timer
+    {
+        let head_start = tokio::time::sleep(HEAD_START);
+        tokio::pin!(head_start);
+        loop {
+            tokio::select! {
+                _ = &mut head_start => break,
+                joined = joinset.join_next() => {
+                    let Some(inner) = joined else { break; };
+                    let Ok((_addr, res)) = inner else {
+                        log::warn!("dial_any: JoinSet task panic（head-start 期）");
+                        continue;
+                    };
+                    match res {
+                        Ok(conn) => {
+                            joinset.abort_all();
+                            return Ok(conn);
+                        }
+                        Err(e) => {
+                            log::warn!("dial_any: dial {_addr} 失败（head-start 期）：{e}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // (5) head-start 内 primary 没赢 → 剩余候选一齐拨
+    for &addr in all {
+        if spawned.contains(&addr) {
+            continue;
+        }
+        let cfg_ref = cfg.clone();
+        let ep_ref = ep.clone();
+        joinset.spawn_local(async move {
+            let res = ep_ref.connect_with(cfg_ref, addr, "lan-mouse");
+            match res {
+                Ok(connecting) => match connecting.await {
+                    Ok(conn) => (addr, Ok(conn)),
+                    Err(e) => (addr, Err(Error::Handshake(e))),
+                },
+                Err(e) => (addr, Err(Error::Connect(e))),
+            }
+        });
+        spawned.insert(addr);
+    }
+
+    // (6) wait for any to win
+    let mut last_err: Option<Error> = None;
+    while let Some(joined) = joinset.join_next().await {
+        let Ok((_addr, res)) = joined else {
+            log::warn!("dial_any: JoinSet task panic");
+            continue;
+        };
+        match res {
+            Ok(conn) => {
+                joinset.abort_all();
+                return Ok(conn);
+            }
+            Err(e) => {
+                log::warn!("dial_any: dial {_addr} 失败：{e}");
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(last_err.expect("JoinSet 至少应 join 一个 task"))
+}
+
+/// happy-eyeballs 给 primary 单独留的 200ms head start（RFC 8305 简化版 /
+/// connect.rs 现有 `PREFERRED_ADDR_HEAD_START` 语义）。
+///
+/// 与 bak `mousehop/src/quic_transport.rs:2004 HEAD_START` 完全对齐。
+const HEAD_START: Duration = Duration::from_millis(200);
 
 /// 接受一条 incoming QUIC 握手连接，完成 TLS 1.3 后返回原始 [`Connection`]。
 ///
@@ -4439,6 +4587,163 @@ mod tests {
 
         drop(client_arc);
         client_ep.wait_idle().await;
+        let _ = std::fs::remove_dir_all(&pins_dir);
+    }
+
+    // === STEP-6.4 `dial_any` happy-eyeballs 单元测试 =====================
+    //
+    // **测试目标**：primary 可达 + 备用候选也可达 → 应选 primary（remote
+    // address == server addr == primary）。
+    //
+    // **为什么本测试不需要测 fallback**：STEP-6.5 重连触发 / STEP-7.2 端
+    // 到端 QUIC smoke 会覆盖完整多 IP 候选路径（SUGGESTION #S-5 + STEP-6.5
+    // 续治）。本测试聚焦 happy-eyeballs 头 start race 的核心契约——
+    // "primary 在 200ms 内赢"。
+    //
+    // **SUGGESTION #S-5**：`lan-mouse` lib 因 14 errors 编不过（STEP-1.2
+    // 遗留——已在本步消化为 0 errors）；本测试本身**不**依赖外部 peer，是
+    // in-process 两端（server endpoint + client endpoint），跑通即可。
+
+    /// STEP-6.4 验收 (1/2)：dial_any 端到端—— primary = server_addr + 备用
+    /// 候选 = 同 server_addr（退化为"primary 即答案"）→ `dial_any` 应返
+    /// `Connection`，且 `remote_address() == primary`。
+    ///
+    /// **端到端路径**：server endpoint 接受 → client `dial_any` → 200ms
+    /// 内 primary 握手成功 → 返 Connection（不返 Rc<PeerSession>，hello
+    /// 是 caller 责任，与 PLAN §6.4 签名一致）。
+    #[tokio::test(flavor = "current_thread")]
+    async fn dial_any_prefers_primary() {
+        install_crypto_provider();
+
+        // (1) server endpoint
+        let (server_cert, server_key) = ephemeral_cert();
+        let server_ep = endpoint_with_test_cert(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+            server_cert,
+            server_key,
+        )
+        .expect("server endpoint bind");
+        let server_addr = server_ep.local_addr().expect("server addr");
+
+        // (2) server task：accept 等连
+        let server_task = tokio::spawn(async move {
+            let _conn = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                accept(&server_ep),
+            )
+            .await
+            .expect("server accept timeout")
+            .expect("server accept");
+            // 不调 client_hello —— 本测试只验证 dial_any 拿到 Connection，
+            // hello 握手由 STEP-6.1 caller 责任
+            let _ = std::time::Duration::from_millis(50); // 给 client 时间看到 remote_address
+        });
+
+        // (3) client：dial_any
+        let pins_dir = std::env::temp_dir().join(format!(
+            "lan-mouse-step-6-4-pins-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&pins_dir);
+        let (client_cert, client_key) = ephemeral_cert();
+        let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .expect("client endpoint bind");
+
+        // primary == server_addr；all 包含 primary + 一个不可达地址
+        // （验证 happy-eyeballs 选 primary 而非 fallback）
+        let unreachable = SocketAddr::new(
+            std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), // TEST-NET-1，RFC 5737
+            65535,
+        );
+        let all = vec![server_addr, unreachable];
+
+        let conn = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dial_any(
+                &client_ep,
+                server_addr,
+                &all,
+                client_cert[0].clone(),
+                client_key,
+                &pins_dir,
+            ),
+        )
+        .await
+        .expect("dial_any 总超时")
+        .expect("dial_any 应成功（primary 赢）");
+
+        // 关键断言：remote_address == primary == server_addr
+        assert_eq!(
+            conn.remote_address(),
+            server_addr,
+            "dial_any 应选 primary（即 server_addr），而非 fallback 不可达地址"
+        );
+
+        // 清理
+        conn.close(quinn::VarInt::from(0u32), b"test done");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
+        drop(client_ep.wait_idle());
+        let _ = std::fs::remove_dir_all(&pins_dir);
+    }
+
+    /// STEP-6.4 验收 (2/2)：dial_any 全部候选不可达 → 返 Err（且不会 hang
+    /// 超过合理上限）。
+    ///
+    /// **不**断言具体错误类型（quinn 返的具体 ConnectionError 在不同 OS /
+    /// 网络栈可能不同）—— 只断言 dial_any 返 Err + 总耗时 < 5s。
+    #[tokio::test(flavor = "current_thread")]
+    async fn dial_any_all_unreachable_returns_err() {
+        install_crypto_provider();
+
+        let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .expect("client endpoint bind");
+
+        let pins_dir = std::env::temp_dir().join(format!(
+            "lan-mouse-step-6-4-pins-unreach-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&pins_dir);
+        let (client_cert, client_key) = ephemeral_cert();
+
+        // 两个 TEST-NET-1 地址，都不可达 → dial_any 应返 Err
+        let primary = SocketAddr::new(
+            std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            65535,
+        );
+        let secondary = SocketAddr::new(
+            std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+            65535,
+        );
+        let all = vec![primary, secondary];
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            dial_any(
+                &client_ep,
+                primary,
+                &all,
+                client_cert[0].clone(),
+                client_key,
+                &pins_dir,
+            ),
+        )
+        .await
+        .expect("dial_any 总超时（应 < 10s 内返 Err）");
+
+        assert!(
+            result.is_err(),
+            "全部候选不可达时 dial_any 应返 Err，实际返：{result:?}"
+        );
+
+        drop(client_ep);
         let _ = std::fs::remove_dir_all(&pins_dir);
     }
 }
