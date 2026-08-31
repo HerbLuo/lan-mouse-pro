@@ -21,9 +21,11 @@
 //! - STEP-2.7（已）：[`AuthorizedKeysVerifier`] —— server 端显式 allowlist，
 //!   命中 → `Ok`；未命中 → `Err`。复用 [`endpoint_with_verifier`]，零新增接
 //!   口；listen.rs 装配点留 STEP-6.2 整段重写时接入
-//! - STEP-3.2：`client_hello` / `server_hello` 握手
-//! - STEP-4.4：`route_input()` ChannelMode 分派
-//! - STEP-5.x：数据通道（datagram + 3 stream）
+//! - STEP-3.2（已）：`client_hello` / `server_hello` 握手
+//! - STEP-4.4（已）：[`Channel`] enum + [`route_input`] 纯函数 —— 按
+//!   `InputChannelConfig` 分派 ProtoEvent → Datagram / StreamA / StreamB；
+//!   StreamC 是 M2 clipboard 元数据预留枚举变体（本步不开 reader task）
+//! - STEP-5.x：数据通道（datagram + 3 stream 实际 IO）
 //! - STEP-6.x：出入站集成（替换 `LanMouseConnection` / `LanMouseListener`）
 
 use std::collections::HashMap;
@@ -49,6 +51,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use lan_mouse_ipc::{ChannelMode, InputChannelConfig};
 use lan_mouse_proto::{ProtoEvent, MAX_EVENT_SIZE};
 
 pub use quinn::{Connection, Endpoint};
@@ -668,6 +671,127 @@ impl PeerSession {
     pub async fn take_stream_a_recv(&self) -> Option<RecvStream> {
         let mut g = self.stream_a_cache.lock().await;
         g.as_mut().and_then(|p| p.recv.take())
+    }
+}
+
+// === STEP-4.4 Channel enum + route_input() 纯函数 ===========================
+//
+// PLAN §4.4：按 `lan_mouse_ipc::InputChannelConfig`（per-handle 配置）把
+// `ProtoEvent` 分派到 4 类通道。本步只落地 enum + 纯函数 + 单测 —— `PeerSession`
+// 的 `send_*` / `read_*` IO 由 STEP-5.x 接入。
+//
+// 与 bak `mousehop/src/quic_transport.rs:929-1004` 的差异：
+// - **ProtoEvent 变体收窄**：主仓 ProtoEvent 不含 `Bounds` / `CursorPos` /
+//   `MotionAbsolute` / `ReceiverSensitivity` / `Clipboard`（PLAN §9 M1 边界）。
+//   这些 M2 才引入；本步 match 走 `StreamA`（control 流兜底），无需新增变体。
+// - **Channel 变体排序对齐 PLAN §4.4**：`Datagram / StreamA / StreamB / StreamC`；
+//   bak 排的是 `Datagram / StreamB / StreamA / StreamC`，本步以 PLAN 为准
+// - **StreamC 不开 reader task**：本步只定义 enum 变体；M2 clipboard 元数据
+//   reader 由独立 STEP 接入
+
+/// 4 类 QUIC 通道（STEP-4.4 引入）。
+///
+/// **Datagram** —— QUIC unreliable datagram，最低延迟、可能丢包。
+/// Motion / Axis / AxisDiscrete120 恒定走本通道；鼠标按键在
+/// `mouse_button = Datagram` 配置下走本通道；键盘在 `keyboard = Datagram`
+/// 配置下走本通道。
+///
+/// **StreamA** —— QUIC reliable bidi stream，control 通道。低频、必到；
+/// Enter / Leave / Ack / Hello / Ping / Pong 一律走本通道，与 per-handle
+/// 配置无关。Step-3.2 hello 握手即建立在 StreamA 上。
+///
+/// **StreamB** —— QUIC reliable bidi stream，input 通道。鼠标按键在
+/// `mouse_button = Stream` 配置下走本通道；键盘在 `keyboard = Stream` 配置
+/// 下走本通道（`Modifiers` 也走 keyboard 配置；见 `route_input` 实现注释）。
+///
+/// **StreamC** —— QUIC reliable bidi stream，clipboard meta 通道（M2 预留）。
+/// 本步不分配任何事件给 StreamC（路由表里全部事件已落到前 3 个变体）；M2 接入
+/// `ProtoEvent::Clipboard` / `Input(ClipboardEvent)` 时再加分支。
+///
+/// **derives**：`Debug / Clone / Copy / PartialEq / Eq` —— 与 bak
+/// `mousehop/src/quic_transport.rs:873` 一致；`Copy` 因为只有 4 个 0-字节变体。
+/// 不带 `Hash`（路由表用 `match`，不存 HashMap key）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    Datagram,
+    StreamA,
+    StreamB,
+    StreamC,
+}
+
+/// 把 `ProtoEvent` 按 per-handle [`InputChannelConfig`] 分派到 [`Channel`] 的
+/// **纯函数**（STEP-4.4 引入）。
+///
+/// **分派表**（与 STEP-4.3 写进 `config.toml` 注释的"Motion 永远走 Datagram
+/// 不受此设置影响"完全一致 —— 文档与实现必须同步）：
+///
+/// | `ProtoEvent` | `Channel` | 触发条件 |
+/// |---|---|---|
+/// | `Input(Pointer::Motion)` | `Datagram` | **恒定**，与 cfg 无关 |
+/// | `Input(Pointer::Axis)` | `Datagram` | **恒定**，高频 scroll 增量 |
+/// | `Input(Pointer::AxisDiscrete120)` | `Datagram` | **恒定**，离散 scroll tick |
+/// | `Input(Pointer::Button)` | `Datagram` 或 `StreamB` | 按 `cfg.mouse_button` |
+/// | `Input(Keyboard::Key)` | `Datagram` 或 `StreamB` | 按 `cfg.keyboard` |
+/// | `Input(Keyboard::Modifiers)` | `Datagram` 或 `StreamB` | 按 `cfg.keyboard`（**关键**：与 Key 走同一通道，避免 modifier 状态与按键解耦丢同步） |
+/// | `Enter` / `Leave` / `Ack` / `Hello` / `Ping` / `Pong` | `StreamA` | **恒定**，control 流 |
+/// | （M2 范围，本步不出现）`Clipboard` 等 | `StreamC` | M2 引入 ProtoEvent 变体时再补 |
+///
+/// **为什么 Motion / Axis / AxisDiscrete120 恒定 Datagram**：高频、丢一帧无
+/// 感的输入不应承担 Stream 重传延迟。`Axis` 是 touchpad scroll 增量、
+/// `AxisDiscrete120` 是鼠标 scroll wheel 单 tick（120 = 一格），与 Motion
+/// 同属"流式增量"，也走 Datagram（与 bak
+/// `mousehop/src/quic_transport.rs:934-936` 完全对齐）。
+///
+/// **为什么 Modifiers 跟 keyboard 配置走**：lan-mouse 的 modifier 状态本质
+/// 是"键状态的压缩视图"——单独把 Modifiers 配成与 Key 不同通道，会出现
+/// "Modifier 已 Datagram 投递 + Key 仍在 Stream B 队列" 的时序错位。STEP-4.3
+/// 文档中"input_channels"只暴露 `mouse_button` / `keyboard` 两字段，`Modifier`
+/// 跟随 `keyboard` 是最自然的契约。
+///
+/// **为什么不暴露 Channel::StreamC 的路由**：M1 不引入 `ProtoEvent::Clipboard` /
+/// `Input(ClipboardEvent)`（PLAN §9 边界）；主仓 `ProtoEvent` 也不含这些变体。
+/// match 全覆盖 → 编译期 `_ => unreachable!()` 也不必要 —— 当前 ProtoEvent
+/// 8 个变体都已显式列出，新增 M2 变体时编译器会报错提醒补 match arm。
+///
+/// **dead_code chain**：STEP-4.4 单测消费 + STEP-5.1 `send_motion()` +
+/// STEP-5.4 `PeerSession::run()` 调用栈消费；目前 main-code 无 caller，
+/// 加 `#[allow(dead_code)]` 守护（与 STEP-1.x / 2.x / 3.x 同模式）。
+#[allow(dead_code)]
+pub fn route_input(cfg: &InputChannelConfig, event: &ProtoEvent) -> Channel {
+    use input_event::{Event as InputEvent, KeyboardEvent, PointerEvent};
+
+    match event {
+        // (1) 高频指针增量 → 恒定 Datagram（Motion / Axis / AxisDiscrete120）
+        ProtoEvent::Input(InputEvent::Pointer(
+            PointerEvent::Motion { .. }
+            | PointerEvent::Axis { .. }
+            | PointerEvent::AxisDiscrete120 { .. },
+        )) => Channel::Datagram,
+
+        // (2) 鼠标按键 → 按 cfg.mouse_button 分派
+        ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Button { .. })) => match cfg.mouse_button
+        {
+            ChannelMode::Datagram => Channel::Datagram,
+            ChannelMode::Stream => Channel::StreamB,
+        },
+
+        // (3) 键盘按键 / Modifiers → 按 cfg.keyboard 分派（同一通道，避免
+        //     modifier / key 时序错位）
+        ProtoEvent::Input(InputEvent::Keyboard(KeyboardEvent::Key { .. }))
+        | ProtoEvent::Input(InputEvent::Keyboard(KeyboardEvent::Modifiers { .. })) => {
+            match cfg.keyboard {
+                ChannelMode::Datagram => Channel::Datagram,
+                ChannelMode::Stream => Channel::StreamB,
+            }
+        }
+
+        // (4) Control 流（PLAN §3 "Stream A — control"）→ 恒定 StreamA
+        ProtoEvent::Enter(_)
+        | ProtoEvent::Leave(_)
+        | ProtoEvent::Ack(_)
+        | ProtoEvent::Hello { .. }
+        | ProtoEvent::Ping
+        | ProtoEvent::Pong(_) => Channel::StreamA,
     }
 }
 
@@ -2159,5 +2283,244 @@ mod tests {
         drop(client_ep);
         let _ = server_task.await;
         let _ = std::fs::remove_dir_all(&pins_dir);
+    }
+
+    // === STEP-4.4 route_input 纯函数 单元测试 =================================
+    //
+    // 4 个组合测试对应 PLAN §4.4 验收清单：
+    // - `route_input_default_motion_datagram_keyboard_stream`
+    //   —— `InputChannelConfig::default()` (mouse=Datagram, keyboard=Stream)
+    //      → Motion / Button / Key / Control 各走预期间通道
+    // - `route_input_all_stream_motion_still_datagram`
+    //   —— 全 Stream 配置下，Motion 仍走 Datagram（关键纪律）
+    // - `route_input_all_datagram_everything_datagram`
+    //   —— 全 Datagram 配置下，Motion / Button / Key 走 Datagram，Control 仍 StreamA
+    // - `route_input_mixed_mouse_stream_keyboard_datagram`
+    //   —— 混合配置下，Button → StreamB, Key/Modifier → Datagram
+    //
+    // 测试不依赖 lib 编译（**纯函数 + 公开枚举**），但仍受 STEP-1.2 留下的
+    // 14 DTLS errors 阻塞（与 SUGGESTION #S-5 同路径）—— 测试代码就位，
+    // STEP-6.x 修 14 errors 后 Leader 手动跑一次确认通过。
+    //
+    // 用 `use lan_mouse_ipc::{ChannelMode, InputChannelConfig}` 在 test mod 内
+    // 显式拉（与 STEP-4.2 `config_input_channels_tests` 同模式），不污染
+    // 主模块顶部 `use`。
+
+    /// 构造常用 ProtoEvent 测试 fixture（避免在每个测试里写一遍 match arm）
+    mod route_input_fixtures {
+        use super::*;
+
+        pub(super) fn motion() -> ProtoEvent {
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion {
+                time: 0,
+                dx: 1.0,
+                dy: 2.0,
+            }))
+        }
+
+        pub(super) fn axis() -> ProtoEvent {
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Axis {
+                time: 0,
+                axis: 0,
+                value: 1.0,
+            }))
+        }
+
+        pub(super) fn axis_discrete() -> ProtoEvent {
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::AxisDiscrete120 {
+                axis: 0,
+                value: 120,
+            }))
+        }
+
+        pub(super) fn button() -> ProtoEvent {
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Button {
+                time: 0,
+                button: 0x110, // BTN_LEFT
+                state: 1,
+            }))
+        }
+
+        pub(super) fn key() -> ProtoEvent {
+            ProtoEvent::Input(InputEvent::Keyboard(KeyboardEvent::Key {
+                time: 0,
+                key: 30, // KEY_A on Linux scancode
+                state: 1,
+            }))
+        }
+
+        pub(super) fn modifiers() -> ProtoEvent {
+            ProtoEvent::Input(InputEvent::Keyboard(KeyboardEvent::Modifiers {
+                depressed: 0x01 | 0x02, // Shift | Ctrl
+                latched: 0,
+                locked: 0,
+                group: 0,
+            }))
+        }
+
+        pub(super) fn enter() -> ProtoEvent {
+            ProtoEvent::Enter(Position::Left)
+        }
+
+        pub(super) fn leave() -> ProtoEvent {
+            ProtoEvent::Leave(42)
+        }
+
+        pub(super) fn ack() -> ProtoEvent {
+            ProtoEvent::Ack(42)
+        }
+
+        pub(super) fn hello() -> ProtoEvent {
+            ProtoEvent::hello(*b"deadbeef")
+        }
+
+        pub(super) fn ping() -> ProtoEvent {
+            ProtoEvent::Ping
+        }
+
+        pub(super) fn pong() -> ProtoEvent {
+            ProtoEvent::Pong(true)
+        }
+    }
+
+    /// (1/4) 默认配置：mouse_button=Datagram, keyboard=Stream
+    ///
+    /// 关键断言：
+    /// - Motion / Button / Axis / AxisDiscrete120 → Datagram（高频指针恒定走）
+    /// - Key / Modifiers → StreamB（keyboard=Stream）
+    /// - Enter / Leave / Ack / Hello / Ping / Pong → StreamA（恒定 control 流）
+    #[test]
+    fn route_input_default_motion_datagram_keyboard_stream() {
+        use route_input_fixtures::*;
+        let cfg = InputChannelConfig::default();
+        assert_eq!(cfg.mouse_button, ChannelMode::Datagram);
+        assert_eq!(cfg.keyboard, ChannelMode::Stream);
+
+        // 高频指针 → Datagram
+        assert_eq!(route_input(&cfg, &motion()), Channel::Datagram);
+        assert_eq!(route_input(&cfg, &axis()), Channel::Datagram);
+        assert_eq!(route_input(&cfg, &axis_discrete()), Channel::Datagram);
+        assert_eq!(route_input(&cfg, &button()), Channel::Datagram);
+
+        // keyboard=Stream → Key / Modifier 走 StreamB
+        assert_eq!(route_input(&cfg, &key()), Channel::StreamB);
+        assert_eq!(route_input(&cfg, &modifiers()), Channel::StreamB);
+
+        // control 流 → StreamA（与 cfg 无关）
+        assert_eq!(route_input(&cfg, &enter()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &leave()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &ack()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &hello()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &ping()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &pong()), Channel::StreamA);
+    }
+
+    /// (2/4) 全 Stream 配置：mouse_button=Stream, keyboard=Stream
+    ///
+    /// **关键纪律（PLAN §4.4 + STEP-4.3 文档明确）**：即使 mouse_button=Stream，
+    /// Motion / Axis / AxisDiscrete120 仍走 Datagram（高频指针不受配置影响）。
+    /// Button 走 StreamB（因为 mouse_button=Stream）。
+    #[test]
+    fn route_input_all_stream_motion_still_datagram() {
+        use route_input_fixtures::*;
+        let cfg = InputChannelConfig {
+            mouse_button: ChannelMode::Stream,
+            keyboard: ChannelMode::Stream,
+        };
+
+        // Motion / Axis / AxisDiscrete120 恒定 Datagram（即使 mouse=Stream）
+        assert_eq!(
+            route_input(&cfg, &motion()),
+            Channel::Datagram,
+            "Motion 永远走 Datagram，不受 cfg.mouse_button 影响"
+        );
+        assert_eq!(
+            route_input(&cfg, &axis()),
+            Channel::Datagram,
+            "Axis 永远走 Datagram（高频 scroll 增量）"
+        );
+        assert_eq!(
+            route_input(&cfg, &axis_discrete()),
+            Channel::Datagram,
+            "AxisDiscrete120 永远走 Datagram（离散 scroll tick）"
+        );
+
+        // Button 走 StreamB（mouse_button=Stream）
+        assert_eq!(route_input(&cfg, &button()), Channel::StreamB);
+
+        // Key / Modifier 走 StreamB（keyboard=Stream）
+        assert_eq!(route_input(&cfg, &key()), Channel::StreamB);
+        assert_eq!(route_input(&cfg, &modifiers()), Channel::StreamB);
+
+        // control 流仍 StreamA
+        assert_eq!(route_input(&cfg, &enter()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &ack()), Channel::StreamA);
+    }
+
+    /// (3/4) 全 Datagram 配置：mouse_button=Datagram, keyboard=Datagram
+    ///
+    /// Motion / Button / Key / Modifier 全部 Datagram；Control 流仍 StreamA。
+    #[test]
+    fn route_input_all_datagram_everything_datagram() {
+        use route_input_fixtures::*;
+        let cfg = InputChannelConfig {
+            mouse_button: ChannelMode::Datagram,
+            keyboard: ChannelMode::Datagram,
+        };
+
+        // 全 Datagram
+        assert_eq!(route_input(&cfg, &motion()), Channel::Datagram);
+        assert_eq!(route_input(&cfg, &axis()), Channel::Datagram);
+        assert_eq!(route_input(&cfg, &axis_discrete()), Channel::Datagram);
+        assert_eq!(route_input(&cfg, &button()), Channel::Datagram);
+        assert_eq!(route_input(&cfg, &key()), Channel::Datagram);
+        assert_eq!(route_input(&cfg, &modifiers()), Channel::Datagram);
+
+        // control 流仍 StreamA
+        assert_eq!(route_input(&cfg, &enter()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &leave()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &ack()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &hello()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &ping()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &pong()), Channel::StreamA);
+    }
+
+    /// (4/4) 混合配置：mouse_button=Stream, keyboard=Datagram
+    ///
+    /// Motion / Axis / AxisDiscrete120 → Datagram（恒定）
+    /// Button → StreamB（mouse=Stream）
+    /// Key / Modifier → Datagram（keyboard=Datagram）—— **关键**：Modifier
+    /// 与 Key 同通道，不会跨 cfg 错位
+    #[test]
+    fn route_input_mixed_mouse_stream_keyboard_datagram() {
+        use route_input_fixtures::*;
+        let cfg = InputChannelConfig {
+            mouse_button: ChannelMode::Stream,
+            keyboard: ChannelMode::Datagram,
+        };
+
+        // Motion / Axis / AxisDiscrete120 → Datagram（恒定）
+        assert_eq!(route_input(&cfg, &motion()), Channel::Datagram);
+        assert_eq!(route_input(&cfg, &axis()), Channel::Datagram);
+        assert_eq!(route_input(&cfg, &axis_discrete()), Channel::Datagram);
+
+        // Button → StreamB（mouse=Stream）
+        assert_eq!(route_input(&cfg, &button()), Channel::StreamB);
+
+        // Key / Modifier → Datagram（keyboard=Datagram）
+        assert_eq!(route_input(&cfg, &key()), Channel::Datagram);
+        assert_eq!(
+            route_input(&cfg, &modifiers()),
+            Channel::Datagram,
+            "Modifier 必须跟 Key 同通道（避免 modifier / key 跨通道时序错位）"
+        );
+
+        // control 流仍 StreamA
+        assert_eq!(route_input(&cfg, &enter()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &leave()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &ack()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &hello()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &ping()), Channel::StreamA);
+        assert_eq!(route_input(&cfg, &pong()), Channel::StreamA);
     }
 }
