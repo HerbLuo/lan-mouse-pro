@@ -469,3 +469,78 @@ inline `open_uni() + write_all() + finish()`（不缓存、不复用、不带
 **优先级**：🟡 中（工程取舍记录；不影响 STEP-6.x）
 
 ---
+
+## #S-18 🟡 中：listen.rs supervisor 整合 + macOS wake 路径未覆盖（**STEP-6.3 闭合**）
+
+**触发**：STEP-6.3 调研阶段发现
+
+**现象**：
+- STEP-6.2 supervisor 仅监听 stream A（控制面）
+- macOS 系统唤醒信号路径缺失（无 `PowerObserver` / 无 `spawn_wake_task`）
+- 非 macOS 上 wake_rx 永久 pending 路径缺失
+
+**根因**：
+- PLAN §6.3 文字明确要求"保留现有 macOS 唤醒后 force-close 行为，与新 PeerSession 路径整合"
+- supervisor 任一 reader task 退出路径未严格配对 `quic_conns` 反注册
+
+**STEP-6.3 闭环（2026-08-31）**：
+- `src/macos_power.rs` 新增（仅 macOS，IOKit `PowerObserver::spawn` + wake_tx 无界通道）
+- `src/lib.rs` 加 `#[cfg(target_os = "macos")] pub(crate) mod macos_power;`
+- `src/listen.rs`：
+  - `LanMouseListener` 新增 `wake_task: JoinHandle<()>` + `quic_conns` + macOS-only `power_observer`
+  - `LanMouseListener::new` 装配 PowerObserver + wake_rx + spawn_wake_task
+  - `spawn_wake_task` 后台 task：recv wake_rx → 遍历 quic_conns → `peer.connection().close(0u32.into(), b"wake")` 同步触发
+  - `QuicConnGuard` RAII：构造时 `insert(addr, peer.clone())`，Drop 时 `remove(&addr)` —— 让 supervisor 任何退出路径都自动反注册（与 bak 对齐）
+  - `terminate()` 改新结构：`wake_task.abort() + accept_task.abort() + listen_tx.close()`
+- `src/emulation.rs` race 修复注释强化（supervisor 路径 `last_response.remove(&addr)` 先于 timeout 路径的 retain —— supervisor 赢得 race）
+- 本条目进入"待 Leader 评审后删除"状态
+
+**优先级**：🟡 中（STEP-6.3 完成；race 已通过注释强化 race 防御）
+
+---
+
+## #S-19 🟠 高：supervisor 不装配 stream B/C reader（STEP-6.3 决策：推到 STEP-7.x）
+
+**触发**：STEP-6.3 调研阶段决策
+
+**现象**：
+- PLAN §6.2 验收要求 supervisor 装配 outer `accept_bi` 循环 + 子 task 用 `read_any_frame` 解码 + 4 路 `select!` dispatch
+- 当前 STEP-6.2 supervisor 只 `read_frame(&mut recv_a)` 推 Msg / Disconnected
+- stream B/C `accept_bi` 路径在 listen.rs supervisor 内未装配
+
+**根因**：
+- STEP-6.2 supervisor 简化：M1 阶段 client 端 `LanMouseConnection::send` 不主动开 3 条 bidi；server 端 supervisor 装配 `accept_bi` 3 次会 hang（等不到 client 主动 open 的 B/C bidi）
+- STEP-6.3 prompt 严格限制"不要重构（只做 supervisor + macOS wake 整合，不动现有 PeerSession 路径）"
+- M1 阶段控制面事件（Enter / Leave / Ack / Hello / Ping / Pong）只走 stream A —— listen.rs ListenTask 的现有 match 臂覆盖所有这些事件
+- stream B/C 输入事件（M1 阶段不发，client LanMouseConnection 仅在 `send_input` 分派 `Channel::StreamB` 时按需开新 bidi）暂时不需要 supervisor 处理
+
+**建议处置**：
+- 推到 STEP-7.x 接本地输入代理时一并装配（届时 supervisor 装配 outer `accept_bi` 循环 + 子 task 用 `read_any_frame` 解码 + 4 路 select! dispatch —— 与 bak `mousehop/src/listen.rs:296-483 handle_quic_peer_supervisor` 形态 1:1 对齐）
+- 当前 M1 阶段功能等价：M1 控制面事件流不依赖 stream B/C reader
+
+**优先级**：🟠 高（功能等价；后续 STEP 续治）
+
+---
+
+## #S-20 🟡 中：server 端 per-IP bind (`enumerate_listenable_addrs`) + `if_addrs` 依赖引入（STEP-6.3 推到后续微步）
+
+**触发**：STEP-6.3 调研阶段决策
+
+**现象**：
+- PLAN §6.3 文字提到"if_watch 接口变化（listener 类型变 `Endpoint`，接入同步改）"
+- 当前 listener 绑 `0.0.0.0:port` 单 endpoint（**4-tuple 受限**：多宿主机器 reply 源 IP 与 peer dial 目的 IP 不一致 → 握手超时——SUGGESTION #29 描述问题）
+- bak `mousehop/src/listen.rs:188-236 is_listenable_addr / enumerate_listenable_addrs` 用 `if_addrs` crate 做 per-IP bind
+
+**根因**：
+- per-IP bind 涉及 listener 大改（多 endpoint + 多 accept_task + `Vec<JoinHandle>` 持有）
+- STEP-6.3 prompt 严格限制"不要重构（只做 supervisor + macOS wake 整合，不动现有 PeerSession 路径）"
+- M1 阶段 happy-eyeballs（STEP-6.4）是 client 端多 IP 并拨，server 端 per-IP bind 是优化项
+- 单 endpoint (0.0.0.0:port) 在 LAN 上**通常**可达（除非 4-tuple 受限场景）
+
+**建议处置**：
+- 后续微步拆 STEP-6.3a（per-IP bind）：workspace `Cargo.toml` 加 `if-addrs = "0.13"` + `lan-mouse/Cargo.toml` 加 dep；`lan-mouse/src/listen.rs` 加 `enumerate_listenable_addrs()` + `is_listenable_addr()` helpers（与 bak `mousehop/src/listen.rs:188-236` 1:1 对齐）；`spawn_quic_accept_tasks` 改造返 `Vec<JoinHandle<()>>`；terminate 改 drain + abort
+- STEP-6.5 接 `RetryState` 退避重连时一并做 server 端 per-IP bind（届时 `LanMouseListener` 持有 endpoints vec 与 conns map 的"per-IP accept task → per-IP peer conn"映射）
+
+**优先级**：🟡 中（功能等价；M1 阶段 LAN 上可达性可接受；后续微步续治）
+
+---

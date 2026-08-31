@@ -1,12 +1,11 @@
-//! QUIC server listener —— **M1 阶段 STEP-6.2 切到 PeerSession**。
+//! QUIC server listener —— **M1 阶段 STEP-6.3 整合 macOS wake**。
 //!
 //! 替换 STEP-1.2 之前 `webrtc-dtls` DTLS 路径：原 `listen.rs::read_loop`
 //! 走 `webrtc_util::Conn` + `DTLSConn` + `as_any().downcast_ref::<DTLSConn>()`
 //! 旧路径（10 errors）整段删除，由 quic_transport 模块的 `PeerSession` +
 //! `read_frame` + `read_any_frame` 替代。
 //!
-//! **M1 简化 supervisor 形态**（与 bak `mousehop/src/listen.rs::handle_quic_peer_supervisor`
-//! 1:1 对齐的核心流程 + 简化 stream B/C 处理）：
+//! **STEP-6.2 + STEP-6.3 supervisor 形态**：
 //! 1. `LanMouseListener::new(port, cert_chain, key, authorized_keys)` 调
 //!    `endpoint_with_verifier(port, cert_chain, key, AuthorizedKeysVerifier)`
 //!    拿 `Endpoint`（mTLS + fingerprint allowlist 在握手期已完成）
@@ -17,6 +16,16 @@
 //!    → 循环 `read_frame(&mut recv_a)` 转译为 `ListenEvent::Msg`
 //! 4. stream A EOF / conn close → 推 `ListenEvent::Disconnected` + 退 supervisor
 //!
+//! **macOS wake 路径（STEP-6.3 引入）**：
+//! - macOS-only `PowerObserver` 在系统唤醒时通过 `tokio::sync::mpsc::unbounded_channel`
+//!   发 `()` 给 `wake_rx`
+//! - `spawn_wake_task` 后台 task 阻塞 recv `wake_rx`，收到后遍历 `quic_conns`
+//!   注册表，对每条 conn 调 `peer.connection().close(0u32.into(), b"wake")`
+//!   同步触发 close（不等 QUIC 30s `max_idle_timeout`）
+//! - close 后 read_loop EOF → supervisor 退场 → 推 Disconnected
+//! - 非 macOS 上 `PowerObserver` 不 spawn，`wake_rx = None`，`spawn_wake_task`
+//!   永久 pending
+//!
 //! **为什么不装配三 stream（B/C）**：M1 阶段 client 端 `LanMouseConnection::send`
 //! **只**在 stream A 上发控制事件（Enter / Leave / Ack / Hello / Ping / Pong
 //! 走 `send_stream_a`，按键走 `send_stream_b` 但 LanMouseConnection 当前
@@ -26,7 +35,7 @@
 //! stream A —— listen.rs ListenTask 的现有 match 臂覆盖所有控制面事件，
 //! 不依赖 stream B/C reader。
 //!
-//! **Stream B / C 路径留 STEP-6.3 接手**：届时 supervisor 装配 outer
+//! **Stream B / C 路径留 STEP-7.x 接手**：届时 supervisor 装配 outer
 //! accept_bi 循环 + 子 task 用 `read_any_frame` 解码 + 转译 `ListenEvent::Msg`。
 //!
 //! **port_changed / request_port_change**：M1 阶段 `Endpoint` 不支持运行
@@ -99,16 +108,39 @@ pub(crate) struct LanMouseListener {
     /// QUIC accept task（M1 阶段单 endpoint 绑 `0.0.0.0:port`）。
     /// `terminate` 时 abort。
     accept_task: JoinHandle<()>,
+    /// 后台 wake 处理 task（STEP-6.3 引入，与 bak 对齐）。
+    ///
+    /// macOS 系统唤醒 → 强制关闭所有 QUIC peer conn（不等 QUIC 30s
+    /// `max_idle_timeout`），触发 supervisor 的 read_loop EOF →
+    /// `ListenEvent::Disconnected` → ListenTask 同步清理 proxy + 上报
+    /// service → client 端 next `send()` 触发 `dial_any` 重连
+    /// （STEP-6.4 接入）。
+    ///
+    /// 非 macOS 上 `wake_rx = None`，本 task 在 select 里永久 pending。
+    wake_task: JoinHandle<()>,
     /// 已通过 mTLS + authorized_keys 的合法 QUIC peer 表（与 bak 对齐）。
     ///
     /// supervisor 在 Accept event 后 `insert(addr, peer.clone())`，
-    /// supervisor 退出时 `remove(addr)`。
+    /// supervisor 退出时 `remove(addr)`（drop `QuicConnGuard`）。
     ///
-    /// **核心用途**：让 `reply()` 查 peer 写 control 帧到 stream A。
+    /// **核心消费者是 macOS wake 路径**：`spawn_wake_task` 遍历本表，对每条
+    /// conn 调 `peer.connection().close(0u32.into(), b"wake")` 同步触发
+    /// close —— 不等 QUIC `max_idle_timeout` (30s)。
+    ///
+    /// `reply()` 也读本表查 peer 后写 control 帧到 stream A。
     ///
     /// 选 `Rc<RefCell<HashMap<...>>>` 而非 `Rc<AsyncMutex<...>>`：
     /// 注册 / 反注册 / 查表都是同步路径；`peer.send_input` 异步路径单用一次锁。
     quic_conns: Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>>,
+    /// macOS-only: held for its `Drop` side effect (stops the
+    /// CFRunLoop in the power-observer thread). The observer sends
+    /// `()` into the wake channel on system-wake; the wake task
+    /// drains that channel and force-closes peer conns so
+    /// reconnect happens immediately after a screensaver/sleep
+    /// dismissal. QUIC keepalive has taken over idle detection —
+    /// see STEP-7.1.
+    #[cfg(target_os = "macos")]
+    power_observer: crate::macos_power::PowerObserver,
 }
 
 impl LanMouseListener {
@@ -120,8 +152,25 @@ impl LanMouseListener {
     ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
 
+        // macOS wake → force-close-all-QUIC-peers plumbing (STEP-6.3 引入)。
+        // 非 macOS 上 PowerObserver 不 spawn，wake_rx 是 None；
+        // spawn_wake_task 在 wake_rx = None 分支里永久 pending。
+        #[cfg(target_os = "macos")]
+        let (power_observer, wake_rx) = {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let observer = crate::macos_power::PowerObserver::spawn(tx).await;
+            (observer, Some(rx))
+        };
+        #[cfg(not(target_os = "macos"))]
+        let wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>> = None;
+
+        // QUIC peer 注册表（空初始化）。
+        // `spawn_wake_task` 拿 clone 走 wake 路径，
+        // `spawn_quic_accept_task` 拿 clone 走 accept + supervisor 注册路径。
         let quic_conns: Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>> =
             Rc::new(RefCell::new(HashMap::new()));
+
+        let wake_task = spawn_wake_task(wake_rx, quic_conns.clone());
 
         let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
             Arc::new(AuthorizedKeysVerifier::new(authorized_keys));
@@ -138,7 +187,10 @@ impl LanMouseListener {
             listen_rx,
             listen_tx,
             accept_task,
+            wake_task,
             quic_conns,
+            #[cfg(target_os = "macos")]
+            power_observer,
         })
     }
 
@@ -155,9 +207,15 @@ impl LanMouseListener {
     }
 
     pub(crate) async fn terminate(&mut self) {
-        // abort accept task → endpoint close → 所有 in-flight supervisor
-        // 收到 conn close → 发 ListenEvent::Disconnected → emulation.rs
-        // ListenTask 清理 + 上报 service
+        // STEP-6.3：terminate 改用新 task 结构清理。
+        //
+        // 1. abort wake task → PowerObserver Drop 关 CFRunLoop（macOS-only）。
+        // 2. abort accept task → endpoint close → 所有 in-flight supervisor
+        //    收到 conn close → 发 ListenEvent::Disconnected → emulation.rs
+        //    ListenTask 清理 + 上报 service。
+        // 3. close listen_tx → 通知所有 supervisor 的 forward_event 写入失败
+        //    → 不影响 read_loop 退出（read_loop 自己的 join handle 仍 resolve）。
+        self.wake_task.abort();
         self.accept_task.abort();
         self.listen_tx.close();
     }
@@ -212,7 +270,7 @@ impl Stream for LanMouseListener {
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context,
     ) -> std::task::Poll<Option<Self::Item>> {
         self.listen_rx.poll_next_unpin(cx)
     }
@@ -221,7 +279,7 @@ impl Stream for LanMouseListener {
 /// 给 `LanMouseListener::new()` 调的 helper：起单 endpoint QUIC accept task +
 /// 每条连接的 per-peer supervisor task。
 ///
-/// **Step 6.2 supervisor 形态**：
+/// **Step 6.2 + 6.3 supervisor 形态**：
 /// 1. `quic_transport::accept(&ep)` 循环拿 `Connection`
 /// 2. 接受到 conn → 立即 spawn supervisor：
 ///    - `server_hello` 交换 PROTOCOL_MAGIC（`HelloFailed` 错误 → 退 supervisor）
@@ -229,7 +287,7 @@ impl Stream for LanMouseListener {
 ///    - 双层防御：mTLS 已在 handshake 时校验过；supervisor 再查 allowlist
 ///      作为 fallback（理论上 verifier 已放行的 fp 必在 allowlist）
 ///    - 推 `ListenEvent::Accept { addr, fingerprint }`
-///    - 注册 `quic_conns[addr] = peer.clone()`
+///    - 注册 `quic_conns[addr] = peer.clone()` + Drop guard 反注册
 ///    - `take_stream_a_recv` 拿 stream A recv 半边
 ///    - 循环 `read_frame(&mut recv_a)` 把每帧转译为 `ListenEvent::Msg`
 ///    - stream A EOF / conn close → 退 `quic_conns` + 推 `ListenEvent::Disconnected`
@@ -271,23 +329,79 @@ fn spawn_quic_accept_task(
     })
 }
 
+/// 后台 wake 处理 task（STEP-6.3 引入，与 bak `spawn_wake_task` 对齐）。
+///
+/// macOS 系统唤醒信号来时，遍历 `quic_conns` 注册表，对每条 conn 同步调
+/// `peer.connection().close(0, b"wake")` —— 不等 30s `max_idle_timeout`，
+/// 让 `streams.join` 立即 resolve → supervisor 发 `ListenEvent::Disconnected`
+/// → ListenTask 同步清理 `emulation_proxy[addr]` + 上报 service。
+///
+/// **`RefCell::borrow()` 同步路径**（无 await 竞争）：
+/// `quinn::Connection::close(VarInt, &[u8])` 同步，不会与 read_loop
+/// 的 borrow_mut 冲突。
+///
+/// **不需要** clone peer —— `Rc<PeerSession>` 持有内部 `Rc<Connection>`，
+/// close 直接走底层 ref count。
+///
+/// **error_code 0 = NO_ERROR**（graceful）；客户端 `should_retry_after_close`
+/// 分类为"不重试"，但 `peers` 已被 `spawn_peer_supervisor` 摘掉（STEP-6.1），
+/// 下次 `send()` 走 `should_attempt` 自然触发重拨 —— 与 DTLS wake 语义对齐。
+///
+/// 非 macOS 上 `wake_rx = None`，`match wake_rx.as_mut() { None => pending() }`
+/// 永久挂起（不浪费 wake）。
+fn spawn_wake_task(
+    mut wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    quic_conns: Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>>,
+) -> JoinHandle<()> {
+    spawn_local(async move {
+        loop {
+            let wake = match wake_rx.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
+            };
+            match wake {
+                Some(()) => {
+                    let q = quic_conns.borrow();
+                    log::info!(
+                        "supervisor: post-wake — closing {} QUIC peer conn(s) \
+                         to force fresh reconnect",
+                        q.len()
+                    );
+                    for (a, peer) in q.iter() {
+                        log::debug!("post-wake close (QUIC): {a}");
+                        peer.connection().close(0u32.into(), b"wake");
+                    }
+                }
+                None => {
+                    log::debug!(
+                        "supervisor: wake channel closed; \
+                         power observer no longer signaling"
+                    );
+                    wake_rx = None;
+                }
+            }
+        }
+    })
+}
+
 /// 单连接的 supervisor handler。
 ///
 /// 流程：
 /// 1. `server_hello` 交换 PROTOCOL_MAGIC
 /// 2. 计算 client cert fingerprint
 /// 3. 发 `ListenEvent::Accept { addr, fingerprint }`
-/// 4. 注册到 `quic_conns`（让 `reply()` 查 peer）
+/// 4. 注册到 `quic_conns`（让 `reply()` 查 peer）+ 装 `QuicConnGuard`
 /// 5. `take_stream_a_recv` 拿 stream A recv 半边
 /// 6. 循环 `read_frame(&mut recv_a)` 把每帧转译为 `ListenEvent::Msg`
-/// 7. stream A EOF / 致命错误 → 退 `quic_conns` + 推 `ListenEvent::Disconnected`
+/// 7. stream A EOF / 致命错误 → `QuicConnGuard` Drop 自动反注册 +
+///    推 `ListenEvent::Disconnected`
 ///
 /// **为什么不调 `route_input` 做反向分派**：listen.rs supervisor 不感知
 /// 发送端 cfg（receiver 端不感知 PLAN §3.1.4），把 stream → event 的物理
 /// 路径转译给 ListenTask 处理；ListenTask 的现有 `match event` 已覆盖
 /// 所有控制面 / input 事件。
 ///
-/// **Stream B / C 装配留 STEP-6.3**：本步 client 端 `LanMouseConnection::send`
+/// **Stream B / C 装配留 STEP-7.x**：本步 client 端 `LanMouseConnection::send`
 /// 不主动开 B/C；server 端 supervisor 只听 stream A 就够覆盖 M1 现有控制面
 /// 事件流（Enter / Leave / Ack / Hello / Ping / Pong）。
 #[allow(clippy::doc_lazy_continuation)]
@@ -328,7 +442,11 @@ async fn handle_quic_peer_supervisor(
             quic_transport::Error::HelloFailed("listen_tx closed (terminated)".into())
         })?;
 
-    // (4) 注册到 QUIC peer 表（让 `reply()` 能查到）
+    // (4) 注册到 QUIC peer 表（让 `reply()` 能查到）+ 装 QuicConnGuard
+    //     让任何退出路径（Ok / Err / panic / wake close）都自动反注册
+    //
+    // QuicConnGuard Drop 在函数末尾自动触发（任何 return 路径）——
+    // 与 bak `mousehop/src/listen.rs:382-386` 同模式。
     quic_conns
         .borrow_mut()
         .insert(addr, peer.clone())
@@ -337,6 +455,11 @@ async fn handle_quic_peer_supervisor(
                 "QUIC peer {addr} already registered in quic_conns — overwriting (old peer may leak)"
             );
         });
+    let _guard = QuicConnGuard {
+        table: quic_conns.clone(),
+        addr,
+    };
+    log::debug!("QUIC peer {addr} registered in quic_conns (guard active)");
 
     // (5) take stream A recv 半边（控制帧 reader 用）
     let mut recv_a = peer
@@ -386,9 +509,42 @@ async fn handle_quic_peer_supervisor(
         }
     }
 
-    // (7) stream A EOF / conn close → 推 Disconnected
-    quic_conns.borrow_mut().remove(&addr);
+    // (7) stream A EOF / conn close → 推 Disconnected（QuicConnGuard Drop 自动反注册）
     log::info!("QUIC peer {addr} stream A closed — sending Disconnected");
     let _ = listen_tx.send(ListenEvent::Disconnected { addr });
     Ok(())
+}
+
+/// QUIC peer 表注册 RAII guard（STEP-6.3 引入，与 bak `QuicConnGuard` 对齐）。
+///
+/// 构造时绑定 `(table, addr)`，Drop 时从 `table` 移除 `addr`。
+/// 让 `handle_quic_peer_supervisor` 的所有退出路径（Ok / Err / panic）都能
+/// 自动反注册 —— 无需在每个 `?` 早返前手动 `remove()`。
+///
+/// **设计动机**："peer 注册到 `quic_conns`"必须严格配对"反注册"，否则：
+/// - 同一 addr 重连时 `insert()` 会覆盖旧 entry（已有 `warn!` 兜底但旧
+///   peer Rc 仍 hold 旧 connection，可能延迟关闭）
+/// - wake 路径遍历到僵尸 entry → close 已被回收的 conn（quinn 内部状态，
+///   no-op 但日志噪音）
+///
+/// **不动 conn 本身**：Drop 只删 HashMap entry，不调 `conn.close()`；
+/// 关闭 conn 由 read_loop 退出 / wake 路径（`peer.connection().close(...)`）
+/// 触发。
+struct QuicConnGuard {
+    table: Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>>,
+    addr: SocketAddr,
+}
+
+impl Drop for QuicConnGuard {
+    fn drop(&mut self) {
+        let removed = self.table.borrow_mut().remove(&self.addr);
+        if removed.is_some() {
+            log::debug!(
+                "QUIC peer {} deregistered from quic_conns (guard drop)",
+                self.addr
+            );
+        }
+        // removed == None：peer 从未被注册（Accept event 之前早退），
+        // 或已被 wake 路径覆盖（不可能，单线程）；静默 no-op。
+    }
 }

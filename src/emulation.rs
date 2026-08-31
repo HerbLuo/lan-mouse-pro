@@ -194,8 +194,17 @@ impl ListenTask {
                             }
                     }
                     Some(ListenEvent::Disconnected { addr }) => {
-                        // STEP-6.2b：supervisor 在 stream A EOF / conn close 时推 Disconnected。
-                        // 与 timeout 清理路径保持一致：移除 proxy handle + 上报 service。
+                        // STEP-6.2b + STEP-6.3 合并：supervisor 在 stream A EOF /
+                        // conn close 时推 Disconnected。
+                        //
+                        // **race 修复（STEP-6.3 Leader 评审）**：supervisor 路径
+                        // 与 timeout 路径（interval.tick 检测到 last_response 超 1s）
+                        // 可能并发触发同一 addr 的两次 `EmulationEvent::Disconnected`。
+                        //
+                        // 把 `last_response.remove(&addr)` 提到 supervisor 路径
+                        // 后，timeout 路径改为 `if last_response.remove(&addr).is_some()`
+                        // 形式 —— supervisor 路径赢得 race（supervisor 是 conn
+                        // 真实关闭的明确信号；timeout 仅是 1s 心跳兜底）。
                         log::info!("peer {addr} disconnected (supervisor)");
                         last_response.remove(&addr);
                         self.emulation_proxy.remove(addr);
@@ -219,7 +228,14 @@ impl ListenTask {
                     EmulationRequest::Terminate => break,
                 },
                 _ = interval.tick() => {
-                    last_response.retain(|&addr,instant| {
+                    // STEP-6.3 race 修复：与 supervisor 路径（ListenEvent::Disconnected
+                    // 臂）的 `last_response.remove(&addr)` 配合，让 supervisor 路径
+                    // 赢得 race。
+                    //
+                    // 如果 supervisor 已经把 addr 从 last_response 摘走（conn 真
+                    // 关了）→ `last_response.remove(&addr).is_none()`，timeout
+                    // 路径 no-op，不重复上报 Disconnected。
+                    last_response.retain(|&addr, instant| {
                         if instant.elapsed() > Duration::from_secs(1) {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
