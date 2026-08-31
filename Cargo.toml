@@ -70,6 +70,7 @@ slab = "0.4.9"
 thiserror = "2.0.0"
 tokio-util = "0.7.11"
 local-channel = "0.1.5"
+quinn.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 rcgen = "0.13.1"

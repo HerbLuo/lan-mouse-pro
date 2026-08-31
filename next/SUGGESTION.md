@@ -51,6 +51,27 @@
 
 ---
 
+## #S-5 🟡 中：`endpoint()` 测试无法在 STEP-1.4 端到端执行
+
+**触发**：STEP-1.4
+
+**现象**：
+- `quic_transport.rs::endpoint_binds_ipv4_localhost` 编译通过（`cargo check -p lan-mouse` 报 14 errors，**0 来自 quic_transport.rs**）
+- 但 `cargo test -p lan-mouse quic_transport::endpoint_binds_ipv4_localhost` 跑不起来 —— `lan-mouse` lib 因 `connect.rs` / `listen.rs` 的 `webrtc_dtls` 引用仍编不过（STEP-1.2 留下的 14 errors）
+
+**根因**：
+- PLAN §1.4 验收清单要求 `cargo test ... 通过`，但 §1.2 故意留下 14 errors 让 lib 编不过（铺路给 STEP-6.x 一次性切到 PeerSession）
+- STEP-1.4 在不修 connect.rs / listen.rs 的前提下，无法独立让单测跑通
+- 测试逻辑本身已对齐（`endpoint()` bind 127.0.0.1:0 → `local_addr().port() != 0` → drop）
+
+**处置**：
+- 本步把 `endpoint_binds_ipv4_localhost` 作为**单元测试逻辑就位**验收 —— 验证手段是 `cargo check -p lan-mouse` 报 0 错来自 quic_transport.rs
+- STEP-6.x 修复 14 errors 后，**leader 需手动跑** `cargo test -p lan-mouse quic_transport::endpoint_binds_ipv4_localhost` 确认通过
+
+**优先级**：🟡 中（属"验收机制与 STEP 进度解耦"的记录，无功能阻塞）
+
+---
+
 ## #S-4 🟡 中：cert.pem + key.pem 当前合并为同一文件，STEP-2.4 必须拆开
 
 **触发**：STEP-1.1（Leader 评审补充）
