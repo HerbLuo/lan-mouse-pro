@@ -359,6 +359,20 @@ inline `open_uni() + write_all() + finish()`（不缓存、不复用、不带
 
 **优先级**：🟢 低（STEP-5.2 自然消化，无功能阻塞）
 
+**STEP-5.2 闭环（2026-08-31）**：
+- `PeerSession::send_datagram_or_stream_b` 降级分支由 inline
+  `open_uni() + write_all() + finish()` 替换为 `self.send_stream_b(bytes).await?`
+- `send_stream_b` 用长度前缀帧 `[u32 BE len][body]`（与对端
+  STEP-5.3 `read_frame` codec 对齐）
+- `Error::StreamB(String)` 替换 `Error::DatagramFallback(String)`（与 bak
+  `mousehop/src/quic_transport.rs:1035-1040 Error::StreamB` 完全对齐；
+  `Error::DatagramFallback` 保留变体但已无 caller，待 STEP-7.3 收尾清理）
+- 本步 `send_stream_b` **不**做 cache 命中复用（偏差 #N-8）——
+  STEP-5.3 read_loop 接入时统一重构（引入 `stream_b: Mutex<Option<StreamPair>>`
+  字段 + 合并进 `PeerSession.stream_bunch`）
+
+**#S-14 完全解决**（建议 Leader 评审后删除本条目）。
+
 ---
 
 ## #S-15 🟢 低：`MAX_SAFE_DATAGRAM = 1162` 与 PLAN-v4 实测相关 —— 后续 MTU spike 变更需重跑

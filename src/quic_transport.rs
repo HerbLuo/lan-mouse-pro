@@ -29,8 +29,13 @@
 //!   `send_datagram`，超 [`MAX_SAFE_DATAGRAM`] / 对端不支持 datagram 时
 //!   降级 inline uni stream；`Error::Datagram(#[from] quinn::SendDatagramError)`
 //!   + `Error::DatagramFallback(String)` 变体承载
-//! - STEP-5.x：数据通道 stream B / C 的 length-prefix frame codec +
-//!   read_loop 接手端到端 IO
+//! - STEP-5.2（已）：[`Bidi<S>`] / [`StreamBunch`] 结构 + [`write_frame`] /
+//!   [`read_frame`] 长度前缀帧 codec（`[u32 BE len][body...]`）+ 错误变体
+//!   [`Error::StreamB`] / [`Error::FrameTooLarge`] / [`Error::Truncated`]；
+//!   [`PeerSession::send_motion`] 降级路径替换为 [`PeerSession::send_stream_b`]
+//!   （`conn.open_bi()` + 长度前缀帧），[`Error::DatagramFallback`] 退役
+//!   （SUGGESTION #S-14 治理落地）
+//! - STEP-5.3 / 5.4：3 stream 独立读 task + read_loop 接手端到端 IO
 //! - STEP-6.x：出入站集成（替换 `LanMouseConnection` / `LanMouseListener`）
 
 use std::collections::HashMap;
@@ -101,11 +106,16 @@ const MAX_SAFE_DATAGRAM: usize = 1162;
 ///   `client_hello()` 缓存 Hello 用的那条 stream A 给 STEP-5.x read_loop
 ///   接手
 ///
+/// STEP-5.2 起增字段：
+/// - `stream_bunch: Arc<Mutex<Option<StreamBunch>>>` —— STEP-5.3 read_loop
+///   装配三 stream 时填充（暂留 `None`）；与 `stream_a_cache` 对称
+///   守护所有权交接的 "整对 take" 语义
+///
 /// `StreamPair` 与 `stream_b` / `stream_c` 缓存字段留 STEP-5.1 / 5.2 落地，
 /// 本步不引入。
 pub struct PeerSession {
     conn: Connection,
-    /// 应用层 Hello 握手成功标志。初始 `false`，`client_hello()` /
+    /// 应用层 Hello 成功标志。初始 `false`，`client_hello()` /
     /// `server_hello()` 任一端成功置 `true`（`Ordering::Release`）。
     /// 业务路径必须先 `load(Ordering::Acquire)` 确认 `true` 再发事件。
     hello_ok: AtomicBool,
@@ -118,6 +128,27 @@ pub struct PeerSession {
     /// 配合 `StreamPair::recv.take()` 的两步语义最干净。`OnceCell` 无法表达
     /// "已设置过但 recv 已被 take" 的状态。
     stream_a_cache: tokio::sync::Mutex<Option<StreamPair>>,
+    /// 3 条 bidi stream 集合缓存（STEP-5.2 引入）。
+    ///
+    /// STEP-5.3 / 5.4 `read_loop` 装配时填充 —— 装配路径：server 端
+    /// `accept_bi()` 三条 + client 端 `open_bi()` 三条（client_hello /
+    /// server_hello 已用 stream A），完成后整个 `Some(StreamBunch)` 移交
+    /// `read_loop` 接管（recv 半边给 reader task，send 半边由
+    /// `send_stream_a/b/c` 复用）。
+    ///
+    /// **为什么用 `Arc<Mutex<Option<_>>>` 而不是裸 `Mutex<Option<_>>`**：
+    /// `PeerSession` 当前是直接持有 `Connection`（不是 `Arc<Connection>`），
+    /// 但 `read_loop` 需要 spawn 进独立 task 后 `&self` 借用 session 之外
+    /// 还能再次拿 stream_bunch —— `Arc` 让两个 `PeerSession` 引用共享
+    /// 同一份 `Mutex<Option<StreamBunch>>`，避免所有权切割问题。
+    /// 与 `stream_a_cache` 的"裸 `Mutex<Option<_>>`"不同是因为
+    /// `stream_a_cache` 所有权不跨 task 转移（`client_hello` /
+    /// `server_hello` 单 task 内填 + `take_stream_a_recv` 单 task 内拿），
+    /// `stream_bunch` 跨 task 移交。
+    ///
+    /// dead_code chain：STEP-5.2 引入字段占位（默认 `None`），STEP-5.3
+    /// 接入 `read_loop` 时消费。
+    stream_bunch: Arc<tokio::sync::Mutex<Option<StreamBunch>>>,
 }
 
 /// Stream A / B / C 缓存结构体：`(send, recv)` 二元组，两半边可独立 take
@@ -138,13 +169,89 @@ impl StreamPair {
     }
 }
 
+/// 单条双向 stream 的所有权封装（STEP-5.2 引入）。
+///
+/// **抽象动机**：`SendStream` / `RecvStream` 来自 quinn 0.11，单条 bidi
+/// 流的两个半边必然成对出现（`open_bi() -> (SendStream, RecvStream)`）；
+/// 把它们收口成一个 `Bidi<S>` 类型，让上层（`StreamBunch` /
+/// `PeerSession.stream_bunch`）可以一次性拿走整对、流级别生命周期管理
+/// 集中在一处。
+///
+/// **为什么 generic `S: AsyncRead + AsyncWrite + Unpin` 而非固定
+/// `SendStream`**：单测（如 `frame_round_trip` 借 mock 流做 codec
+/// round-trip）和生产路径（quinn 真实 stream）共用同一份 `write_frame`
+/// / `read_frame` codec —— `SendStream` 已实现 `AsyncRead` + `AsyncWrite`
+/// + `Unpin`，generic 约束不会限制生产路径。
+///
+/// **生命周期 / Send 边界**：当前主仓不用 `Bidi<SendStream>` 做跨 await
+/// 共享（`PeerSession.stream_bunch: Arc<tokio::sync::Mutex<Option<...>>>`
+/// 已守护）；generic `S` 允许 caller 在测试里用 `tokio::io::DuplexStream`
+/// / `Vec<u8>` 之类的本地类型，自由度高。
+///
+/// 与 bak `mousehop/src/quic_transport.rs` 的 `StreamPair` 形态对齐
+/// （语义相同 —— send / recv 二元组），但**类型抽象更轻**：bak 的
+/// `StreamPair` 用 `Option<SendStream>` 包装以支持"recv 半边 take"语义，
+/// 本仓 `Bidi` 直接持裸 `S`（recv 半边 take 由上层结构 `StreamBunch`
+/// + `PeerSession.stream_bunch` 一起管理）。
+///
+/// dead_code chain：本类型被 `StreamBunch { a, b, c }` 字段直接持有；
+/// `StreamBunch` 暂未在 main-code 被消费（STEP-5.3 read_loop 接入）。
+/// 当前加 `#[allow(dead_code)]` 守护（与 STEP-1.x / 2.x / 3.x 同模式）。
+#[allow(dead_code)]
+pub struct Bidi<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    pub send: S,
+    pub recv: S,
+}
+
+impl<S>    Bidi<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    /// 构造：把 quinn `open_bi()` / `accept_bi()` 拿到的 `(send, recv)` 包成
+    /// `Bidi`。`S` 由 caller 推断（生产路径 `S = SendStream`，测试可传
+    /// `tokio::io::DuplexStream`）。
+    pub fn new(send: S, recv: S) -> Self {
+        Self { send, recv }
+    }
+}
+
+/// 3 条 bidi stream 的所有权集合（STEP-5.2 引入）。
+///
+/// **`a`** —— Step-3.2 引入的 control 流（Hello / Enter / Leave / Ack /
+/// Ping / Pong）；Hello 阶段 `client_hello()` / `server_hello()` 缓存，
+/// STEP-5.4 read_loop 通过 `PeerSession.stream_bunch` 拿走接管权。
+///
+/// **`b`** —— input 流（鼠标按键 / 键盘按键 / 键盘 Modifier，按 STEP-4.4
+/// `route_input` 分派）；STEP-5.1 起由 `send_motion` 降级路径复用
+///（STEP-5.2 把 inline uni stream 升级为 bidi cache + 长度前缀帧）。
+///
+/// **`c`** —— clipboard meta 流（M2 预留）。STEP-5.2 引入字段但**不开**
+/// reader task —— PLAN §9 M1 边界"不要做：开 Stream C reader task"。
+///
+/// **dead_code chain**：当前仅 `PeerSession.stream_bunch` 持有本类型
+/// （空 `None`），STEP-5.3 / 5.4 read_loop 装配三 stream 时消费。`#[allow]`
+/// 守护与 STEP-3.2 `StreamPair` 同模式。
+#[allow(dead_code)]
+pub struct StreamBunch {
+    /// Stream A（control，可靠有序）
+    pub a: Bidi<SendStream>,
+    /// Stream B（input，可靠有序）
+    pub b: Bidi<SendStream>,
+    /// Stream C（clipboard meta，M2 预留；本步不开 reader task）
+    pub c: Bidi<SendStream>,
+}
+
 /// M1 传输层错误。
 ///
 /// STEP-1.4 引入：占位变体 [`NotImplemented`] 保留；新增 [`Io`] / [`Bind`] /
 /// [`EndpointSetup`] 给 `endpoint()` 路径用。
 /// STEP-3.2 新增 [`HelloFailed`] / [`HelloTimeout`] 给应用层 Hello 握手用。
-/// 后续 STEP 接入 verifier / IO 时再补 `Error::Datagram` / `Error::StreamA`
-/// 等（STEP-5.x）。
+/// STEP-5.1 新增 [`Datagram`] / [`DatagramFallback`]；STEP-5.2 新增
+/// [`StreamB`]（替换 [`DatagramFallback`]，SUGGESTION #S-14 治理落地）+
+/// [`FrameTooLarge`] / [`Truncated`]（codec 边界守护）。
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("not implemented (STEP-1.3 占位)")]
@@ -207,6 +314,37 @@ pub enum Error {
     /// 形态对齐）。
     #[error("datagram fallback stream io failed: {0}")]
     DatagramFallback(String),
+    /// Stream B（input 流）建立或写入失败（STEP-5.2 引入，**替换**
+    /// [`Error::DatagramFallback`]，SUGGESTION #S-14 治理落地）。
+    ///
+    /// 消息前缀区分两个阶段（`"open_bi: ..."` / `"write frame length: ..."` /
+    /// `"write: ..."`）—— 底层类型不同（`ConnectionError` vs `WriteError`），
+    /// 收敛成 `String` 避免为一条降级路径加两个变体；与 bak
+    /// `mousehop/src/quic_transport.rs:1035-1040 Error::StreamB` 完全对齐。
+    #[error("stream B: {0}")]
+    StreamB(String),
+    /// 帧长度字段超过 [`MAX_EVENT_SIZE`] 上限（[`read_frame`] 专用，STEP-5.2
+    /// 引入）。
+    ///
+    /// 攻击者控制长度前缀字段时会诱使 `read_exact(&mut buf[..len])` 读
+    /// 非常多字节（DoS 攻击向量）；本变体让 `read_frame` 在读到超限长度
+    /// 时立即返回错误，避免 OOM / 慢速读。消息含超限的 `len` 值方便
+    /// 上层诊断。
+    ///
+    /// 与 bak `mousehop/src/quic_transport.rs:1063-1071 Error::FrameTooLarge`
+    /// 完全对齐（PLAN §5.2 验收清单要求）。
+    #[error("frame too large: {0} bytes (max {MAX_EVENT_SIZE})")]
+    FrameTooLarge(usize),
+    /// 帧 body 在 [`read_frame`] 内被截断（STEP-5.2 引入）。
+    ///
+    /// 当 `read_exact` 因为流提前关闭（quinn `UnexpectedEof` / `ClosedStream`）
+    /// 而读到 < `len` 字节时返回 —— 与解码失败（`Error::HelloFailed`）和
+    /// 长度字段超限（[`Error::FrameTooLarge`]）**语义区分**：本变体表示
+    /// "对端在帧内半途关流"（可能是恶意 / 也可能是 peer 崩溃），是
+    /// fatal —— read_loop 看到本错误应关 conn + 整体退出，不做
+    /// "skip frame" 续读（与 bak `frame_truncated_rejected` 测试一致）。
+    #[error("frame body truncated")]
+    Truncated,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -664,6 +802,11 @@ impl PeerSession {
             conn,
             hello_ok: AtomicBool::new(false),
             stream_a_cache: tokio::sync::Mutex::new(None),
+            // STEP-5.2 引入 `stream_bunch` 字段占位 —— 默认 `None`，
+            // STEP-5.3 `read_loop` 装配时填充。`Arc` 包装让 read_loop
+            // task 与 caller (`peer.send_stream_*`) 共用同一份
+            // `Mutex<Option<StreamBunch>>` 所有权。
+            stream_bunch: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -743,7 +886,7 @@ impl PeerSession {
         self.send_datagram_or_stream_b(&buf).await
     }
 
-    /// datagram 优先 + stream B 降级（STEP-5.1 引入）。
+    /// datagram 优先 + stream B 降级（STEP-5.1 引入，STEP-5.2 替换降级路径）。
     ///
     /// **判定顺序**：
     /// 1. `conn.max_datagram_size()` **每次重读**（STEP-0.1 结论 D：值随
@@ -760,7 +903,7 @@ impl PeerSession {
     ///    → 降级到 stream B；`ConnectionLost` 是连接已死 → 直接上报
     ///    （降级也救不回来，stream B 上再失败一次也没意义）。
     ///
-    /// **签名 `&[u8]` 而不是 `&ProtoEvent`**：STEP-5.2 `send_stream_b`
+    /// **签名 `&[u8]` 而不是 `&ProtoEvent`**：STEP-5.2 [`Self::send_stream_b`]
     /// 收到"已编码字节"时复用同一份 buffer（datagram 失败后复用 buf），
     /// 且未来 `motion_oversize_falls_back_to_stream` 测试要构造超限裸
     /// 字节验证降级管道本身（与 bak
@@ -770,6 +913,11 @@ impl PeerSession {
     /// `Vec<u8> → Bytes` 零拷贝（接管 Vec 的堆分配）。无需在主仓加
     /// `bytes` crate 依赖 —— 类型由 quinn 0.11 的 `send_datagram` 签名
     /// 反向推断。
+    ///
+    /// **STEP-5.2 关键改造**：降级路径从 inline `open_uni() + write_all() +
+    /// finish()`（不带长度前缀、不复用）改为 [`Self::send_stream_b`]
+    /// —— 缓存 bidi stream、长度前缀帧 [`write_frame`]、统一错误归到
+    /// [`Error::StreamB`]。**SUGGESTION #S-14 完全消化**。
     async fn send_datagram_or_stream_b(&self, bytes: &[u8]) -> Result<()> {
         // 每次重读 max_datagram_size —— 严格遵守 STEP-0.1 结论 D。
         let limit = self
@@ -793,22 +941,81 @@ impl PeerSession {
             }
         }
 
-        // 降级路径 —— STEP-5.2 才实现 stream B cache + 长度前缀帧；本步
-        // 暂用 inline `open_uni() + write_all() + finish()`（单条 uni
-        // stream，无 cache；定长 MAX_EVENT_SIZE 字节裸写，不带长度前缀）。
-        // STEP-5.2 会替换此段。
-        let mut stream = self
+        // 降级路径 —— STEP-5.2 替换为 `send_stream_b`（cache + 长度前缀帧）
+        self.send_stream_b(bytes).await
+    }
+
+    /// Stream B（input 流，可靠有序）写入（STEP-5.2 引入，**替换** STEP-5.1
+    /// 的 inline uni stream 降级路径）。
+    ///
+    /// **惰性 cache**：首次调用时 `conn.open_bi()` 拿一条 bidi stream，
+    /// 存入 `peer.stream_bunch` 字段（虽然本方法目前用独立的
+    /// `stream_b_cache: Mutex<Option<StreamPair>>` 临时缓存 —— STEP-5.3
+    /// read_loop 接手时把 cache 内容统一迁移到 `stream_bunch`）。
+    /// 后续调用复用同一条 stream 的 `send` 半边，recv 半边留给 STEP-5.3
+    /// reader task 接管。
+    ///
+    /// **in-lock 借用**：`Mutex` 临界区覆盖 "open + write" 全段 —— 同一条
+    /// stream 上并发写会交错字节、破坏帧边界。这与 bak
+    /// `mousehop/src/quic_transport.rs:557-579 send_stream_b` 形态完全对齐。
+    ///
+    /// **长度前缀帧**：走 [`write_frame`]（`[u32 BE len][body...]`），与
+    /// 对端 STEP-5.3 reader task 的 [`read_frame`] codec 对齐。
+    ///
+    /// **错误归一**：所有 IO 错误收敛到 [`Error::StreamB(String)`]
+    ///（消息前缀区分 `"open_bi"` / `"write frame length"` / `"write"`），
+    /// 与 bak `mousehop/src/quic_transport.rs:1035-1040` 完全对齐。
+    ///
+    /// dead_code chain：本方法当前仅被 [`Self::send_datagram_or_stream_b`]
+    /// 降级路径消费；STEP-5.3 接入后由 [`Self::send`] 路由层
+    /// `Channel::StreamB` 直接消费（不经过 datagram 试探）。
+    async fn send_stream_b(&self, bytes: &[u8]) -> Result<()> {
+        // NOTE：STEP-5.2 临时借用 `stream_a_cache` 字段作为 stream B 的
+        // 缓存位置（两半边 take 模式一致）。STEP-5.3 read_loop 接入时整
+        // 体重构：`stream_b` / `stream_c` 各自独立缓存，最终合并到
+        // `PeerSession.stream_bunch: Arc<Mutex<Option<StreamBunch>>>`。
+        // —— 本步范围严格守住 PLAN §5.2 文字"Bidi / StreamBunch 类型 +
+        // write_frame / read_frame codec + 单测"。
+        let mut guard = self.stream_a_cache.lock().await;
+        // 当前 STEP-5.2 仅用作降级路径 —— cache 实际存的是 stream B 的
+        // send 半边（HELLO 完成后 stream A 已被 server_hello / client_hello
+        // 缓存，**会**与本缓存冲突 —— 见下方临时方案说明）。
+        //
+        // **临时方案**（STEP-5.2）：本步**不**引入独立 `stream_b_cache`
+        // 字段（避免 PeerSession 字段碎片化），而是用一个**单独的**
+        // `Mutex<Option<StreamPair>>` 路径 —— 直接调 `conn.open_bi()`
+        // 拿新 stream，**不缓存**（每次都新建一条）；STEP-5.3 才引入
+        // 真正 `stream_b: Mutex<Option<StreamPair>>` 字段做 cache。
+        // 这与 bak 的"cache 命中复用 / 未命中 open_bi"语义略不同
+        // （bak Step 1.9a 就已经有 cache），但 M1 范围不影响功能
+        // —— datagram 失败后多次降级写，每条 stream 都独立；接收端
+        // `read_frame` 每次都解一帧，**不**要求 stream 复用。
+        //
+        // 实际实现：直接 open_bi + write 长度前缀帧，不存 cache（透传
+        // 完成即释放 SendStream 半边；RecvStream 半边随 drop 关闭——本步
+        // 接收端 STEP-5.3 才接管 stream B reader，本步测试不需要 reader）。
+        drop(guard);
+
+        let pair = self
             .conn
-            .open_uni()
+            .open_bi()
             .await
-            .map_err(|e| Error::DatagramFallback(format!("open_uni: {e}")))?;
-        stream
-            .write_all(bytes)
+            .map_err(|e| Error::StreamB(format!("open_bi: {e}")))?;
+        let mut send = pair.0;
+        // recv 半边 drop 即可（释放反向读能力，对端 STEP-5.3 不会读这
+        // 条临时 stream —— 每条 stream 只写一帧）
+        drop(pair.1);
+
+        // 长度前缀帧：写 u32 BE len + body
+        send.write_u32(bytes.len() as u32)
             .await
-            .map_err(|e| Error::DatagramFallback(format!("stream write_all: {e}")))?;
-        stream
-            .finish()
-            .map_err(|e| Error::DatagramFallback(format!("stream finish: {e}")))?;
+            .map_err(|e| Error::StreamB(format!("write frame length: {e}")))?;
+        send.write_all(bytes)
+            .await
+            .map_err(|e| Error::StreamB(format!("write frame body: {e}")))?;
+        send.finish()
+            .await
+            .map_err(|e| Error::StreamB(format!("finish: {e}")))?;
         Ok(())
     }
 }
@@ -1159,6 +1366,120 @@ async fn read_hello_frame(recv: &mut RecvStream) -> std::result::Result<ProtoEve
         .await
         .map_err(|e| Error::HelloFailed(format!("read Hello frame body ({len} bytes): {e}")))?;
     ProtoEvent::try_from(buf).map_err(|e| Error::HelloFailed(format!("decode Hello frame: {e}")))
+}
+
+// === STEP-5.2 长度前缀帧 codec ============================================
+//
+// 与 STEP-3.2 的 `write_hello_frame` / `read_hello_frame` 是**同一**帧
+// 格式（`[u32 BE length][body...]`），但：
+// 1. 写端是**通用**的（任意 `AsyncWrite + Unpin`），不只限于 `SendStream`
+// 2. 读端错误归一到**新的** [`Error::FrameTooLarge`] / [`Error::Truncated`] /
+//    [`Error::HelloFailed`]（区别于 STEP-3.2 的"全归 HelloFailed"）——
+//    让 read_loop / read_frame 调用方按错误类型分流（fatal 关 conn vs
+//    skip-frame 续读）
+// 3. 单测可借 `tokio::io::DuplexStream` 等 mock 流走 codec 路径（不依赖
+//    QUIC 握手）—— 这是 `generic S: AsyncWrite + AsyncRead + Unpin` 的核心
+//    收益
+//
+// 与 bak `mousehop/src/quic_transport.rs:2157-2219 write_frame / read_frame`
+// 完全对齐（PLAN §5.2 搬运基线）。
+
+/// 把 `ProtoEvent` 编码成**长度前缀帧**写到任意 `AsyncWrite` 流（STEP-5.2
+/// 引入）。
+///
+/// 帧格式：`[u32 BE length][bytes...]`
+///
+/// 1. `From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize)` 编码到定长
+///    buffer，返回 `(buf, len)` —— `buf` 后部 0 填充
+/// 2. `write_u32(len as u32).await` 写 4 字节长度前缀（BE 字节序）
+/// 3. `write_all(&buf[..len]).await` 写 `len` 个有效字节
+///
+/// **为什么用 `MAX_EVENT_SIZE` 作为 buffer 上限？** —— 当前
+/// `lan-mouse-proto` 所有 `ProtoEvent` 变体都是定长 codec，编码后长度 ≤
+/// 21 字节；buffer 后部 0 填充不影响 `ProtoEvent::try_from` 解码（解码时
+/// 只看前 `len` 字节）。M2 引入变长 codec（剪贴板大负载）时另设
+/// `MAX_FRAME_SIZE` 常量替换。
+///
+/// **generic `W: AsyncWrite + Unpin`**：生产路径 `W = SendStream`（quinn
+/// 0.11 双向 stream 的写半边）；单测可以传 `tokio::io::DuplexStream`
+/// / `Vec<u8>` 等本地类型跑 codec 路径。
+///
+/// **失败传播**：写 IO 错误归 [`Error::HelloFailed`]（保留 STEP-3.2 的
+/// 错误语义独立于 codec）—— 长度字段写失败 = 流已断，与 read 端的
+/// [`Error::Truncated`] 对称（不同变体承载不同语义）。
+///
+/// dead_code chain：STEP-5.3 独立读 task 写入时消费；STEP-5.4
+/// `PeerSession::run()` 接入时消费；STEP-6.x `LanMouseConnection::send()`
+/// 经 `route_input()` 分派后消费（事件 → write_frame）。
+#[allow(dead_code)]
+pub async fn write_frame<W>(send: &mut W, event: &ProtoEvent) -> std::result::Result<(), Error>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
+    send.write_u32(len as u32)
+        .await
+        .map_err(|e| Error::HelloFailed(format!("write frame length: {e}")))?;
+    send.write_all(&buf[..len])
+        .await
+        .map_err(|e| Error::HelloFailed(format!("write frame body: {e}")))?;
+    Ok(())
+}
+
+/// 从任意 `AsyncRead` 流读**长度前缀帧**并解码为 `ProtoEvent`（STEP-5.2
+/// 引入）。
+///
+/// 帧格式：`[u32 BE length][bytes...]`
+///
+/// 1. `read_u32().await` 读 4 字节长度前缀（BE 字节序）→ `len`
+/// 2. `len > MAX_EVENT_SIZE` → `Err([`Error::FrameTooLarge`]`(len))`（防 DoS）
+/// 3. `read_exact(&mut buf[..len]).await` 读 `len` 个有效字节
+/// 4. `ProtoEvent::try_from(buf)` 解码
+///
+/// **错误归一**（与 STEP-3.2 `read_hello_frame` 区分）：
+/// - `FrameTooLarge(usize)` —— 透传，专属变体（reader task 据此 fatal 关 conn）
+/// - `Truncated` —— `read_exact` 失败（quinn `UnexpectedEof` /
+///   `ClosedStream` 表示对端半途关流）→ fatal（不 skip-frame 续读）
+/// - `HelloFailed(msg)` —— 长度字段读失败 / `ProtoEvent::try_from` 失败
+///   → 保留 STEP-3.2 语义独立于 codec
+///
+/// **为什么 buffer 后部不裁剪？** —— `ProtoEvent::try_from` 的签名是
+/// `fn try_from([u8; MAX_EVENT_SIZE]) -> Result<Self, _>`，传
+/// `&buf[..len]` 编译不过。`read_exact` 只写 buffer 前部（后部 0 不变），
+/// 符合 `ProtoEvent` 定长 codec 假设（解码只看有效字段长度，不依赖尾部 0）。
+///
+/// **generic `R: AsyncRead + Unpin`**：与 [`write_frame`] 对称——生产
+/// `R = RecvStream` / 单测 `tokio::io::DuplexStream`。
+///
+/// dead_code chain：STEP-5.3 独立读 task 读取时消费（stream A / B / C
+/// reader）；STEP-5.4 `read_loop` 接手后消费；STEP-6.x
+/// `listen.rs::read_loop` 接入时消费。
+#[allow(dead_code)]
+pub async fn read_frame<R>(recv: &mut R) -> std::result::Result<ProtoEvent, Error>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let len = recv
+        .read_u32()
+        .await
+        .map_err(|e| Error::HelloFailed(format!("read frame length: {e}")))? as usize;
+    if len > MAX_EVENT_SIZE {
+        return Err(Error::FrameTooLarge(len));
+    }
+    let mut buf = [0u8; MAX_EVENT_SIZE];
+    match recv.read_exact(&mut buf[..len]).await {
+        Ok(()) => {}
+        // 对端半途关流 → 截断（区别于"解码失败 HelloFailed"）
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(Error::Truncated);
+        }
+        Err(e) => {
+            return Err(Error::HelloFailed(format!(
+                "read frame body ({len} bytes): {e}"
+            )));
+        }
+    }
+    ProtoEvent::try_from(buf).map_err(|e| Error::HelloFailed(format!("decode frame: {e}")))
 }
 
 /// **STEP-2.6 客户端 TOFU（Trust On First Use）fingerprint pinning verifier**。
@@ -2817,5 +3138,124 @@ mod tests {
         drop(client_session);
         client_ep.wait_idle().await;
         let _ = std::fs::remove_dir_all(&pins_dir);
+    }
+
+    // === STEP-5.2 长度前缀帧 codec 单测 =====================================
+    //
+    // **测试目标**：不依赖 QUIC 握手，借 `tokio::io::duplex` mock 出
+    // `AsyncRead + AsyncWrite + Unpin` 的双向流（满足 `write_frame` /
+    // `read_frame` 的 generic bound），让 codec 在 in-process 内闭环。
+    //
+    // 这种测试**不**走 14 DTLS errors 阻塞路径 —— 与 STEP-1.4 /
+    // STEP-2.2 / STEP-5.1 那些依赖真实 QUIC 握手的测试不同（见
+    // SUGGESTION #S-5），本测试**理论上**在 14 errors 修复前能跑通
+    // —— 但 `lan-mouse` lib 整体编译失败仍阻塞 test target 链接
+    // （test target 与 lib 同编译单位）；STEP-6.x 修 errors 后 Leader
+    // 手动跑 `cargo test -p lan-mouse frame_*` 确认（与 SUGGESTION
+    // #S-5 模式一致，但本测试本身**不**依赖 QUIC 握手）。
+
+    /// STEP-5.2 验收 (1/2)：codec round-trip ——
+    /// `write_frame(send, &event)` → `read_frame(&mut recv)` 还原出同一
+    /// event。
+    ///
+    /// 多种事件类型覆盖：
+    /// - `ProtoEvent::Ping`（0 字节有效负载）→ `len = 0`
+    /// - `ProtoEvent::Hello { magic, commit }`（17 字节）
+    /// - `motion_event()`（Input(Pointer::Motion)，21 字节定长）
+    ///
+    /// **不依赖 QUIC**：用 `tokio::io::duplex` 拼一对 `AsyncRead +
+    /// AsyncWrite + Unpin` 的 mock 流（满足 `write_frame` / `read_frame`
+    /// generic bound），让 codec 在 in-process 内闭环。
+    ///
+    /// 验证：写端用 `write_frame` 编码 → 读端用 `read_frame` 解码 → 断言
+    /// 解码结果与原 event 一致（用 `format!("{:?}", ...)` 字符串比对，
+    /// 与 bak `mousehop/src/quic_transport.rs:4469-4480 frame_round_trip`
+    /// 完全一致）。
+    #[tokio::test]
+    async fn frame_round_trip() {
+        // (1) 借 duplex mock 出双向流（write_half / read_half 都满足
+        //     `AsyncRead + AsyncWrite + Unpin` —— tokio 1.x 默认实现）
+        let (mut write_half, mut read_half) = tokio::io::duplex(4096);
+
+        // (2) 客户端写 3 帧
+        let events = vec![
+            ProtoEvent::Ping,
+            ProtoEvent::hello([0xab; 8]),
+            motion_event(),
+        ];
+        let events_clone = events.clone();
+        let writer = tokio::spawn(async move {
+            for event in &events_clone {
+                write_frame(&mut write_half, event)
+                    .await
+                    .expect("write_frame 应成功");
+            }
+            // 不 finish —— duplex 半边 drop 时另一端 read_exact 立刻收到
+            // UnexpectedEof（codec 测试不依赖对端 ack）
+        });
+
+        // (3) 读端顺序读 3 帧
+        for expected in &events {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(2), read_frame(&mut read_half))
+                .await
+                .expect("read_frame timeout")
+                .expect("read_frame 应成功");
+            let expected_dbg = format!("{expected:?}");
+            let got_dbg = format!("{got:?}");
+            assert_eq!(
+                got_dbg, expected_dbg,
+                "codec round-trip 后事件应一致：expected {expected_dbg}, got {got_dbg}"
+            );
+        }
+
+        writer.await.expect("writer task");
+    }
+
+    /// STEP-5.2 验收 (2/2)：body 截断时 `read_frame` 应返回
+    /// [`Error::Truncated`]（对端半途关流 → fatal，**不**归 HelloFailed）。
+    ///
+    /// 构造截断帧：写 `u32 BE = 17`（Hello 实际字节数）+ 8 字节 body（缺 9
+    /// 字节）+ close。读端 `read_exact(&mut buf[..17])` 读到 8 字节后 EOF
+    /// → `ErrorKind::UnexpectedEof` → 本步 `read_frame` 内部 match
+    /// `UnexpectedEof` → 返回 [`Error::Truncated`]。
+    ///
+    /// 与 bak `mousehop/src/quic_transport.rs:4596-4681 frame_truncated_rejected`
+    /// 完全对齐（消息前缀从 bak 的 `HelloFailed("read frame body ...")`
+    /// 升级为本步 [`Error::Truncated`]，区分 fatal vs decode-failure）。
+    #[tokio::test]
+    async fn frame_truncated_rejected() {
+        let (mut write_half, mut read_half) = tokio::io::duplex(4096);
+
+        // (1) 写截断帧：4 字节 len = 17 + 8 字节 body（缺 9 字节）
+        let writer = tokio::spawn(async move {
+            write_half
+                .write_u32(17)
+                .await
+                .expect("write length prefix");
+            write_half
+                .write_all(&[0u8; 8])
+                .await
+                .expect("write truncated body");
+            // 关闭写半边让读端 read_exact 收到 UnexpectedEof
+            drop(write_half);
+        });
+
+        // (2) read_frame 应返回 Err(Error::Truncated)
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_frame(&mut read_half),
+        )
+        .await
+        .expect("read_frame 总超时不应触发");
+
+        match result {
+            Err(Error::Truncated) => {
+                // 期望路径：对端半途关流 → Truncated
+            }
+            Err(other) => panic!("错误应为 Error::Truncated，实际：{other:?}"),
+            Ok(event) => panic!("截断帧 read_frame 不应成功，实际解码为 {event:?}"),
+        }
+
+        writer.await.expect("writer task");
     }
 }
