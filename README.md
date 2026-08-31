@@ -423,6 +423,43 @@ port = 4242
 
 Where `left` can be either `left`, `right`, `top` or `bottom`.
 
+### Input channels (Stream vs Datagram)
+
+Each client can independently choose how mouse buttons and keyboard events are
+transported over the QUIC connection:
+
+| Field | Values | Default |
+| --- | --- | --- |
+| `input_channels.mouse_button` | `"stream"` / `"datagram"` | `"datagram"` |
+| `input_channels.keyboard` | `"stream"` / `"datagram"` | `"stream"` |
+
+The two modes trade reliability for latency:
+
+- **Stream 模式不丢操作** (`"stream"`) — events are sent over a reliable,
+  ordered QUIC stream. The receiver is guaranteed to see every event in the
+  order it was sent, but the stream's in-order delivery can stall and add
+  ~200ms+ of latency when packets are reordered or retransmitted on the
+  network. Use this when correctness matters more than freshness — e.g. when
+  one missed key press would leave a sticky modifier on the receiver.
+- **Datagram 模式丢操作** (`"datagram"`) — events are sent as individual
+  QUIC datagrams. They reach the receiver with the lowest possible latency
+  but, like UDP, individual packets can be dropped silently when the path
+  is congested. Use this when freshness matters more than completeness —
+  e.g. for mouse button clicks while dragging, or for low-latency typing.
+
+Mouse motion (pointer movement, scroll wheels, axis ticks) **always** uses
+datagrams regardless of this setting — frequent stale motion events are
+useless, so a dropped motion is preferable to one that arrives late.
+
+The GTK peer editor exposes the same two choices as dropdowns labelled
+`Mouse button channel` and `Keyboard channel`. Changing a dropdown sends a
+single IPC update that atomically writes both fields, so the on-disk
+`config.toml` never observes a partial edit (mouse changed but keyboard
+not yet).
+
+If the `input_channels` key is omitted entirely, lan-mouse uses the
+defaults shown above — no migration is needed for existing config files.
+
 ## Roadmap
 - [x] Graphical frontend (gtk + libadwaita)
 - [x] respect xdg-config-home for config file location.

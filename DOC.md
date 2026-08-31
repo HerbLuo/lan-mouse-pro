@@ -75,3 +75,25 @@ This ensures that
 - b) As soon as a virtual input enters another client, lan-mouse will stop receiving events,
 which ensures clients can only be controlled directly and not indirectly through other clients.
 
+## Configuration
+
+The runtime configuration lives in `$XDG_CONFIG_HOME/lan-mouse/config.toml`
+(defaults to `~/.config/lan-mouse/config.toml`) and is read on daemon /
+CLI / GTK startup. The GTK frontend and the `lan-mouse cli` command
+mutate the same file in place.
+
+The authoritative, up-to-date schema and worked example are documented
+in the project's `README.md` under the **Configuration** section:
+
+- The full example config (release bind, port, `authorized_fingerprints`,
+  each `[[clients]]` block) is reproduced there verbatim.
+- Per-client input channel modes (`input_channels.mouse_button`,
+  `input_channels.keyboard`) — the trade-off between **Stream 模式不丢操作**
+  and **Datagram 模式丢操作** — are also described there, alongside the
+  fact that **mouse motion always uses datagrams regardless of this
+  setting**.
+
+If you change `config.toml` while lan-mouse is running, restart the
+daemon (or click the GTK frontend's refresh, when available) for the
+new values to take effect; the file is not watched for live edits.
+
