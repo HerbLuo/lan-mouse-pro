@@ -7,7 +7,7 @@
 //! - STEP-1.4（已）：[`endpoint`] —— UDP socket bind + 占位 client-mode Endpoint
 //! - STEP-2.1（已）：[`build_quic_client_config`] + [`install_crypto_provider`]
 //! - STEP-2.2（已）：[`dial`] —— QUIC TLS 1.3 握手完成（占位 verifier）
-//! - STEP-2.3 / 2.4：`accept()` / `endpoint_with_cert()`
+//! - STEP-2.3（已）：[`accept`] —— 接受 incoming QUIC 握手（占位 ServerConfig）
 //! - STEP-2.4：`endpoint_with_cert()` 持久化 cert 注入
 //! - STEP-2.6 / 2.7：`TofuVerifier` / `AuthorizedKeysVerifier`
 //! - STEP-3.2：`client_hello` / `server_hello` 握手
@@ -301,6 +301,53 @@ pub async fn dial(
     let conn = ep
         .connect_with(cfg, addr, "lan-mouse")?
         .await?;
+    Ok(conn)
+}
+
+/// 接受一条 incoming QUIC 握手连接，完成 TLS 1.3 后返回原始 [`Connection`]。
+///
+/// **STEP-2.3 占位**：与 [`dial`] 对称 —— 当前仅返回握手完成的
+/// `quinn::Connection`（不做 Hello 协议握手，那是 STEP-3.2）；
+/// STEP-5.4 起由 `PeerSession::run()` 接管，后续会包成 `PeerSession`。
+///
+/// **两步式握手**：
+/// 1. `ep.accept().await` 返回 `Option<Incoming>` —— `None` 表示
+///    endpoint 已关闭（典型场景：listener 主动 drop / runtime 退出）；
+///    wrap 成 [`Error::EndpointSetup`]，让 caller 能区分"endpoint 退出"
+///    vs "握手失败"
+/// 2. `incoming.await` 返回 `Result<Connection, ConnectionError>` —— 证
+///    书校验 / ALPN / 中断 / TLS 错误一律归到 [`Error::Handshake`]（已
+///    有 `#[from]` 派生，`?` 直接转换）
+///
+/// **占位 ServerConfig 注意**：当前 [`endpoint`] 是 client-mode
+/// （`None::<ServerConfig>`，见 STEP-1.4 占位说明），即 `ep.accept()`
+/// **永远等不到** incoming —— 这是 STEP-2.4 `endpoint_with_cert()` 的工
+/// 作。本步先实现 `accept()` 公共函数 + 错误归一；STEP-2.4 注入真 server
+/// cert 后，调用方（`listen.rs` supervisor）才能真正拿到 `Connection`。
+/// 测试路径由 STEP-2.2 已就位的 `endpoint_with_test_cert()` 测试 helper
+/// 内联 server endpoint（已含 `Some(server_cfg)`），`accept()` 的内部
+/// 逻辑（`ep.accept().await?.await?`）不变，与 bak
+/// `mousehop/src/quic_transport.rs:2040-2044` 模式完全对齐。
+///
+/// **错误归一**：
+/// - endpoint 已关闭 → [`Error::EndpointSetup`]（复用现有变体，避免新增）
+/// - 握手失败 → [`Error::Handshake`]（`#[from] quinn::ConnectionError`）
+///
+/// **`#[allow(dead_code)]`**：与 [`dial`] 对称 —— STEP-2.3 仅被
+/// STEP-2.2 测试 helper 间接覆盖（in-process server 调
+/// `endpoint.accept().await.await`），未在 main-code 出现；
+/// STEP-6.2 `listen.rs::read_loop` 改造时 `accept()` 切换为真正的
+/// caller，dead_code 自动消失。
+///
+/// **不**主动 `install_crypto_provider`：与 [`dial`] 对称，caller 已在
+/// main 启动期守护过。
+#[allow(dead_code)]
+pub async fn accept(ep: &Endpoint) -> Result<Connection> {
+    let incoming = ep
+        .accept()
+        .await
+        .ok_or_else(|| Error::EndpointSetup("endpoint closed (accept returned None)".into()))?;
+    let conn = incoming.await?;
     Ok(conn)
 }
 
