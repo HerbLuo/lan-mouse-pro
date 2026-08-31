@@ -426,4 +426,9 @@ inline `open_uni() + write_all() + finish()`（不缓存、不复用、不带
 
 **STEP-5.3 闭环**：Reliable 类阻塞 sender 已落实 + 单测验证；Datagram 类策略留 STEP-5.4 续治。本条目进入"待 Leader 评审后删除"状态（STEP-5.4 完成后一起删）。
 
+**STEP-5.4 闭环（2026-08-31）**：
+- `datagram_reader_task` 实现"丢最旧"策略（`try_send` 失败 → `try_recv` 拿最旧 → 再 `try_send` → 8 次上限防活锁）
+- `READ_STREAM_BUFFER_CAP` doc 表更新：Reliable 阻塞 sender ✅ / Datagram 丢最旧 ✅ / Control 由 caller 自然阻塞读
+- 本条目进入"待 Leader 评审后删除"状态（建议 Leader 评审后删）
+
 **优先级**：🟡 中（SUGGESTION #28 治理部分消化，STEP-5.4 续治）

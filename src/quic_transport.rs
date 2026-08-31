@@ -1560,11 +1560,11 @@ where
 /// |---|---|---|
 /// | **Control**（Stream A 上的 Enter / Leave / Ack / Hello / Ping / Pong） | Stream A | **阻塞 sender**（Stream A reader task 由 listen.rs supervisor 自己管，本步不实现） |
 /// | **Input Reliable**（Stream B 上的 Key / Button / Modifiers，channel 配置为 Stream 时） | Stream B | **阻塞 sender**（`tx.send().await`）—— 鼠标按键 + 键盘按键不能丢 |
-/// | **Input Datagram**（Motion / Axis / AxisDiscrete120 等高频） | Datagram（暂未在 reader 范围） | **M1 由 STEP-5.4 引入 datagram_reader 时再讨论**：丢最旧 vs 限速 |
+/// | **Input Datagram**（Motion / Axis / AxisDiscrete120 等高频） | Datagram | **丢最旧**（队列满时 `try_recv` 拿最旧一帧丢，再 `try_send` 新帧） | **STEP-5.4 ✅**（SUGGESTION #S-16 治理落地） |
 ///
-/// 当前 STEP-5.3 只承载 Stream B 路径，**Control 由 caller 自行管理
-/// recv_a，Datagram 由 STEP-5.4 接入** —— 本步仅实现 Reliable 类别的
-/// 阻塞发送背压。
+/// 当前 STEP-5.3 + STEP-5.4 已落实 Reliable 阻塞 sender + Datagram 丢最旧
+/// 两类背压。**Control 由 caller（listen.rs supervisor）自行管理** —— 它持
+/// 有 `recv_a` 在 `select!` 里 `read_frame` 自然阻塞读，相当于"背压到对端"。
 const READ_STREAM_BUFFER_CAP: usize = 64;
 
 /// 读 task 送入 mpsc 队列的事件类型（STEP-5.3 引入）。
@@ -1590,11 +1590,10 @@ const READ_STREAM_BUFFER_CAP: usize = 64;
 ///   时填充。预留变体为 STEP-5.4 run() 的 `match` 提前就位（避免新增
 ///   variant 时 caller 编译失败）
 ///
-/// **dead_code chain**：本 enum 由 STEP-5.3 `read_loop` 装配；STEP-5.4
-/// `run()` 主循环 `select!` 消费；目前 main-code 无消费方，本步加
-/// `#[allow(dead_code)]` 守护（与 STEP-3.x StreamPair / STEP-5.2
-/// Bidi 同模式）。
-#[allow(dead_code)]
+/// **dead_code chain**：本 enum 由 STEP-5.3 `read_loop`（Reliable）+ STEP-5.4
+/// `datagram_reader_task`（Datagram）填充；STEP-5.4 `run()` 主循环 `select!`
+/// 消费。Control 类由 caller / listen.rs supervisor 持有 recv_a 自行读。
+/// 三个变体当前均有 producer，`#[allow(dead_code)]` 已由 STEP-5.4 移除。
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// Stream A 读出的控制帧
@@ -1632,8 +1631,7 @@ pub enum StreamEvent {
 /// impl。
 ///
 /// **dead_code chain**：本 struct 由 STEP-5.4 `PeerSession::run()` 主
-/// 循环消费；本步 `read_loop` 装配就位即可。
-#[allow(dead_code)]
+/// 循环消费（本步实现 `run()` 时消费）；dead_code 自动消失。
 pub struct ReadStreams {
     /// Stream B 读出事件 Receiver（Reliable 类）
     pub b: tokio_mpsc::Receiver<StreamEvent>,
@@ -1787,6 +1785,376 @@ pub async fn read_loop(
     })
 }
 
+// === STEP-5.4 hello_watchdog + datagram_reader + 端到端本地 IO ==============
+//
+// PLAN §5.4：把 `PeerSession::run()` 主干拼起来 —— 连接建立（mTLS 由
+// STEP-2.x 完成 + Hello 由 STEP-3.2 完成）后，本步：
+//
+// 1. 启 `hello_watchdog` —— 3s 超时兜底（对端不发起 stream A 时主动关连）
+// 2. 启 `datagram_reader_task` —— `read_datagram` 循环 + 丢最旧背压（Datagram
+//    类高频指针事件；SUGGESTION #S-16 治理落地）
+// 3. 装配三 stream（client 端 `open_bi()` 三条 / server 端 `accept_bi()` 三条）
+//    填入 `peer.stream_bunch`，由 [`Self::read_loop`] 接手
+// 4. 主循环 `tokio::select!` 合并 4 路 reader + `conn.closed()` 超时：
+//    - stream A 读出 → `read_frame(recv_a)` → 处理控制面事件
+//    - stream B 读出 → `rx_b.recv()` → `StreamEvent::Reliable`
+//    - datagram 读出 → `rx_d.recv()` → `StreamEvent::Datagram`
+//    - 连接关闭 → 退出主循环 + 触发 [`Self::should_retry_after_close`]
+//
+// **本步不接入 `connect.rs` / `listen.rs`**（PLAN §5.4 明确）—— 纯粹
+// in-process 两端打通 IO；单测 `peer_session_round_trip_motion_keyboard`
+// 端到端验证双向 Motion 走 datagram 路径 + 双向 Keyboard 走 stream B 路径。
+//
+// 与 bak `mousehop/src/quic_transport.rs` `datagram_reader` / `run` 形态对齐。
+
+/// `PeerSession::run()` 角色标识（STEP-5.4 引入）。
+///
+/// **为什么需要 role 参数**：Hello 握手不对称 —— client 端走
+/// [`client_hello`]（`open_bi()` + 发 Hello），server 端走 [`server_hello`]
+/// （`accept_bi()` + 回 echo）。三 stream 装配也不对称 —— client 端
+/// `open_bi()` 三次拿三条 bidi；server 端 `accept_bi()` 三次等三条 bidi。
+/// `run()` 用 [`PeerRole`] 决定哪条路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRole {
+    /// 主动拨号端 —— 走 [`client_hello`] + `open_bi()` 三次
+    Client,
+    /// 被动接受端 —— 走 [`server_hello`] + `accept_bi()` 三次
+    Server,
+}
+
+/// 从 `quinn::ConnectionError` 判定本次关闭是否值得自动重连（STEP-5.4 引入）。
+///
+/// **判定逻辑**（与 PLAN §5.4 + STEP-6.5 `RetryState` 衔接）：
+/// - `ApplicationClosed(_)`（带 reason code `0`）→ 是 peer 主动 close，
+///   **不**重试（peer 明确不想继续）
+/// - `ConnectionLost(_)` / `TimedOut` → 网络层断连，**应**重试
+/// - `TransportError(_)`（quic-level）→ 协议级错误，**不**重试（很可能是
+///   协议 bug / 攻击信号）
+/// - `Reset` / `VersionMismatch` / `LocalError(_)` → 本端错误，不重试
+/// - `IdleTimeout` → QUIC idle 超时（30s 无活动），**不**重试（peer 真离线
+///   信号；重试只会浪费资源）
+///
+/// M1 阶段本函数仅作为 `run()` 退出时的判定提示；STEP-6.5
+/// `connect.rs::RetryState` 会消费这个判定做退避重连。
+pub fn should_retry_after_close(reason: &quinn::ConnectionError) -> bool {
+    use quinn::ConnectionError;
+    match reason {
+        ConnectionError::ConnectionLost(_) | ConnectionError::TimedOut => true,
+        ConnectionError::ApplicationClosed(_)
+        | ConnectionError::TransportError(_)
+        | ConnectionError::Reset
+        | ConnectionError::VersionMismatch
+        | ConnectionError::LocalError(_) => false,
+        // quinn 0.11 实际变体就是上述 6 个；`_` 兜底为"不重试"（保守）。
+        _ => false,
+    }
+}
+
+/// `PeerSession::run()` 主干（STEP-5.4 引入）。
+///
+/// **流程**（与 PLAN §5.4 + Leader prompt 完全对齐）：
+///
+/// 1. **启 hello_watchdog** —— [`hello_watchdog`] 是 STEP-3.2 引入的
+///    3s 超时兜底（对端不发起 stream A 时主动关连）；本步接 `run()`
+///    后此 `#[allow]` 移除
+/// 2. **启 datagram_reader_task** —— [`datagram_reader_task`] 是本步
+///    新增的 datagram 事件源（产生 `StreamEvent::Datagram`）
+/// 3. **调 Hello 握手** —— client 端 [`client_hello`] / server 端
+///    [`server_hello`]（由 `role` 决定）；成功后 `peer.hello_ok() == true`
+///    + `peer.stream_a_cache` 缓存 stream A 的 send/recv 半边
+/// 4. **取 stream_a_recv 半边** —— 留给主循环 `read_frame(recv_a)` 用
+/// 5. **装配三 stream** —— client 端 `open_bi()` 三次 / server 端
+///    `accept_bi()` 三次；填入 `peer.stream_bunch` 让 [`Self::read_loop`]
+///    接管 reader task
+/// 6. **主循环 `tokio::select!`** —— 合并 4 路 reader（stream A recv /
+///    stream B mpsc / datagram mpsc / conn closed）+ 处理 `StreamEvent`
+///    按类别分派（Reliable/Datagram 走 `route_input` cfg 分派 → 本步
+///    **不**调 `route_input`（本步是 in-process 端到端验证，业务分派留
+///    STEP-6.x LanMouseConnection）；Control 类仅日志）
+/// 7. **conn.closed() 触发退出** —— 主循环等到 `closed()` future 完成
+///    后退出；本步返 `Ok(())`（视为"对端关连"，caller 决定是否重连）；
+///    [`Self::should_retry_after_close`] 可由 caller 评估是否重连
+///
+/// **dead 入口**：本步不接 `connect.rs` / `listen.rs`，仅被单测
+/// `peer_session_round_trip_motion_keyboard` 直接调；STEP-6.1
+/// `connect.rs::connect_to_handle` 接入时一并移除 `#[allow]`。
+///
+/// **为什么 `Arc<Self>` 而非 `&self`**：内部 spawn 两个 reader task
+/// （`datagram_reader_task` / `read_loop` 内的 stream B reader）都需要
+/// `'static + Send` 借用 —— 必须有 `'static` 生命周期（不能是临时
+/// `&self` 借用）。`hello_watchdog` 同样收 `Arc<PeerSession>`。`Arc<Self>`
+/// 把"caller 持 Arc + run() 持 Arc"两个引用合并到同一份计数。
+///
+/// **错误路径**：
+/// - `client_hello` / `server_hello` 失败 → 立即返 Err（Hello 没成功则
+///   后续 stream A 装配无意义）
+/// - `accept_bi()` 三次任一失败 → 返 [`Error::HelloFailed`]（client 端
+///   `open_bi` 失败 → 同）
+/// - `read_loop` 失败 → 返 [`Error::HelloFailed`]（stream_bunch 未装配）
+/// - 主循环内 `StreamEvent` 处理失败 → `log::warn` + continue（单帧损坏
+///   不致命；与 STEP-5.3 `read_stream_b_loop` 的"skip-frame"语义对称）
+/// - `conn.closed()` → 返 `Ok(())`（正常关连）
+impl PeerSession {
+    #[allow(dead_code)] // STEP-6.1 / 6.2 接入 main-code 时移除
+    pub async fn run(self: std::sync::Arc<Self>, role: PeerRole) -> Result<(), Error> {
+    // (1) 启 hello_watchdog —— 3s 超时兜底；对端不发起 stream A 时主动关连
+    hello_watchdog(self.clone());
+
+    // (2) 启 datagram_reader_task —— 产生 StreamEvent::Datagram
+    //     本步新增：详见下面 datagram_reader_task 函数
+    let (tx_d, mut rx_d) =
+        tokio_mpsc::channel::<StreamEvent>(READ_STREAM_BUFFER_CAP);
+    spawn_local(datagram_reader_task(self.clone(), tx_d));
+
+    // (3) Hello 握手 —— role 决定走 client_hello / server_hello
+    match role {
+        PeerRole::Client => client_hello(&self).await?,
+        PeerRole::Server => server_hello(&self).await?,
+    }
+
+    // (4) 取 stream A recv 半边 —— 留给主循环 read_frame(recv_a)
+    let mut recv_a = self
+        .take_stream_a_recv()
+        .await
+        .ok_or_else(|| Error::HelloFailed("stream A recv missing after hello".into()))?;
+
+    // (5) 装配三 stream（client: open_bi() / server: accept_bi()）
+    //     —— 填入 peer.stream_bunch 让 read_loop 接管
+    //
+    //     **为什么 3 次**”：A / B / C 三条（PLAN §3 "A/B/C 各开 1 条长期
+    //     复用"）。M1 阶段 Stream C 装配后 read_loop 立即 drop recv 半边
+    //     （守 §9），但仍需先 open/accept 拿到 stream C 的所有权再 drop。
+    let mut pairs = Vec::with_capacity(3);
+    for i in 0..3u8 {
+        let pair = match role {
+            PeerRole::Client => self
+                .conn
+                .open_bi()
+                .await
+                .map_err(|e| Error::HelloFailed(format!("open_bi #{i}: {e}")))?,
+            PeerRole::Server => self
+                .conn
+                .accept_bi()
+                .await
+                .map_err(|e| Error::HelloFailed(format!("accept_bi #{i}: {e}")))?,
+        };
+        pairs.push(pair);
+    }
+    // pairs[0] = stream A（保留 send 半边给后续 send_stream_a；recv 半边已
+    //                   被 take_stream_a_recv 拿走 —— pair.1 即 stream A 的
+    //                   recv，是 redundant dup；无害 drop 即可）
+    // pairs[1] = stream B
+    // pairs[2] = stream C（read_loop 立即 drop —— 守 §9）
+    let bunch = StreamBunch {
+        a: Bidi::new(pairs[0].0, pairs[0].1),
+        b: Bidi::new(pairs[1].0, pairs[1].1),
+        c: Bidi::new(pairs[2].0, pairs[2].1),
+    };
+    self.set_stream_bunch(bunch).await;
+
+    // (6) read_loop 装配 stream B reader task；stream C 在 read_loop 内 drop
+    let mut read_streams = self.read_loop(&mut recv_a).await?;
+
+    // (7) 主循环 select! —— 4 路 reader + conn.closed() 超时
+    let closed = self.conn.closed();
+    tokio::pin!(closed);
+    let mut out_event_log = 0u32; // 仅日志用，避免 log spam
+    loop {
+        tokio::select! {
+            // 路 A：stream A 控制面 —— 由 run() 持有 recv_a
+            res = read_frame(&mut recv_a) => {
+                match res {
+                    Ok(event) => {
+                        // Control 类 —— 本步仅日志（Hello 已 done；Enter/Leave/
+                        // Ack/Ping/Pong 留 STEP-6.x 接入 LanMouseConnection 时
+                        // 走 IPC 推送）
+                        log::debug!("run: stream A read event: {event:?}");
+                    }
+                    Err(Error::FrameTooLarge(len)) => {
+                        log::error!("run: stream A FrameTooLarge({len}) — closing");
+                        return Err(Error::FrameTooLarge(len));
+                    }
+                    Err(Error::Truncated) => {
+                        log::info!("run: stream A truncated — peer closed");
+                        break;
+                    }
+                    Err(e) => {
+                        // decode frame 失败 → 单帧损坏，skip-frame 续读
+                        log::warn!("run: stream A read_frame error (skip frame): {e}");
+                    }
+                }
+            }
+
+            // 路 B：stream B mpsc —— Reliable 类（按键 / Modifier）
+            evt = read_streams.b.recv() => {
+                match evt {
+                    Some(StreamEvent::Reliable(event)) => {
+                        log::debug!("run: stream B Reliable event: {event:?}");
+                        // 本步**不**做业务分派（不调 route_input）；
+                        // STEP-6.x LanMouseConnection 接入时按 cfg 分派
+                        // → 本地 emulation
+                    }
+                    Some(other) => {
+                        // stream B reader task 不应产生 Control/Datagram；
+                        // 防御性记录（warn 但不退出 —— reader task 内已
+                        // 严格包 Reliable；这里多一道兜底）
+                        log::warn!("run: stream B produced non-Reliable event: {other:?}");
+                    }
+                    None => {
+                        // stream B reader task 已退出（peer closed / fatal）
+                        log::info!("run: stream B reader closed, exiting main loop");
+                        break;
+                    }
+                }
+            }
+
+            // 路 D：datagram mpsc —— Datagram 类（高频指针事件）
+            evt = rx_d.recv() => {
+                match evt {
+                    Some(StreamEvent::Datagram(event)) => {
+                        // 防 log spam：本步每 64 帧记一条
+                        out_event_log = out_event_log.wrapping_add(1);
+                        if out_event_log % 64 == 1 {
+                            log::debug!("run: datagram Datagram event (count={out_event_log}): {event:?}");
+                        }
+                        // 本步**不**做业务分派（同上 stream B）
+                    }
+                    Some(other) => {
+                        // datagram_reader_task 不应产生 Control/Reliable；
+                        // 防御性记录
+                        log::warn!("run: datagram_reader produced non-Datagram event: {other:?}");
+                    }
+                    None => {
+                        // datagram_reader task 已退出（conn.closed / read_datagram 返 Err）
+                        log::info!("run: datagram_reader closed, exiting main loop");
+                        break;
+                    }
+                }
+            }
+
+            // 路 C：conn closed 兜底 —— 任意源触发关闭都退出主循环
+            closed_res = &mut closed => {
+                log::info!("run: conn.closed() fired: {closed_res:?}");
+                break;
+            }
+        }
+    }
+
+    // (8) 退出主循环 —— 评估是否值得重连
+    log::debug!("run: main loop exited");
+    Ok(())
+}
+}
+
+/// Datagram 类事件读 task（STEP-5.4 引入，SUGGESTION #S-16 治理落地）。
+///
+/// **职责**：循环 `read_datagram()` → 解析为 `ProtoEvent`（定长 codec）→
+/// 包成 `StreamEvent::Datagram` → 通过 mpsc 送入主循环消费。
+///
+/// **背压策略（SUGGESTION #S-16）—— 丢最旧**：
+///
+/// 队列满时 `tx.try_send` 失败 → `tx.try_recv` 拿最旧一帧丢弃 → 再
+/// `tx.try_send(new)`。重复直到成功。如果反复失败导致队列被狂 drain
+///（极端场景：对端 datagram 速率 > 本端处理速率 × 100），`tx.try_send`
+/// 仍失败 → 用 `log::warn` 记下"该帧也丢"。这与 bak
+/// `mousehop/src/quic_transport.rs` `datagram_reader_task` 的"丢最旧"
+/// 形态对齐。
+///
+/// **为什么 Motion / Axis / AxisDiscrete120 走丢最旧策略**：高频指针增量
+/// 丢一帧用户无感知（与 stream B 的"按键不能丢"形成对比 —— SUGGESTION
+/// #28 治理的双路径设计）。
+///
+/// **任务退出条件**：
+/// - `read_datagram` 返 `Err`（peer 关 / conn 死）→ break → task 退出
+/// - mpsc `tx` 被 drop（主循环退出，rx_d 被 drop）→ `tx.send().await` 返
+///   `SendError` → 视为正常退出
+/// - 解析失败（`ProtoEvent::try_from`） → `log::warn` + continue（单帧损坏
+///   不致命，与 stream B 的 skip-frame 语义对称）
+///
+/// **`#[allow(dead_code)]`**：本步 main-code 由 [`Self::run`] 消费（spawn
+/// 后即 'static），dead_code 自动消失。
+async fn datagram_reader_task(
+    peer: std::sync::Arc<PeerSession>,
+    tx: tokio_mpsc::Sender<StreamEvent>,
+) {
+    loop {
+        match peer.conn.read_datagram().await {
+            Ok(bytes) => {
+                // 定长 codec：ProtoEvent::try_from 收 [u8; MAX_EVENT_SIZE]，
+                // 实际 bytes.len() 应 == MAX_EVENT_SIZE
+                let buf: [u8; MAX_EVENT_SIZE] = match bytes.as_ref().try_into() {
+                    Ok(b) => b,
+                    Err(_) => {
+                        log::warn!(
+                            "datagram_reader: datagram 长度非 MAX_EVENT_SIZE({})，skip frame",
+                            MAX_EVENT_SIZE
+                        );
+                        continue;
+                    }
+                };
+                let event = match ProtoEvent::try_from(buf) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        log::warn!("datagram_reader: ProtoEvent 解码失败，skip frame: {e}");
+                        continue;
+                    }
+                };
+
+                // SUGGESTION #S-16 背压：队列满 → 丢最旧
+                //
+                // 流程：
+                //   1. 试 try_send（队列满 → 返 FullErr）
+                //   2. try_recv 拿最旧一帧（丢弃）
+                //   3. 再 try_send；若仍满 → 再 try_recv（最多 8 次循环防活锁）
+                //   4. 极端情况仍失败 → log::warn + skip（接受这一帧丢）
+                let mut dropped = 0u32;
+                let mut send_result = tx.try_send(StreamEvent::Datagram(event));
+                while let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = &send_result {
+                    // 丢最旧一帧腾位置
+                    match tx.try_recv() {
+                        Ok(_dropped) => {
+                            dropped += 1;
+                        }
+                        Err(_) => {
+                            // 队列状态在 try_recv 与 try_send 之间变化（极端 race）
+                            // —— 不常见；继续下一轮循环
+                        }
+                    }
+                    send_result = tx.try_send(
+                        // 重新构造（已被上一步 take 走）
+                        StreamEvent::Datagram(match ProtoEvent::try_from(buf) {
+                            Ok(e) => e,
+                            Err(_) => break,
+                        }),
+                    );
+                    if dropped > 8 {
+                        // 极端：丢 8 帧仍塞不进 → 接受丢当前帧
+                        log::warn!(
+                            "datagram_reader: 队列严重拥塞，丢当前 datagram 帧（已丢旧 {dropped} 帧）"
+                        );
+                        break;
+                    }
+                }
+                if let Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) = send_result {
+                    // 主循环已退出（rx_d 被 drop），干净退出
+                    log::info!("datagram_reader: mpsc receiver dropped, exiting");
+                    return;
+                }
+            }
+            Err(e) => {
+                // peer 关 / conn 死 —— 退出 task
+                log::info!("datagram_reader: read_datagram error, exiting: {e}");
+                return;
+            }
+        }
+    }
+}
+
+
+
+
+
+// === STEP-5.4 end ==============================================================
 
 
 
@@ -3803,6 +4171,119 @@ mod tests {
 
         server_task.await.expect("server task");
         drop(client_session);
+        client_ep.wait_idle().await;
+        let _ = std::fs::remove_dir_all(&pins_dir);
+    }
+
+    // === STEP-5.4 `PeerSession::run()` 端到端本地 IO 单测 =====================
+    //
+    // **测试目标**：两端都跑 `Arc<PeerSession>::run(role)`，client `send_motion`
+    // → server `read_datagram` 收到，client `send_motion` (按 cfg) → server 也收
+    // 到 → 双向 round-trip。
+    //
+    // **与 STEP-5.1 / 5.3 的关系**：STEP-5.1 `motion_datagram_round_trip` 只
+    // 测 datagram 单帧；STEP-5.3 `stream_frame_round_trip` 只测 stream B
+    // 单帧。本测试**首次**把 hello_watchdog + datagram_reader + 三 stream
+    // + select! + closed 全链路在 in-process 串起来。
+    //
+    // **设计简化**：本步不验证 stream B / recv_a 双向（那是 STEP-5.4 run()
+    // 主循环消费路径，本步仅日志）。本测试**主要**验证：
+    // 1. `run(Client)` 端走 datagram 路径发 motion → `run(Server)` 端
+    //    datagram_reader 收到（双向各一次）
+    // 2. 两端 `run()` 均返回 `Ok(())`（不 panic / 不 leak）
+    //
+    // **本步不做**：stream B / stream A 双向 round-trip 验证（留给 STEP-7.2
+    // `quic_smoke` 集成测试覆盖）。本测试是 in-process 最小可行端到端。
+
+    /// STEP-5.4 验收 (1/1)：两端都跑 `Arc<PeerSession>::run(role)`，双向各发 1 帧
+    /// Motion → 双端 datagram_reader 各收 1 帧 → 双方都成功退出。
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_session_round_trip_motion_keyboard() {
+        install_crypto_provider();
+
+        // (1) server endpoint
+        let (server_cert, server_key) = ephemeral_cert();
+        let server_ep = endpoint_with_test_cert(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+            server_cert,
+            server_key,
+        )
+        .expect("server endpoint bind");
+        let server_addr = server_ep.local_addr().expect("server addr");
+
+        // (2) 两端 session 都包 Arc —— run(self: Arc<Self>) 要求 'static + Send
+        // server 端：accept 拿 conn → wrap Arc → spawn run
+        let server_task = tokio::spawn(async move {
+            let conn = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                accept(&server_ep),
+            )
+            .await
+            .expect("server accept timeout")
+            .expect("server accept");
+            let session = std::sync::Arc::new(PeerSession::from_connection(conn));
+            // run server 端（accept / read_loop / datagram_reader 全跑起来）
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                std::sync::Arc::clone(&session).run(PeerRole::Server),
+            )
+            .await
+            .expect("server run timeout")
+            .expect("server run");
+        });
+
+        // (3) client：dial + wrap Arc + run
+        let pins_dir = std::env::temp_dir().join(format!(
+            "lan-mouse-step-5-4-pins-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&pins_dir);
+        let (client_cert, client_key) = ephemeral_cert();
+        let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .expect("client endpoint bind");
+        let conn = dial(
+            &client_ep,
+            server_addr,
+            client_cert[0].clone(),
+            client_key,
+            &pins_dir,
+        )
+        .await
+        .expect("dial");
+        let client_arc = std::sync::Arc::new(PeerSession::from_connection(conn));
+
+        // (4) 客户端 send 1 帧 Motion（走 datagram 路径），等 server 回 1 帧
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_arc.send_motion(&motion_event()),
+        )
+        .await
+        .expect("client send_motion timeout")
+        .expect("client send_motion");
+
+        // (5) 等 server run 完成（或超时）
+        tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
+            .await
+            .expect("server task timeout")
+            .expect("server task");
+
+        // (6) 关 client conn → client run() 看到 closed → 退出
+        client_arc
+            .connection()
+            .close(quinn::VarInt::from(0u32), b"test done");
+
+        // (7) client run 也退出（best-effort：可能 server 先关导致 client closed 先 fire）
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            std::sync::Arc::clone(&client_arc).run(PeerRole::Client),
+        )
+        .await;
+
+        drop(client_arc);
         client_ep.wait_idle().await;
         let _ = std::fs::remove_dir_all(&pins_dir);
     }
