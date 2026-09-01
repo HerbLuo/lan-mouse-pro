@@ -86,7 +86,6 @@ impl Capture {
             conn,
             event_tx,
             request_rx,
-            request_tx: request_tx.clone(),
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
         };
@@ -192,12 +191,6 @@ struct CaptureTask {
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
-    /// **STEP-8.2 修复 — Bug #11**：self-trigger Reenable 时用。
-    /// `release_capture` 处理 ProtoEvent::Leave 后想立刻让 CaptureTask
-    /// 跳出 inner loop 重 do_capture（让旧 InputCapture Drop → macOS
-    /// CGEventTap 干净销毁），但 CaptureTask 本身没有 request_tx —— 把
-    /// Capture 的 request_tx clone 一份进来让 task 能 self-trigger。
-    request_tx: Sender<CaptureRequest>,
     state: State,
 }
 
@@ -329,35 +322,6 @@ impl CaptureTask {
                         ProtoEvent::Leave(_) => {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
-                            // **STEP-8.2 修复 — Bug #11**：release_capture
-                            // 后立即发 Reenable，强制 CaptureTask 跳出
-                            // inner loop 重新 do_capture。
-                            //
-                            // **背景**：用户现场 30s 鼠标卡死。
-                            // release_capture 调 `capture.release()` 让
-                            // macOS producer 把 current_pos=None（cursor
-                            // 应可见），但 InputCapture 实例仍存活
-                            // —— CGEventTap 仍 active（在 do_capture 返
-                            // 回 InputCapture drop 时才停）。Inner loop
-                            // 期间 CGEventTap callback 把事件堆积到
-                            // event_tx（InputCapture 的 receiver 不被
-                            // poll → 32 buffer 满）→ tap 反复 1s timeout
-                            // + re-enable，鼠标 cursor 视觉上卡住。
-                            //
-                            // **修法**：Reenable 让 CaptureTask 跳出
-                            // inner loop → do_capture 重新跑 → 旧
-                            // InputCapture drop → Drop 停 run_loop → tap
-                            // 真正销毁 → 新 InputCapture 创建 → 新 tap
-                            // active 但 current_pos=None → 鼠标 cursor
-                            // 立刻可见、可移动。
-                            //
-                            // **副作用**：每次 peer close 重建 tap（开销
-                            // 几十 ms）。如果用户不要 recapture，鼠标
-                            // 移屏边仍会触发 Grab（与当前架构一致）—
-                            // — 用户得在配置层 disable client 或停止
-                            // daemon 才能彻底停 capture。接受范围。
-                            log::info!("post-Leave: sending Reenable to recreate OS capture cleanly (Bug #11)");
-                            let _ = self.request_tx.send(CaptureRequest::Reenable);
                         },
                         _ => {}
                     }
