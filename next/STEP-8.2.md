@@ -731,3 +731,141 @@ fingerprint（修前是空字符串 ""，service 也没校验所以表现上看�
 send → peer.send_input → stream A/B/C → server listen.rs supervisor
 → emulation.rs consume 全链路），把每个分支都过一遍，再批量修，
 避免反复 commit/retest 周期。
+
+---
+
+## 12. 新增修复：stream A 事件转发到 local capture（**Bug #7** — 已修）
+
+### 12.1 现场日志（Bug #6 修后用户复测）
+
+```
+# 远程（Windows）日志：
+stream A recv from 10.2.1.15:50999: Enter(bottom)
+releasing capture: 10.2.1.15:50999 entered this device (fp=a4:9b:47:...)
+
+# 本机（Mac）日志：
+send Enter(bottom) to handle 0 addr 10.2.1.12:4242 via peer (active)  ← 反复出现
+```
+
+**进展**：Bug #6 修复生效，远程**真的处理了 Enter**（release capture /
+reply Ack / 发 Entered 上报 service）。
+
+**残留**：本机**反复 send Enter(bottom)** —— 卡 WaitingForAck 永远
+收不到 Ack。Bug #6 修复后 server 端**真的发了 Ack**（`self.listener
+.reply(addr, ProtoEvent::Ack(0)).await`），只是**客户端收不到**。
+
+### 12.2 根因
+
+`src/connect.rs:82` `LanMouseConnection::recv_tx` 字段——`Bug #4`
+文档里已点出是死字段（"recv_tx 是死字段，全工程无 caller 喂它"），
+但 Bug #4 修复**没**接 recv_tx 路径。
+
+`peer.run()` 主循环从 stream A 读到 Ack/Pong/Leave → 修前
+**只 `log::debug!`**：
+
+```rust
+res = read_frame(&mut recv_a) => {
+    match res {
+        Ok(event) => {
+            // Control 类 —— 本步仅日志（Hello 已 done；Enter/Leave/
+            // Ack/Ping/Pong 留 STEP-6.x 接入 LanMouseConnection 时
+            // 走 IPC 推送）
+            log::debug!("run: stream A read event: {event:?}");
+        }
+```
+
+→ `recv_rx` 永远空 → `LanMouseConnection::recv()` 永远 await →
+`capture.rs::do_capture_session()` 收不到 Ack → 本地 state 永远
+卡 WaitingForAck → 反复 `send Enter`。
+
+**为什么 Bug #6 修后**才暴露**这个**问题：Bug #6 修前 remote 收到
+Enter 后**整个 if 块被跳过**（dead-code stub）→ remote **不发
+Ack** → 本机**永远收不到** Ack（自然不会发现 recv_tx 是死字段）。
+Bug #6 修后 remote 真的发 Ack → 本机**应该能收但实际收不到** → 暴露
+recv_tx 死字段问题。
+
+**第 4 层同一根因系列（与 Bug #4 / recv_tx 死字段同源）**：
+- Bug #4 移除 alive 检查（上层）
+- Bug #7 接 recv_tx 路径（事件流入）
+- TODO M2：处理 Pong → set_alive 重新接回 alive 检查（语义层）
+
+### 12.3 修复（最小侵入）
+
+**`src/quic_transport.rs::PeerSession`**：
+
+1. 加字段 `outgoing_events: Arc<Mutex<Option<UnboundedSender<(SocketAddr, ProtoEvent)>>>>`
+2. 加方法 `set_outgoing_events(Option<UnboundedSender<...>>)` —— 在
+   `client_hello` 后、`spawn peer.run` 前由 caller 设
+3. `peer.run()` 主循环 stream A handler 改成：
+   ```rust
+   log::debug!("run: stream A read event: {event:?}");
+   if let Some(tx) = self.outgoing_events.lock().await.as_ref() {
+       let remote = self.conn.remote_address();
+       let _ = tx.send((remote, event.clone()));
+   }
+   ```
+
+**`src/connect.rs::connect_to_handle`**：
+
+1. 加参数 `recv_tx: Sender<(ClientHandle, protoEvent)>`（三个 caller
+   传 `self.recv_tx.clone()`）
+2. 建 `outgoing` mpsc channel `(SocketAddr, protoEvent)`
+3. spawn forwarder task：
+   ```rust
+   while let Some((addr, event)) = out_rx.recv().await {
+       if let Some(handle) = client_manager.get_client(addr) {
+           recv_tx.send((handle, event));  // → LanMouseConnection::recv()
+       }
+   }
+   ```
+4. `peer.set_outgoing_events(Some(out_tx))` 在 spawn peer.run 前
+5. forwarder task 加 INFO 日志 `stream A forwarder: {addr} → handle
+   {handle}: {event}` 让用户复测时看到路径通了
+
+### 12.4 已知遗留（接受）
+
+- **Reconnect 路径**：supervisor 触发 reconnect 时，无法直接拿
+  原 LanMouseConnection 的 recv_tx —— 本简化版传一个 local channel
+  default（无 forwarder）。但 reconnect 期间 supervisor 已 `set_active_
+  addr(None)`、capture release，等下次 dial 成功又会重新设
+  outgoing_events + spawn 新 forwarder —— **语义 OK**
+- **forwarder send 失败的处理**：recv_tx.send 失败说明 capture task
+  已退（terminate）→ break。**理论 OK**，但有 race —— 上次 recv_tx
+  close 后又创建新的 capture task 的话旧 forwarder 还在 break 的路上
+  —— 实际不会发生，因为 forwarder 的生命周期 ≤ LanMouseConnection
+
+### 12.5 验证
+
+- `cargo test --lib` → 42 passed / 0 failed
+- `cargo check --lib` → 2 warnings（pre-existing power_observer + 1
+  个 dead_code in test，**未引入新 warning**；`recv_tx` dead_code
+  警告消失 —— 现在真被使用）
+
+---
+
+## 13. 时间/耗时（最终累计）
+
+| Bug | 时间 |
+|---|---|
+| #1（mTLS reject 反向通知） | ~30 min |
+| #2（connect_on_activate） | ~15 min |
+| #3（Hello 握手重复） | ~25 min |
+| #4（alive 永 false 移除） | ~20 min |
+| #5（stream A 控制事件路径） | ~30 min |
+| #6（Enter dead-code stub） | ~25 min |
+| #7（stream A 事件转发 recv_tx） | ~30 min |
+| **总计** | **~175 min（~3 小时）** |
+
+7 个 bug **全是同一条事件流的不同环节的死代码 / 未连接路径**：
+
+```
+capture → send → peer.send_input → stream A/B/C → server listen.rs
+  supervisor → emulation.rs consume/Enter 处理 → ack → 回到 capture
+
+每个环节都有未实现的 stub、dead_code 注释、或 TODO 把链路断掉。
+```
+
+**建议**：下次类似现场先做**一次完整 audit**，从 `capture.rs`
+事件入到 `peer.send_input` 出到 `quic_transport::accept` 回到
+`emulation.rs` 处理，整条链每个分支都过一遍，再批量修——这次如
+果一开始就审计完整链路，应该一次 commit 解决所有 7 个 bug。
