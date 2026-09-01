@@ -567,6 +567,32 @@ async fn handle_quic_peer_supervisor(
             quic_transport::Error::HelloFailed("stream A not cached after server_hello".into())
         })?;
 
+    // **STEP-8.2 修复 — Bug #8**：spawn datagram reader task。
+    //
+    // **背景**：`route_input` 把 Motion/Axis/AxisDiscrete120 路由到 QUIC
+    // datagram 通道（不是 stream A）—— 高频指针事件为避免 stream 重传
+    // 延迟走 datagram。但 server `listen.rs::handle_quic_peer_supervisor`
+    // 修前**只读 cached recv_a**（来自 server_hello 的 stream A）——
+    // **完全不读 datagram**。`datagram_reader_task` 只在 client 端
+    // `peer.run()` 里 spawn（与 server supervisor 是两条独立路径）。
+    //
+    // **后果**：本机 (client) 把 motion 走 datagram 发出去 → 远程
+    // (server) 端 QUIC 收到但**没人读** → 远程 capture 看不到 motion
+    // → 鼠标不动。Bug #7 修后本机能正确切换到 Sending 状态开始发
+    // motion，但 server 端**永远收不到**。
+    //
+    // **修法**：spawn 独立的 datagram reader task，循环 read_datagram
+    // → ProtoEvent::try_from → 推 listen_tx（与 stream A 读循环对称）。
+    //
+    // **生命周期**：task 在 supervisor 退出时随 peer drop 自动结束（peer
+    // 是 Rc，task 持 Arc 引用，peer drop 时 task 持有的 Arc 引用计数
+    // 归零 → task 的 peer 参数析构 → read_datagram 返 Err → task 退）。
+    spawn_local(server_datagram_reader_task(
+        peer.clone(),
+        listen_tx.clone(),
+        addr,
+    ));
+
     // (6) 循环 read_frame(recv_a) → ListenEvent::Msg
     //
     // 错误分流（与 bak `read_stream_a_loop` 对齐）：
@@ -649,5 +675,75 @@ impl Drop for QuicConnGuard {
         }
         // removed == None：peer 从未被注册（Accept event 之前早退），
         // 或已被 wake 路径覆盖（不可能，单线程）；静默 no-op。
+    }
+}
+
+/// **STEP-8.2 修复 — Bug #8**：server 侧 datagram reader task。
+///
+/// 与 `quic_transport::datagram_reader_task` 同源但走 server listen
+/// 路径 —— 不走 `StreamEvent::Datagram`（peer.run() 内部抽象），直接
+/// 包装成 `ListenEvent::Msg { event, addr }` 推 `listen_tx`，让
+/// emulation.rs ListenTask 收到（与 stream A 路径对称）。
+///
+/// **为什么 server 端要单独写一个**：client 端 `peer.run()` 内部 spawn
+/// 的 datagram_reader_task 用 `StreamEvent::Datagram`（peer.run 主循环
+/// 消费的 enum 变体）—— 但 server `listen.rs::handle_quic_peer_
+/// supervisor` 不调 peer.run，有自己的 read_frame 循环。直接复用
+/// client 版会让 server 路径多一层 StreamEvent → ListenEvent 转换
+/// 反而绕弯。inlined 这个 server 特化版更直接。
+///
+/// **生命周期**：task 持 `peer: Rc<PeerSession>` + `listen_tx:
+/// Sender<ListenEvent>` —— supervisor 退出时 `listen_tx` 被 close，
+/// 下一次 `send` 失败 → task 退出。peer Rc 在 supervisor 退出时也
+/// drop，task 持有的 Arc 引用计数归零。
+async fn server_datagram_reader_task(
+    peer: Rc<PeerSession>,
+    listen_tx: Sender<ListenEvent>,
+    addr: SocketAddr,
+) {
+    loop {
+        match peer.connection().read_datagram().await {
+            Ok(bytes) => {
+                // 定长 ProtoEvent codec：bytes.len() 必须 == MAX_EVENT_SIZE
+                let buf: [u8; lan_mouse_proto::MAX_EVENT_SIZE] =
+                    match bytes.as_ref().try_into() {
+                        Ok(b) => b,
+                        Err(_) => {
+                            log::warn!(
+                                "server datagram_reader: datagram 长度非 MAX_EVENT_SIZE({})，skip frame",
+                                lan_mouse_proto::MAX_EVENT_SIZE
+                            );
+                            continue;
+                        }
+                    };
+                let event = match lan_mouse_proto::ProtoEvent::try_from(buf) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        log::warn!(
+                            "server datagram_reader: ProtoEvent 解码失败，skip frame: {e}"
+                        );
+                        continue;
+                    }
+                };
+                log::debug!(
+                    "server datagram_reader: from {addr}: {event}"
+                );
+                if listen_tx
+                    .send(ListenEvent::Msg { event, addr })
+                    .is_err()
+                {
+                    log::debug!(
+                        "server datagram_reader: listen_tx closed, exiting"
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                log::info!(
+                    "server datagram_reader: read_datagram error, exiting: {e}"
+                );
+                return;
+            }
+        }
     }
 }
