@@ -137,6 +137,23 @@ pub struct PeerSession {
     /// 配合 `StreamPair::recv.take()` 的两步语义最干净。`OnceCell` 无法表达
     /// "已设置过但 recv 已被 take" 的状态。
     stream_a_cache: tokio::sync::Mutex<Option<StreamPair>>,
+    /// **STEP-8.2 修复**：hello 完成后从 `stream_a_cache.send` 搬过来
+    /// 的 send 半边，给 [`Self::send_stream_a`] 复用 —— **不再每次
+    /// `open_bi` 开新 bidi**。
+    ///
+    /// **为什么独立字段而不是复用 stream_a_cache**：与 recv 半边的
+    /// take_stream_a_recv 不同，`send_stream_a` 是一次调用写一帧但
+    /// **整个 peer 生命周期内被多次调用**（Enter / Ack / Ping / Pong /
+    /// 每次进 capture 重发 Enter ...），需要持有同一 `SendStream` 重复
+    /// write。`Mutex<Option<_>>` + 持锁写 + 写完不释放（同一个 Mutex
+    /// guard 内 await）是 QUIC 流的常规模式（本 peer 独占，无锁竞争）。
+    ///
+    /// **调用顺序**：`client_hello` / `server_hello` 完成 → 从
+    /// `stream_a_cache.send` 拿 send → 存本字段。listen.rs supervisor /
+    /// peer.run 调 `take_stream_a_recv` 拿 recv（来自 `stream_a_cache`
+    /// 的同一 `StreamPair`）—— client 写 send_a ↔ server 读 recv_a 是
+    /// **同一条 bidi**。
+    cached_send_a: tokio::sync::Mutex<Option<SendStream>>,
     /// 3 条 bidi stream 集合缓存（STEP-5.2 引入）。
     ///
     /// STEP-5.3 / 5.4 `read_loop` 装配时填充 —— 装配路径：server 端
@@ -971,6 +988,20 @@ impl PeerSession {
             conn,
             hello_ok: AtomicBool::new(false),
             stream_a_cache: tokio::sync::Mutex::new(None),
+            // STEP-8.2 修复 — `cached_send_a`：hello 完成后从
+            // `stream_a_cache.send` 搬过来，让 [`Self::send_stream_a`]
+            // 复用同一 bidi 的 send 半边（与 server 端
+            // `take_stream_a_recv` 拿到的 recv 半边是**同一条** bidi），
+            // 不再每次开新 bidi。
+            //
+            // **历史**：修前 `send_stream_a` 每次 `open_bi()` 开新
+            // stream 写控制事件（Enter / Leave / Ack / Ping / Pong），
+            // 但 server `listen.rs` supervisor 只读缓存的 recv_a（即
+            // hello 时的同一条 bidi）—— 控制事件走新 stream、server
+            // 不读新 stream → Enter 永远到不了 server → server 不
+            // release capture、不 inject input，用户看到"连上了但键
+            // 鼠不通"。
+            cached_send_a: tokio::sync::Mutex::new(None),
             // STEP-5.2 引入 `stream_bunch` 字段占位 —— 默认 `None`，
             // STEP-5.3 `read_loop` 装配时填充。`Arc` 包装让 read_loop
             // task 与 caller (`peer.send_stream_*`) 共用同一份
@@ -1026,6 +1057,27 @@ impl PeerSession {
     pub async fn take_stream_a_recv(&self) -> Option<RecvStream> {
         let mut g = self.stream_a_cache.lock().await;
         g.as_mut().and_then(|p| p.recv.take())
+    }
+
+    /// **STEP-8.2 修复**：取出 stream A 的 `SendStream` 半边，**保留**
+    /// `RecvStream` 半边在 cache（给 `take_stream_a_recv` 用）。
+    ///
+    /// 与 `take_stream_a_recv` 对称 —— 设计用途：
+    /// - `client_hello` / `server_hello` 完成后 put `Pair { send, recv }`
+    ///   进 `stream_a_cache`，**然后**调本方法把 `send` 搬到
+    ///   `cached_send_a` 供 `send_stream_a` 复用
+    /// - 与 supervisor / peer.run 后续调 `take_stream_a_recv` 拿
+    ///   `recv` 不冲突（双方各自 take 自己的半边）
+    ///
+    /// **设计动机**（详见 `cached_send_a` 字段 docstring）：
+    /// `send_stream_a` 一次调用写一帧但整个 peer 生命周期被多次调用
+    /// （Enter / Ack / Ping / Pong / 重复 Enter ...），需要持有同一
+    /// `SendStream` 重复 write —— 必须从 `stream_a_cache` 取出 send
+    /// 独立存放。
+    #[allow(dead_code)]
+    pub async fn take_stream_a_send(&self) -> Option<SendStream> {
+        let mut g = self.stream_a_cache.lock().await;
+        g.as_mut().and_then(|p| p.send.take())
     }
 
     /// 发送高频 motion 输入事件（STEP-5.1 引入）。
@@ -1256,12 +1308,11 @@ impl PeerSession {
     ///   每 500ms × 4 ≈ 2s 流密度的额外 stream 开销在 M1 范围内可接受
     ///
     /// **后续优化空间**（STEP-6.x 之外）：
-    /// - 复用 `stream_a_cache.send` 半边：在 `take_stream_a_recv` 拿 recv
-    ///   半边时**不**取 send 半边（已有此形态），让 LanMouseConnection
-    ///   的 send 路径直接持有 cached send 做 in-place write
     /// - 与 bak `mousehop/src/quic_transport.rs::send_stream_a` 对齐（缓存
-    ///   + in-place write）
-    /// - M1 阶段不做（保持单步范围可控）
+    ///   + in-place write）—— 本步已**部分实现**：send 路径走
+    ///   `cached_send_a` 复用 hello 同 bidi（详见 `cached_send_a`
+    ///   docstring），但仍持锁 await（无锁优化空间）
+    /// - M1 阶段不做进一步优化（保持单步范围可控）
     ///
     /// **错误归一**：与 [`Self::send_stream_b`] 对称 —— IO 错误归到
     /// `Error::HelloFailed(...)`（避免新增 `Error::StreamA` 变体；HELLO
@@ -1272,6 +1323,42 @@ impl PeerSession {
     /// `send_input` 又被 STEP-6.1 `LanMouseConnection::send()` 消费。
     #[allow(dead_code)]
     async fn send_stream_a(&self, bytes: &[u8]) -> Result<()> {
+        // **STEP-8.2 修复 — Bug #5**：优先用 `cached_send_a`（hello 时
+        // 缓存的同一条 bidi send 半边）。**不**再每次 `open_bi` 开新
+        // stream —— 那条新 stream server 端 supervisor 不会读（它只
+        // 读 `take_stream_a_recv` 拿到的 recv 半边 = hello 时的同条
+        // bidi），控制事件（Enter / Ack / Ping / Pong）永远到不了
+        // server，看起来"连上了但键鼠不通"。
+        //
+        // **持锁 await 设计**：`send_stream_a` 是 stream A 的唯一写
+        // 路径（无其他 caller），持锁期间并发 caller 排队串行 —— 与
+        // QUIC stream write 的"一帧一帧"语义对齐（避免两帧交错）。
+        //
+        // **Fallback**：`cached_send_a` 为 `None` 时（hello 未完成 / 已
+        // 被 take）走旧的 open_bi 路径 —— 保留兜底兼容早期 caller /
+        // 测试（单测可能直接 `open_bi` + `peer.send_input` 不走 hello）。
+        let mut g = self.cached_send_a.lock().await;
+        if let Some(send) = g.as_mut() {
+            send.write_u32(bytes.len() as u32)
+                .await
+                .map_err(|e| {
+                    Error::HelloFailed(format!("send_stream_a cached length: {e}"))
+                })?;
+            send.write_all(bytes)
+                .await
+                .map_err(|e| {
+                    Error::HelloFailed(format!("send_stream_a cached body: {e}"))
+                })?;
+            log::trace!(
+                "send_stream_a cached: wrote {} bytes on hello bidi",
+                bytes.len()
+            );
+            return Ok(());
+        }
+        drop(g);
+
+        // Fallback path —— cached_send_a 不可用时开新 bidi（旧行为）
+        log::debug!("send_stream_a: cached_send_a 不可用，fallback 开新 bidi");
         let pair = self
             .conn
             .open_bi()
@@ -1526,7 +1613,20 @@ pub async fn client_hello(peer: &PeerSession) -> std::result::Result<(), Error> 
 
     match response {
         ProtoEvent::Hello { magic, .. } if magic == lan_mouse_proto::PROTOCOL_MAGIC => {
+            // **STEP-8.2 修复**：缓存 send 半边到 `cached_send_a` 供后续
+            // `send_stream_a` 复用 —— 详见 cached_send_a 字段 docstring 与
+            // `send_stream_a` docstring。
+            //
+            // **顺序**：先 put 进 stream_a_cache（Pair 形式），再
+            // take_stream_a_send 拿出来存 cached_send_a —— 与
+            // supervisor / peer.run 后续调 take_stream_a_recv 不冲突
+            // （send / recv 各自独立 take）。
             *peer.stream_a_cache.lock().await = Some(StreamPair::new(send, recv));
+            let send_a = peer
+                .take_stream_a_send()
+                .await
+                .expect("stream_a_cache just put Some(Pair { send: Some, recv: Some }) — take_stream_a_send must return Some");
+            *peer.cached_send_a.lock().await = Some(send_a);
             peer.hello_ok.store(true, Ordering::Release);
             Ok(())
         }
@@ -1617,8 +1717,18 @@ pub async fn server_hello(peer: &PeerSession) -> std::result::Result<(), Error> 
     let outgoing = ProtoEvent::hello(crate::config::local_commit());
     write_hello_frame(&mut send, &outgoing).await?;
 
-    // 缓存 stream A 给 STEP-5.4 read_loop 接手
+    // **STEP-8.2 修复**：缓存 send 半边到 `cached_send_a` 供后续
+    // `send_stream_a` 复用 —— 详见 client_hello 镜像注释 + cached_send_a
+    // 字段 docstring。`send_stream_a` 走 cached 与 client 走 cached 是
+    // **同一条 bidi**（server 的 recv ↔ client 的 send / client 的 recv
+    // ↔ server 的 send），server 端 supervisor 读 recv_a 即可读到
+    // client 的 Enter / Ack / Pong 等控制事件。
     *peer.stream_a_cache.lock().await = Some(StreamPair::new(send, recv));
+    let send_a = peer
+        .take_stream_a_send()
+        .await
+        .expect("stream_a_cache just put Some(Pair { send: Some, recv: Some }) — take_stream_a_send must return Some");
+    *peer.cached_send_a.lock().await = Some(send_a);
 
     peer.hello_ok.store(true, Ordering::Release);
     Ok(())
@@ -3720,11 +3830,21 @@ mod tests {
                 "server 端 hello_ok 应为 true（server_hello 已置位）"
             );
 
-            // server 端 stream A 应已缓存
-            let cached = session.take_stream_a_cache().await;
+            // server 端 stream A 应已缓存 —— **STEP-8.2**：修后
+            // `client_hello` / `server_hello` 会把 `send` 半边搬到
+            // `cached_send_a` 供 `send_stream_a` 复用，剩 `recv` 在
+            // `stream_a_cache`。take_stream_a_cache 返 None 是正常的，
+            // 改 assert 单独查两个半边：
             assert!(
-                cached.is_some(),
-                "server_hello 后 peer.stream_a_cache 应有缓存"
+                session.take_stream_a_recv().await.is_some(),
+                "server_hello 后 peer.stream_a_cache.recv 应已缓存"
+            );
+            // cached_send_a 不暴露 take_stream_a_send（已被 hello 内部
+            // take），但 hello_ok 守卫保证 send 也已搬过来（否则 hello
+            // 自身的 expect 早就 panic 了）
+            assert!(
+                session.hello_ok(),
+                "server_hello 应已置 hello_ok（隐含 cached_send_a 已就绪）"
             );
 
             // 留出时间让 client_hello 完成 read
@@ -3762,11 +3882,18 @@ mod tests {
             "client 端 hello_ok 应为 true（client_hello 已置位）"
         );
 
-        // (3) client 端 stream A 也应已缓存（client/server 对称缓存）
-        let cached = client_session.take_stream_a_cache().await;
+        // (3) client 端 stream A 也应已缓存（client/server 对称缓存）——
+        // **STEP-8.2**：修后 `client_hello` 把 `send` 半边搬到
+        // `cached_send_a` 供 `send_stream_a` 复用，剩 `recv` 在
+        // `stream_a_cache`。take_stream_a_cache 返 None 是正常的，
+        // 改 assert 单独查两个半边：
         assert!(
-            cached.is_some(),
-            "client_hello 后 peer.stream_a_cache 应已缓存 Hello 用的 stream A"
+            client_session.take_stream_a_recv().await.is_some(),
+            "client_hello 后 peer.stream_a_cache.recv 应已缓存"
+        );
+        assert!(
+            client_session.hello_ok(),
+            "client_hello 应已置 hello_ok（隐含 cached_send_a 已就绪）"
         );
 
         // (4) 清理
@@ -5013,6 +5140,129 @@ mod tests {
 
         // (8) 等 server task 收尾
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
+
+        drop(client_arc);
+        client_ep.wait_idle().await;
+        let _ = std::fs::remove_dir_all(&pins_dir);
+    });
+
+    /// **STEP-8.2 验收 — Bug #5 回归**：stream A 控制事件端到端可达。
+    ///
+    /// **修前**：`send_stream_a` 每次 `open_bi()` 开**新** bidi 写控制
+    /// 事件（Enter / Ack / Ping / Pong）；server `listen.rs` supervisor
+    /// 只读缓存的 `recv_a`（来自 hello 同 bidi）—— 控制事件走新
+    /// stream、server 不读 → 用户现场"连上了但键鼠不通"。
+    ///
+    /// **修后**：`send_stream_a` 复用 hello 时缓存的 `cached_send_a`
+    /// —— 与 server 端的 `recv_a` 是**同一条 bidi**，控制事件可达。
+    ///
+    /// **本测试断言**：client `peer.send_input`（route_input 选
+    /// StreamA） → server `take_stream_a_recv` 拿到的 recv 读到该
+    /// 事件。修前 recv 永远读不到新 bidi 的数据（超时或 EOF）。
+    ///
+    /// **与 `peer_session_round_trip_motion_keyboard` 的区别**：那条
+    /// 测试用 datagram 路径（Motion 走 datagram），**绕过**了 stream A
+    /// —— 修前也能过。本测试专门覆盖 stream A 路径，确保 Bug #5 修
+    /// 后控制事件端到端通。
+    local_set_test!(send_stream_a_round_trip_control_event, {
+        install_crypto_provider();
+
+        // (1) server endpoint
+        let (server_cert, server_key) = ephemeral_cert();
+        let server_ep = endpoint_with_test_cert(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+            server_cert,
+            server_key,
+        )
+        .expect("server endpoint bind");
+        let server_addr = server_ep.local_addr().expect("server addr");
+
+        // (2) 后台 server task：accept → server_hello → take_stream_a_recv → 等 1 帧
+        let server_task = spawn_local(async move {
+            let conn = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                accept(&server_ep),
+            )
+            .await
+            .expect("server accept timeout")
+            .expect("server accept");
+            let session = PeerSession::from_connection(conn);
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                server_hello(&session),
+            )
+            .await
+            .expect("server hello timeout")
+            .expect("server hello should succeed");
+
+            // 关键断言：take_stream_a_recv 拿到的 recv 上能读到 client 写的 Ping
+            let mut recv_a = session
+                .take_stream_a_recv()
+                .await
+                .expect("server_hello 后 stream_a_recv 应已缓存");
+            let event = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                super::read_hello_frame(&mut recv_a),
+            )
+            .await
+            .expect("server stream A read 3s 超时 —— Bug #5 回归：send_stream_a 走新 bidi、server 读不到")
+            .expect("server stream A read 应成功");
+
+            // 验证收到的是 Ping（ProtoEvent::Ping 是 control 流默认值）
+            assert!(
+                matches!(event, ProtoEvent::Ping),
+                "server 应收到 client 发的 Ping，实际: {event:?}"
+            );
+
+            // 留出时间让 client 端 send 完成
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(session);
+        });
+
+        // (3) client：dial → client_hello → send_input(Ping) → close
+        let pins_dir = ephemeral_pins_dir();
+        let _ = std::fs::remove_dir_all(&pins_dir);
+        let (client_cert, client_key) = ephemeral_cert();
+        let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .expect("client endpoint bind");
+        let conn = dial(
+            &client_ep,
+            server_addr,
+            client_cert[0].clone(),
+            client_key,
+            &pins_dir,
+        )
+        .await
+        .expect("dial");
+        let client_arc = std::sync::Arc::new(PeerSession::from_connection(conn));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_hello(&client_arc),
+        )
+        .await
+        .expect("client_hello timeout")
+        .expect("client_hello");
+        assert!(client_arc.hello_ok());
+
+        // (4) 关键：send_input(Ping) —— 应走 cached_send_a（与 server
+        //     recv_a 同 bidi）。修前会开新 bidi，server 永远读不到。
+        // 用 cfg 让 Ping 走 StreamA（route_input 默认 Enter/Leave/Ack/
+        // Hello/Ping/Pong 都走 StreamA，所以 default cfg 即可）
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_arc.send_input(
+                &ProtoEvent::Ping,
+                &lan_mouse_ipc::InputChannelConfig::default(),
+            ),
+        )
+        .await
+        .expect("client send_input(Ping) 超时")
+        .expect("client send_input(Ping) 应成功");
+
+        // (5) 等 server 收尾
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server_task).await;
 
         drop(client_arc);
         client_ep.wait_idle().await;
