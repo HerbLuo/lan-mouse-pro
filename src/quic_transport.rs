@@ -2503,7 +2503,7 @@ impl PeerSession {
                         return Err(Error::FrameTooLarge(len));
                     }
                     Err(Error::Truncated) => {
-                        log::info!("run: stream A truncated — peer closed");
+                        log::info!("run: stream A truncated — peer closed (Bug #9 path)");
                         // **STEP-8.2 修复 — Bug #9**：peer 单方面关闭
                         // 时主动 `conn.close()`，让 quinn `closed()` future
                         // 立刻 fire（quinn 默认要双向 close 才 fire，
@@ -2516,6 +2516,29 @@ impl PeerSession {
                         // → capture.rs 立即 release_capture（不等下次
                         // mouse event 触发 send）。
                         let _ = self.conn.close(0u32.into(), b"peer closed stream");
+                        let remote = self.conn.remote_address();
+                        self.send_outgoing_event(ProtoEvent::Leave(0), remote).await;
+                        break;
+                    }
+                    Err(Error::HelloFailed(msg)) if msg.starts_with("read frame") => {
+                        // **STEP-8.2 修复 — Bug #10**：read_u32 / read_exact
+                        // 的 IO 错误（如 "connection lost"、"closed stream"）
+                        // —— peer 已关 / conn 死。本应是 stream 结束信号，
+                        // 走与 Truncated 相同的"主动 close + 推 Leave"路径
+                        // 让 capture 立即 release。
+                        //
+                        // **修前**：这条路径误归为 "decode error → skip-frame
+                        // 续读"，但 read IO 错误不是 decode 错误（数据未到
+                        // 达解码阶段）—— 主循环**永远 continue 继续读**
+                        // 每次都同一错 + 30s idle_timeout 才让 closed()
+                        // fire，期间 capture 不 release（用户 30s 延迟
+                        // 看到 mouse 恢复）。
+                        //
+                        // **对照 listen.rs supervisor**（旧路径）：
+                        // `Err(e) => return Err(e)` —— 任何 IO 错误立刻
+                        // 退出，与本 fix 语义一致。
+                        log::info!("run: stream A read IO error (Bug #10 path): {msg}");
+                        let _ = self.conn.close(0u32.into(), b"peer read IO error");
                         let remote = self.conn.remote_address();
                         self.send_outgoing_event(ProtoEvent::Leave(0), remote).await;
                         break;
