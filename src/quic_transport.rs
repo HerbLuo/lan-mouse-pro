@@ -68,7 +68,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc as tokio_mpsc;
-use tokio::task::{JoinHandle, JoinSet, spawn_local};
+use tokio::task::{JoinHandle, JoinSet};
 
 use lan_mouse_ipc::{ChannelMode, InputChannelConfig};
 use lan_mouse_proto::{ProtoEvent, MAX_EVENT_SIZE};
@@ -776,7 +776,7 @@ pub async fn dial(
 /// 握手完成；超时则并发拨兜底 LAN 多宿主延迟漂移
 ///
 /// **`JoinSet` vs `Vec<SpawnLocal>`**：JoinSet 提供 `join_next().await`
-/// + `abort_all()` 一站式 API，与 STEP-0.1 全仓 `spawn_local` 惯例一致。
+/// + `abort_all()` 一站式 API，与 STEP-0.1 全仓 `spawn` 惯例一致。
 /// quinn `Connection` 实现 `Drop` 自动 close（QUIC 相对 DTLS 的简化），
 /// 输家被 abort 时 RAII 自动关连，**不**需要显式 `conn.close(...)`。
 ///
@@ -804,7 +804,7 @@ pub async fn dial_any(
     {
         let cfg_ref = cfg.clone();
         let ep_ref = ep.clone();
-        joinset.spawn_local(async move {
+        joinset.spawn(async move {
             let res = ep_ref.connect_with(cfg_ref, primary, "lan-mouse");
             match res {
                 Ok(connecting) => match connecting.await {
@@ -851,7 +851,7 @@ pub async fn dial_any(
         }
         let cfg_ref = cfg.clone();
         let ep_ref = ep.clone();
-        joinset.spawn_local(async move {
+        joinset.spawn(async move {
             let res = ep_ref.connect_with(cfg_ref, addr, "lan-mouse");
             match res {
                 Ok(connecting) => match connecting.await {
@@ -1810,7 +1810,7 @@ pub async fn read_any_frame(recv: &mut RecvStream) -> std::result::Result<ProtoE
 
 // === STEP-5.3 3 stream 独立读 task + 路由分派 =============================
 //
-// PLAN §5.3：每条 stream 一个独立 `spawn_local` 读 task，事件经由
+// PLAN §5.3：每条 stream 一个独立 `spawn` 读 task，事件经由
 // `tokio::sync::mpsc` 队列；`select!` 合并对外暴露。本步实现：
 //
 // 1. `StreamEvent` enum —— 区分 3 类事件（Control / Reliable / Datagram）
@@ -2051,7 +2051,7 @@ pub async fn read_loop(
 
     // (2) stream B 装配：mpsc + reader task
     let (tx_b, rx_b) = tokio_mpsc::channel::<StreamEvent>(READ_STREAM_BUFFER_CAP);
-    let join_b = spawn_local(read_stream_b_loop(bunch.b.recv, tx_b));
+    let join_b = tokio::task::spawn(read_stream_b_loop(bunch.b.recv, tx_b));
 
     // (3) stream A：caller 已持有 recv_a（参数借用），不内部 spawn
     //     —— leader 决策：减少 task 数 + 减少 mpsc 层
@@ -2201,7 +2201,7 @@ impl PeerSession {
     //     本步新增：详见下面 datagram_reader_task 函数
     let (tx_d, mut rx_d) =
         tokio_mpsc::channel::<StreamEvent>(READ_STREAM_BUFFER_CAP);
-    spawn_local(datagram_reader_task(self.clone(), tx_d));
+    tokio::task::spawn(datagram_reader_task(self.clone(), tx_d));
 
     // (3) Hello 握手 —— role 决定走 client_hello / server_hello
     match role {
