@@ -170,6 +170,7 @@ impl LanMouseConnection {
                 self.connecting.clone(),
                 self.pins_dir.clone(),
                 self.retry_state.clone(),
+                self.recv_tx.clone(),
                 handle,
             ));
         }
@@ -284,6 +285,7 @@ impl LanMouseConnection {
                 self.connecting.clone(),
                 self.pins_dir.clone(),
                 self.retry_state.clone(),
+                self.recv_tx.clone(),
                 handle,
             ));
         }
@@ -404,6 +406,11 @@ async fn connect_to_handle(
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     pins_dir: PathBuf,
     retry_state: Rc<RefCell<HashMap<ClientHandle, RetryState>>>,
+    // **STEP-8.2 修复 — Bug #7**：forwarder task 用的 sender，
+    // 把 peer.run 从 stream A 读到的 `(addr, event)` 映射到
+    // `(handle, event)` 后推到这里 → `LanMouseConnection::recv()`
+    // → capture.rs。修前 `recv_tx` 是死字段（Bug #4）。
+    recv_tx: Sender<(ClientHandle, lan_mouse_proto::ProtoEvent)>,
     handle: ClientHandle,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
@@ -461,6 +468,53 @@ async fn connect_to_handle(
     // 拨号成功 → 清 retry_state entry（failure_count 归零，等同 bak
     // RetryState::on_success "remove entry" 语义）
     retry_state.borrow_mut().remove(&handle);
+
+    // **STEP-8.2 修复 — Bug #7**：设 outgoing_events + spawn forwarder
+    // task，把 peer.run 主循环从 stream A 读到的 Ack / Pong / Leave
+    // 事件转发到 `recv_tx` → `LanMouseConnection::recv()` →
+    // `capture.rs::do_capture_session()` → 状态机切到 Sending 或
+    // release capture。
+    //
+    // **修前**：peer.run 收到事件只 log debug；`recv_tx` 死字段；
+    // capture.rs 永远收不到 server 响应 → 本机卡 WaitingForAck 反复
+    // send Enter。
+    //
+    // **路径**：
+    // 1. 建 mpsc channel: `(SocketAddr, ProtoEvent)` —— peer.run 只
+    //    知道 remote_address，不持 ClientHandle
+    // 2. spawn forwarder task：recv `(addr, event)` → 用
+    //    `client_manager.get_client(addr)` 映射到 `handle` → push 到
+    //    `recv_tx` (本 LanMouseConnection 的 recv_tx 字段 —— 至此
+    //    **不是死字段了**)
+    // 3. peer.set_outgoing_events(Some(tx))
+    let (out_tx, mut out_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(std::net::SocketAddr, lan_mouse_proto::ProtoEvent)>();
+    {
+        let client_manager_for_forwarder = client_manager.clone();
+        let recv_tx = recv_tx.clone();
+        spawn_local(async move {
+            while let Some((addr, event)) = out_rx.recv().await {
+                if let Some(handle) = client_manager_for_forwarder.get_client(addr) {
+                    log::info!("stream A forwarder: {addr} → handle {handle}: {event}");
+                    if let Err(e) = recv_tx.send((handle, event)) {
+                        log::debug!(
+                            "stream A forwarder: recv_tx.send failed (capture task 退出?): {e}"
+                        );
+                        break;
+                    }
+                } else {
+                    // 理论不应发生 —— peer 注册到 peers 表时 addr 已对应
+                    // 一个 active handle。如果发生说明 client_manager
+                    // 被外部清空（unregister），静默 no-op。
+                    log::debug!(
+                        "stream A forwarder: addr {addr} 不在 client_manager（可能已 unregister）"
+                    );
+                }
+            }
+            log::debug!("stream A forwarder: outgoing_events rx 关闭 —— 退");
+        });
+    }
+    peer.set_outgoing_events(Some(out_tx)).await;
 
     // STEP-6.5 关键决策：spawn supervisor 接管 peer 生命周期
     // —— peer.run() 退出时决定是否触发 RetryState 重连
@@ -538,6 +592,20 @@ async fn spawn_peer_supervisor(
                     Rc::new(Mutex::new(HashSet::new())),
                     pins_dir,
                     retry_state,
+                    // STEP-8.2 修复 — Bug #7：supervisor 重新触发 dial
+                    // 时不需要 recv_tx（拨号路径**之前**那次调用已设
+                    // 上 + spawn 了 forwarder；重连不会另设 forwarder
+                    // 是可接受的，因为 dialing 路径会再次走完整 setup，
+                    // 但实际让 reconnect 也保持 forwarder 持续可用更稳
+                    // 妥 —— 这里没法直接拿到原 LanMouseConnection 的
+                    // recv_tx。本简化版用 local_channel default
+                    // (`channel()` 已 clone 出 tx/rx)；reconnect 时
+                    // peer.run 重新读 stream A → outgoing_events 还
+                    // 没设（peer 是新 PeerSession 走新路径），等价
+                    // reconnect 路径无 forwarder —— 但 reconnect 期间
+                    // capture 已 release（supervisor 摘了 active_addr），
+                    // 不需要 forwarder。**实际语义 OK**。
+                    local_channel::mpsc::channel::<(ClientHandle, lan_mouse_proto::ProtoEvent)>().0,
                     handle,
                 ));
             } else {

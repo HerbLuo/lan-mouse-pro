@@ -154,6 +154,25 @@ pub struct PeerSession {
     /// 的同一 `StreamPair`）—— client 写 send_a ↔ server 读 recv_a 是
     /// **同一条 bidi**。
     cached_send_a: tokio::sync::Mutex<Option<SendStream>>,
+    /// **STEP-8.2 修复 — Bug #7**：可选的 stream A 事件出向 channel。
+    ///
+    /// **背景**：peer.run 主循环从 stream A 读 control 事件（Ack /
+    /// Pong / Leave），但修前只 log debug —— `recv_tx` 死字段（见
+    /// Bug #4），capture.rs 永远收不到 server 的响应 → 本地卡
+    /// WaitingForAck、反复 send Enter。
+    ///
+    /// **修法**：peer.run 读到 stream A 事件时，若本字段设了 sender，
+    /// send `(remote_addr, event)` 出去；client 端 `connect_to_handle`
+    /// 在 spawn peer.run 之前设上 + spawn 一个 forwarder task 把
+    /// `(addr, event)` 通过 `client_manager.get_client(addr)` 映射
+    /// 到 `(handle, event)` 再推到 `recv_tx`。
+    ///
+    /// **为何 server 端不用设**：server 端 `listen.rs::handle_quic_
+    /// peer_supervisor` 不调 peer.run，自己 accept_bi + read_frame
+    /// + 推 listen_tx，forwarding 路径已存在。
+    outgoing_events: std::sync::Arc<
+        tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<(SocketAddr, ProtoEvent)>>>,
+    >,
     /// 3 条 bidi stream 集合缓存（STEP-5.2 引入）。
     ///
     /// STEP-5.3 / 5.4 `read_loop` 装配时填充 —— 装配路径：server 端
@@ -1002,6 +1021,10 @@ impl PeerSession {
             // release capture、不 inject input，用户看到"连上了但键
             // 鼠不通"。
             cached_send_a: tokio::sync::Mutex::new(None),
+            // STEP-8.2 修复 — Bug #7：stream A 事件出向 channel
+            // 初始 None；client 端 connect_to_handle 在 spawn peer.run
+            // 之前调 `set_outgoing_events` 设上。详见字段 docstring。
+            outgoing_events: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             // STEP-5.2 引入 `stream_bunch` 字段占位 —— 默认 `None`，
             // STEP-5.3 `read_loop` 装配时填充。`Arc` 包装让 read_loop
             // task 与 caller (`peer.send_stream_*`) 共用同一份
@@ -1078,6 +1101,20 @@ impl PeerSession {
     pub async fn take_stream_a_send(&self) -> Option<SendStream> {
         let mut g = self.stream_a_cache.lock().await;
         g.as_mut().and_then(|p| p.send.take())
+    }
+
+    /// **STEP-8.2 修复 — Bug #7**：设置 stream A 事件出向 sender。
+    ///
+    /// `connect_to_handle` 在 spawn peer.run 之前调用本方法把 sender
+    /// 设到 `outgoing_events`，让 peer.run 主循环从 stream A 读到
+    /// Ack / Pong / Leave 时能 forward 出去（详见字段 docstring）。
+    /// `Some(_)` 覆盖旧值；`None` 关闭 forwarding（兜底用，理论上
+    /// 不需要 —— client 路径应保持设上）。
+    pub async fn set_outgoing_events(
+        &self,
+        tx: Option<tokio::sync::mpsc::UnboundedSender<(SocketAddr, ProtoEvent)>>,
+    ) {
+        *self.outgoing_events.lock().await = tx;
     }
 
     /// 发送高频 motion 输入事件（STEP-5.1 引入）。
@@ -2426,10 +2463,24 @@ impl PeerSession {
             res = read_frame(&mut recv_a) => {
                 match res {
                     Ok(event) => {
-                        // Control 类 —— 本步仅日志（Hello 已 done；Enter/Leave/
-                        // Ack/Ping/Pong 留 STEP-6.x 接入 LanMouseConnection 时
-                        // 走 IPC 推送）
+                        // Control 类 —— 本步**转发**到 outgoing_events
+                        // （client 端 connect_to_handle 设的 sender），
+                        // 让 `LanMouseConnection::recv()` 通过 recv_tx
+                        // 收到 Ack / Pong / Leave 等响应，capture.rs 据
+                        // 此切到 Sending 状态或释放 capture。
+                        //
+                        // **STEP-8.2 修复 — Bug #7**：修前只 log debug，
+                        // recv_tx 是死字段（Bug #4 同源），server 响应
+                        // 永远到不了本地 capture。
                         log::debug!("run: stream A read event: {event:?}");
+                        if let Some(tx) = self.outgoing_events.lock().await.as_ref() {
+                            let remote = self.conn.remote_address();
+                            if let Err(e) = tx.send((remote, event.clone())) {
+                                log::debug!(
+                                    "run: outgoing_events send failed (forwarder 已退): {e}"
+                                );
+                            }
+                        }
                     }
                     Err(Error::FrameTooLarge(len)) => {
                         log::error!("run: stream A FrameTooLarge({len}) — closing");
