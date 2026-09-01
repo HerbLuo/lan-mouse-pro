@@ -3626,7 +3626,7 @@ mod tests {
         let server_addr = server_ep.local_addr().expect("server addr");
 
         // (1) 后台 server task：accept + 手动 accept_bi + 发错 magic Hello
-        let server_task = tokio::spawn(async move {
+        let server_task = spawn_local(async move {
             let conn = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 accept(&server_ep),
@@ -4499,7 +4499,7 @@ mod tests {
         // server_session.stream_a_cache）。**不**调 read_loop（那是 STEP-5.4
         // 范围）—— 本测试只验证 stream_bunch 字段当前为 None（未装配），
         // 取走仍返 None
-        let server_task = tokio::spawn(async move {
+        let server_task = spawn_local(async move {
             let conn = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 accept(&server_ep),
@@ -4587,7 +4587,7 @@ mod tests {
 
         // (2) 两端 session 都包 Arc —— run(self: Arc<Self>) 要求 'static + Send
         // server 端：accept 拿 conn → wrap Arc → spawn run
-        let server_task = tokio::spawn(async move {
+        let server_task = spawn_local(async move {
             let conn = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 accept(&server_ep),
