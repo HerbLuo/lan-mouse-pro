@@ -869,3 +869,131 @@ capture → send → peer.send_input → stream A/B/C → server listen.rs
 事件入到 `peer.send_input` 出到 `quic_transport::accept` 回到
 `emulation.rs` 处理，整条链每个分支都过一遍，再批量修——这次如
 果一开始就审计完整链路，应该一次 commit 解决所有 7 个 bug。
+
+---
+
+## 14. Follow-ups（不修，记录到 doc）
+
+### 14.1 quic_transport.rs 拆分（refactor follow-up）
+
+**现状**：`src/quic_transport.rs` 5534 lines —— 7.4× 第二大文件（listen.rs 748 lines）。
+占项目总代码 ~51%。
+
+**结构**（STEP 章节）：
+- STEP-3.2 PeerSession + Hello: 488 lines
+- STEP-4.4 Channel + route_input: 370 lines
+- STEP-5.2 Frame codec: 135 lines
+- STEP-5.3 read_loop + stream management: 265 lines
+- STEP-5.4 run + watchdog + datagram_reader: 482 + 468 lines
+- Verifiers (TofuVerifier / AuthorizedKeysVerifier / permissive): 430 lines
+- Tests: 2342 lines（占 42%！）
+
+**推荐拆分（3 文件 + 测试分摊）**：
+
+| 文件 | 内容 | 预计 | 职责 |
+|---|---|---|---|
+| `quic_endpoint.rs` | `endpoint/dial/dial_any/accept`、`endpoint_with_cert/verifier`、`build_quic_client_config`、`install_crypto_provider`、`default_transport_config`、`PeerSession::from_connection`、HELLO_TIMEOUT/ALPN 常量 | ~600 | **连接建立** |
+| `quic_verifier.rs` | `TofuVerifier`、`AuthorizedKeysVerifier`、`permissive_client_cert_verifier` | ~430 | **TLS 证书校验** |
+| `quic_transport.rs` (保留) | PeerSession struct + impl + run、StreamPair/Bidi/StreamBunch、Error、Hello 握手、codec、Channel + route_input、read_loop、datagram_reader_task、PeerRole、should_retry_after_close | ~1900 | **会话生命周期** |
+| 各文件 `mod tests` | tests 跟着对应文件走（verifier tests 进 verifier，endpoint tests 进 endpoint，session tests 进 main） | 分摊 | 测试访问 private items 必须同文件 |
+
+**不拆的**：
+- `Error` enum 留 main（核心错误类型，跟 PeerSession 同源）
+- `StreamPair/Bidi/StreamBunch` 留 main（与 PeerSession 紧耦合）
+- `Channel` + `route_input` 留 main（与 `send_input` 紧密耦合）
+
+**公开 API 不变**（re-export from main file），调用方零修改。
+
+**何时做**：下一次大重构窗口（5 个以上 PR 或项目转阶段时）。当前 7 个 bug 链已让文件混乱，但**优先修 bug 不优先重构**。
+
+### 14.2 macOS 30s 鼠标卡死（已知限制）
+
+**症状**：peer 关闭（或 QUIC idle_timeout 30s）后，本地 mouse 卡 30s 内无法移动/显示，
+之后才恢复（"几十秒" 匹配 QUIC `max_idle_timeout = 30s`）。
+
+**当前修复状态**：
+- Bug #9/Bug #10：peer.run 检测 closed() future fire 或 read IO 错 → 推 Leave → capture 立即 release（**协议层正确**）
+- Bug #11 防御性 Reenable：**已回退**（`9d0b4d5`）—— 重建 OS tap 没能解决 macOS tap 启动期状态问题，反而可能引入新问题
+
+**根因（推测，未证实）**：
+- macOS `input-capture` crate 的 CGEventTap 在 peer close 时未真正停止
+- capture.rs `release_capture` 调 `capture.release()` 仅让 macOS producer 设 `current_pos = None`（cursor 应可见），但 `CGEventTap` 本身仍 active
+- capture.rs 进入 inner loop（等 Reenable），不 poll `capture.next()` → `event_tx` buffer 32 满 → tap callback `blocking_send` 阻塞 → CGEventTap 1s timeout → re-enable → 死循环
+- macOS 用户态 cursor 视觉卡住（内核 cursor position 在更新，但 user-perceived "卡 30s"）
+
+**修复路径（需深入 input-capture crate）**：
+1. 修改 `input-capture/src/macos.rs` —— release() 时同步 disable CGEventTap（不只发 notify）
+2. 或在 capture.rs 检测 TimedOut 后调 `set_alive(false)` 暂停 capture（让用户手动重启 daemon）
+3. 或在 Drop impl 里加 `CGEventTapEnable(port, false)` 显式停 tap
+
+**项目范围**：超出 lan-mouse-pro（属 input-capture crate 内部问题）。需要单独 PR。
+
+**当前 workaround**：用户接受 30s 延迟，或远端 daemon 关闭后**等满 30s 再开始新会话**（让 QUIC idle_timeout 自然触发）。
+
+### 14.3 首次连接应自动弹窗接受指纹（功能缺失）
+
+**现状**：首次连接对端时，需要用户**手动**在 `~/.config/lan-mouse/config.toml`
+的 `[authorized_fingerprints]` 段加对方 cert fingerprint，否则 mTLS 拒握 +
+握手失败。如果不加，连接建立后立即断开（用户看到 "dial timed out"
+但日志里有 `AuthorizedKeysVerifier: rejected unauthorized peer ...`）。
+
+**期望**：对端 dial 进时，本地 verifier 拒绝 → 弹 GTK 窗口显示对端 fingerprint
++ "接受 / 拒绝"按钮 → 接受后自动写入 `[authorized_fingerprints]`
+→ 重连成功（无需手动编辑 config）。
+
+**当前代码状态**（Bug #1 修后已大半到位）：
+- ✅ `quic_transport.rs` AuthorizedKeysVerifier 拒握时通过反向 channel 发 fingerprint
+  （`rejection_tx.send(fp)`）
+- ✅ `listen.rs` `spawn_rejection_forwarder_task` 把 fp 推 `ListenEvent::Rejected`
+- ✅ `emulation.rs` ListenTask match Some(Rejected) 推 `EmulationEvent::ConnectionAttempt { fp }`
+- ✅ `service.rs` handle_emulation_event 转发为 `FrontendEvent::ConnectionAttempt { fp }`
+- ✅ `lan-mouse-gtk/src/lib.rs:286-287` match ConnectionAttempt → `window.request_authorization(&fp)`
+- ✅ `window.rs:573` request_authorization 创建 `AuthorizationWindow` 并 `present()`
+- ✅ `authorization_window.rs` 提供 GTK 模板
+
+**链路完整**，但用户实测**没看到弹窗**。推测：
+- A. GTK lib.rs 端 IPC 链路没接通（AsyncFrontendListener 接收有问题）
+- B. AuthorizationWindow 的 `connect_closure` 信号没正确绑定（`confirm-clicked` /
+  `cancel-clicked` 在 template 里名字不一致）
+- C. `present()` 调了但 window 没聚焦（macOS 上常见，application not active）
+
+**排查建议**：
+1. 在 `request_authorization` 里加 `log::info!` 看是否被调用
+2. 在 `AuthorizationWindow::new` 里检查 `fingerprint` 是否非空
+3. 检查 `authorization_window.ui` template 的按钮 id（`confirm-clicked` / `cancel-clicked`
+   是否对应 GtkButton 的 action-name 或 signal）
+4. 检查 macOS 应用是否 focus（`window.present()` 后可能需要 `window.present_with_time()` 或
+   `set_keep_above(true)`）
+
+**修复路径**：需要 GTK 调试 + macOS GUI 调试（user-perceived bug，跟具体 macOS
+版本 / 焦点策略有关）。可能 1-2 小时。
+
+**当前 workaround**：用户在 `~/.config/lan-mouse/config.toml` 加对端 fingerprint：
+```toml
+[authorized_fingerprints]
+"<对方 fingerprint>" = ""
+```
+对端 cert fingerprint 可在远端 daemon 日志 `creating self-signed cert` 附近找到
+（或 `openssl x509 -in ~/.local/share/lan-mouse/cert.pem -noout -fingerprint -sha256`）。
+
+---
+
+## 15. 时间/耗时（最终累计 — 含 14 follow-ups）
+
+| Bug / Follow-up | 时间 |
+|---|---|
+| Bug #1（mTLS reject 反向通知） | ~30 min |
+| Bug #2（connect_on_activate） | ~15 min |
+| Bug #3（Hello 握手重复） | ~25 min |
+| Bug #4（alive 永 false 移除） | ~20 min |
+| Bug #5（stream A 控制事件路径） | ~30 min |
+| Bug #6（Enter dead-code stub） | ~25 min |
+| Bug #7（stream A 事件转发 recv_tx） | ~30 min |
+| Bug #8（server 侧补 datagram reader） | ~30 min |
+| Bug #9（peer 关闭 release capture） | ~25 min |
+| Bug #10（read IO 错误路径） | ~20 min |
+| Bug #11 防御性修复 + 回退 | ~40 min |
+| Doc 整理 + follow-up 记录 | ~30 min |
+| **总计** | **~5 小时** |
+
+7 个核心 bug 都已修复（协议层）；3 个 follow-up 列入 14 节。
