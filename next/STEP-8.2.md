@@ -516,3 +516,107 @@ $ grep -rn 'send(ListenEvent::Rejected' src/
 
 - 调研：~15 min（已在本 STEP 内完成）
 - 实现修复：未开始
+---
+
+## 8. 新增修复：stream A 控制事件路径走新 bidi，server 不读（**Bug #5** — 已修）
+
+### 8.1 现场日志（Bug #1-#4 修后用户报"还是不行"）
+
+```
+[2026-09-01T13:12:17Z INFO  lan_mouse] creating input emulation ...
+[2026-09-01T13:12:17Z INFO  input_emulation] using emulation backend: macos
+[2026-09-01T13:12:17Z INFO  lan_mouse::connect] client 0 connecting ...
+...
+[2026-09-01T13:12:47Z INFO  lan_mouse::connect] client 0 connecting ...
+[2026-09-01T13:12:47Z INFO  lan_mouse::connect] client (0) connected @ 10.2.1.12:4242 (quic)
+[2026-09-01T13:12:47Z INFO  lan_mouse::quic_transport] read_loop: stream B reader spawned (cap=64), stream C dropped (M1 §9 守门)
+```
+
+**关键观察**：Bug #3 修后 client_hello 成功；Bug #4 修后 send 不再返
+TargetEmulationDisabled。但 read_loop 起来后**没有任何 Enter / Ack /
+Pong 等控制事件日志** —— 用户移动鼠标后键鼠还是不通。
+
+### 8.2 根因
+
+**客户端** `PeerSession::send_stream_a` 每次 `open_bi()` 开**新** bidi
+stream 写控制事件（Enter / Leave / Ack / Hello / Ping / Pong）。
+
+**服务端** `listen.rs::handle_quic_peer_supervisor` 只读缓存的
+`recv_a`（来自 server_hello 同 bidi）。
+
+→ **两条不同的 stream** → server 端不读新 stream → 控制事件永远
+到不了 server：
+
+- server 不知道 client 想 release capture（**无 Enter**）→ server
+  capture 不释放、server 不 inject input
+- server 不知道 client 想 Ack（**无 Ack**）→ client state 卡在
+  WaitingForAck 也不影响（client 端也有死代码，但本地 send 不阻塞）
+- server 不知道 client 想 Pong（**无 Pong**）→ alive 状态永远无更新
+  （与 Bug #4 同源，但即使 Bug #4 修了，Pong 也到不了）
+
+→ 用户看到"连上了但键鼠不通"。
+
+**为什么修前 `peer_session_round_trip_motion_keyboard` 测试还过**：那条
+测试发 Motion → route_input 选 Datagram → 走 QUIC datagram 通道
+（非 stream）→ 收发都通。**Stream A 路径从未被任何测试覆盖**。
+
+### 8.3 修复
+
+**`src/quic_transport.rs::PeerSession`**：
+
+1. 加字段 `cached_send_a: tokio::sync::Mutex<Option<SendStream>>` —
+   缓存 hello 时的同一条 bidi 的 send 半边
+2. 加方法 `take_stream_a_send()` —— 镜像 `take_stream_a_recv`，从
+   `stream_a_cache.send` 取出 send 半边（保留 recv 给 take_recv 用）
+3. `client_hello` / `server_hello` 完成后 put `Pair { send, recv }` 进
+   `stream_a_cache`，**然后**调 `take_stream_a_send` 把 send 搬到
+   `cached_send_a`
+4. `send_stream_a` 优先用 `cached_send_a`（与 server 端
+   `take_stream_a_recv` 拿到的 recv 是**同一条 bidi**）；cached 不可
+   用时 fallback 旧 open_bi 路径（保留兜底）
+
+**Mutex + 持锁 await 设计**：send_stream_a 是 stream A 唯一写路径（无
+其他 caller），持锁期间并发 caller 排队串行 —— 与 QUIC stream 一帧
+一帧语义对齐。
+
+### 8.4 测试
+
+**新增** `send_stream_a_round_trip_control_event`（`src/quic_transport.rs`）：
+
+模拟生产路径：
+1. server_ep + client_ep
+2. server task: accept → server_hello → take_stream_a_recv → 等 1 帧
+3. client: dial → client_hello → send_input(Ping)
+4. **断言**：server 在 3s 内能从 recv_a 读到 Ping
+5. 修前：server 永远读不到（Ping 走新 bidi）→ 3s 超时 panic
+6. 修后：server 读到 Ping → 测试通过
+
+**修改** `hello_happy_path_exchanges_magic` 测试断言：
+
+- 原断言 `take_stream_a_cache` 返 Some（验证 Pair 整对缓存）——
+  修后返 None（因为 send 半边被 take 走了）
+- 改为分别断言 `take_stream_a_recv` 返 Some + `hello_ok()` 为 true
+  （隐含 cached_send_a 已就绪）
+
+### 8.5 已知遗留
+
+- `peer.run()` 主循环里 `open_bi × 3`（pairs[0..2]）中的 `pairs[0]`
+  被注释为 "stream A" 但实际上是**新 bidi** —— 现在 send_stream_a
+  走 cached_send_a，`pairs[0]` 完全没用了
+- 修法：把 peer.run 的 `for i in 0..3u8` 改成 `for i in 0..2u8`（只开
+  B/C 两 stream）+ `set_stream_bunch` 不再设 `a` 字段
+- 影响：无功能影响（仅多余 stream 开销 + bunch.a.send 是死引用）；
+  留 M2 cleanup
+
+---
+
+## 9. 时间/耗时（最终）
+
+- 调研 + Bug #1/#2 修：~45 min
+- Bug #3 + 回归测试：~25 min
+- Bug #4：~20 min
+- Bug #5：~30 min（含回归测试设计 + 现有断言迁移 + 文档追加）
+- **总计：~2 小时**（超出 PLANER 期望的 1 小时上限 —— 五个相关联的 bug 累
+  计时间，且每个修复后都要等用户复测才暴露下一个；建议下次类似场
+  景先一次性翻完整个数据通路再批量修，避免反复 commit/retest 周期）
+
