@@ -115,6 +115,64 @@ impl LanMouseConnection {
         self.recv_rx.recv().await.expect("channel closed")
     }
 
+    /// **STEP-8.2 修复 — `connect_on_activate`**：主动触发拨号，但不发送
+    /// 任何事件。
+    ///
+    /// **背景**：[`send()`] 仅在"我要发送事件"时才触发拨号。STEP-8.2 调
+    /// 研发现：即便 `activate_on_startup=true`，本机 daemon 启动后也不主动
+    /// dial —— 等鼠标移到屏边（capture 触发 `send()`）才拨。两侧都启动
+    /// 后没人移鼠标 → 永远不建连。
+    ///
+    /// **本方法语义**：与 `send()` 的下半段等价 —— 跑 RetryState gate →
+    /// 检查 `connecting` 去重 → `spawn_local(connect_to_handle)`。
+    /// **不**发任何 ProtoEvent、不返回 NotConnected 之外的 Err。
+    ///
+    /// **何时调**：`service.rs::activate_client` 在 `client_manager.activate_
+    /// client(handle)` 成功后立即 fire-and-forget —— 配合 capture 已有的
+    /// `send()`-触发拨号路径，两路独立：
+    /// - `activate_client` → `dial(handle)` 主动 dial
+    /// - 鼠标移边 → `send()` 触发 dial（路径不变）
+    ///
+    /// **去重**：`connecting` set 已保证同一 handle 不会并发 spawn 多个
+    /// `connect_to_handle`（`spawn_local(connect_to_handle)` 前 `connecting
+    /// .insert(handle)`，connect_to_handle 成功 / 失败末尾 `connecting
+    /// .remove(&handle)`）。RetryState 退避门也复用了 send() 的逻辑。
+    ///
+    /// **fire-and-forget**：本方法 spawn 后立即返回 `Ok(())`，不阻塞
+    /// caller。dial 结果由 `connect_to_handle` 自己处理（成功 register peer
+    /// + spawn supervisor；失败 record_retry_failure）。
+    pub(crate) async fn dial(&self, handle: ClientHandle) -> Result<(), LanMouseConnectionError> {
+        // RetryState gate —— 与 send() 同语义：退避期内不再 spawn dial。
+        {
+            let map = self.retry_state.borrow();
+            if let Some(entry) = map.get(&handle) {
+                let now = std::time::Instant::now();
+                if now < entry.next_attempt_at {
+                    log::trace!(
+                        "client {handle} dial() RetryState gate：等待 backoff（剩余 {:?}）",
+                        entry.next_attempt_at - now
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        let mut connecting = self.connecting.lock().await;
+        if !connecting.contains(&handle) {
+            connecting.insert(handle);
+            spawn_local(connect_to_handle(
+                self.client_manager.clone(),
+                self.client_endpoint.clone(),
+                self.quic_creds.clone(),
+                self.peers.clone(),
+                self.connecting.clone(),
+                self.pins_dir.clone(),
+                self.retry_state.clone(),
+                handle,
+            ));
+        }
+        Ok(())
+    }
+
     /// 发送一个事件到对端（STEP-6.1 切到 QUIC 路径）。
     ///
     /// **3 步流程**（与 bak `MousehopConnection::send` 对齐）：

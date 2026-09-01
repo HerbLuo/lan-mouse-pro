@@ -48,6 +48,26 @@
 //! **dead_code 守门**：`ArcConn` / `DTLSConn` / `VerifyPeerCertificateFn` 等
 //! 老类型引用整段删除；emulation.rs `ListenTask` 通过 `ListenEvent` 流式
 //! 消费 `Msg / Accept / Rejected / Disconnected` 4 变体。
+//!
+//! **STEP-8.2 修复 — mTLS reject 反向通知路径**：
+//! `ListenEvent::Rejected { fingerprint }` 之前是死代码（`AuthorizedKeysVerifier
+//! ::verify_client_cert` 在 rustls 拒握时直接 `Err(rustls::Error)`，
+//! `quinn::Endpoint::accept` 不暴露被拒 cert 的 fingerprint，listen.rs
+//! supervisor 永远收不到这条事件 → GUI 不弹窗 → 用户看不见"未授权对端尝试
+//! 接入"的提示）。修复方案：
+//! 1. `AuthorizedKeysVerifier` 加 `rejection_tx: Option<UnboundedSender<String>>`
+//!    字段（`with_rejection_tx` builder 注入）
+//! 2. `verify_client_cert` 在 Err 路径上 `rejection_tx.send(fp)`（best-effort）
+//! 3. `LanMouseListener::new` 创 `tokio::sync::mpsc::unbounded_channel::<String>()`
+//!    → 把 tx clone 给 verifier + spawn `spawn_rejection_forwarder_task` 在
+//!    spawn_local 上把 `rx.recv()` 翻译成 `ListenEvent::Rejected { fingerprint }`
+//!    走同一 `listen_tx`（与 Accept / Msg / Disconnected 同一通道）
+//! 4. `terminate()` 把 forwarder task 也 abort（与 `wake_task` 同模式）
+//!
+//! 这样 `AuthorizedKeysVerifier` 拒握时 fingerprint 即时送到
+//! `EmulationTask::ListenTask` 已有 match 分支（emulation.rs:190）→
+//! `EmulationEvent::ConnectionAttempt` → `FrontendEvent::ConnectionAttempt` →
+//! GTK `request_authorization` 弹窗。
 
 use futures::{Stream, StreamExt};
 use lan_mouse_proto::ProtoEvent;
@@ -93,10 +113,18 @@ pub(crate) enum ListenEvent {
     },
     /// Peer 握手失败 / fingerprint 未授权（mTLS 阶段被拒）。
     ///
-    /// STEP-6.2 暂不触发（mTLS 在 quinn handshake 阶段已拒 fingerprint 不
-    /// 在 allowlist 的 client；mTLS 通过后 server_hello 失败由 supervisor
-    /// 退场 → 不发任何 ListenEvent）。保留变体是为 STEP-6.3 supervisor 加
-    /// 二次校验或 hello 失败时仍能复用现有 match 臂。
+    /// **STEP-8.2 修复**：由 [`crate::quic_transport::AuthorizedKeysVerifier`]
+    /// 通过反向 channel (`tokio::sync::mpsc::UnboundedSender<String>`) 通
+    /// 知 `spawn_rejection_forwarder_task`，后者把 fingerprint 翻译为本事件
+    /// 走 `listen_tx` 同一条流。
+    ///
+    /// **为什么需要反向 channel（而不是 rustls 拒握后从 quinn `Connection`
+    /// 拿 fingerprint）**：rustls 拒握时 `quinn::Connecting::await` 直接
+    /// 返 `Err(ConnectionError::TransportError(rustls::Error::General))`，
+    /// 此时还没 resolve 出 `Connection`，**没有 `peer_identity()` 可读** —
+    /// fingerprint 信息只在 `verify_client_cert` 调用现场被丢弃。只能在
+    /// verifier 内部 `verify_client_cert` 即将返 Err 时把 fp clone 一份
+    /// 发出来。
     Rejected {
         fingerprint: String,
     },
@@ -108,6 +136,17 @@ pub(crate) struct LanMouseListener {
     /// QUIC accept task（M1 阶段单 endpoint 绑 `0.0.0.0:port`）。
     /// `terminate` 时 abort。
     accept_task: JoinHandle<()>,
+    /// **STEP-8.2 修复**：把 `AuthorizedKeysVerifier` 的反向通知 channel
+    /// (`tokio::sync::mpsc::UnboundedReceiver<String>`) 转译为
+    /// `ListenEvent::Rejected` 的 forwarder task。
+    ///
+    /// `spawn_local` 起的 task，阻塞 recv `rejection_rx` → 收到 fp 后
+    /// `listen_tx.send(ListenEvent::Rejected { fingerprint })`。**复用同
+    /// 一 `listen_tx`** —— 不另开 channel，让 `emulation.rs::ListenTask`
+    /// 已在的 match 臂（emulation.rs:190）天然生效。
+    ///
+    /// `terminate` 时 abort —— 与 `wake_task` 同模式。
+    rejection_forwarder_task: JoinHandle<()>,
     /// 后台 wake 处理 task（STEP-6.3 引入，与 bak 对齐）。
     ///
     /// macOS 系统唤醒 → 强制关闭所有 QUIC peer conn（不等 QUIC 30s
@@ -172,8 +211,23 @@ impl LanMouseListener {
 
         let wake_task = spawn_wake_task(wake_rx, quic_conns.clone());
 
+        // STEP-8.2 修复：装配 rejection 反向通知 channel。
+        //
+        // 路径：`AuthorizedKeysVerifier::verify_client_cert` Err → `tx.send(fp)`
+        // → 本 forwarder task `rx.recv()` → `listen_tx.send(ListenEvent::Rejected)`
+        // → emulation.rs:190 → `EmulationEvent::ConnectionAttempt` → service.rs:320
+        // → `FrontendEvent::ConnectionAttempt` → GTK `request_authorization`。
+        //
+        // **channel 类型**：`tokio::sync::mpsc::unbounded_channel`（与
+        // §1 `wake_tx` 同模式 —— verifier 在 rustls 握手回调里 send，
+        // 可能在非 local 线程上，需 Send/Sync sender；forwarder 在
+        // spawn_local 上 recv）。
+        let (rejection_tx, rejection_rx) =
+            tokio::sync::mpsc::unbounded_channel::<String>();
+        let rejection_forwarder_task = spawn_rejection_forwarder_task(rejection_rx, listen_tx.clone());
+
         let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
-            Arc::new(AuthorizedKeysVerifier::new(authorized_keys));
+            Arc::new(AuthorizedKeysVerifier::new(authorized_keys).with_rejection_tx(rejection_tx));
 
         let addr = SocketAddr::new(
             "0.0.0.0".parse().expect("invalid ip"),
@@ -187,6 +241,7 @@ impl LanMouseListener {
             listen_rx,
             listen_tx,
             accept_task,
+            rejection_forwarder_task,
             wake_task,
             quic_conns,
             #[cfg(target_os = "macos")]
@@ -213,10 +268,14 @@ impl LanMouseListener {
         // 2. abort accept task → endpoint close → 所有 in-flight supervisor
         //    收到 conn close → 发 ListenEvent::Disconnected → emulation.rs
         //    ListenTask 清理 + 上报 service。
-        // 3. close listen_tx → 通知所有 supervisor 的 forward_event 写入失败
+        // 3. abort rejection forwarder task（STEP-8.2）→ verifier 持有的
+        //    rejection_tx sender 之后 send 会返 Err（被静默吞，与 verify_
+        //    client_cert 设计一致）。
+        // 4. close listen_tx → 通知所有 supervisor 的 forward_event 写入失败
         //    → 不影响 read_loop 退出（read_loop 自己的 join handle 仍 resolve）。
         self.wake_task.abort();
         self.accept_task.abort();
+        self.rejection_forwarder_task.abort();
         self.listen_tx.close();
     }
 
@@ -381,6 +440,45 @@ fn spawn_wake_task(
                 }
             }
         }
+    })
+}
+
+/// **STEP-8.2 修复**：把 `AuthorizedKeysVerifier` 的反向通知 channel
+/// (`tokio::sync::mpsc::UnboundedReceiver<String>`) 转译为
+/// `ListenEvent::Rejected` 的 forwarder task。
+///
+/// **路径**：`AuthorizedKeysVerifier::verify_client_cert` Err →
+/// `tx.send(fp)`（在 verifier 内部，已在 quic_transport.rs 装配）→
+/// 本 task `rx.recv()` → `listen_tx.send(ListenEvent::Rejected { fingerprint })`
+/// → emulation.rs:190 → `EmulationEvent::ConnectionAttempt` →
+/// service.rs:320 → `FrontendEvent::ConnectionAttempt` → GTK `request_authorization`
+/// 弹窗。
+///
+/// **去重**：emulation.rs:191-194 已有 2 秒去重（同一 fp 在 2 秒内只弹一
+/// 次窗），避免对端 retry 时被 rustls 反复拒握导致弹窗刷屏 —— forwarder
+/// 这一层不需要再 dedup，**直接转译**。
+///
+/// **退出路径**：`terminate()` 调 `rejection_forwarder_task.abort()` —
+/// 与 `wake_task` / `accept_task` 同模式；abort 后 verifier 持有的
+/// `rejection_tx` 后续 send 会返 Err（已在 verifier 内部被静默吞）。
+fn spawn_rejection_forwarder_task(
+    mut rejection_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    listen_tx: Sender<ListenEvent>,
+) -> JoinHandle<()> {
+    spawn_local(async move {
+        while let Some(fp) = rejection_rx.recv().await {
+            log::debug!("rejection forwarder: peer {fp} rejected by mTLS — sending ListenEvent::Rejected");
+            if listen_tx
+                .send(ListenEvent::Rejected { fingerprint: fp })
+                .is_err()
+            {
+                log::debug!(
+                    "rejection forwarder: listen_tx send failed (channel closed, terminating)"
+                );
+                break;
+            }
+        }
+        log::debug!("rejection forwarder: rejection channel closed — exiting");
     })
 }
 

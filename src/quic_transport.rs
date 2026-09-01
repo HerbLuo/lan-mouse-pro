@@ -2749,6 +2749,21 @@ pub struct AuthorizedKeysVerifier {
     /// 转发到 `rustls::crypto::verify_*_signature` 时拿它的
     /// `signature_verification_algorithms`）。
     provider: Arc<rustls::crypto::CryptoProvider>,
+    /// **STEP-8.2 修复**：被拒对端 fingerprint 反向通知 channel —— 把
+    /// rustls 拒握路径里拿到的 fingerprint 透回 listen task，转译为
+    /// `ListenEvent::Rejected` → emulation.rs 上报 `ConnectionAttempt`
+    /// → GUI 弹窗。
+    ///
+    /// **`Option` 而非必填**：单测 + 早期 caller（无 listen task 装配时）
+    /// 不接 channel 时为 `None`，`verify_client_cert` 走 no-op 分支。
+    ///
+    /// **为什么用 `tokio::sync::mpsc::UnboundedSender` 而非 `local_channel`**：
+    /// `verify_client_cert` 由 rustls 在 QUIC 握手回调链里调用 —— quinn
+    /// 的 I/O task 可能跑在非 local 线程上（与 spawn_local 不属同一 task）。
+    /// `tokio::sync::mpsc::UnboundedSender` 是 `Send + Sync`，可跨线程持有；
+    /// listen task 的 forwarder 在 `spawn_local` 上 recv（同 §1 `wake_rx`
+    /// 模式）。
+    rejection_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl AuthorizedKeysVerifier {
@@ -2757,12 +2772,31 @@ impl AuthorizedKeysVerifier {
     ///
     /// `allowlist` 必须 `Send + Sync + 'static`（rustls 要求 verifier
     /// `Send + Sync + 'static`；`Arc<RwLock<HashMap<...>>>` 自动满足）。
+    ///
+    /// **无 rejection channel**：单测 / 早期 caller 用此构造；rustls 拒握
+    /// 时仅 `log::warn` 留审计线索，不通知 GUI。
     #[allow(dead_code)]
     pub fn new(allowlist: Arc<RwLock<HashMap<String, String>>>) -> Self {
         Self {
             allowlist,
             provider: Arc::new(rustls::crypto::ring::default_provider()),
+            rejection_tx: None,
         }
+    }
+
+    /// **STEP-8.2 修复**：注入 rejection 反向通知 channel —— builder 模式，
+    /// 不破坏既有 `new()` / `with_known()` 单测与 caller 的签名。
+    ///
+    /// `verify_client_cert` 在 Err 路径上额外 `rejection_tx.send(fp.clone())`
+    /// （channel 满 / 关闭时静默 no-op —— reject 事件是 best-effort，不应
+    /// 干扰 rustls 原本返 Err 的语义）。
+    #[allow(dead_code)]
+    pub fn with_rejection_tx(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Self {
+        self.rejection_tx = Some(tx);
+        self
     }
 
     /// 构造：已知 peer 状态（预填 `allowlist` 让后续 verify 走 Authorized 分支）。
@@ -2835,10 +2869,20 @@ impl rustls::server::danger::ClientCertVerifier for AuthorizedKeysVerifier {
         } else {
             // Unauthorized —— allowlist 不命中
             //
-            // 注意：本步不触发 IPC 推送（IPC 集成属于 STEP-6.x 接入 listen.rs supervisor
-            // 时一并处理），仅 log::warn 留下审计线索。错误消息含 fingerprint 方便
-            // 上层诊断（用户对照"信任的 peer 列表"判定）。
+            // **STEP-8.2 修复**：除了 `log::warn` 留审计线索 + 返回 rustls
+            // `Err` 触发握手拒绝，**同时**把 fingerprint 通过反向 channel
+            // 通知 listen task → 转译 `ListenEvent::Rejected` →
+            // `EmulationEvent::ConnectionAttempt` → GUI `request_authorization`
+            // 弹窗（emulation.rs:190 + service.rs:320 + GTK `request_authorization`）。
+            //
+            // **send 失败静默吞**：`UnboundedSender::send` 仅在 receiver drop
+            // 时返 `Err`（channel 关闭），此时 listen task 已退出（terminate）
+            // —— 拒握已是终局，发不出"弹窗"信号合理 no-op，**不**应让这影响
+            // rustls 原本返 Err 的语义（rustls 仍按设计拒握，错误消息不变）。
             log::warn!("AuthorizedKeysVerifier: rejected unauthorized peer {fp}");
+            if let Some(tx) = &self.rejection_tx {
+                let _ = tx.send(fp.clone());
+            }
             Err(rustls::Error::General(format!("unauthorized peer {fp}")))
         }
     }
@@ -3510,6 +3554,68 @@ mod tests {
         assert!(
             !verifier.allowlist().read().unwrap().contains_key(&fp),
             "allowlist 应不含 cert_der 的 fp"
+        );
+    }
+
+    /// **STEP-8.2 验收**：rejection channel 接通 — 当 `verify_client_cert`
+    /// 在 allowlist 未命中返 Err 时，fingerprint 必须通过 `rejection_tx`
+    /// 同步送达 rx（供 listen.rs forwarder 转译为 `ListenEvent::Rejected`）。
+    ///
+    /// **不依赖 QUIC 握手** —— 直接调 `verify_client_cert` + 同步 `rx.try_recv()`
+    /// 验证 channel 已 send。**正向路径**（allowlist 命中）也应不发 ——
+    /// 避免误报导致 GUI 弹窗。
+    ///
+    /// **回归 `authorized_keys_rejects_unknown`** 的 Err-消息断言（fingerprint
+    /// + 'unauthorized' 关键字），不重复已覆盖项。
+    #[test]
+    fn rejection_channel_forwards_rejected_fingerprint() {
+        let allowlist = tmp_allowlist("rejection-tx");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+        // (1) 装配 verifier：allowlist 空 + rejection_tx 已注入
+        let (cert_chain, _key) = ephemeral_cert();
+        let cert_der = cert_chain[0].clone();
+        let fp = crypto::generate_fingerprint(cert_der.as_ref());
+        let verifier =
+            AuthorizedKeysVerifier::new(allowlist.clone()).with_rejection_tx(tx);
+
+        // (2) 正向路径（allowlist 命中）→ tx 不应 send —— 防止误报
+        allowlist
+            .write()
+            .expect("RwLock poisoned")
+            .insert(fp.clone(), String::new());
+        let r = <AuthorizedKeysVerifier as rustls::server::danger::ClientCertVerifier>::verify_client_cert(
+            &verifier,
+            &cert_der,
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        );
+        assert!(r.is_ok(), "allowlist 命中应 Ok");
+        assert!(
+            rx.try_recv().is_err(),
+            "allowlist 命中路径不应 send rejection（防止误报）"
+        );
+
+        // (3) 负向路径（allowlist 移除该 fp）→ tx 应 send 该 fp
+        allowlist.write().expect("RwLock poisoned").remove(&fp);
+        let r = <AuthorizedKeysVerifier as rustls::server::danger::ClientCertVerifier>::verify_client_cert(
+            &verifier,
+            &cert_der,
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        );
+        assert!(r.is_err(), "allowlist 不命中应 Err");
+
+        // (4) 断言：channel 收到同一 fp（验证反向通知路径）
+        let received = rx.try_recv().expect("rejection_tx 应在 Err 路径 send fp");
+        assert_eq!(
+            received, fp,
+            "rejection channel 收到的 fp 应与被拒 cert 的 fp 一致"
+        );
+        // rx 空 —— 一次拒绝只 send 一次
+        assert!(
+            rx.try_recv().is_err(),
+            "第二次 try_recv 应为空（一次拒绝只 send 一次）"
         );
     }
 

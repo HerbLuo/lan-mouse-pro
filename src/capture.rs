@@ -15,6 +15,7 @@ use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
 use crate::connect::LanMouseConnection;
+use lan_mouse_ipc::ClientHandle;
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -61,6 +62,11 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
+    /// **STEP-8.2 修复 — `connect_on_activate`**：主动触发拨号但不发送
+    /// 任何事件。`service.rs::activate_client` 在 client 激活后立即 fire-
+    /// and-forget 发这条请求 → `CaptureTask` 调用 `conn.dial(handle)` →
+    /// `connect_to_handle` 后台 spawn。详见 connect.rs::dial docstring。
+    Dial(ClientHandle),
 }
 
 impl Capture {
@@ -136,6 +142,26 @@ impl Capture {
 
     pub(crate) fn set_release_bind(&mut self, bind: Vec<scancode::Linux>) {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
+    }
+
+    /// **STEP-8.2 修复 — `connect_on_activate`**：主动触发对端的拨号，但不
+    /// 发送任何事件。
+    ///
+    /// **为什么需要这条路径**：`service.rs::activate_client` 在 client 激活
+    /// 时调它 —— 即便没人移鼠标到屏边，也能立即 spawn 一次拨号尝试。解决
+    /// "两侧 daemon 启动 + 指纹已授权 + 没人移鼠标 → 永远不建连"的鸡生蛋
+    /// 问题。
+    ///
+    /// **fire-and-forget**：本方法 send `CaptureRequest::Dial` 后立即返回。
+    /// `CaptureTask` 在两个 `select!` 臂（`run()` 重启循环 + `do_capture_
+    /// session()` 主循环）的任一臂收到 `Dial(handle)` 时调
+    /// `self.conn.dial(handle)`（fire-and-forget spawn `connect_to_handle`）。
+    ///
+    /// **失败模式**：send `request_tx` 失败仅在 task 已退出时发生（terminate
+    /// 已触发），**不**是用户可见的失败 —— 此后 activate_client 也不再有
+    /// 意义。静默 no-op。
+    pub(crate) fn dial(&self, handle: ClientHandle) {
+        let _ = self.request_tx.send(CaptureRequest::Dial(handle));
     }
 }
 
@@ -213,6 +239,13 @@ impl CaptureTask {
                         CaptureRequest::Release => { /* nothing to do */ }
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
+                        }
+                        // STEP-8.2 修复：do_capture 退出循环期间（重启期
+                        // 间）来的 dial 请求也要立即转发 —— 等下次 capture
+                        // 起来再处理就太晚了（peer daemon 可能已退出
+                        // retry 退避窗口）。fire-and-forget 调 conn.dial。
+                        CaptureRequest::Dial(handle) => {
+                            let _ = self.conn.dial(handle).await;
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -306,6 +339,12 @@ impl CaptureTask {
                     }
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
+                    }
+                    // STEP-8.2 修复：service.rs::activate_client 触发的主
+                    // 动拨号。fire-and-forget 调 conn.dial —— RetryState
+                    // gate + connecting set 去重由 connect.rs 内部保证。
+                    CaptureRequest::Dial(handle) => {
+                        let _ = self.conn.dial(handle).await;
                     }
                 },
                 _ = self.cancellation_token.cancelled() => break,

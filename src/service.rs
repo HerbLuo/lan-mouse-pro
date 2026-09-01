@@ -564,6 +564,22 @@ impl Service {
             self.capture.create(handle, pos, CaptureType::Default);
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
+
+            // STEP-8.2 修复 — `connect_on_activate`：
+            //
+            // 之前 activate 仅置 ClientState.active=true，不触发拨号 —— 只有
+            // 鼠标移到屏边（capture 触发 `conn.send()`）才 dial。两侧 daemon
+            // 启动后没人移鼠标 → 永远不建连。修复：activate 成功路径末尾立即
+            // fire-and-forget 触发拨号，与 capture 触发的 send()-触发-dial 路
+            // 径完全独立。RetryState + connecting set 去重由 connect.rs 保证。
+            //
+            // **必须在 `client_manager.activate_client` 返 true 之后调**：
+            // - 之前调 → connect_to_handle 拿不到 active handle → 直接返
+            //   NotConnected + retry（虽然 RetryState 退避会拦住，但逻辑上
+            //   是先有 active 状态再有 dial）
+            // - 在 `broadcast_client` 之后调 → 通知 GUI 之后再 dial，GUI 显
+            //   示 client 状态为 active 时拨号已在途（更符合直觉）
+            self.capture.dial(handle);
         }
     }
 
