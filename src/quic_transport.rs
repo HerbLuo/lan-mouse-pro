@@ -2888,22 +2888,13 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     /// `local_set_test!` 把测试体包在 `LocalSet::run_until` 里，让
-    /// `spawn_local` / `JoinSet::spawn_local` 在单元测试中也能正常工作。
+    /// `spawn_local` / `JoinSet::spawn_local` 在单元测试中也能用。
     ///
-    /// 生产路径 `main.rs::run_async` 已经是 current_thread + LocalSet 包裹；
-    /// 单元测试 `#[tokio::test]` 默认 multi-threaded runtime 没 LocalSet 包裹，
-    /// 在 tokio 1.51 上 `spawn_local` 会 panic。
-    /// 用 `#[tokio::test(flavor = "current_thread")]` 也不够 —— current_thread
-    /// 是 LocalRuntime 但不会自动 wrap LocalSet。
-    ///
-    /// **flavor 选 multi_thread 而非 current_thread**：multi_thread runtime
-    /// 有独立 worker pool 跑 `tokio::spawn`（Send）任务（如 Quinn I/O driver
-    /// / server task），LocalSet 单独跑 `spawn_local` 任务和 main future；
-    /// current_thread 虽也能跑，但所有 Send 任务排在 LocalSet 主 future 之后，
-    /// 出现 server task 还没起来 client 就 dial 完成 → handshake timeout
-    /// （实测 hello_wrong_magic / stream_c_take 失败）。
-    /// multi_thread 需要 tokio 的 `rt-multi-thread` feature —— 见 Cargo.toml
-    /// `[dev-dependencies]`。
+    /// **为什么 multi_thread flavor**：multi_thread runtime 让 Quinn I/O
+    /// driver / server task 等 `Send` future 在独立 worker thread 跑，LocalSet
+    /// 单独跑 main future + `spawn_local` 任务，避免 current_thread 下所有
+    /// `Send` 任务排在 main future 之后（server task 还没起来 client 就 dial
+    /// 完成 → handshake timeout）。需要 tokio `rt-multi-thread` feature。
     ///
     /// 用法：
     /// ```ignore
@@ -2945,6 +2936,29 @@ mod tests {
         let cp = dir.join("cert.pem");
         let kp = dir.join("key.pem");
         crypto::generate_self_signed("lan-mouse-test", &cp, &kp).expect("test cert 自签")
+    }
+
+    /// 测试用临时 TOFU pins 目录 —— 与 `ephemeral_cert()` 同三重隔离（PID +
+    /// nanos + counter）。
+    ///
+    /// **必须 per-test 唯一**：`TofuVerifier` 三态判定依赖 pins_dir 内
+    /// `.pin` 文件集合。共享 pins_dir 在并行跑下发生 race：A/B 都 `remove_
+    /// dir_all` → 都从空目录开始 → A 写完 `fp_A.pin` → B 验证时发现目录
+    /// 有 `.pin` 但没 `fp_B.pin` → Known Mismatch 拒握。
+    fn ephemeral_pins_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "lan-mouse-quic-pins-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            n
+        ))
     }
 
     /// 测试用 server endpoint 装配 —— 直接调公共 [`endpoint_with_cert`]
@@ -3003,8 +3017,7 @@ mod tests {
         let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
             .expect("client endpoint bind 不应失败");
         // STEP-2.6：dial 加 pins_dir 参数；测试用临时 pins_dir 隔离。
-        let pins_dir =
-            std::env::temp_dir().join(format!("lan-mouse-quic-test-pins-{}", std::process::id()));
+        let pins_dir = ephemeral_pins_dir();
         let _ = std::fs::remove_dir_all(&pins_dir);
         let conn = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -3059,8 +3072,7 @@ mod tests {
         let (cert_chain, key) = ephemeral_cert();
         // STEP-2.6：`build_quic_client_config` 加 `pins_dir` 参数（TofuVerifier
         // 替换 WebPkiServerVerifier；构造由 `TofuVerifier::new(pins_dir)` 全权负责）。
-        let pins_dir =
-            std::env::temp_dir().join(format!("lan-mouse-quic-test-pins-{}", std::process::id()));
+        let pins_dir = ephemeral_pins_dir();
         let _ = std::fs::remove_dir_all(&pins_dir);
         // STEP-2.5 起：`build_quic_client_config` 收 `Vec<CertificateDer>`（`with_client_auth_cert`
         // 要求 chain 形态）—— 单张 cert 包成 `vec![cert]` 即可
@@ -3117,8 +3129,7 @@ mod tests {
         let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
             .expect("client endpoint bind 不应失败");
         // STEP-2.6：dial 加 pins_dir 参数；测试用临时 pins_dir 隔离。
-        let pins_dir =
-            std::env::temp_dir().join(format!("lan-mouse-quic-test-pins-{}", std::process::id()));
+        let pins_dir = ephemeral_pins_dir();
         let _ = std::fs::remove_dir_all(&pins_dir);
         let conn = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -3569,8 +3580,7 @@ mod tests {
         });
 
         // (2) client：dial + client_hello
-        let pins_dir =
-            std::env::temp_dir().join(format!("lan-mouse-quic-test-pins-{}", std::process::id()));
+        let pins_dir = ephemeral_pins_dir();
         let _ = std::fs::remove_dir_all(&pins_dir);
         let (client_cert_chain, client_key) = ephemeral_cert();
         let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
@@ -3635,11 +3645,9 @@ mod tests {
         let server_addr = server_ep.local_addr().expect("server addr");
 
         // (1) 后台 server task：accept + 手动 accept_bi + 发错 magic Hello
-        // STEP-7.2d 修复：原代码误用 `conn.open_bi()` 打开了**新**的 bi stream，
-        // 但 client_hello 读的是 client 自己 open_bi() 那条 stream 的 recv 端
-        // —— server 必须 `accept_bi()` 接 client 的 stream 才能在它的 send 半边
-        // 写错 magic。原 bug 导致 client_hello 永远等不到 server 的 hello →
-        // HELLO_TIMEOUT（3s）后 connection lost。
+        // **必须 accept_bi 接 client 的 stream A**：client_hello 在自己
+        // open_bi() 那条 stream 的 recv 半边读 server 的 hello；server 用
+        // accept_bi() 拿到 send 半边，写错 magic 后 client 立刻收到。
         let server_task = spawn_local(async move {
             let conn = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -3675,8 +3683,7 @@ mod tests {
         });
 
         // (2) client：dial + client_hello → 期望 HelloFailed
-        let pins_dir =
-            std::env::temp_dir().join(format!("lan-mouse-quic-test-pins-{}", std::process::id()));
+        let pins_dir = ephemeral_pins_dir();
         let _ = std::fs::remove_dir_all(&pins_dir);
         let (client_cert_chain, client_key) = ephemeral_cert();
         let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
@@ -3761,8 +3768,7 @@ mod tests {
         });
 
         // (2) client：dial + client_hello → 期望 HelloTimeout(3s)
-        let pins_dir =
-            std::env::temp_dir().join(format!("lan-mouse-quic-test-pins-{}", std::process::id()));
+        let pins_dir = ephemeral_pins_dir();
         let _ = std::fs::remove_dir_all(&pins_dir);
         let (client_cert_chain, client_key) = ephemeral_cert();
         let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
@@ -4513,6 +4519,11 @@ mod tests {
                 .expect("server hello timeout")
                 .expect("server hello");
 
+            // 留出时间让 client_hello 完成 server-Hello 帧读取 —— 否则 server
+            // 立刻 close 会让 client 在 client_hello 内部 read Hello frame
+            // length 时拿到 connection lost（实测 30 次跑约 1 次失败）
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
             // 关键断言：take_stream_bunch 应返 None（STEP-5.4 run() 装配
             // 前 stream_bunch 字段保持 None；本步验证"未装配时不 panic"）
             let bunch = session.take_stream_bunch().await;
@@ -4643,8 +4654,7 @@ mod tests {
         .expect("dial");
         let client_arc = std::sync::Arc::new(PeerSession::from_connection(conn));
 
-        // 客户端必须先 client_hello 才能 send_motion（hello_ok 门禁）——
-        // STEP-7.2c 修复 local_set_test! 后这条用例会进到这里，需要补这个调用。
+        // 客户端必须先 client_hello 才能 send_motion（hello_ok 门禁）
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             client_hello(&client_arc),
@@ -4674,10 +4684,8 @@ mod tests {
         )
         .await;
 
-        // (7) 等 server run 完成（5s 兜底 —— STEP-7.2c 修复后 server task
-        //     在 LocalSet 里跑，能正常响应 client close；测试设计要求 server
-        //     看到 conn.closed() 后 run() 返 Ok —— 但 STEP-6.5 改造后 run()
-        //     返 Err(close_reason)，这里用 ignore 包装 best-effort 完成）
+        // (7) 等 server run 完成 —— server.run() 看到 conn.closed() 后返
+        //     Err(close_reason)，用 ignore 包装 best-effort 完成
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
             .await;
 
@@ -4791,25 +4799,17 @@ mod tests {
     /// **不**断言具体错误类型（quinn 返的具体 ConnectionError 在不同 OS /
     /// 网络栈可能不同）—— 只断言 dial_any 返 Err。
     ///
-    /// **STEP-7.2d 超时调整**：原 docstring 期望 `< 5s`，但 quinn 默认
-    /// `max_idle_timeout = 30s` 也是 handshake 超时（见 quinn-0.11.11
-    /// `src/tests.rs:43 handshake_timeout()` 测试用 500ms 验证）—— 每条
-    /// 候选 dial 都等满 30s 才放弃。dial_any 用 JoinSet 并发拨，主 future 等
-    /// 最后一条 join → 30s + 几 ms。测试超时 35s 兜底。
+    /// **超时 35s 兜底**：quinn 默认 `max_idle_timeout = 30s` 同时也是
+    /// handshake 超时（见 quinn-0.11.11 `src/tests.rs:43 handshake_timeout()`
+    /// 测试用 500ms 验证）—— 每条候选 dial 都等满 30s 才放弃。dial_any 用
+    /// JoinSet 并发拨，主 future 等最后一条 join → ~30s + 几 ms。
     local_set_test!(dial_any_all_unreachable_returns_err, {
         install_crypto_provider();
 
         let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
             .expect("client endpoint bind");
 
-        let pins_dir = std::env::temp_dir().join(format!(
-            "lan-mouse-step-6-4-pins-unreach-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let pins_dir = ephemeral_pins_dir();
         let _ = std::fs::remove_dir_all(&pins_dir);
         let (client_cert, client_key) = ephemeral_cert();
 
