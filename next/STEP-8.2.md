@@ -620,3 +620,114 @@ stream 写控制事件（Enter / Leave / Ack / Hello / Ping / Pong）。
   计时间，且每个修复后都要等用户复测才暴露下一个；建议下次类似场
   景先一次性翻完整个数据通路再批量修，避免反复 commit/retest 周期）
 
+
+---
+
+## 10. 新增修复：Enter 处理被 dead-code stub 跳过（**Bug #6** — 已修）
+
+### 10.1 现场日志（Bug #1-#5 修后用户复测，进展 + 残留）
+
+**进展**：
+- 远程 daemon 重启后 INFO 正常：`stream A recv from 10.2.1.15:61252: Enter(top)`
+  —— Bug #5 修复生效，stream A 端到端通
+- 本机日志正常：`send Enter(bottom) to handle 0 addr 10.2.1.12:4242 via peer (active)`
+
+**残留**：
+- 远程收到 Enter 后**鼠标没出现** —— 远程不 inject input
+- 本机反复 `send Enter(bottom)`（约每秒一次）—— 卡在 WaitingForAck
+  永远收不到 Ack
+- 结束远程程序后**过好久本机才出现鼠标** —— 因为 RetryState 退避
+  30s 上限，dial 不再尝试，等 supervisor 超时
+
+### 10.2 根因
+
+`src/emulation.rs:175` Enter 处理：
+```rust
+ProtoEvent::Enter(pos) => {
+    if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
+        log::info!("releasing capture: {addr} entered this device");
+        self.event_tx.send(EmulationEvent::ReleaseNotify).expect("...");
+        self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+        self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("...");
+    }
+}
+```
+
+但 `src/listen.rs:316` `LanMouseListener::get_certificate_fingerprint` 是
+**dead-code stub**：
+```rust
+pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
+    let _ = addr;
+    None  // 永远 None
+}
+```
+
+→ 整个 if 块跳过 → 远程 Enter 后**不**：
+- release capture（service.add_incoming 不触发）
+- reply Ack（本机永远等不到 → 反复 send Enter）
+- 发 EmulationEvent::Entered（service + frontend 不知道有 peer 进入）
+
+**listen.rs:316 的 docstring 写的是期望**：
+> "ListenTask 在 Enter 时不需要重算 fingerprint —— 直接查 map
+>  即可。本函数保留是 emulation.rs 的现有 API 调用站桩，**M1
+>  阶段不真正用**"
+
+—— 但实际 `addr_to_fingerprint` map **从来没建过**，与 docstring 描述
+的"未来路径"从未落地。
+
+### 10.3 修复
+
+`src/emulation.rs::ListenTask` 自己维护 `addr_to_fingerprint: HashMap<SocketAddr, String>`：
+
+1. **新字段** `addr_to_fingerprint: HashMap<SocketAddr, String>`
+   （ListenTask struct + Emulation::new 构造初始化空 map）
+2. **`ListenEvent::Accept { addr, fingerprint }` 分支**：
+   ```rust
+   self.addr_to_fingerprint.insert(addr, fingerprint.clone());
+   self.event_tx.send(EmulationEvent::Connected { addr, fingerprint });
+   ```
+   （同时仍 forward Connected 给 service —— 兼容现有 service.rs 路径）
+3. **`ListenEvent::Disconnected { addr }` 分支**：
+   `self.addr_to_fingerprint.remove(&addr);` —— peer 重连会触发新
+   Accept 重填 fingerprint，旧 fingerprint 不能残留
+4. **Enter 处理**：直接查 map，不调 dead stub：
+   ```rust
+   let fingerprint = self.addr_to_fingerprint.get(&addr).cloned()
+       .unwrap_or_default();  // race 兜底：理论上 Accept 必在 Enter 之前
+   ```
+   后续 send ReleaseNotify / reply Ack / send Entered 都不再被 if 包
+   住。
+
+### 10.4 副效应
+
+service.rs:323 `add_incoming(addr, pos, fingerprint)` 现在能收到真实
+fingerprint（修前是空字符串 ""，service 也没校验所以表现上看不出
+差别，但 GUI / 配置侧能看到）。
+
+### 10.5 已知遗留（接受范围）
+
+- 本机反复 send Enter 的"spam"：Bug #5 修后 send 走 cached，**但
+  Bug #4 移除了 alive 守护** → 客户端 send 不知道 server 已收到
+  Ack（无 Pong 路径）→ 持续发 Enter 直到 mouse 离开 capture 区。
+  严格说有 Pong 路径后应 stop sending Enter，但 Pong 路径要
+  接 recv_tx 是更大的修复（见 §6.4 Bug #4 已知缺陷）—— 接受范围
+- 没有新单测覆盖 ListenTask 主循环（需要 mock LanMouseListener +
+  完整 capture 配合，超 M1 单测范围）—— 用户复测是最终验证
+
+---
+
+## 11. 时间/耗时（累计）
+
+- Bug #1（mTLS reject 反向通知）：~30 min
+- Bug #2（connect_on_activate）：~15 min
+- Bug #3（Hello 握手重复）：~25 min
+- Bug #4（alive 永 false 移除）：~20 min
+- Bug #5（stream A 控制事件路径）：~30 min
+- Bug #6（Enter dead-code stub）：~25 min
+- **总计：~145 min（~2.5 小时）**
+
+5/6 bug 都是同一类：**死代码 / 未连接路径让关键逻辑被 bypass**。
+建议下次类似现场先做一次**全数据通路 audit**（capture →
+send → peer.send_input → stream A/B/C → server listen.rs supervisor
+→ emulation.rs consume 全链路），把每个分支都过一遍，再批量修，
+避免反复 commit/retest 周期。
