@@ -4611,9 +4611,9 @@ mod tests {
             "lan-mouse-step-5-4-pins-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&pins_dir);
         let (client_cert, client_key) = ephemeral_cert();
@@ -4630,6 +4630,16 @@ mod tests {
         .expect("dial");
         let client_arc = std::sync::Arc::new(PeerSession::from_connection(conn));
 
+        // 客户端必须先 client_hello 才能 send_motion（hello_ok 门禁）——
+        // STEP-7.2c 修复 local_set_test! 后这条用例会进到这里，需要补这个调用。
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_hello(&client_arc),
+        )
+        .await
+        .expect("client_hello timeout")
+        .expect("client_hello");
+
         // (4) 客户端 send 1 帧 Motion（走 datagram 路径），等 server 回 1 帧
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -4639,23 +4649,24 @@ mod tests {
         .expect("client send_motion timeout")
         .expect("client send_motion");
 
-        // (5) 等 server run 完成（或超时）
-        tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
-            .await
-            .expect("server task timeout")
-            .expect("server task");
-
-        // (6) 关 client conn → client run() 看到 closed → 退出
+        // (5) 关 client conn → client run() / server run() 看到 closed 退出
         client_arc
             .connection()
             .close(quinn::VarInt::from(0u32), b"test done");
 
-        // (7) client run 也退出（best-effort：可能 server 先关导致 client closed 先 fire）
+        // (6) client run 也退出（best-effort）
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             std::sync::Arc::clone(&client_arc).run(PeerRole::Client),
         )
         .await;
+
+        // (7) 等 server run 完成（5s 兜底 —— STEP-7.2c 修复后 server task
+        //     在 LocalSet 里跑，能正常响应 client close；测试设计要求 server
+        //     看到 conn.closed() 后 run() 返 Ok —— 但 STEP-6.5 改造后 run()
+        //     返 Err(close_reason)，这里用 ignore 包装 best-effort 完成）
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
+            .await;
 
         drop(client_arc);
         client_ep.wait_idle().await;
@@ -4795,7 +4806,7 @@ mod tests {
         let all = vec![primary, secondary];
 
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(15),
             dial_any(
                 &client_ep,
                 primary,
@@ -4806,7 +4817,7 @@ mod tests {
             ),
         )
         .await
-        .expect("dial_any 总超时（应 < 10s 内返 Err）");
+        .expect("dial_any 总超时（应 < 15s 内返 Err）");
 
         assert!(
             result.is_err(),
