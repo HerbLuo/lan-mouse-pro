@@ -86,6 +86,12 @@ impl Emulation {
             emulation_proxy,
             request_rx,
             event_tx,
+            // **STEP-8.2 修复 — Bug #6**：addr_to_fingerprint map 初始化
+            // 空，由 ListenTask 在 `ListenEvent::Accept` 分支填充、
+            // `ListenEvent::Disconnected` 分支清理。详见 struct 字段
+            // docstring + 旧 `get_certificate_fingerprint` stub 在
+            // `listen.rs:316` 的死代码分析。
+            addr_to_fingerprint: HashMap::new(),
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -134,6 +140,23 @@ struct ListenTask {
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
+    /// **STEP-8.2 修复 — Bug #6**：`addr -> client cert fingerprint` map。
+    ///
+    /// **来源**：`ListenEvent::Accept { addr, fingerprint }` 是 supervisor
+    /// 计算 client cert fingerprint 后唯一送给 ListenTask 的入口；本字段
+    /// 在 Accept 分支插入、在 Disconnected 分支移除。
+    ///
+    /// **用途**：`ProtoEvent::Enter` 处理时查 map 拿 fingerprint（与
+    /// mTLS verified 的 peer 关联）→ 进 `EmulationEvent::Entered` 上报
+    /// service（service.rs:323 用来 `add_incoming` + 通知 frontend）。
+    ///
+    /// **修前**：`emulation.rs:152` 调 `self.listener.get_certificate_
+    /// fingerprint(addr)`，但 `listen.rs:316` 该方法是 dead-code stub
+    /// 直接返 None → 整个 `if let Some(fingerprint) = ...` 分支跳过 →
+    /// Enter 收下后**不 release capture、不 reply Ack、不发
+    /// EmulationEvent::Entered** —— 远程侧 enter 后无任何后续行为，
+    /// 看起来"收到了 Enter 但没反应"。
+    addr_to_fingerprint: HashMap<SocketAddr, String>,
 }
 
 impl ListenTask {
@@ -149,12 +172,31 @@ impl ListenTask {
                         last_response.insert(addr, Instant::now());
                         match event {
                             ProtoEvent::Enter(pos) => {
-                                if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
-                                    log::info!("releasing capture: {addr} entered this device");
-                                    self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
-                                    self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                                    self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
-                                }
+                                // **STEP-8.2 修复 — Bug #6**：直接查
+                                // `addr_to_fingerprint` map 拿 fingerprint
+                                // （不再调 `listener.get_certificate_fingerprint`
+                                // —— 那是 `listen.rs:316` 的 dead-code stub，
+                                // 永远返 None 让整个 Enter 处理被跳过）。
+                                //
+                                // **map 来源**：`ListenEvent::Accept`
+                                // 分支在 mTLS + supervisor 计算 fingerprint
+                                // 后 insert；`ListenEvent::Disconnected`
+                                // 分支 remove。
+                                //
+                                // **map 缺失兜底**：Accept 在 supervisor
+                                // 启动后**立刻**发，理论上 Accept 总在
+                                // Enter 之前（server_hello → Accept → client
+                                // 才进 capture 触发 Enter）。如果 map 缺
+                                // fp（理论上不应该 —— 但 race / 测试场景
+                                // 可能出现），用空字符串占位让流程不卡死
+                                // （service 端 add_incoming 用 "" 也是
+                                // 合法值 —— M1 不校验）。
+                                let fingerprint = self.addr_to_fingerprint.get(&addr).cloned()
+                                    .unwrap_or_default();
+                                log::info!("releasing capture: {addr} entered this device (fp={fingerprint})");
+                                self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
+                                self.listener.reply(addr, ProtoEvent::Ack(0)).await;
+                                self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
                             }
                             ProtoEvent::Leave(_) => {
                                 self.emulation_proxy.remove(addr);
@@ -185,6 +227,12 @@ impl ListenTask {
                         }
                     }
                     Some(ListenEvent::Accept { addr, fingerprint }) => {
+                        // **STEP-8.2 修复 — Bug #6**：同时把 fingerprint
+                        // 存进 `addr_to_fingerprint` map，供 Enter 处理
+                        // 查询（替代旧的 `listener.get_certificate_
+                        // fingerprint` dead-code stub）。
+                        log::debug!("ListenTask: peer {addr} accepted with fingerprint {fingerprint}");
+                        self.addr_to_fingerprint.insert(addr, fingerprint.clone());
                         self.event_tx.send(EmulationEvent::Connected { addr, fingerprint }).expect("channel closed");
                     }
                     Some(ListenEvent::Rejected { fingerprint }) => {
@@ -205,7 +253,12 @@ impl ListenTask {
                         // 后，timeout 路径改为 `if last_response.remove(&addr).is_some()`
                         // 形式 —— supervisor 路径赢得 race（supervisor 是 conn
                         // 真实关闭的明确信号；timeout 仅是 1s 心跳兜底）。
+                        //
+                        // **STEP-8.2 修复 — Bug #6**：同时清理 `addr_to_fingerprint`
+                        // map（peer 重连会触发新的 Accept 重填 fingerprint，
+                        // 但旧 fingerprint 不能残留）。
                         log::info!("peer {addr} disconnected (supervisor)");
+                        self.addr_to_fingerprint.remove(&addr);
                         last_response.remove(&addr);
                         self.emulation_proxy.remove(addr);
                         self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
