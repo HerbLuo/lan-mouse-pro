@@ -231,6 +231,7 @@ impl LanMouseConnection {
                 // STEP-8.2 临时移除 alive 检查 —— 详见 send() docstring。
                 // 原 alive 守护永远 false（recv_tx 路径未接），反而阻塞
                 // 所有 send。乐观假设 peer 在线。
+                log::info!("send {event_display} to handle {handle} addr {addr} via peer (active)");
                 let cfg = self
                     .client_manager
                     .input_channels(handle)
