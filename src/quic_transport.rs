@@ -2896,6 +2896,15 @@ mod tests {
     /// 用 `#[tokio::test(flavor = "current_thread")]` 也不够 —— current_thread
     /// 是 LocalRuntime 但不会自动 wrap LocalSet。
     ///
+    /// **flavor 选 multi_thread 而非 current_thread**：multi_thread runtime
+    /// 有独立 worker pool 跑 `tokio::spawn`（Send）任务（如 Quinn I/O driver
+    /// / server task），LocalSet 单独跑 `spawn_local` 任务和 main future；
+    /// current_thread 虽也能跑，但所有 Send 任务排在 LocalSet 主 future 之后，
+    /// 出现 server task 还没起来 client 就 dial 完成 → handshake timeout
+    /// （实测 hello_wrong_magic / stream_c_take 失败）。
+    /// multi_thread 需要 tokio 的 `rt-multi-thread` feature —— 见 Cargo.toml
+    /// `[dev-dependencies]`。
+    ///
     /// 用法：
     /// ```ignore
     /// local_set_test!(my_test_name, {
@@ -2907,7 +2916,7 @@ mod tests {
     #[allow(unused_macros)]
     macro_rules! local_set_test {
         ($name:ident, $body:block) => {
-            #[tokio::test(flavor = "current_thread")]
+            #[tokio::test(flavor = "multi_thread")]
             async fn $name() {
                 tokio::task::LocalSet::new().run_until(async move $body).await;
             }
@@ -3626,6 +3635,11 @@ mod tests {
         let server_addr = server_ep.local_addr().expect("server addr");
 
         // (1) 后台 server task：accept + 手动 accept_bi + 发错 magic Hello
+        // STEP-7.2d 修复：原代码误用 `conn.open_bi()` 打开了**新**的 bi stream，
+        // 但 client_hello 读的是 client 自己 open_bi() 那条 stream 的 recv 端
+        // —— server 必须 `accept_bi()` 接 client 的 stream 才能在它的 send 半边
+        // 写错 magic。原 bug 导致 client_hello 永远等不到 server 的 hello →
+        // HELLO_TIMEOUT（3s）后 connection lost。
         let server_task = spawn_local(async move {
             let conn = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -3637,11 +3651,11 @@ mod tests {
 
             let (mut send, _recv) = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                conn.open_bi(),
+                conn.accept_bi(),
             )
             .await
-            .expect("open_bi timeout")
-            .expect("open_bi");
+            .expect("accept_bi timeout")
+            .expect("accept_bi");
 
             // 发一个错 magic 的 Hello（不是 PROTOCOL_MAGIC）
             let wrong = ProtoEvent::Hello {
@@ -4484,22 +4498,7 @@ mod tests {
         let (client_cert, client_key) = ephemeral_cert();
         let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
             .expect("client endpoint bind");
-        let conn = dial(
-            &client_ep,
-            server_addr,
-            client_cert[0].clone(),
-            client_key,
-            &pins_dir,
-        )
-        .await
-        .expect("dial");
-        let client_session = PeerSession::from_connection(conn);
-
-        // server task：accept + server_hello（server_hello 把 stream A 缓存到
-        // server_session.stream_a_cache）。**不**调 read_loop（那是 STEP-5.4
-        // 范围）—— 本测试只验证 stream_bunch 字段当前为 None（未装配），
-        // 取走仍返 None
-        let server_task = spawn_local(async move {
+        let server_session_fut = spawn_local(async move {
             let conn = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 accept(&server_ep),
@@ -4526,7 +4525,21 @@ mod tests {
             session
                 .connection()
                 .close(quinn::VarInt::from(0u32), b"test done");
+            session
         });
+
+        // 跑 client dial —— Quinn handshake 需要 server 的 accept 已 poll
+        // 注册到 I/O driver；spawn server_task 先于 dial 保证 accept 已入队。
+        let conn = dial(
+            &client_ep,
+            server_addr,
+            client_cert[0].clone(),
+            client_key,
+            &pins_dir,
+        )
+        .await
+        .expect("dial");
+        let client_session = PeerSession::from_connection(conn);
 
         // 跑 client_hello 让 server 端 server_hello 触发 accept_bi 完成
         tokio::time::timeout(
@@ -4544,7 +4557,7 @@ mod tests {
             "client 端 stream_bunch 也应为 None（与 server 端对称）"
         );
 
-        server_task.await.expect("server task");
+        let _server_session = server_session_fut.await.expect("server task");
         drop(client_session);
         client_ep.wait_idle().await;
         let _ = std::fs::remove_dir_all(&pins_dir);
@@ -4776,7 +4789,13 @@ mod tests {
     /// 超过合理上限）。
     ///
     /// **不**断言具体错误类型（quinn 返的具体 ConnectionError 在不同 OS /
-    /// 网络栈可能不同）—— 只断言 dial_any 返 Err + 总耗时 < 5s。
+    /// 网络栈可能不同）—— 只断言 dial_any 返 Err。
+    ///
+    /// **STEP-7.2d 超时调整**：原 docstring 期望 `< 5s`，但 quinn 默认
+    /// `max_idle_timeout = 30s` 也是 handshake 超时（见 quinn-0.11.11
+    /// `src/tests.rs:43 handshake_timeout()` 测试用 500ms 验证）—— 每条
+    /// 候选 dial 都等满 30s 才放弃。dial_any 用 JoinSet 并发拨，主 future 等
+    /// 最后一条 join → 30s + 几 ms。测试超时 35s 兜底。
     local_set_test!(dial_any_all_unreachable_returns_err, {
         install_crypto_provider();
 
@@ -4806,7 +4825,7 @@ mod tests {
         let all = vec![primary, secondary];
 
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
+            std::time::Duration::from_secs(35),
             dial_any(
                 &client_ep,
                 primary,
@@ -4817,7 +4836,7 @@ mod tests {
             ),
         )
         .await
-        .expect("dial_any 总超时（应 < 15s 内返 Err）");
+        .expect("dial_any 总超时（应 < 35s 内返 Err）");
 
         assert!(
             result.is_err(),

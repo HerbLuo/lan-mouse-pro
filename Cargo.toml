@@ -79,6 +79,10 @@ notify = "8.2.0"
 
 [dev-dependencies]
 rcgen = "0.13"
+# STEP-7.2d: local_set_test! macro 用 multi_thread flavor 需要 rt-multi-thread
+# feature —— 多 worker 让 server_task 与 main future 在不同 OS thread 上并行调度，
+# 解决 current_thread + LocalSet 下 spawn_local 任务的调度 race。
+tokio = { version = "1.32.0", features = ["rt-multi-thread", "time", "macros"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
