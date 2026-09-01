@@ -2204,9 +2204,56 @@ impl PeerSession {
     spawn_local(datagram_reader_task(self.clone(), tx_d));
 
     // (3) Hello 握手 —— role 决定走 client_hello / server_hello
+    //
+    // **STEP-8.2 修复（Bug #3 — Hello 重复调用）**：
+    //
+    // **根因**：本仓 client 路径 `connect_to_handle` 在 `dial_any` 成功
+    // 后**先**调一次 `client_hello`（这一步是 STEP-6.1 引入的早期语义），
+    // 再 `spawn_local(spawn_peer_supervisor → peer.run(PeerRole::Client))`
+    // —— 而 `peer.run()` 内部**又**无条件调 `client_hello`（这是 STEP-5.4
+    // 引入 `run()` 时的原始语义）。两次 `client_hello` 的后果：
+    // - 第一次：`open_bi()` 开 stream A + 写 Hello + 读 Hello 回包 + 缓存
+    //   stream_a + `hello_ok = true`
+    // - 第二次（run() 内）：`open_bi()` 又开一条 stream D + 写 Hello + 等
+    //   Hello 回包 3s —— 但 server 端 `server_hello` 只 `accept_bi()` 一
+    //   次（接的是 stream A），accept 完就进 stream A 读循环，**永远不会**
+    //   accept stream D
+    // - 客户端第二次 client_hello 等 3s 超时 → `peer.conn.close(...)` 关
+    //   连 → server stream A 的 `read_frame()` 报 "connection lost"
+    //   → 整个 peer.run() 返 `Err(HelloTimeout)`
+    //   → "client (0) peer.run() 返了非预期 Err: hello handshake timed out
+    //   after 3s — 不触发 RetryState"
+    //
+    // **修复**：peer.run() 在调 hello 前查 `hello_ok.load(Acquire)` ——
+    // 已置位则跳过整个 hello 块（open_bi / accept_bi 也不会跑），让 caller
+    // （`connect_to_handle` / `handle_quic_peer_supervisor`）做的早期 hello
+    // 结果继续生效。
+    //
+    // **为什么 caller 路径还要保留早期 hello**：是历史顺序决定的 ——
+    // `connect_to_handle` 早期把 client_hello 放在 peer 生命周期注册到
+    // `peers` 表**之前**（失败则不注册，便于 retry 不影响其他 caller），
+    // `spawn_peer_supervisor` 只接管 peer 死后的 RetryState。`peer.run()`
+    // 设计为"既可独立跑（单测）也可被外部 caller 提前 partial-init 后接
+    // 管"——本步用 hello_ok 守卫表达后者语义。
+    //
+    // **不破坏单测 `peer_session_round_trip_motion_keyboard`**：单测直接调
+    // `peer.run(PeerRole::Client/Server)`，无早期 hello，hello_ok 初始 false
+    // → 走原始 hello 路径，行为不变。
     match role {
-        PeerRole::Client => client_hello(&self).await?,
-        PeerRole::Server => server_hello(&self).await?,
+        PeerRole::Client => {
+            if !self.hello_ok.load(std::sync::atomic::Ordering::Acquire) {
+                client_hello(&self).await?;
+            } else {
+                log::debug!("peer.run(Client): hello_ok 已置位，跳过重复 client_hello");
+            }
+        }
+        PeerRole::Server => {
+            if !self.hello_ok.load(std::sync::atomic::Ordering::Acquire) {
+                server_hello(&self).await?;
+            } else {
+                log::debug!("peer.run(Server): hello_ok 已置位，跳过重复 server_hello");
+            }
+        }
     }
 
     // (4) 取 stream A recv 半边 —— 留给主循环 read_frame(recv_a)
@@ -4794,6 +4841,178 @@ mod tests {
         //     Err(close_reason)，用 ignore 包装 best-effort 完成
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
             .await;
+
+        drop(client_arc);
+        client_ep.wait_idle().await;
+        let _ = std::fs::remove_dir_all(&pins_dir);
+    });
+
+    /// **STEP-8.2 验收 — Bug #3 回归**：模拟生产路径——先
+    /// `client_hello(&peer)` 置 `hello_ok=true`（与 `connect_to_handle`
+    /// 在 STEP-6.1 引入的早期 hello 一致），**再** `peer.run(Client)` —
+    /// `peer.run()` 必须在 hello_ok 已置位时**跳过** `client_hello`（不再
+    /// `open_bi` 开第二条 stream、不再等 3s 超时），让早期 hello 的结果
+    /// 继续生效。
+    ///
+    /// **不修前**：`peer.run()` 内无条件调 `client_hello` → 第二次
+    /// `open_bi` 开新 stream D、写 Hello、等对端回 Hello —— 但 server
+    /// 端 `server_hello` 只 accept stream A 后就进 read_frame 循环，不会
+    /// accept stream D → client 第二次 client_hello 3s 超时 → 关连 →
+    /// server stream A 读循环报 "connection lost"。
+    ///
+    /// **修后**：`peer.run()` 内 `hello_ok.load(Acquire) == true` → 跳过
+    /// client_hello → 继续 open 3 streams（B/C/冗余 A）+ read_loop + 主循
+    /// 环，连接保持活跃。
+    ///
+    /// **测试设计**：与 `peer_session_round_trip_motion_keyboard` 不同 —— 本
+    /// 测试**同步**等 `peer.run` 完成且**断言**主循环持续时间（2s）后正
+    /// 常退出（被 client 主动 close 触发）而非超时；之前那条测试 `let _ = `
+    /// 吞掉了 peer.run 的 Err，无法区分"hello 重复调用致超时关连"和
+    /// "正常 close"两种结果。
+    local_set_test!(peer_run_skips_hello_if_already_done, {
+        install_crypto_provider();
+
+        // (1) server endpoint
+        let (server_cert, server_key) = ephemeral_cert();
+        let server_ep = endpoint_with_test_cert(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+            server_cert,
+            server_key,
+        )
+        .expect("server endpoint bind");
+        let server_addr = server_ep.local_addr().expect("server addr");
+
+        // (2) 后台 server task：accept → server_hello → 模拟"先 hello 后 supervisor"
+        //     的生产 supervisor 路径；server_hello 完成后保持 connection 不关，让
+        //     client 的 stream A read 循环能看到 client 后续 send 的帧。
+        let server_task = spawn_local(async move {
+            let conn = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                accept(&server_ep),
+            )
+            .await
+            .expect("server accept timeout")
+            .expect("server accept");
+            let session = PeerSession::from_connection(conn);
+
+            // 先 server_hello（生产 supervisor 路径，与 client_hello 对称）
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                server_hello(&session),
+            )
+            .await
+            .expect("server hello timeout")
+            .expect("server hello should succeed");
+
+            // 取 stream A recv，半 blocking 模拟 supervisor 的 read_frame 循环
+            // （读 1s 后放弃 —— client 端会用 close 触发对端 IO 错误，本测试只
+            // 关心 client peer.run() 不再重复 hello）
+            let mut recv_a = session
+                .take_stream_a_recv()
+                .await
+                .expect("server stream A recv cached");
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                read_frame::<quinn::RecvStream>(&mut recv_a),
+            )
+            .await;
+
+            // 不主动关 —— 让 client 端 close 触发服务端 IO closed 退出
+            drop(session);
+        });
+
+        // (3) client：dial → client_hello（早期，与生产 connect_to_handle 对齐）
+        let pins_dir = ephemeral_pins_dir();
+        let _ = std::fs::remove_dir_all(&pins_dir);
+        let (client_cert, client_key) = ephemeral_cert();
+        let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .expect("client endpoint bind");
+        let conn = dial(
+            &client_ep,
+            server_addr,
+            client_cert[0].clone(),
+            client_key,
+            &pins_dir,
+        )
+        .await
+        .expect("dial");
+        let client_arc = std::sync::Arc::new(PeerSession::from_connection(conn));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client_hello(&client_arc),
+        )
+        .await
+        .expect("client_hello timeout")
+        .expect("client_hello");
+        assert!(
+            client_arc.hello_ok(),
+            "client_hello 后 hello_ok 应已置位（修复前提）"
+        );
+
+        // (4) peer.run(Client) —— **Bug #3 修复核心断言**：跑通且不超时
+        //
+        // 修前：会重复调 client_hello，开第二条 stream，3s 超时后关连 —— 整个
+        //       run() 返 Err(HelloTimeout)
+        // 修后：hello_ok == true → 跳过 client_hello → 进 open 3 streams +
+        //       read_loop + 主循环 —— 保持连接活跃直到 client 主动 close
+        let client_for_run = std::sync::Arc::clone(&client_arc);
+        let run_task = spawn_local(async move {
+            client_for_run.run(PeerRole::Client).await
+        });
+
+        // (5) 让 run 跑 1s（让 open_bi / read_loop / 主循环都进入稳态）——
+        //     修前此时 hello 重复调用已在 stream D 等回包；修后应平静
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // (6) 关 client conn → run_task 应见 conn.closed() 退出
+        client_arc
+            .connection()
+            .close(quinn::VarInt::from(0u32), b"test done");
+
+        // (7) run_task 在 close 后合理时间内返（不应被卡在 3s hello 超时）
+        let run_result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_task,
+        )
+        .await
+        .expect("peer.run 未在 2s 内退出（修前：被卡在重复 client_hello 3s 超时；修后应快速退出）")
+        .expect("peer.run task 未 panic");
+
+        // 修后预期：run() 因 conn.closed() 正常退出 → close_reason 是
+        // LocallyClosed → Err(Handshake(LocallyClosed))；supervisor 评估
+        // should_retry_after_close → false → 不重试（acceptable）。
+        // **关键断言**：**不**应是 HelloTimeout / HelloFailed（那是修前的
+        // 症状：peer.run 内重复 client_hello 开 stream D、server 不 accept、
+        // 第二次 hello 失败/超时 —— 实际错误常是
+        // HelloFailed("read Hello frame length: connection lost")，不是
+        // HelloTimeout，因为 client 关 conn 后 read 立即返 Err 而不是等 3s）。
+        match run_result {
+            Err(Error::HelloTimeout(_)) => {
+                panic!(
+                    "Bug #3 回归：peer.run() 返 Err(HelloTimeout) —— \
+                     重复 client_hello 又被 server 不 accept 致 3s 超时"
+                );
+            }
+            Err(Error::HelloFailed(msg)) => {
+                panic!(
+                    "Bug #3 回归：peer.run() 返 Err(HelloFailed({msg})) —— \
+                     重复 client_hello 开 stream D、server 不 accept、read 失败"
+                );
+            }
+            Err(Error::Handshake(reason)) => {
+                log::debug!("peer.run exited with Handshake({reason:?}) —— 修后期望的正常 close 路径");
+            }
+            Err(other) => {
+                log::debug!("peer.run exited with: {other:?}");
+            }
+            Ok(()) => {
+                log::debug!("peer.run exited Ok —— 也可接受");
+            }
+        }
+
+        // (8) 等 server task 收尾
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
 
         drop(client_arc);
         client_ep.wait_idle().await;

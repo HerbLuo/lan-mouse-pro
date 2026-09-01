@@ -1,9 +1,9 @@
-# STEP-8.2 — 10.2.1.12 远程对接：mTLS Rejected 未接通 + 拨号 lazy 触发
+# STEP-8.2 — 10.2.1.12 远程对接：mTLS Rejected / 拨号 lazy / Hello 重复调用三 bug
 
 > PLAN-M1 §STEP-8 / **新方向：远程对接可用性问题**
 > 起点：用户现场问题（两台机器 10.2.1.15 / 10.2.1.12 互 ping / UDP 4242 互通但连不上）
 > 执行日期：2026-09-01
-> 状态：**调研 + 修复完成**（两路修复 + 1 单测已加，40 个 lib 测试全绿）
+> 状态：**调研 + 修复完成（三路）+ 2 单测已加**（41 个 lib 测试全绿）
 
 ---
 
@@ -17,6 +17,7 @@
 - `[authorized_fingerprints]` 后用户加了 `8d:b4:f1:... = ""`（对方 cert fingerprint）
 - 用户问："加了指纹还是不行"
 - 用户问："GUI 按道理请求链接时应该有弹窗提示接受指纹吗？"
+- **Bug #1/Bug #2 fix 后用户仍报"还是不行"** → 新日志暴露 **Bug #3：Hello 握手超时**
 
 ---
 
@@ -175,7 +176,179 @@ Finished `dev` profile [unoptimized + debuginfo] target(s)
 
 ---
 
-## 4. 用户操作建议（修复后）
+## 4. 新增修复：Hello 握手重复调用（**Bug #3** — 已修）
+
+### 4.1 现场日志（Bug #1/#2 fix 后用户报"还是不行"）
+
+**用户侧（10.2.1.15）**：
+```
+[12:48:42Z INFO  lan_mouse::connect] client (0) connected @ 10.2.1.12:4242 (quic)
+[12:48:45Z WARN  lan_mouse::quic_transport] client hello handshake timed out after 3s
+[12:48:45Z ERROR lan_mouse::connect] client (0) peer.run() 返了非预期 Err: hello handshake timed out after 3s — 不触发 RetryState
+[12:48:45Z INFO  lan_mouse::quic_transport] datagram_reader: read_datagram error, exiting: closed
+```
+
+**对端（10.2.1.12）**：
+```
+[04:48:45Z INFO  lan_mouse::quic_transport] AuthorizedKeysVerifier: authorized peer a4:9b:47:...
+[04:48:45Z INFO  lan_mouse::listen] QUIC peer connected: 10.2.1.15:61252
+[04:48:45Z INFO  lan_mouse::listen] QUIC peer 10.2.1.15:61252 authorized (fingerprint a4:9b:47:...)
+[04:48:48Z INFO  lan_mouse::listen] stream A reader exiting (IO closed): hello handshake failed: read frame length: connection lost
+[04:48:48Z WARN  lan_mouse::listen] QUIC peer supervisor exited with err: hello handshake failed: read frame length: connection lost
+```
+
+**关键观察**：
+- 客户端 `dial_any` 成功（12:48:42 UTC）
+- 客户端 `client_hello` 第二次超时（12:48:45 UTC，**3s 后**）
+- 服务端 mTLS 通过 + 第一次 hello OK（04:48:45 UTC，与客户端超时**同一瞬间**）
+- 服务端 stream A 读循环 3s 后报 "connection lost"
+
+→ 看似"mTLS 慢导致 server_hello 来不及响应"，但实际是更隐蔽的问题（见下）。
+
+### 4.2 根因（与"mTLS 慢"假设不同的真正 bug）
+
+**真正的根因**：客户端 `peer.run()` 内部**重复调用**了 `client_hello`。
+
+`src/connect.rs::connect_to_handle` 的语义顺序：
+
+```rust
+let peer = Arc::new(PeerSession::from_connection(conn));
+if let Err(e) = quic_transport::client_hello(&peer).await {  // ← 第一次 client_hello
+    ...
+}
+spawn_local(spawn_peer_supervisor(..., peer));  // ← peer.run(PeerRole::Client) 内又调 client_hello
+```
+
+而 `src/quic_transport.rs::PeerSession::run()` 第 2207-2210 行（修复前）：
+
+```rust
+// (3) Hello 握手 —— role 决定走 client_hello / server_hello
+match role {
+    PeerRole::Client => client_hello(&self).await?,
+    PeerRole::Server => server_hello(&self).await?,
+}
+```
+
+→ **两次 `client_hello`** 的灾难链：
+
+1. **第一次**（`connect_to_handle`）：`open_bi()` 开 stream A → 写 Hello → 读 server 回 Hello → 缓存 `stream_a` → `hello_ok = true`
+2. **第二次**（`peer.run()` 内）：`open_bi()` 又开一条 stream D（！）→ 写 Hello → 等 server 回 Hello，**3s 超时**
+3. 但服务端 `server_hello` 只 `accept_bi()` **一次**（接的是 stream A），accept 完就进 stream A 读循环，**永远不会** accept stream D
+4. 客户端第二次 `client_hello` 等 3s 超时 → `peer.conn.close(VarInt(0), b"hello failed (timeout)")` → 关连
+5. 服务端 stream A 的 `read_frame()` 报 "connection lost"
+6. 整个 `peer.run()` 返 `Err(HelloTimeout)` → "client (0) peer.run() 返了非预期 Err: hello handshake timed out after 3s — 不触发 RetryState"
+
+**为什么 mTLS 看起来慢是表象**：客户端 dial 成功后**立刻**调用第一次 `client_hello` —— 但服务端 mTLS 完成后，supervisor 启动 `server_hello` —— 服务端 `accept_bi` 接到 stream A、写 Hello 回包 —— 客户端收到后第一次 client_hello 成功。这部分耗时正常 ~ms。
+
+**真正慢的是客户端 peer.run() 内的第二次 client_hello**：开 stream D、等 3s 超时。所以用户看到的"3s 后失败"其实是第二次 hello 的超时，而非 mTLS 慢。
+
+### 4.3 修复
+
+**`src/quic_transport.rs::PeerSession::run()`**：
+
+```rust
+match role {
+    PeerRole::Client => {
+        if !self.hello_ok.load(std::sync::atomic::Ordering::Acquire) {
+            client_hello(&self).await?;
+        } else {
+            log::debug!("peer.run(Client): hello_ok 已置位，跳过重复 client_hello");
+        }
+    }
+    PeerRole::Server => {
+        if !self.hello_ok.load(std::sync::atomic::Ordering::Acquire) {
+            server_hello(&self).await?;
+        } else {
+            log::debug!("peer.run(Server): hello_ok 已置位，跳过重复 server_hello");
+        }
+    }
+}
+```
+
+**为什么 caller 路径还要保留早期 hello**：是历史顺序决定的 —— `connect_to_handle` 早期把 `client_hello` 放在 peer 生命周期注册到 `peers` 表**之前**（失败则不注册，便于 retry 不影响其他 caller），`spawn_peer_supervisor` 只接管 peer 死后的 RetryState。`peer.run()` 设计为"既可独立跑（单测）也可被外部 caller 提前 partial-init 后接管"——本步用 `hello_ok` 守卫表达后者语义。
+
+**不破坏单测 `peer_session_round_trip_motion_keyboard`**：单测直接调 `peer.run(PeerRole::Client/Server)`，无早期 hello，`hello_ok` 初始 `false` → 走原始 hello 路径，行为不变。
+
+### 4.4 回归测试
+
+新增 `peer_run_skips_hello_if_already_done`（`src/quic_transport.rs`）：
+
+模拟生产路径：
+1. server 端：accept → `server_hello` → 模拟 supervisor 读 stream A（2s 后退出）
+2. client 端：dial → **早期 `client_hello`**（与生产 `connect_to_handle` 对齐）
+3. client 端：`peer.run(PeerRole::Client)` —— **核心断言点**
+4. 让 run 跑 1s（让 open_bi / read_loop / 主循环进入稳态）
+5. client 主动 close conn
+6. 同步等 `run_task` 在 2s 内退出
+7. **断言**：`Err(HelloTimeout(_))` 或 `Err(HelloFailed(_))` 都 panic（修前的症状）；`Err(Handshake(LocallyClosed))` 是修后期望的正常 close 路径
+
+**回归验证**：
+
+- 修复后：测试通过（peer.run 跳过 hello，进 read_loop + 主循环，conn close 触发 `Handshake(LocallyClosed)`）
+- 临时回退修复：测试**失败**，panic 信息：
+  ```
+  Bug #3 回归：peer.run() 返 Err(HelloFailed(read Hello frame length: connection lost)) ——
+  重复 client_hello 开 stream D、server 不 accept、read 失败
+  ```
+
+→ 测试有效捕获 root cause，不会随实现漂移漏过。
+
+---
+
+## 5. 验收（全三 bug 修后）
+
+### 5.1 单测
+
+```
+cargo test --lib
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+新增 2 个测试：
+- `rejection_channel_forwards_rejected_fingerprint`（Bug #1）
+- `peer_run_skips_hello_if_already_done`（Bug #3）
+
+其余 39 个原有测试不变。**Bug #2 的 `dial()` 与 `send()` 共享同一套 RetryState + connecting 去重逻辑** —— 既有 `backoff_doubles_on_each_failure` + `reconnect_on_peer_close` 测试已覆盖，不重复加 E2E。
+
+### 5.2 编译
+
+```
+cargo check --lib
+warning: `lan-mouse` (lib) generated 4 warnings   ← 全部 pre-existing
+Finished `dev` profile [unoptimized + debuginfo] target(s)
+```
+
+新增代码未引入新 warning。
+
+```
+cargo build
+warning: `lan-mouse` (lib) generated 4 warnings   ← 全部 pre-existing
+Finished `dev` profile [unoptimized + debuginfo] target(s)
+```
+
+完整 build（main.rs / GTK / cli）通过。
+
+---
+
+## 6. 用户操作建议（修复后）
+
+两侧 daemon 拉最新代码重新 `cargo run` 启动后：
+
+1. **若指纹已在 `[authorized_fingerprints]`**：Bug #2 修复让两侧启动后立即主动拨号；Bug #3 修复让 client_hello 不再重复调用 → 几秒内建连
+2. **若指纹缺失或错误**：
+   - 对端 dial 进 → 本地 verifier 拒 → **GUI 弹窗**（之前是静默失败）
+   - 用户点击"接受" → fingerprint 加入 allowlist
+   - **当前局限**：peer 端 supervisor 不会自动重试 —— `should_retry_after_close` 对 `TransportError` 返 `false`（保守不重试，认为是协议错误）。用户需手动 toggle client 状态 / 重启 daemon 触发新一轮 `activate_client` → `dial()` → 拨号
+   - **未来 follow-up**：可考虑 `should_retry_after_close` 区分"rustls allowlist 拒绝"（可重试）vs "协议错误"（不可重试），或让 connect_to_handle 在失败时自动 backoff loop 重试。当前不阻塞本 STEP 验收
+
+---
+
+## 7. 时间/耗时
+
+- 调研：~15 min（§0-§3 + 用户确认）
+- 实施修复：~30 min（Bug #1 三文件 + Bug #2 三文件 + 1 单测 + 文档）
+- 二次修复：~25 min（Bug #3 + 回归测试 + 用户回退验证 + 文档追加）
+- 总计：~70 min
 
 两侧 daemon 拉最新代码重新 `cargo run` 启动后：
 
