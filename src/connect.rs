@@ -232,7 +232,12 @@ impl LanMouseConnection {
                 // STEP-8.2 临时移除 alive 检查 —— 详见 send() docstring。
                 // 原 alive 守护永远 false（recv_tx 路径未接），反而阻塞
                 // 所有 send。乐观假设 peer 在线。
-                log::info!("send {event_display} to handle {handle} addr {addr} via peer (active)");
+                //
+                // **生产日志级别（DEBUG）**：高频事件（motion 每秒 60+
+                // 次）放 INFO 会刷屏；保留 trace 级别的旧 log 让 RUST_LOG=trace
+                // 时可诊断具体帧内容，DEBUG 仅记"send 成功"路径不展开
+                // event 详情。
+                log::debug!("send to handle {handle} addr {addr} via peer (active)");
                 let cfg = self
                     .client_manager
                     .input_channels(handle)
@@ -495,7 +500,10 @@ async fn connect_to_handle(
         spawn_local(async move {
             while let Some((addr, event)) = out_rx.recv().await {
                 if let Some(handle) = client_manager_for_forwarder.get_client(addr) {
-                    log::info!("stream A forwarder: {addr} → handle {handle}: {event}");
+                    // **生产日志级别（DEBUG）**：高频路径（Ack / Pong / Leave
+                    // 等都会走这里，motion 不走这条路径——motion 走 datagram
+                    // 直接发不出去到 server —— 见 Bug #8）。INFO 仍会刷屏。
+                    log::debug!("stream A forwarder: {addr} → handle {handle}");
                     if let Err(e) = recv_tx.send((handle, event)) {
                         log::debug!(
                             "stream A forwarder: recv_tx.send failed (capture task 退出?): {e}"

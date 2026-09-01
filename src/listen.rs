@@ -602,11 +602,11 @@ async fn handle_quic_peer_supervisor(
     loop {
         match quic_transport::read_frame(&mut recv_a).await {
             Ok(event) => {
-                // **STEP-8.2 验收日志**：每条 stream A 收到的 control
-                // 事件打 INFO（含 Enter / Leave / Ack / Ping / Pong），
-                // 让"控制事件到底有没有从 client 到 server"的诊断路径
-                // 一目了然。修 Bug #5 前后这里是否出日志是核心区别。
-                log::info!("stream A recv from {addr}: {event}");
+                // **生产日志级别（DEBUG）**：高频路径（每个 control 事件
+                // 都过这里）。INFO 仍会刷屏。Step 8.2 调试期间是 INFO，
+                // 上线前调回 DEBUG —— 配合 RUST_LOG=lan_mouse::listen=debug
+                // 仍能精确诊断"控制事件有没有从 client 到 server"。
+                log::debug!("stream A recv from {addr}: {event}");
                 if listen_tx
                     .send(ListenEvent::Msg { event, addr })
                     .is_err()
