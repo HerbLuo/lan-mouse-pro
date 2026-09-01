@@ -137,68 +137,55 @@ pango / gio 都需要 pkg-config）。GTK 本身是 optional feature，不影响
 ### 3.2 实测：5 个失败测试结果
 
 ```
-running 5 tests
-test quic_transport::tests::dial_any_prefers_primary ... ok ✅
-test quic_transport::tests::dial_any_all_unreachable_returns_err ... FAILED ❌
-test quic_transport::tests::hello_wrong_magic_closes_connection ... FAILED ❌
-test quic_transport::tests::peer_session_round_trip_motion_keyboard ... FAILED ❌
-test quic_transport::tests::stream_c_take_releases_quinn_recv_stream ... FAILED ❌
-test result: FAILED. 1 passed; 4 failed; 0 ignored; ... finished in 30.04s
+test result: FAILED. 23 passed; 3 failed; 0 ignored; 0 measured; ... finished in 50.36s
 ```
 
-**关键变化**：
+**关键变化**（按修复顺序）：
 
-| 测试 | 修复前（A/B 类错误） | 修复后（错误） |
-|---|---|---|
-| `dial_any_prefers_primary` | A: `spawn_local` panic | ✅ **PASS** |
-| `dial_any_all_unreachable_returns_err` | A: `spawn_local` panic | ❌ `dial_any 总超时: Elapsed(())` —— Quinn handshake 超时 |
-| `hello_wrong_magic_closes_connection` | B: connection lost | ❌ `read Hello frame length: connection lost` —— server task 调度问题 |
-| `peer_session_round_trip_motion_keyboard` | B: hello not complete | ❌ `client send_motion: HelloFailed("hello not complete")` —— **测试设计 bug** |
-| `stream_c_take_releases_quinn_recv_stream` | B: handshake TimedOut | ❌ `dial: Handshake(TimedOut)` —— server task 调度问题 |
+| 测试 | 修复前 | STEP-7.2c 修复后 | STEP-7.2c-2 修复后 |
+|---|---|---|---|
+| `dial_any_prefers_primary` | A: `spawn_local` panic | ✅ **PASS** | ✅ PASS |
+| `peer_session_round_trip_motion_keyboard` | B: hello not complete | ❌ hello not complete | ✅ **PASS** |
+| `dial_any_all_unreachable_returns_err` | A: `spawn_local` panic | ❌ timeout (10s) | ❌ timeout (15s) |
+| `hello_wrong_magic_closes_connection` | B: connection lost | ❌ connection lost | ❌ connection lost |
+| `stream_c_take_releases_quinn_recv_stream` | B: handshake TimedOut | ❌ handshake TimedOut | ❌ handshake TimedOut |
 
-**结论**：PROJECT-STATE.md §6.3 预测的"5 个全绿"**只对了一半**。
+**最终结果**：**23 passed, 3 failed**（5 个原失败中修复了 2 个）。
 
-- ✅ 1 个测试（`dial_any_prefers_primary`）确实被 STEP-7.2c 修复
-- ⚠️ 4 个测试的 `spawn_local` panic 消失，但暴露出 **pre-existing 设计问题**：
-  1. **测试设计 bug**（`peer_session_round_trip_motion_keyboard`）：测试
-     只对 server 端调 `run(Server)`（隐式调 `server_hello`），但 client
-     端**从未**调 `client_hello`，直接 `send_motion` → `hello_ok == false`
-     → `HelloFailed("hello not complete")`。修复方法：测试体应在
-     `send_motion` 之前先 `client_hello(&client_arc).await`。
-  2. **current_thread + LocalSet 调度问题**（`hello_wrong_magic_*` /
-     `stream_c_take_*`）：测试用 `tokio::spawn(server_task)` 在 main
-     future 启动 dial；on multi-thread runtime，server_task 由 worker
-     thread 立即接管 → dial 来时已 accept；on current_thread + LocalSet，
-     server_task 在 LocalSet 队列里，main future 的 `dial(...).await` 虽
-     让出控制，但 Quinn handshake 可能在 server_task 启动 `accept` 前就
-     完成 → server 端 `accept` 永远等不到 → connection lost。
-  3. **测试超时边界过紧**（`dial_any_all_unreachable_returns_err`）：测试
-     超时 10s，quinn 默认 handshake 超时也是 10s 左右 → 边界 race。
+**STEP-7.2c 修了什么**：
+- ✅ `local_set_test!` macro 解决 `spawn_local` panic（5 个全部不再 panic）
+- ✅ `dial_any_prefers_primary` 通过（join_next / select 不依赖额外 task）
+- ✅ `peer_session_round_trip_motion_keyboard` 加 `client_hello` + 调
+  整 close 顺序后通过（测试设计 bug 修复）
 
-**已落地尝试**：把 4 个失败测试的 `tokio::spawn(server_task)` 改为
-`spawn_local(server_task)`（语义上更合理：在 LocalSet 里就该用 LocalSet
-的任务队列）。**但实测未解决问题** —— 错误信息不变。
+**STEP-7.2c 没修什么**（剩余 3 个，**立 STEP-7.2d**）：
+- ❌ `dial_any_all_unreachable_returns_err`：Quinn 默认 handshake 超时
+  边界 race（即使测试调到 15s 仍偶发）—— 需要降 Quinn handshake 超时配置
+- ❌ `hello_wrong_magic_closes_connection`：current_thread + LocalSet 下
+  server_task 调度时序问题（oneshot ready signal 实验失败 —— Quinn driver
+  在 runtime queue 而非 LocalSet，需要 multi_thread flavor 才稳）
+- ❌ `stream_c_take_releases_quinn_recv_stream`：同上
 
 ### 3.3 全量回归
 
 ```bash
-cargo test -p lan-mouse --lib --no-default-features
+cargo test -p lan-mouse --lib --no-default-features -- --test-threads=1
 ```
 
-预期（基于当前实际状态）：
-- ✅ 其他 33 个 lib 测试 + 1 修复后 = 34 passed
-- ❌ 4 个失败测试（pre-existing，见 §3.2）
-- 集成测试 `tests/quic_smoke` / `tests/input_channel_routing` 不在本 STEP
-  验证范围（默认 features 关掉 GTK 后集成测试构建不受影响）
+实测结果：
+- ✅ 23 passed（含 2 个 STEP-7.2c 修复）
+- ❌ 3 failed（pre-existing，详见 §3.4）
 
-### 3.4 4 个 pre-existing 失败的修复建议（**不在本 STEP 范围**）
+集成测试 `tests/quic_smoke` / `tests/input_channel_routing` 不在本 STEP
+验证范围（默认 features 关掉 GTK 后集成测试构建不受影响）。
 
-| 测试 | 修复 |
-|---|---|
-| `peer_session_round_trip_motion_keyboard` | 在 `send_motion` 之前调 `client_hello(&client_arc).await` |
-| `hello_wrong_magic_closes_connection` | server 端 accept 完成后通过 `oneshot::channel` 通知 client 再 dial |
-| `stream_c_take_releases_quinn_recv_stream` | 同上 |
-| `dial_any_all_unreachable_returns_err` | 测试超时调到 15s 或配置 quinn handshake 超时 < 10s |
+### 3.4 3 个 remaining 失败的修复建议（**立 STEP-7.2d**）
+
+| 测试 | 根因 | 修复方向 |
+|---|---|---|
+| `dial_any_all_unreachable_returns_err` | Quinn 默认 handshake timeout (10s) vs 测试 timeout (15s) 边界 race | 配置 Quinn handshake 超时 < 测试 timeout（如 8s） |
+| `hello_wrong_magic_closes_connection` | current_thread + LocalSet 调度：server_task 入队后需等 LocalSet 调度 → Quinn driver 在 runtime queue 不同步 | 测试改用 multi_thread flavor（需要 Cargo.toml 加 `rt-multi-thread` feature）或重写测试为同步 server task |
+| `stream_c_take_releases_quinn_recv_stream` | 同上 | 同上 |
 
 ## 4. 与 PLAN-M1 的偏差 / M1 边界
 
