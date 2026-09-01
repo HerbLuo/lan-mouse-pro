@@ -1,9 +1,9 @@
-# STEP-8.2 — 10.2.1.12 远程对接：mTLS Rejected / 拨号 lazy / Hello 重复调用三 bug
+# STEP-8.2 — 10.2.1.12 远程对接：mTLS Rejected / 拨号 lazy / Hello 重复 / alive 阻塞 四 bug
 
 > PLAN-M1 §STEP-8 / **新方向：远程对接可用性问题**
 > 起点：用户现场问题（两台机器 10.2.1.15 / 10.2.1.12 互 ping / UDP 4242 互通但连不上）
 > 执行日期：2026-09-01
-> 状态：**调研 + 修复完成（三路）+ 2 单测已加**（41 个 lib 测试全绿）
+> 状态：**调研 + 修复完成（四路）+ 2 单测已加**（41 个 lib 测试全绿）
 
 ---
 
@@ -330,7 +330,69 @@ Finished `dev` profile [unoptimized + debuginfo] target(s)
 
 ---
 
-## 6. 用户操作建议（修复后）
+## 6. 新增修复：alive 永远 false 阻塞 send（**Bug #4** — 已修）
+
+### 6.1 现场日志（Bug #1/#2/#3 修后用户报"还是不行"）
+
+```
+[2026-09-01T13:05:52Z WARN  lan_mouse::capture] releasing capture: emulation is disabled on the target device
+```
+
+**关键观察**：连接已建立（Bug #3 fix 后），鼠标移到屏边 → capture 触发 `conn.send()` → `send()` 返 `TargetEmulationDisabled` → capture 立刻释放 → 用户看到 "releasing capture: emulation is disabled on the target device"。
+
+### 6.2 根因
+
+`alive` 字段（`lan_mouse_ipc::ClientState::alive`）默认 `false`（`#[derive(Default)]`）。
+
+- `set_alive(handle, bool)` 函数存在（`src/client.rs:307`），但**全工程无生产 caller**
+- 设计意图：服务端的 Pong 响应会通过 stream A 传到客户端，客户端收到后调 `set_alive(pong_value)` —— 但**客户端没有 reader 把 stream A 上的 Pong 推到 `recv_tx`**
+- `recv_tx` 字段（`src/connect.rs:85`）是死字段：`#[allow(dead_code)]` 都不需要（实际无 caller）
+- `src/capture.rs:306` 的 `(handle, event) = self.conn.recv()` 永远挂起 —— recv_tx 永远没数据
+- 后果链：
+  1. 服务端发 Pong(true) → 客户端 peer.run() stream A 读到（peer.run 不处理，只 log debug）
+  2. `alive` 始终是默认 `false`
+  3. `send()` 在 peer 存在时立刻 `if !alive { return Err(TargetEmulationDisabled); }`
+  4. capture 释放 → 用户看到 "releasing capture: emulation is disabled on the target device"
+
+### 6.3 修复（最小变更）
+
+**`src/connect.rs::LanMouseConnection::send()`**：移除 alive 检查，乐观假设 peer 在线。
+
+```rust
+// 修前
+if let Some(peer) = peer {
+    if !self.client_manager.alive(handle) {
+        return Err(LanMouseConnectionError::TargetEmulationDisabled);
+    }
+    // ...
+}
+
+// 修后
+if let Some(peer) = peer {
+    // STEP-8.2 临时移除 alive 检查 —— 详见 send() docstring。
+    // 乐观假设 peer 在线：supervisor 看到 peer.run() 退出（peer 真死）时
+    // set_active_addr(None) 让下次 send 走重拨路径。
+    // ...
+}
+```
+
+**`LanMouseConnectionError::TargetEmulationDisabled` 变体保留**（`#[allow(dead_code)]`）—— M2 接回 Pong → `recv_tx` → `set_alive` 路径后重新启用。
+
+### 6.4 已知缺陷（接受）
+
+- **peer 把 emulation 关了**：本端 send 仍把事件推到 peer；peer 的 `emulation.rs:163` `consume()` 检查 `emulation_active.get()`，false 时事件**静默丢弃**
+- **理想行为**：peer 关 emulation 时本端能感知 → 主动释放 capture（节省带宽 + 让 GUI 状态对）
+- **当前能做的修复路径**：M2 接回 Pong → set_alive(true/false) + send 恢复 alive 检查
+- **为什么本次不修**：recv_tx → `LanMouseConnection::recv()` 整个事件流入路径未装配，需要：
+  1. peer.run() 主循环 stream A reader 加一条"Pong → recv_tx.send"分支
+  2. capture.rs:306 的 `conn.recv()` 才能收到 Pong
+  3. 加 Pong 处理分支调 set_alive
+  - 这是 STEP-7.x stream A reader 的下游工作（listen.rs 已有 stream A reader，但 LanMouseConnection 路径未装配），范围超出当前 10.2.1.12 现场修复
+  - 接受范围：peer 端关闭 emulation 是边缘场景（用户主动操作），核心是"连接 + 键鼠"能通
+
+---
+
+## 7. 用户操作建议（修复后）
 
 两侧 daemon 拉最新代码重新 `cargo run` 启动后：
 
@@ -348,7 +410,8 @@ Finished `dev` profile [unoptimized + debuginfo] target(s)
 - 调研：~15 min（§0-§3 + 用户确认）
 - 实施修复：~30 min（Bug #1 三文件 + Bug #2 三文件 + 1 单测 + 文档）
 - 二次修复：~25 min（Bug #3 + 回归测试 + 用户回退验证 + 文档追加）
-- 总计：~70 min
+- 三次修复：~20 min（Bug #4 + 文档追加）
+- 总计：~90 min
 
 两侧 daemon 拉最新代码重新 `cargo run` 启动后：
 

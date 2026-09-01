@@ -35,6 +35,7 @@ pub(crate) struct QuicDialerCreds {
     pub key: PrivateKeyDer<'static>,
 }
 
+#[allow(dead_code)] // STEP-8.2: Timeout / TargetEmulationDisabled 暂无人构造；TargetEmulationDisabled 留 M2 接 Pong 路径后重新启用
 #[derive(Debug, Error)]
 pub(crate) enum LanMouseConnectionError {
     #[error(transparent)]
@@ -48,6 +49,8 @@ pub(crate) enum LanMouseConnectionError {
     Quic(#[from] quic_transport::Error),
     #[error("not connected")]
     NotConnected,
+    /// **STEP-8.2 临时 unused**：alive 检查已移除（详见 `send()` docstring）。
+    /// 留变体供 M2 接回 Pong → recv_tx 路径后重新启用。
     #[error("emulation is disabled on the target device")]
     TargetEmulationDisabled,
     #[error("Connection timed out")]
@@ -179,10 +182,35 @@ impl LanMouseConnection {
     /// 1. 查 `client_manager.active_addr(handle)` 拿 socket addr
     /// 2. 查 `peers` 表拿 QUIC 会话（命中 → 调
     ///    [`PeerSession::send_input`]；未命中 → 触发拨号）
-    /// 3. alive 守护 + 错误归并（send_input 失败 → 摘 peer + 通知 manager）
+    /// 3. 错误归并（send_input 失败 → 摘 peer + 通知 manager）
     ///
-    /// **alive 守护**：与 DTLS 路径对称 —— 对端把 emulation 关了（ponged
-    /// 返 `false`），继续注入无意义，先返 `TargetEmulationDisabled`。
+    /// ~~alive 守护~~（STEP-8.2 临时移除）**：原设计对端把 emulation 关了
+    /// （Pong 返 `false`）应置 `alive = false`，下次 `send()` 返
+    /// `TargetEmulationDisabled` 避免无意义注入。**但是**当前架构下 alive
+    /// 永不被置 `true` —— 服务端发 Pong 的路径在
+    /// `src/emulation.rs:164`（`ProtoEvent::Ping => reply Pong(emulation_active)`），
+    /// 但客户端**没有任何 reader 把 stream A 上的 Pong 帧转发到 `recv_tx`**
+    /// —— `recv_tx` 是死字段（`src/connect.rs:82` 加 `#[allow(dead_code)]`
+    /// 不需要，但本仓实际无 caller）。后果：
+    /// 1. 服务端发 Pong(true) → 客户端 peer.run() stream A 读到，但 peer.run
+    ///    的主循环不把 Pong 推到 recv_tx
+    /// 2. `capture.rs:306` 的 `(handle, event) = self.conn.recv()` 永远挂起
+    /// 3. `alive` 始终是默认 `false`（`lan_mouse_ipc::ClientState::default()`）
+    /// 4. 所有 `send()` 在 peer 存在时立即返 `TargetEmulationDisabled`
+    ///    → `capture.rs:409` `log::warn!("releasing capture: ...")` →
+    ///    鼠标移到屏边后立刻释放 capture，看起来"连上但键鼠不通"
+    ///
+    /// **临时修法**：移除 alive 检查。**乐观假设 peer 在线** —— 任何 send
+    /// 都尝试推到 peer；supervisor 看到 peer.run() 退出（peer 真死）时
+    /// `set_active_addr(None)` 让下次 send 走重拨路径。这与 DTLS 时代
+    /// "peer 死 → supervisor 关 → 重拨"语义对齐，只是缺了"Pong 假阴性
+    /// → 提前返"这一道细节优化。
+    ///
+    /// **TODO M2**：等 stream A reader → recv_tx 转发路径补完后，重新
+    /// 接入 alive 检查 + 处理 Pong(true/false)：
+    /// - Pong(true) → set_alive(true)
+    /// - Pong(false) → set_alive(false) → 下次 send 返
+    ///   `TargetEmulationDisabled`（保留当前已存在的错误变体语义）
     ///
     /// **M1 简化**：所有 `send_input` 错误都视为 transport fatal —
     /// protocol-level 错误（M2 clipboard 才会有 `UnsupportedEvent`）
@@ -200,9 +228,9 @@ impl LanMouseConnection {
                 peers.get(&addr).cloned()
             };
             if let Some(peer) = peer {
-                if !self.client_manager.alive(handle) {
-                    return Err(LanMouseConnectionError::TargetEmulationDisabled);
-                }
+                // STEP-8.2 临时移除 alive 检查 —— 详见 send() docstring。
+                // 原 alive 守护永远 false（recv_tx 路径未接），反而阻塞
+                // 所有 send。乐观假设 peer 在线。
                 let cfg = self
                     .client_manager
                     .input_channels(handle)
