@@ -1117,6 +1117,22 @@ impl PeerSession {
         *self.outgoing_events.lock().await = tx;
     }
 
+    /// **STEP-8.2 修复 — Bug #9**：把 ProtoEvent 推给 outgoing_events（如
+    /// 设了）→ forwarder → capture.rs。专门用于 peer.run 主循环在
+    /// 检测到 peer 关闭时主动推 Leave 让本地 capture 立即 release。
+    ///
+    /// **为何不直接 send 而封一个 helper**：send 失败静默吞 + 集中
+    /// log `peer closed push Leave` 让用户复测时能看到完整释放路径。
+    async fn send_outgoing_event(&self, event: ProtoEvent, addr: SocketAddr) {
+        if let Some(tx) = self.outgoing_events.lock().await.as_ref() {
+            if let Err(e) = tx.send((addr, event)) {
+                log::debug!(
+                    "send_outgoing_event: outgoing_events 已退（forwarder 不在）: {e}"
+                );
+            }
+        }
+    }
+
     /// 发送高频 motion 输入事件（STEP-5.1 引入）。
     ///
     /// **通道选择** —— 优先 QUIC datagram；超 [`MAX_SAFE_DATAGRAM`] /
@@ -2488,6 +2504,20 @@ impl PeerSession {
                     }
                     Err(Error::Truncated) => {
                         log::info!("run: stream A truncated — peer closed");
+                        // **STEP-8.2 修复 — Bug #9**：peer 单方面关闭
+                        // 时主动 `conn.close()`，让 quinn `closed()` future
+                        // 立刻 fire（quinn 默认要双向 close 才 fire，
+                        // 等 peer 单方 close 会卡 30s idle_timeout）→
+                        // supervisor 立刻收到 peer.run 退出 → set_active_
+                        // addr(None) + remove peer → capture 下次 send
+                        // 触发 release（user-noticeable 立即恢复）。
+                        //
+                        // 同时推一个 Leave 到 outgoing_events → forwarder
+                        // → capture.rs 立即 release_capture（不等下次
+                        // mouse event 触发 send）。
+                        let _ = self.conn.close(0u32.into(), b"peer closed stream");
+                        let remote = self.conn.remote_address();
+                        self.send_outgoing_event(ProtoEvent::Leave(0), remote).await;
                         break;
                     }
                     Err(e) => {
@@ -2547,6 +2577,12 @@ impl PeerSession {
             // 路 C：conn closed 兜底 —— 任意源触发关闭都退出主循环
             closed_res = &mut closed => {
                 log::info!("run: conn.closed() fired: {closed_res:?}");
+                // **STEP-8.2 修复 — Bug #9**：closed() fire 通常意味
+                // 着 peer 已发 close 帧（双向 close 路径）。推一个
+                // Leave 让本地 capture 立即 release（不等下次 mouse
+                // event 触发 send）。
+                let remote = self.conn.remote_address();
+                self.send_outgoing_event(ProtoEvent::Leave(0), remote).await;
                 break;
             }
         }
