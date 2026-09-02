@@ -194,18 +194,7 @@ impl ListenTask {
                                 let fingerprint = self.addr_to_fingerprint.get(&addr).cloned()
                                     .unwrap_or_default();
                                 log::info!("releasing capture: {addr} entered this device (fp={fingerprint})");
-                                // **STEP-X 修复 — mouse 卡住 bug**:
-                                // 删除这里的 `EmulationEvent::ReleaseNotify`。
-                                // **原因**:收到主控 Enter 时不该让被控端调
-                                // `self.capture.release()`,否则会释放被控端的
-                                // EnterOnly 捕获(用于检测被控端自己的鼠标
-                                // 移向主控屏幕边缘),导致鼠标永远卡在被控端。
-                                //
-                                // **正确的释放路径**:被控端自己的鼠标移到
-                                // 屏幕边缘 → `capture.rs` 触发
-                                // `ICaptureEvent::CaptureBegin` →
-                                // `service.rs:384` 的 `send_leave_event`
-                                // 通知主控释放(走 `EmulationRequest::Release`)。
+                                self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                 log::info!("emulation: sending Ack(0) to {addr} (responding to master Enter)");
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                 self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");

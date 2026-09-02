@@ -505,8 +505,10 @@ async fn connect_to_handle(
                     // 直接发不出去到 server —— 见 Bug #8）。INFO 仍会刷屏。
                     log::debug!("stream A forwarder: {addr} → handle {handle}");
                     if let Err(e) = recv_tx.send((handle, event)) {
-                        log::debug!(
-                            "stream A forwarder: recv_tx.send failed (capture task 退出?): {e}"
+                        // **mouse 卡住 bug 排查**：recv_tx.send 失败说明
+                        // capture task 已退出 → 整条链路断裂。
+                        log::warn!(
+                            "stream A forwarder: recv_tx.send failed (capture task 已退): {e}"
                         );
                         break;
                     }
@@ -514,12 +516,14 @@ async fn connect_to_handle(
                     // 理论不应发生 —— peer 注册到 peers 表时 addr 已对应
                     // 一个 active handle。如果发生说明 client_manager
                     // 被外部清空（unregister），静默 no-op。
-                    log::debug!(
+                    log::warn!(
                         "stream A forwarder: addr {addr} 不在 client_manager（可能已 unregister）"
                     );
                 }
             }
-            log::debug!("stream A forwarder: outgoing_events rx 关闭 —— 退");
+            // **mouse 卡住 bug 排查**：forwarder 退出意味着 peer.outgoing_events
+            // sender 全部 drop —— 链路彻底断了。
+            log::warn!("stream A forwarder: outgoing_events rx 关闭 —— forwarder 退");
         });
     }
     peer.set_outgoing_events(Some(out_tx)).await;
@@ -571,7 +575,13 @@ async fn spawn_peer_supervisor(
     addr: SocketAddr,
     peer: Arc<PeerSession>,
 ) {
+    log::info!(
+        "spawn_peer_supervisor: starting for handle {handle} addr {addr}"
+    );
     let close_result = peer.run(PeerRole::Client).await;
+    log::info!(
+        "spawn_peer_supervisor: peer.run() returned for handle {handle} addr {addr}"
+    );
 
     // (1) 摘 peers —— 不论 close 是 graceful 还是异常，都让 send() 立即走重拨路径
     let removed = peers.lock().await.remove(&addr).is_some();
