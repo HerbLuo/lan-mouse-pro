@@ -325,6 +325,44 @@ impl LanMouseListener {
         let _ = addr;
         None
     }
+
+    /// **补丁 — last_response 超时时触发对端重拨**：强制用
+    /// [`crate::quic_transport::session::WAKE_CLOSE_CODE`] 关掉指定 addr
+    /// 的 QUIC conn，让对端 [`crate::quic_transport::should_retry_after_close`]
+    /// 看到 wake code 走 RetryState 重试路径。
+    ///
+    /// **使用方**：[`crate::emulation::ListenTask`] 在 5s tick 检测到
+    /// `last_response[addr].elapsed() > 1s` 时调 —— 替代原"仅发
+    /// `EmulationEvent::Disconnected` 不动 conn"的逻辑，那条路径下主控端
+    /// QUIC conn 仍活着、supervisor 收不到 close reason、**没人重拨**。
+    ///
+    /// **与 wake 路径协同**：复用同一 `WAKE_CLOSE_CODE` 语义 —— 对端
+    /// 不区分"系统唤醒 close"与"应用层超时 close"，统一走重试分支。
+    ///
+    /// **与 supervisor 路径 race**：本调用 force-close 后 slave 的
+    /// `handle_quic_peer_supervisor` 也会看到 stream A EOF → 推
+    /// `ListenEvent::Disconnected`，可能跟 timeout 分支自己推的
+    /// `EmulationEvent::Disconnected` 重叠；service.rs
+    /// [`crate::service::Service::remove_incoming`] 通过
+    /// `if let Some(addr) = self.remove_incoming(addr)` 守卫住了重复
+    /// remove（第二次返回 None，无副作用）。
+    pub(crate) fn close_with_wake_code(&self, addr: SocketAddr) {
+        let peer = self.quic_conns.borrow().get(&addr).cloned();
+        match peer {
+            Some(peer) => {
+                log::debug!("close_with_wake_code: peer {addr} → WAKE_CLOSE_CODE (timeout path)");
+                peer.connection().close(
+                    crate::quic_transport::session::WAKE_CLOSE_CODE.into(),
+                    b"timeout",
+                );
+            }
+            None => {
+                // peer 不在 quic_conns —— 可能已被 supervisor 路径先摘掉
+                // (race: supervisor EOF 与 timeout tick 并发)。静默 no-op。
+                log::trace!("close_with_wake_code: peer {addr} not in quic_conns (already gone)");
+            }
+        }
+    }
 }
 
 impl Stream for LanMouseListener {

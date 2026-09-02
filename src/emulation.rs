@@ -292,10 +292,19 @@ impl ListenTask {
                     // 如果 supervisor 已经把 addr 从 last_response 摘走（conn 真
                     // 关了）→ `last_response.remove(&addr).is_none()`，timeout
                     // 路径 no-op，不重复上报 Disconnected。
+                    //
+                    // **补丁 — last_response 超时触发对端重拨**：调
+                    // [`crate::listen::LanMouseListener::close_with_wake_code`]
+                    // force-close QUIC conn with `WAKE_CLOSE_CODE`，让对端
+                    // supervisor 走 RetryState 重试路径。原方案仅发
+                    // `EmulationEvent::Disconnected` 不动 conn → 对端 QUIC 仍活
+                    // → supervisor 收不到 close reason → **没人重拨**。这个兜
+                    // 底专门对付"心跳 task 异常退出 / send 卡住"等场景。
                     last_response.retain(|&addr, instant| {
                         if instant.elapsed() > Duration::from_secs(1) {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
+                            self.listener.close_with_wake_code(addr);
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                             false
                         } else {
