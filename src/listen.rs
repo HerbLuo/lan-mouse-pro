@@ -463,8 +463,8 @@ fn spawn_wake_task(
                 Some(()) => {
                     let q = quic_conns.borrow();
                     log::info!(
-                        "supervisor: post-wake — closing {} QUIC peer conn(s) \
-                         to force fresh reconnect",
+                        "mac wake: force-closing {} QUIC peer conn(s) with WAKE_CLOSE_CODE (0xCAFE) — \
+                         peer supervisor will see ApplicationClosed and trigger reconnect",
                         q.len()
                     );
                     for (a, peer) in q.iter() {

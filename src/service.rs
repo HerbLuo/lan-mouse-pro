@@ -338,9 +338,41 @@ impl Service {
                 }
             }
             EmulationEvent::Disconnected { addr } => {
-                if let Some(addr) = self.remove_incoming(addr) {
-                    self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
-                }
+                // **补丁 — 保留 barrier 跨 disconnect**：让"网络断 → 恢复"
+                // 后用户移动鼠标到屏幕边能立即触发 Leave（CaptureBegin handler
+                // 通过 incoming_conn_info 查 addr 发 Leave）。详见下方完整注释。
+                //
+                // **修前**：调 `self.remove_incoming(addr)` 走完整清理路径
+                // —— `capture.destroy(handle)` 销毁屏障 + `incoming_conns.
+                // remove(&addr)` + `incoming_conn_info.remove(&handle)`。
+                // 后果：网络断后从控端 capture barrier 不在了，主控端 reconnect
+                // 后不会主动重发 Enter（Enter 语义是"鼠标刚跨边"），
+                // barrier 永远不重建，用户鼠标"回不去"。
+                //
+                // **修后**：仅发 frontend 通知，**不**调 remove_incoming。
+                // - barrier 留在 capture module → 鼠标跨边时 CaptureBegin
+                //   正常 fire
+                // - conn_info 保留 entry → CaptureBegin handler 查得到 addr
+                //   → 调 send_leave_event(addr)
+                // - incoming_conns 保留 addr → 下次 Enter 走 update_incoming
+                //   路径（pos/fp 不变则 no-op，barrier 完全保留；变了走
+                //   remove + add 重建，旧的留 orphan）
+                //
+                // **资源泄漏**：每次 Disconnected 留 1 个 orphan barrier
+                // handle（CREATE 后不 destroy）。handle 编号 = `ENTER_HANDLE_
+                // BEGIN + next_trigger_handle`，上限 `u64::MAX/2`，一般场景
+                // 跑一辈子都打不到。**严重资源压力场景**（如反复断连几百次）
+                // 才会显形，那时再加清理机制（"incoming_conns 空时 GC 旧
+                // barrier"）即可。
+                //
+                // **何时仍会真清理**：pos/fingerprint 变化时 update_incoming
+                // 主动 remove + add（destroy 旧 + 建新，orphan 自然消解）；
+                // 用户主动 disable client 的路径走 deactivate_client 也不
+                // 走本 Disconnected handler（不同事件流）。
+                log::info!(
+                    "peer {addr} transiently disconnected — barrier preserved for fast recovery"
+                );
+                self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
             }
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {

@@ -487,7 +487,19 @@ async fn connect_to_handle(
     }
 
     let remote = peer.connection().remote_address();
-    log::info!("client ({handle}) connected @ {remote} (quic)");
+    // **状态转移日志（INFO）**：区分"初次拨号"和"重拨成功"。在清除
+    // retry_state 之前看 entry 是否存在 —— 存在 = 之前失败过、本次是
+    // 重拨；不存在 = 首次建立。这样日志能直接告诉用户"是不是刚刚经历
+    // 了一次 wake / 网络异常后自动恢复"，免去对日志前后文做关联的麻烦。
+    let was_retry = retry_state.borrow().contains_key(&handle);
+    if was_retry {
+        log::info!(
+            "client ({handle}) reconnected @ {remote} (quic) — \
+             自动恢复（之前的连接中断已通过 RetryState 兜底）"
+        );
+    } else {
+        log::info!("client ({handle}) connected @ {remote} (quic) — 首次建立");
+    }
     client_manager.set_active_addr(handle, Some(remote));
     peers.lock().await.insert(remote, peer.clone());
     connecting.lock().await.remove(&handle);
@@ -635,10 +647,30 @@ async fn spawn_peer_supervisor(
     match close_result {
         Err(quic_transport::Error::Handshake(reason)) => {
             if should_retry_after_close(&reason) {
-                record_retry_failure(&retry_state, handle);
-                log::warn!(
-                    "client ({handle}) conn {addr} closed abnormally: {reason:?} — RetryState 退避触发"
+                // **状态转移日志（INFO）**：区分两种 close path
+                // - `ApplicationClosed(WAKE_CLOSE_CODE)` → peer 端系统唤醒
+                //   (Mac 等)，是**预期**事件 → INFO
+                // - 其他 retry-worthy reason（TimedOut 等）→ 网络层异常
+                //   → 保留 WARN
+                let is_wake = matches!(
+                    &reason,
+                    quinn::ConnectionError::ApplicationClosed(frame)
+                        if frame.error_code.into_inner() as u32
+                            == quic_transport::session::WAKE_CLOSE_CODE
                 );
+                record_retry_failure(&retry_state, handle);
+                if is_wake {
+                    log::info!(
+                        "client ({handle}) conn {addr} wake-detected \
+                         (peer system wake, expecting peer back soon) — \
+                         RetryState 退避触发"
+                    );
+                } else {
+                    log::warn!(
+                        "client ({handle}) conn {addr} closed abnormally: {reason:?} — \
+                         RetryState 退避触发"
+                    );
+                }
                 // 触发新一轮拨号（spawn_local fire-and-forget）。
                 // **不**复用 caller 的 `connecting` set —— caller (`connect_to_handle`)
                 // 已 `remove(&handle)`，supervisor 持有的副本是 empty
