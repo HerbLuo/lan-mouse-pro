@@ -4,12 +4,11 @@
   lib,
   pkg-config,
   libX11,
-  gtk4,
-  libadwaita,
   libXtst,
-  wrapGAppsHook4,
   librsvg,
   git,
+  nodejs,
+  npm,
 }:
 let
   cargoToml = fromTOML (builtins.readFile ../Cargo.toml);
@@ -22,19 +21,16 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [
     pkg-config
-    wrapGAppsHook4
+    nodejs
+    npm
     git
   ];
 
-  buildInputs = [
-    gtk4
-    libadwaita
-    librsvg
-  ]
-  ++ lib.optionals stdenv.isLinux [
-    libX11
-    libXtst
-  ];
+  buildInputs = [ librsvg ]
+    ++ lib.optionals stdenv.isLinux [
+      libX11
+      libXtst
+    ];
 
   src = builtins.path {
     name = pname;
@@ -48,7 +44,7 @@ rustPlatform.buildRustPackage {
 
   postInstall = ''
     install -Dm444 *.desktop -t $out/share/applications
-    install -Dm444 lan-mouse-gtk/resources/*.svg -t $out/share/icons/hicolor/scalable/apps
+    install -Dm444 resources/*.svg -t $out/share/icons/hicolor/scalable/apps
   '';
 
   meta = with lib; {

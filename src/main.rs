@@ -6,16 +6,11 @@ use lan_mouse::{
     config::{self, Command, Config, ConfigError},
     emulation_test,
     service::{Service, ServiceError},
+    web::{self, WebError},
 };
 use lan_mouse_cli::CliError;
-#[cfg(feature = "gtk")]
-use lan_mouse_gtk::GtkError;
 use lan_mouse_ipc::{IpcError, IpcListenerCreationError};
-use std::{
-    future::Future,
-    io,
-    process::{self, Child},
-};
+use std::{future::Future, io, process};
 use thiserror::Error;
 use tokio::task::LocalSet;
 
@@ -33,9 +28,8 @@ enum LanMouseError {
     Capture(#[from] InputCaptureError),
     #[error(transparent)]
     Emulation(#[from] InputEmulationError),
-    #[cfg(feature = "gtk")]
     #[error(transparent)]
-    Gtk(#[from] GtkError),
+    Web(#[from] WebError),
     #[error(transparent)]
     Cli(#[from] CliError),
 }
@@ -49,6 +43,12 @@ fn main() {
     // init logging
     let env = Env::default().filter_or("LAN_MOUSE_LOG_LEVEL", "info");
     env_logger::init_from_env(env);
+
+    // Initialise the daemon→browser event bus once, before either the
+    // WebServer or the IPC bridge tries to subscribe to it. Done here
+    // (not inside `web::run`) so a CLI-only invocation that never
+    // starts the web UI still leaves the global in a consistent state.
+    web::init_event_bus();
 
     if let Err(e) = run() {
         log::error!("{e}");
@@ -74,34 +74,49 @@ fn run() -> Result<(), LanMouseError> {
             }
         },
         None => {
-            //  otherwise start the service as a child process and
-            //  run a frontend
-            #[cfg(feature = "gtk")]
-            {
-                let mut service = start_service()?;
-                let res = lan_mouse_gtk::run(config::local_commit());
-                #[cfg(unix)]
-                {
-                    // on unix we give the service a chance to terminate gracefully
-                    let pid = service.id() as libc::pid_t;
-                    unsafe {
-                        libc::kill(pid, libc::SIGINT);
+            // No subcommand → run the service in-process AND start the
+            // embedded web frontend. We spawn both the service and the
+            // HTTP/WS server in the same tokio LocalSet. The web server
+            // connects back to the service over the existing IPC socket,
+            // the same path the local CLI uses.
+            let web_port = web::resolve_port(None, config.web_port());
+            let config_path = config.config_path().to_owned();
+            let release_bind = config.release_bind();
+
+            run_async(async move {
+                // Order matters: the service must bind the IPC socket
+                // BEFORE the web server tries to connect to it. We
+                // construct the service (which is what creates the
+                // listener) up front, then run both `service.run()`
+                // and `server.run()` concurrently.
+                let mut service = Service::new(config).await?;
+                let (request_tx, _event_pump) = web::spawn_ipc_bridge().await?;
+                let server = web::WebServer::bind(web_port, request_tx).await?;
+
+                // Best-effort: open the user's browser on launch. Skip
+                // when LAN_MOUSE_HIDDEN is set (useful for headless /
+                // LaunchAgent setups).
+                if std::env::var_os("LAN_MOUSE_HIDDEN").is_none() {
+                    let url = web::local_url(web_port);
+                    log::info!("opening {url} in the default browser");
+                    if let Err(e) = open::that_detached(&url) {
+                        log::warn!("could not open browser: {e} — visit {url} manually");
                     }
-                    service.wait()?;
                 }
-                service.kill()?;
-                res?;
-            }
-            #[cfg(not(feature = "gtk"))]
-            {
-                // run daemon if gtk is diabled
-                match run_async(run_service(config)) {
-                    Err(LanMouseError::Service(ServiceError::IpcListen(
-                        IpcListenerCreationError::AlreadyRunning,
-                    ))) => log::info!("service already running!"),
-                    r => r?,
+
+                log::info!("using config: {config_path:?}");
+                log::info!("Press {release_bind:?} to release the mouse");
+
+                // Run the service in the foreground; the HTTP server
+                // runs on the same LocalSet as a concurrently polled
+                // future so Ctrl-C from either side tears both down.
+                tokio::select! {
+                    res = server.run() => res?,
+                    res = service.run() => res?,
                 }
-            }
+                log::info!("service exited!");
+                Ok::<(), LanMouseError>(())
+            })?;
         }
     }
 
@@ -121,14 +136,6 @@ where
 
     // run async event loop
     Ok(runtime.block_on(LocalSet::new().run_until(f))?)
-}
-
-fn start_service() -> Result<Child, io::Error> {
-    let child = process::Command::new(std::env::current_exe()?)
-        .args(std::env::args().skip(1))
-        .arg("daemon")
-        .spawn()?;
-    Ok(child)
 }
 
 async fn run_service(config: Config) -> Result<(), ServiceError> {

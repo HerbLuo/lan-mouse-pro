@@ -69,6 +69,9 @@ struct ConfigToml {
     cert_path: Option<PathBuf>,
     clients: Option<Vec<TomlClient>>,
     authorized_fingerprints: Option<HashMap<String, String>>,
+    /// Port for the embedded web UI. Optional; falls back to
+    /// `LAN_MOUSE_WEB_PORT` / `DEFAULT_WEB_PORT` when unset.
+    web_port: Option<u16>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -495,6 +498,13 @@ impl Config {
             .port
             .or(self.config_toml.as_ref().and_then(|c| c.port))
             .unwrap_or(DEFAULT_PORT)
+    }
+
+    /// Port the embedded web UI binds to. `None` means "use
+    /// `LAN_MOUSE_WEB_PORT` or `DEFAULT_WEB_PORT`" — see
+    /// [`crate::web::resolve_port`].
+    pub fn web_port(&self) -> Option<u16> {
+        self.config_toml.as_ref().and_then(|c| c.web_port)
     }
 
     /// list of configured clients

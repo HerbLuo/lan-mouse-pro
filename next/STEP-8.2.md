@@ -129,6 +129,7 @@ dial** —— 没有 periodic re-attempt / startup dial。
 **`src/service.rs`**：
 
 `activate_client` 在 `client_manager.activate_client(handle)` 返 true 之后：
+
 - `self.capture.create(handle, pos, CaptureType::Default)`（不变）
 - `self.broadcast_client(handle)`（不变）
 - **新增** `self.capture.dial(handle)` —— 主动 fire-and-forget 触发拨号
@@ -181,6 +182,7 @@ Finished `dev` profile [unoptimized + debuginfo] target(s)
 ### 4.1 现场日志（Bug #1/#2 fix 后用户报"还是不行"）
 
 **用户侧（10.2.1.15）**：
+
 ```
 [12:48:42Z INFO  lan_mouse::connect] client (0) connected @ 10.2.1.12:4242 (quic)
 [12:48:45Z WARN  lan_mouse::quic_transport] client hello handshake timed out after 3s
@@ -189,6 +191,7 @@ Finished `dev` profile [unoptimized + debuginfo] target(s)
 ```
 
 **对端（10.2.1.12）**：
+
 ```
 [04:48:45Z INFO  lan_mouse::quic_transport] AuthorizedKeysVerifier: authorized peer a4:9b:47:...
 [04:48:45Z INFO  lan_mouse::listen] QUIC peer connected: 10.2.1.15:61252
@@ -198,6 +201,7 @@ Finished `dev` profile [unoptimized + debuginfo] target(s)
 ```
 
 **关键观察**：
+
 - 客户端 `dial_any` 成功（12:48:42 UTC）
 - 客户端 `client_hello` 第二次超时（12:48:45 UTC，**3s 后**）
 - 服务端 mTLS 通过 + 第一次 hello OK（04:48:45 UTC，与客户端超时**同一瞬间**）
@@ -274,6 +278,7 @@ match role {
 新增 `peer_run_skips_hello_if_already_done`（`src/quic_transport.rs`）：
 
 模拟生产路径：
+
 1. server 端：accept → `server_hello` → 模拟 supervisor 读 stream A（2s 后退出）
 2. client 端：dial → **早期 `client_hello`**（与生产 `connect_to_handle` 对齐）
 3. client 端：`peer.run(PeerRole::Client)` —— **核心断言点**
@@ -305,6 +310,7 @@ test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 新增 2 个测试：
+
 - `rejection_channel_forwards_rejected_fingerprint`（Bug #1）
 - `peer_run_skips_hello_if_already_done`（Bug #3）
 
@@ -516,6 +522,7 @@ $ grep -rn 'send(ListenEvent::Rejected' src/
 
 - 调研：~15 min（已在本 STEP 内完成）
 - 实现修复：未开始
+
 ---
 
 ## 8. 新增修复：stream A 控制事件路径走新 bidi，server 不读（**Bug #5** — 已修）
@@ -584,6 +591,7 @@ stream 写控制事件（Enter / Leave / Ack / Hello / Ping / Pong）。
 **新增** `send_stream_a_round_trip_control_event`（`src/quic_transport.rs`）：
 
 模拟生产路径：
+
 1. server_ep + client_ep
 2. server task: accept → server_hello → take_stream_a_recv → 等 1 帧
 3. client: dial → client_hello → send_input(Ping)
@@ -620,7 +628,6 @@ stream 写控制事件（Enter / Leave / Ack / Hello / Ping / Pong）。
   计时间，且每个修复后都要等用户复测才暴露下一个；建议下次类似场
   景先一次性翻完整个数据通路再批量修，避免反复 commit/retest 周期）
 
-
 ---
 
 ## 10. 新增修复：Enter 处理被 dead-code stub 跳过（**Bug #6** — 已修）
@@ -628,11 +635,13 @@ stream 写控制事件（Enter / Leave / Ack / Hello / Ping / Pong）。
 ### 10.1 现场日志（Bug #1-#5 修后用户复测，进展 + 残留）
 
 **进展**：
+
 - 远程 daemon 重启后 INFO 正常：`stream A recv from 10.2.1.15:61252: Enter(top)`
   —— Bug #5 修复生效，stream A 端到端通
 - 本机日志正常：`send Enter(bottom) to handle 0 addr 10.2.1.12:4242 via peer (active)`
 
 **残留**：
+
 - 远程收到 Enter 后**鼠标没出现** —— 远程不 inject input
 - 本机反复 `send Enter(bottom)`（约每秒一次）—— 卡在 WaitingForAck
   永远收不到 Ack
@@ -642,6 +651,7 @@ stream 写控制事件（Enter / Leave / Ack / Hello / Ping / Pong）。
 ### 10.2 根因
 
 `src/emulation.rs:175` Enter 处理：
+
 ```rust
 ProtoEvent::Enter(pos) => {
     if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
@@ -655,6 +665,7 @@ ProtoEvent::Enter(pos) => {
 
 但 `src/listen.rs:316` `LanMouseListener::get_certificate_fingerprint` 是
 **dead-code stub**：
+
 ```rust
 pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
     let _ = addr;
@@ -663,14 +674,16 @@ pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Opti
 ```
 
 → 整个 if 块跳过 → 远程 Enter 后**不**：
+
 - release capture（service.add_incoming 不触发）
 - reply Ack（本机永远等不到 → 反复 send Enter）
 - 发 EmulationEvent::Entered（service + frontend 不知道有 peer 进入）
 
 **listen.rs:316 的 docstring 写的是期望**：
+
 > "ListenTask 在 Enter 时不需要重算 fingerprint —— 直接查 map
->  即可。本函数保留是 emulation.rs 的现有 API 调用站桩，**M1
->  阶段不真正用**"
+> 即可。本函数保留是 emulation.rs 的现有 API 调用站桩，**M1
+> 阶段不真正用**"
 
 —— 但实际 `addr_to_fingerprint` map **从来没建过**，与 docstring 描述
 的"未来路径"从未落地。
@@ -785,6 +798,7 @@ Bug #6 修后 remote 真的发 Ack → 本机**应该能收但实际收不到** 
 recv_tx 死字段问题。
 
 **第 4 层同一根因系列（与 Bug #4 / recv_tx 死字段同源）**：
+
 - Bug #4 移除 alive 检查（上层）
 - Bug #7 接 recv_tx 路径（事件流入）
 - TODO M2：处理 Pong → set_alive 重新接回 alive 检查（语义层）
@@ -820,13 +834,13 @@ recv_tx 死字段问题。
    ```
 4. `peer.set_outgoing_events(Some(out_tx))` 在 spawn peer.run 前
 5. forwarder task 加 INFO 日志 `stream A forwarder: {addr} → handle
-   {handle}: {event}` 让用户复测时看到路径通了
+{handle}: {event}` 让用户复测时看到路径通了
 
 ### 12.4 已知遗留（接受）
 
 - **Reconnect 路径**：supervisor 触发 reconnect 时，无法直接拿
-  原 LanMouseConnection 的 recv_tx —— 本简化版传一个 local channel
-  default（无 forwarder）。但 reconnect 期间 supervisor 已 `set_active_
+  原 LanMouseConnection 的 recv*tx —— 本简化版传一个 local channel
+  default（无 forwarder）。但 reconnect 期间 supervisor 已 `set_active*
   addr(None)`、capture release，等下次 dial 成功又会重新设
   outgoing_events + spawn 新 forwarder —— **语义 OK**
 - **forwarder send 失败的处理**：recv_tx.send 失败说明 capture task
@@ -845,16 +859,16 @@ recv_tx 死字段问题。
 
 ## 13. 时间/耗时（最终累计）
 
-| Bug | 时间 |
-|---|---|
-| #1（mTLS reject 反向通知） | ~30 min |
-| #2（connect_on_activate） | ~15 min |
-| #3（Hello 握手重复） | ~25 min |
-| #4（alive 永 false 移除） | ~20 min |
-| #5（stream A 控制事件路径） | ~30 min |
-| #6（Enter dead-code stub） | ~25 min |
-| #7（stream A 事件转发 recv_tx） | ~30 min |
-| **总计** | **~175 min（~3 小时）** |
+| Bug                             | 时间                    |
+| ------------------------------- | ----------------------- |
+| #1（mTLS reject 反向通知）      | ~30 min                 |
+| #2（connect_on_activate）       | ~15 min                 |
+| #3（Hello 握手重复）            | ~25 min                 |
+| #4（alive 永 false 移除）       | ~20 min                 |
+| #5（stream A 控制事件路径）     | ~30 min                 |
+| #6（Enter dead-code stub）      | ~25 min                 |
+| #7（stream A 事件转发 recv_tx） | ~30 min                 |
+| **总计**                        | **~175 min（~3 小时）** |
 
 7 个 bug **全是同一条事件流的不同环节的死代码 / 未连接路径**：
 
@@ -874,36 +888,6 @@ capture → send → peer.send_input → stream A/B/C → server listen.rs
 
 ## 14. Follow-ups（不修，记录到 doc）
 
-### 14.1 quic_transport.rs 拆分（refactor follow-up）
-
-**现状**：`src/quic_transport.rs` 5534 lines —— 7.4× 第二大文件（listen.rs 748 lines）。
-占项目总代码 ~51%。
-
-**结构**（STEP 章节）：
-- STEP-3.2 PeerSession + Hello: 488 lines
-- STEP-4.4 Channel + route_input: 370 lines
-- STEP-5.2 Frame codec: 135 lines
-- STEP-5.3 read_loop + stream management: 265 lines
-- STEP-5.4 run + watchdog + datagram_reader: 482 + 468 lines
-- Verifiers (TofuVerifier / AuthorizedKeysVerifier / permissive): 430 lines
-- Tests: 2342 lines（占 42%！）
-
-**推荐拆分（3 文件 + 测试分摊）**：
-
-| 文件 | 内容 | 预计 | 职责 |
-|---|---|---|---|
-| `quic_endpoint.rs` | `endpoint/dial/dial_any/accept`、`endpoint_with_cert/verifier`、`build_quic_client_config`、`install_crypto_provider`、`default_transport_config`、`PeerSession::from_connection`、HELLO_TIMEOUT/ALPN 常量 | ~600 | **连接建立** |
-| `quic_verifier.rs` | `TofuVerifier`、`AuthorizedKeysVerifier`、`permissive_client_cert_verifier` | ~430 | **TLS 证书校验** |
-| `quic_transport.rs` (保留) | PeerSession struct + impl + run、StreamPair/Bidi/StreamBunch、Error、Hello 握手、codec、Channel + route_input、read_loop、datagram_reader_task、PeerRole、should_retry_after_close | ~1900 | **会话生命周期** |
-| 各文件 `mod tests` | tests 跟着对应文件走（verifier tests 进 verifier，endpoint tests 进 endpoint，session tests 进 main） | 分摊 | 测试访问 private items 必须同文件 |
-
-**不拆的**：
-- `Error` enum 留 main（核心错误类型，跟 PeerSession 同源）
-- `StreamPair/Bidi/StreamBunch` 留 main（与 PeerSession 紧耦合）
-- `Channel` + `route_input` 留 main（与 `send_input` 紧密耦合）
-
-**公开 API 不变**（re-export from main file），调用方零修改。
-
 **何时做**：下一次大重构窗口（5 个以上 PR 或项目转阶段时）。当前 7 个 bug 链已让文件混乱，但**优先修 bug 不优先重构**。
 
 ### 14.2 macOS 30s 鼠标卡死（已知限制）
@@ -912,16 +896,19 @@ capture → send → peer.send_input → stream A/B/C → server listen.rs
 之后才恢复（"几十秒" 匹配 QUIC `max_idle_timeout = 30s`）。
 
 **当前修复状态**：
+
 - Bug #9/Bug #10：peer.run 检测 closed() future fire 或 read IO 错 → 推 Leave → capture 立即 release（**协议层正确**）
 - Bug #11 防御性 Reenable：**已回退**（`9d0b4d5`）—— 重建 OS tap 没能解决 macOS tap 启动期状态问题，反而可能引入新问题
 
 **根因（推测，未证实）**：
+
 - macOS `input-capture` crate 的 CGEventTap 在 peer close 时未真正停止
 - capture.rs `release_capture` 调 `capture.release()` 仅让 macOS producer 设 `current_pos = None`（cursor 应可见），但 `CGEventTap` 本身仍 active
 - capture.rs 进入 inner loop（等 Reenable），不 poll `capture.next()` → `event_tx` buffer 32 满 → tap callback `blocking_send` 阻塞 → CGEventTap 1s timeout → re-enable → 死循环
 - macOS 用户态 cursor 视觉卡住（内核 cursor position 在更新，但 user-perceived "卡 30s"）
 
 **修复路径（需深入 input-capture crate）**：
+
 1. 修改 `input-capture/src/macos.rs` —— release() 时同步 disable CGEventTap（不只发 notify）
 2. 或在 capture.rs 检测 TimedOut 后调 `set_alive(false)` 暂停 capture（让用户手动重启 daemon）
 3. 或在 Drop impl 里加 `CGEventTapEnable(port, false)` 显式停 tap
@@ -938,10 +925,12 @@ capture → send → peer.send_input → stream A/B/C → server listen.rs
 但日志里有 `AuthorizedKeysVerifier: rejected unauthorized peer ...`）。
 
 **期望**：对端 dial 进时，本地 verifier 拒绝 → 弹 GTK 窗口显示对端 fingerprint
-+ "接受 / 拒绝"按钮 → 接受后自动写入 `[authorized_fingerprints]`
-→ 重连成功（无需手动编辑 config）。
+
+- "接受 / 拒绝"按钮 → 接受后自动写入 `[authorized_fingerprints]`
+  → 重连成功（无需手动编辑 config）。
 
 **当前代码状态**（Bug #1 修后已大半到位）：
+
 - ✅ `quic_transport.rs` AuthorizedKeysVerifier 拒握时通过反向 channel 发 fingerprint
   （`rejection_tx.send(fp)`）
 - ✅ `listen.rs` `spawn_rejection_forwarder_task` 把 fp 推 `ListenEvent::Rejected`
@@ -952,12 +941,14 @@ capture → send → peer.send_input → stream A/B/C → server listen.rs
 - ✅ `authorization_window.rs` 提供 GTK 模板
 
 **链路完整**，但用户实测**没看到弹窗**。推测：
+
 - A. GTK lib.rs 端 IPC 链路没接通（AsyncFrontendListener 接收有问题）
 - B. AuthorizationWindow 的 `connect_closure` 信号没正确绑定（`confirm-clicked` /
   `cancel-clicked` 在 template 里名字不一致）
 - C. `present()` 调了但 window 没聚焦（macOS 上常见，application not active）
 
 **排查建议**：
+
 1. 在 `request_authorization` 里加 `log::info!` 看是否被调用
 2. 在 `AuthorizationWindow::new` 里检查 `fingerprint` 是否非空
 3. 检查 `authorization_window.ui` template 的按钮 id（`confirm-clicked` / `cancel-clicked`
@@ -969,10 +960,12 @@ capture → send → peer.send_input → stream A/B/C → server listen.rs
 版本 / 焦点策略有关）。可能 1-2 小时。
 
 **当前 workaround**：用户在 `~/.config/lan-mouse/config.toml` 加对端 fingerprint：
+
 ```toml
 [authorized_fingerprints]
 "<对方 fingerprint>" = ""
 ```
+
 对端 cert fingerprint 可在远端 daemon 日志 `creating self-signed cert` 附近找到
 （或 `openssl x509 -in ~/.local/share/lan-mouse/cert.pem -noout -fingerprint -sha256`）。
 
@@ -980,20 +973,20 @@ capture → send → peer.send_input → stream A/B/C → server listen.rs
 
 ## 15. 时间/耗时（最终累计 — 含 14 follow-ups）
 
-| Bug / Follow-up | 时间 |
-|---|---|
-| Bug #1（mTLS reject 反向通知） | ~30 min |
-| Bug #2（connect_on_activate） | ~15 min |
-| Bug #3（Hello 握手重复） | ~25 min |
-| Bug #4（alive 永 false 移除） | ~20 min |
-| Bug #5（stream A 控制事件路径） | ~30 min |
-| Bug #6（Enter dead-code stub） | ~25 min |
-| Bug #7（stream A 事件转发 recv_tx） | ~30 min |
-| Bug #8（server 侧补 datagram reader） | ~30 min |
-| Bug #9（peer 关闭 release capture） | ~25 min |
-| Bug #10（read IO 错误路径） | ~20 min |
-| Bug #11 防御性修复 + 回退 | ~40 min |
-| Doc 整理 + follow-up 记录 | ~30 min |
-| **总计** | **~5 小时** |
+| Bug / Follow-up                       | 时间        |
+| ------------------------------------- | ----------- |
+| Bug #1（mTLS reject 反向通知）        | ~30 min     |
+| Bug #2（connect_on_activate）         | ~15 min     |
+| Bug #3（Hello 握手重复）              | ~25 min     |
+| Bug #4（alive 永 false 移除）         | ~20 min     |
+| Bug #5（stream A 控制事件路径）       | ~30 min     |
+| Bug #6（Enter dead-code stub）        | ~25 min     |
+| Bug #7（stream A 事件转发 recv_tx）   | ~30 min     |
+| Bug #8（server 侧补 datagram reader） | ~30 min     |
+| Bug #9（peer 关闭 release capture）   | ~25 min     |
+| Bug #10（read IO 错误路径）           | ~20 min     |
+| Bug #11 防御性修复 + 回退             | ~40 min     |
+| Doc 整理 + follow-up 记录             | ~30 min     |
+| **总计**                              | **~5 小时** |
 
 7 个核心 bug 都已修复（协议层）；3 个 follow-up 列入 14 节。

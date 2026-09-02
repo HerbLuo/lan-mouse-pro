@@ -37,7 +37,7 @@ impl ClientManager {
             // selection. Without this line the `ConfigClient` →
             // `ClientConfig` conversion silently drops the field, so
             // whatever the user wrote in `config.toml`
-            // (`input_channels = { ... }`) never reaches the GTK
+            // (`input_channels = { ... }`) never reaches the frontend
             // editor / runtime. Half-link bug introduced by STEP-4.2
             // (which only stored the field on disk). Mirrored from
             // bak `mousehop/src/client.rs:1-50 add_with_config`.

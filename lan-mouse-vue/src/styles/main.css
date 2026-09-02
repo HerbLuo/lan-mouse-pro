@@ -1,0 +1,148 @@
+:root {
+  --fg-default: #bbbbbb;
+  --fg-muted: #8e8e93;
+  --border: 1px solid #aaa;
+  --accent: #ff9f43;
+  --accent-soft: rgba(255, 159, 67, 0.15);
+  --error: #ff6b6b;
+  --shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --radius: 4px;
+  --radius-sm: 2px;
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, 'Helvetica Neue',
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-size: 16px;
+  line-height: 1.45;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  background: #3d3d3d;
+  color: var(--fg-default);
+  min-height: 100vh;
+}
+
+.muted {
+  color: var(--fg-muted);
+}
+
+.em1 {
+  font-size: 1em;
+}
+
+/* --- inputs (some are used outside scoped styles) -------------- */
+
+input[type='text'],
+input[type='number'],
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  border: 0;
+  border-bottom: 1px solid var(--fg-muted);
+  border-radius: 0;
+  padding: 0;
+  padding-left: 2px;
+  outline: none;
+  font-size: 1em;
+  transition: border-color 0.15s;
+}
+
+input[type='text']:focus,
+input[type='number']:focus,
+select:focus {
+  border-bottom-color: var(--accent);
+}
+
+.mono {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+}
+
+/* --- buttons ---------------------------------------------------- */
+
+button {
+  appearance: none;
+  border: 1px solid #4a4a55;
+  background: #414141;
+  color: var(--fg-default);
+  border-radius: var(--radius);
+  padding: 8px 14px;
+  font-size: 14px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+button:hover {
+  background: #3a3a44;
+  border-color: var(--fg-muted);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--accent);
+  color: #1a1a1e;
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+button.primary:hover {
+  background: #ffb56b;
+}
+
+button.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--fg-muted);
+}
+
+button.ghost:hover {
+  background: #414141;
+  color: var(--fg-default);
+}
+
+button.icon {
+  padding: 0px;
+  width: 23px;
+  height: 23px;
+  justify-content: center;
+}
+
+button.danger {
+  border-color: rgba(255, 107, 107, 0.5);
+  color: var(--error);
+}
+
+button.danger:hover {
+  background: rgba(255, 107, 107, 0.12);
+}
+
+/* --- common helpers used across components --------------------- */
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.faint {
+  color: #5f5f66;
+}

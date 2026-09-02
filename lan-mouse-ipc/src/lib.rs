@@ -143,15 +143,15 @@ pub struct ClientConfig {
     /// Per-input-event transport selection (datagram vs reliable stream).
     /// Sender-side preference; the receiver has no parallel concept. See
     /// [`InputChannelConfig`] and STEP-4.4 `route_input` for the routing
-    /// side. The GTK client editor (STEP-4.5) writes this when the user
-    /// flips the mouse-button / keyboard channel dropdowns.
+    /// side. The frontend writes this when the user flips the
+    /// mouse-button / keyboard channel dropdowns.
     ///
     /// `#[serde(default)]` makes the field backward-compatible: existing
-    /// GTK / daemon wire payloads that don't carry this field deserialize
-    /// as `InputChannelConfig::default()` (mouse → datagram,
-    /// keyboard → stream). Required because the wire is consumed by
-    /// older daemons that pre-date ChannelMode (STEP-4.1) and would
-    /// otherwise fail with "missing field `input_channels`".
+    /// frontend / daemon wire payloads that don't carry this field
+    /// deserialize as `InputChannelConfig::default()` (mouse →
+    /// datagram, keyboard → stream). Required because the wire is
+    /// consumed by older daemons that pre-date ChannelMode (STEP-4.1)
+    /// and would otherwise fail with "missing field `input_channels`".
     #[serde(default)]
     pub input_channels: InputChannelConfig,
 }
@@ -200,7 +200,7 @@ pub enum ChannelMode {
 /// The defaults match the long-standing behavior of `lan-mouse` (mouse button
 /// → datagram for low latency; keyboard → stream so modifier releases
 /// cannot be dropped). Users can switch either field via `config.toml` /
-/// the GTK client editor; see STEP-4.3 / STEP-4.5.
+/// the frontend; see STEP-4.3 / STEP-4.5.
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Serialize, Deserialize)]
 pub struct InputChannelConfig {
     /// Channel used for mouse button press / release events.
@@ -253,7 +253,7 @@ mod input_channel_tests {
     fn client_config_input_channels_default_when_missing() {
         // Wire payload that pre-dates ChannelMode / InputChannelConfig.
         // Must deserialize cleanly via #[serde(default)] on the new
-        // `input_channels` field; otherwise the GTK editor on a fresh
+        // `input_channels` field; otherwise the frontend on a fresh
         // build would fail every time it talks to a pre-M1 daemon.
         let legacy = r#"{
             "hostname": "peer-east",

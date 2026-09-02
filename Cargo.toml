@@ -5,7 +5,6 @@ members = [
     "input-event",
     "lan-mouse-ipc",
     "lan-mouse-cli",
-    "lan-mouse-gtk",
     "lan-mouse-proto",
 ]
 
@@ -43,7 +42,6 @@ input-event = { path = "input-event", version = "0.4.0" }
 input-emulation = { path = "input-emulation", version = "0.4.0", default-features = false }
 input-capture = { path = "input-capture", version = "0.4.0", default-features = false }
 lan-mouse-cli = { path = "lan-mouse-cli", version = "0.3.0" }
-lan-mouse-gtk = { path = "lan-mouse-gtk", version = "0.3.0", optional = true }
 lan-mouse-ipc = { path = "lan-mouse-ipc", version = "0.3.0" }
 lan-mouse-proto = { path = "lan-mouse-proto", version = "0.3.0" }
 shadow-rs = { version = "1.2.0", features = ["metadata"] }
@@ -77,6 +75,21 @@ rcgen = "0.13.1"
 sha2 = "0.10.8"
 notify = "8.2.0"
 
+# Web frontend. axum for HTTP/WS, rust-embed for baking the built Vue
+# bundle into the binary, open to launch the user's default browser
+# on startup. `hostname` is reused so the General view can show the
+# local system hostname.
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.4"
+tower-http = { version = "0.6", features = ["trace"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+rust-embed = "8"
+mime_guess = "2"
+open = "5"
+hostname = "0.4"
+local-ip-address = "0.6"
+
 [dev-dependencies]
 rcgen = "0.13"
 # rt-multi-thread: local_set_test! macro 走 multi_thread flavor 需要
@@ -87,7 +100,6 @@ libc = "0.2.148"
 
 [features]
 default = [
-    "gtk",
     "layer_shell_capture",
     "x11_capture",
     "libei_capture",
@@ -96,7 +108,6 @@ default = [
     "rdp_emulation",
     "x11_emulation",
 ]
-gtk = ["dep:lan-mouse-gtk"]
 layer_shell_capture = ["input-capture/layer_shell"]
 x11_capture = ["input-capture/x11"]
 libei_capture = ["input-event/libei", "input-capture/libei"]
@@ -107,8 +118,7 @@ rdp_emulation = ["input-emulation/remote_desktop_portal"]
 
 [package.metadata.bundle]
 name = "Lan Mouse"
-icon = ["target/icon.icns", "lan-mouse-gtk/resources/de.feschber.LanMouse.svg"]
+icon = ["target/icon.icns", "resources/de.feschber.LanMouse.svg"]
 identifier = "de.feschber.LanMouse"
-deb_depends = [ "libadwaita-1-0" ]
 osx_info_plist_exts = ["build-aux/macos-lsui-element.plist"]
 resources = ["target/menubar-template.png"]

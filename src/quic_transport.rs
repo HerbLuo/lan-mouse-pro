@@ -613,7 +613,7 @@ fn endpoint_inner(
 /// 否则运行期 panic（见 PLAN §2.1 + bak lib.rs:60-69 注释）。
 ///
 /// 用 [`OnceLock`] 守护：cargo test 多线程并发 / `lan-mouse-cli` 子进程 /
-/// GTK + daemon 双进程 同时 install 时，第二次 `install_default()` 返回
+/// CLI 与 daemon 同时 install 时，第二次 `install_default()` 返回
 /// `Err(SomeInstalled)` 会让裸调用 panic / 噪音日志。`OnceLock` 保证整个
 /// 进程只 install 一次，幂等可重入。
 ///
@@ -3140,7 +3140,7 @@ impl rustls::server::danger::ClientCertVerifier for AuthorizedKeysVerifier {
             // `Err` 触发握手拒绝，**同时**把 fingerprint 通过反向 channel
             // 通知 listen task → 转译 `ListenEvent::Rejected` →
             // `EmulationEvent::ConnectionAttempt` → GUI `request_authorization`
-            // 弹窗（emulation.rs:190 + service.rs:320 + GTK `request_authorization`）。
+            // 弹窗（emulation.rs:190 + service.rs:320 + 前端 `request_authorization`）。
             //
             // **send 失败静默吞**：`UnboundedSender::send` 仅在 receiver drop
             // 时返 `Err`（channel 关闭），此时 listen task 已退出（terminate）

@@ -12,6 +12,7 @@ mod listen;
 pub(crate) mod macos_power;
 pub mod quic_transport;
 pub mod service;
+pub mod web;
 
 // 启动期必须先调：早于任何 `rustls::ClientConfig::builder` /
 // `rustls::ServerConfig::builder`（见 STEP-2.1 / next/STEP-2.1.md）。

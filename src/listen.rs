@@ -67,7 +67,7 @@
 //! 这样 `AuthorizedKeysVerifier` 拒握时 fingerprint 即时送到
 //! `EmulationTask::ListenTask` 已有 match 分支（emulation.rs:190）→
 //! `EmulationEvent::ConnectionAttempt` → `FrontendEvent::ConnectionAttempt` →
-//! GTK `request_authorization` 弹窗。
+//! 前端 `request_authorization` 弹窗。
 
 use futures::{Stream, StreamExt};
 use lan_mouse_proto::ProtoEvent;
@@ -216,7 +216,7 @@ impl LanMouseListener {
         // 路径：`AuthorizedKeysVerifier::verify_client_cert` Err → `tx.send(fp)`
         // → 本 forwarder task `rx.recv()` → `listen_tx.send(ListenEvent::Rejected)`
         // → emulation.rs:190 → `EmulationEvent::ConnectionAttempt` → service.rs:320
-        // → `FrontendEvent::ConnectionAttempt` → GTK `request_authorization`。
+        // → `FrontendEvent::ConnectionAttempt` → 前端 `request_authorization`。
         //
         // **channel 类型**：`tokio::sync::mpsc::unbounded_channel`（与
         // §1 `wake_tx` 同模式 —— verifier 在 rustls 握手回调里 send，
@@ -451,7 +451,7 @@ fn spawn_wake_task(
 /// `tx.send(fp)`（在 verifier 内部，已在 quic_transport.rs 装配）→
 /// 本 task `rx.recv()` → `listen_tx.send(ListenEvent::Rejected { fingerprint })`
 /// → emulation.rs:190 → `EmulationEvent::ConnectionAttempt` →
-/// service.rs:320 → `FrontendEvent::ConnectionAttempt` → GTK `request_authorization`
+/// service.rs:320 → `FrontendEvent::ConnectionAttempt` → 前端 `request_authorization`
 /// 弹窗。
 ///
 /// **去重**：emulation.rs:191-194 已有 2 秒去重（同一 fp 在 2 秒内只弹一

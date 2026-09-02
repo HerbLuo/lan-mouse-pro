@@ -76,8 +76,8 @@
               [
                 rustToolchain
                 pkg-config
-                gtk4
-                libadwaita
+                nodejs
+                npm
                 librsvg
               ]
               ++ lib.optionals pkgs.stdenv.isLinux [
