@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
+use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT, InputChannelConfig};
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -345,6 +345,17 @@ const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_RETRY_FAILURES_BEFORE_OFFLINE: u32 = 5;
 
+/// **应用层心跳周期**：主控端周期性向被控端发 `ProtoEvent::Ping`，刷新
+/// [`crate::emulation::ListenTask`] 的 `last_response` map，避免鼠标在被
+/// 控端静止（或主控端静止等场景）期间触发 `releasing keys: ... not
+/// responding!` 1s 伪超时——QUIC `keep_alive_interval = 5s` 是传输层 PING
+/// 帧（[`quinn::TransportConfig`]），不会产生 `ListenEvent::Msg`、不能
+/// 刷 `last_response`，所以必须有应用层 Ping。
+///
+/// 500ms 远低于 1s 阈值 + 5s tick 检测窗口，余量充裕；2 帧/秒 × 双向
+/// stream A 流量（Pong 回包）对控制平面负载可忽略。
+const PING_INTERVAL: Duration = Duration::from_millis(500);
+
 /// 记录一次拨号失败（dial_any / client_hello / etc.）—— 把 backoff 翻倍
 /// + 累加 `failure_count`，到 `MAX_RETRY_FAILURES_BEFORE_OFFLINE` 打
 /// `log::error`。
@@ -578,10 +589,30 @@ async fn spawn_peer_supervisor(
     log::info!(
         "spawn_peer_supervisor: starting for handle {handle} addr {addr}"
     );
+
+    // **应用层心跳任务** —— 与 supervisor 并行：每 [`PING_INTERVAL`] 主动
+    // 发 `ProtoEvent::Ping` 到被控端，被控端 `emulation.rs::ListenTask`
+    // 的 `ListenEvent::Msg` 处理刷新 `last_response`，从而防止 1s 阈值 +
+    // 5s tick 检测窗口在 Input 流静默时把 peer 误判为 not responding 并
+    // 销毁 capture trigger（详见 docstring at top of file）。
+    //
+    // **生命周期**：与 supervisor 绑定 —— supervisor 入口 spawn、心跳
+    // 在 supervisor 末尾（peer.run 返回）abort。`send_input` 失败时
+    // 心跳任务自然 return，与 abort 双保险。
+    //
+    // **为什么不在 `connect_to_handle` 里 spawn**：那里 spawn 的话没有
+    // 自然的退出触发器（`connect_to_handle` 一次性返回）；放 supervisor
+    // 里和 `peer.run()` 严格对齐生命周期最干净。
+    let ping_task = spawn_local(ping_heartbeat_task(peer.clone(), addr));
+
     let close_result = peer.run(PeerRole::Client).await;
     log::info!(
         "spawn_peer_supervisor: peer.run() returned for handle {handle} addr {addr}"
     );
+
+    // peer 已死 → 停心跳。`send_input` 早已失败自退，但 abort 让日志与
+    // supervisor 退出同步，避免停手后还有 tick 触发 send_input 报 warn。
+    ping_task.abort();
 
     // (1) 摘 peers —— 不论 close 是 graceful 还是异常，都让 send() 立即走重拨路径
     let removed = peers.lock().await.remove(&addr).is_some();
@@ -643,6 +674,54 @@ async fn spawn_peer_supervisor(
             log::error!(
                 "client ({handle}) peer.run() 返了 Ok(())（quinn API 行为变化? 或本步未捕获 close reason）"
             );
+        }
+    }
+}
+
+/// **应用层 Ping 心跳任务**（[`crate::emulation::ListenTask`] 1s 阈值 +
+/// 5s tick 检测窗口下的防伪超时补丁）。
+///
+/// **触发**：被 [`spawn_peer_supervisor`] 在 `peer.run()` 之前 spawn；
+/// 退出 `spawn_peer_supervisor` 时 `ping_task.abort()`。
+///
+/// **行为**：每 [`PING_INTERVAL`] 调一次 `peer.send_input(Ping, default)`，
+/// 路由到 stream A。被控端 `emulation.rs:210` 收到 Ping 后回 Pong（同时
+/// 主循环把 Ping 帧作为 `ListenEvent::Msg` 推到 `last_response`，**这才是
+/// 关键**——`last_response` 看到 Ping 帧就刷新）。
+///
+/// **退出路径**（三选一，先到先退）：
+/// 1. peer 死 → `send_input` 返 `Err` → 本函数 `return`
+/// 2. supervisor 末尾 `ping_task.abort()` → task 被取消
+/// 3. （理论）peer.run() 抛错 → 同 (1)
+///
+/// **为什么跳过首个 tick**：`tokio::time::interval` 默认在 `t=0` 立即触发
+/// 首 tick；supervisor 刚 spawn 时 peer 还在握手/装配阶段（虽
+/// `connect_to_handle` 末尾才调 supervisor，多数情况下 cached_send_a 已
+/// 就绪），跳过首 tick 让"启动后第一个 Ping"在第一个完整周期后到达，避免
+/// 与握手期 `Hello` 流撞帧。
+async fn ping_heartbeat_task(peer: Arc<PeerSession>, addr: SocketAddr) {
+    let mut interval = tokio::time::interval(PING_INTERVAL);
+    // 跳过首 tick —— 见 docstring
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        match peer
+            .send_input(&ProtoEvent::Ping, &InputChannelConfig::default())
+            .await
+        {
+            Ok(()) => {
+                log::trace!("ping_heartbeat: sent Ping to {addr}");
+            }
+            Err(e) => {
+                // peer 已死 —— 自然退出。supervisor 也会 abort 本 task，
+                // 这里是 send_input 先失败时的提前退出路径。warn 而非
+                // error：peer 死亡本身会被 supervisor 报出来，这里只
+                // 是心跳线程先察觉到。
+                log::warn!(
+                    "ping_heartbeat: send Ping to {addr} failed (peer dead): {e}"
+                );
+                return;
+            }
         }
     }
 }
