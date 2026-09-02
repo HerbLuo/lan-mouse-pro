@@ -35,13 +35,13 @@ use super::{Error, Result, ALPN_LAN_MOUSE};
 ///
 /// - `keep_alive_interval = 5s` —— QUIC 主动探活，配合 PLAN §7 "Wi-Fi
 ///   切换恢复 < 1s" 预算；与 bak Step 0.1 spike 实测一致。
-/// - `max_idle_timeout = 30s` —— QUIC keepalive 自带；应用层 idle 检测
-///   已于 STEP-7.1 下线（原 DTLS 时代 8s 应用层 idle 探测随 STEP-6.2
-///   listen.rs 重写一并消失）。对端静默不再触发本端主动关连：只有 QUIC
-///   自身 30s idle 超时（且 5s keepalive 在健康链路上永远先到）才关。
+/// - `max_idle_timeout = 10s` —— 2026-09 调整：原 30s 太慢，应用层
+///   post-connect 握手（connect.rs Enter/Ack）已经把"主动 reconnect
+///   秒级验证"做掉，10s 是 QUIC 自身兜底；健康链路上 5s keepalive
+///   永远先到，10s 只在 send/ping 主动 force-close 失败的边界场景生效。
 ///
 /// `IdleTimeout::try_from(Duration)` 失败当且仅当 Duration 超 VarInt
-/// 2^30 ms 上限（≈ 12.4 天），30s 远在范围内 —— `expect` 注明理由。
+/// 2^30 ms 上限（≈ 12.4 天），10s 远在范围内 —— `expect` 注明理由。
 ///
 /// **可见性**：`pub(super)` —— 仅 `endpoint.rs` 通过 `super::tls::default_transport_config`
 /// 调。`endpoint_inner`（在 endpoint.rs）需要它做 server transport 配置；
@@ -50,8 +50,8 @@ pub(super) fn default_transport_config() -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
     t.keep_alive_interval(Some(Duration::from_secs(5)));
     t.max_idle_timeout(Some(
-        IdleTimeout::try_from(Duration::from_secs(30))
-            .expect("30s 远小于 VarInt 2^30 ms 上限（≈ 12.4 天）"),
+        IdleTimeout::try_from(Duration::from_secs(10))
+            .expect("10s 远小于 VarInt 2^30 ms 上限（≈ 12.4 天）"),
     ));
     Arc::new(t)
 }

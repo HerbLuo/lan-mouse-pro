@@ -103,6 +103,17 @@ pub struct PeerSession {
     /// peer_supervisor` 不调 peer.run，自己 accept_bi + read_frame
     /// + 推 listen_tx，forwarding 路径已存在。
     pub(crate) outgoing_events: Arc<Mutex<Option<tokio_mpsc::UnboundedSender<(std::net::SocketAddr, ProtoEvent)>>>>,
+    /// **post-connect 握手信号**：dial 端在重拨成功后 set 一个 oneshot
+    /// sender；peer.run 主循环从 stream A 读到 `Ack(_)` 时 fire 它，让
+    /// dial 端能等到"Enter 已送达 slave 且 slave 已 Ack"的确认。
+    ///
+    /// **用途**（详见 `src/connect.rs::connect_to_handle` post-connect 握手段）：
+    /// reconnect 后主动发 Enter 等 Ack —— 应用层秒级验证，比 QUIC keepalive
+    /// (5s) + idle timeout (10s) 快得多。
+    ///
+    /// **一次性**：`take()` 后置 `None` —— 一次握手消费一次。多次重拨时
+    /// 每次握手前重新 `set_handshake_ack` 设上。
+    pub(crate) handshake_ack: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     /// 3 条 bidi stream 集合缓存（STEP-5.2 引入）。
     ///
     /// STEP-5.3 / 5.4 `read_loop` 装配时填充 —— 装配路径：server 端
@@ -248,7 +259,22 @@ impl PeerSession {
             // task 与 caller (`peer.send_stream_*`) 共用同一份
             // `Mutex<Option<StreamBunch>>` 所有权。
             stream_bunch: Arc::new(Mutex::new(None)),
+            // post-connect 握手信号 —— 初始 None；dial 端在
+            // `connect_to_handle` 成功路径调 `set_handshake_ack` 设上。
+            // peer.run 读到 Ack 时 `take()` 消费。详见字段 docstring。
+            handshake_ack: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// **post-connect 握手信号 setter**：dial 端在重拨成功、peer 注册到
+    /// `peers` 表之后调本方法设 oneshot sender，然后调 `send_input(Enter)`
+    /// 触发 slave 回 Ack —— peer.run 读 Ack 时 fire 本 sender，让 caller
+    /// 能等到"Enter 已送达 + slave 已 Ack"的应用层秒级连接验证。
+    ///
+    /// **一次性**：peer.run 内部 `take()` 后置 None，多次握手需重设。
+    /// 详见 [`Self::handshake_ack`] 字段 docstring。
+    pub async fn set_handshake_ack(&self, tx: tokio::sync::oneshot::Sender<()>) {
+        *self.handshake_ack.lock().await = Some(tx);
     }
 
     /// 暴露底层 `quinn::Connection`，给 STEP-5.x 读 `peer_identity()` /
@@ -893,6 +919,20 @@ impl PeerSession {
                                     log::debug!(
                                         "run: outgoing_events send failed (forwarder 已退): {e}"
                                     );
+                                }
+                            }
+                            // **post-connect 握手信号**：收到 Ack 时 fire
+                            // oneshot，让 dial 端能立刻知道"Enter 已被
+                            // slave 收到并 Ack"。这样 reconnect 后 dial
+                            // 端可以主动发 Enter 等 Ack，比等 QUIC
+                            // keepalive (5s) + idle timeout (10s) 快得多。
+                            // Pong 也 fire 同源但目前不消费（Pong 用于
+                            // capture alive 检测，目前是死字段 —— 详见
+                            // connect.rs send() docstring TODO M2）。
+                            if matches!(event, ProtoEvent::Ack(_)) {
+                                if let Some(tx) = self.handshake_ack.lock().await.take() {
+                                    log::debug!("run: firing handshake_ack (Ack received)");
+                                    let _ = tx.send(());
                                 }
                             }
                         }

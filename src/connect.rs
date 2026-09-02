@@ -14,7 +14,7 @@ use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
-use tokio::{sync::Mutex, task::spawn_local};
+use tokio::{sync::{oneshot, Mutex}, task::spawn_local};
 
 use crate::client::ClientManager;
 use crate::quic_transport::{
@@ -560,6 +560,99 @@ async fn connect_to_handle(
         });
     }
     peer.set_outgoing_events(Some(out_tx)).await;
+
+    // **Post-connect Enter 握手**：reconnect 后 dial 端发 Enter 等 Ack
+    // —— 应用层秒级验证连接 + 重新激活 slave 的 Entered 路径
+    // （slave 收到 Enter → reply Ack + 发 Entered → service.add_incoming /
+    // update_incoming 重整 barrier 与 capture_proxy）。
+    //
+    // **为什么 reconnect 后必须主动 Enter**：
+    // - 网络断开 → 双方 conn close → slave 端 ListenTask 推 Disconnected
+    //   → service.remove_incoming 销毁 barrier（即使是 patch #6 保留
+    //   barrier 的版本，Entered 路径也断了，emulation_proxy 没了）
+    // - reconnect 后 master 不主动 Enter，slave 端不会再走 Entered 处理
+    //   → 没有 AcK 回来 → 用户侧 "mouse 卡 30s"
+    //
+    // **为什么用 Enter 而不是 Ping**：Enter 走完整控制路径（slave 端
+    // emulation.rs Enter 分支 → Entered 事件 → service.add_incoming
+    // + capture_proxy 重建），Ping 只刷 last_response 不重建 proxy/barrier。
+    // 同样能用 WAKE_CLOSE_CODE 走重试（timeout 失败时强制关 conn 触发）。
+    //
+    // **超时 3s**：Enter 是 reliable stream A 帧，正常 1ms 内送达；3s 是
+    // 极保守值，只在网络严重异常时触发。超时 → 主动 close conn with
+    // WAKE_CLOSE_CODE → supervisor 走 retry 路径（与 wake close 同语义）。
+    if let Some(pos) = client_manager.get_pos(handle) {
+        // lan_mouse_ipc::Position → lan_mouse_proto::Position（同名枚举不同 crate，
+        // 没有 From impl，手动 match；两者 variant 完全一致）
+        let proto_pos = match pos {
+            lan_mouse_ipc::Position::Left => lan_mouse_proto::Position::Left,
+            lan_mouse_ipc::Position::Right => lan_mouse_proto::Position::Right,
+            lan_mouse_ipc::Position::Top => lan_mouse_proto::Position::Top,
+            lan_mouse_ipc::Position::Bottom => lan_mouse_proto::Position::Bottom,
+        };
+        let cfg = client_manager.input_channels(handle).unwrap_or_default();
+        let (ack_tx, ack_rx) = oneshot::channel::<()>();
+        peer.set_handshake_ack(ack_tx).await;
+        log::info!(
+            "post-connect handshake: sending Enter to {remote} (pos={proto_pos:?})"
+        );
+        match peer
+            .send_input(&ProtoEvent::Enter(proto_pos), &cfg)
+            .await
+        {
+            Ok(()) => {
+                match tokio::time::timeout(Duration::from_secs(3), ack_rx).await {
+                    Ok(Ok(())) => {
+                        log::info!(
+                            "post-connect handshake: Ack received, connection verified for handle {handle}"
+                        );
+                    }
+                    Ok(Err(_)) => {
+                        log::warn!(
+                            "post-connect handshake: oneshot dropped before Ack for handle {handle}"
+                        );
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "post-connect handshake: timeout (3s) waiting for Ack from {remote} — \
+                             forcing close + retry"
+                        );
+                        peer.connection().close(
+                            crate::quic_transport::session::WAKE_CLOSE_CODE.into(),
+                            b"post-connect handshake timeout",
+                        );
+                        record_retry_failure(&retry_state, handle);
+                        connecting.lock().await.remove(&handle);
+                        // 注意：peer.run() 看到本地 close 会返回 LocallyClosed，
+                        // supervisor 不再 retry —— 我们已经 record_retry_failure
+                        // + connecting.remove，下次 send() 会按 backoff 重拨。
+                        return Err(LanMouseConnectionError::Quic(
+                            quic_transport::Error::Handshake(
+                                quinn::ConnectionError::LocallyClosed,
+                            ),
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "post-connect handshake: Enter send to {remote} failed: {e} — \
+                     forcing close + retry"
+                );
+                peer.connection().close(
+                    crate::quic_transport::session::WAKE_CLOSE_CODE.into(),
+                    b"post-connect handshake failed",
+                );
+                record_retry_failure(&retry_state, handle);
+                connecting.lock().await.remove(&handle);
+                return Err(LanMouseConnectionError::Quic(e));
+            }
+        }
+    } else {
+        log::warn!(
+            "post-connect handshake: no pos for handle {handle} — skipping Enter handshake"
+        );
+    }
 
     // STEP-6.5 关键决策：spawn supervisor 接管 peer 生命周期
     // —— peer.run() 退出时决定是否触发 RetryState 重连
