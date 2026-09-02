@@ -197,7 +197,7 @@ impl ListenTask {
                                 self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
                                 log::info!("emulation: sending Ack(0) to {addr} (responding to master Enter)");
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
-                                self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
+                                self.event_tx.send(EmulationEvent::Entered { addr, pos: to_ipc_pos(pos), fingerprint }).expect("channel closed");
                             }
                             ProtoEvent::Leave(_) => {
                                 log::info!(

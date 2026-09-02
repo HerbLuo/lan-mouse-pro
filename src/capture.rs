@@ -366,18 +366,9 @@ impl CaptureTask {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
 
-        // **DEBUG：每次事件都打印 release-bind 检测状态** ——
-        // mouse 卡住的 bug 复现时看 `keys_pressed=true` 但没触发 release
-        // 还是 release-bind 检测失败。
         let pressed = capture.keys_pressed(&self.release_bind.borrow());
-        log::trace!(
-            "capture event: handle={handle:?} event={event:?} state={:?} active_client={:?} release_bind_pressed={pressed}",
-            self.state,
-            self.active_client,
-        );
-        // **INFO on rising edge** —— 持续按下 release-bind 不刷屏,只在
-        // false→true 那一刻记一条;mouse 卡住 bug 复现时用 INFO 日志精准
-        // 定位用户按下那一刻。
+        // 持续按住 release-bind 时不刷屏,只在按下那一瞬间记一条 INFO,
+        // 便于诊断 "鼠标卡住但 release-bind 已按下" 这类状态错乱 bug。
         if pressed && !self.release_bind_prev {
             log::info!("release_bind detected as PRESSED (rising edge)");
         }

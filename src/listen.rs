@@ -286,30 +286,22 @@ impl LanMouseListener {
     /// 走 PeerSession::send_input 通道分派：当前 `InputChannelConfig::default()`
     /// 把控制面事件映射到 `Channel::StreamA`，所以 reply 自然走 stream A。
     pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
-        log::trace!("reply {event} >=>=>=>=>=> {addr}");
         let peer = self.quic_conns.borrow().get(&addr).cloned();
         match peer {
             Some(peer) => {
                 use lan_mouse_ipc::InputChannelConfig;
                 match peer.send_input(&event, &InputChannelConfig::default()).await {
                     Ok(()) => {
-                        // **INFO on rising edge for Ack/Leave**：mouse 卡住排查时,
-                        // 确认 reply 是否真的成功送到对端 —— 之前是 debug 静默,
-                        // 可能漏掉关键失败信号。
                         if matches!(event, ProtoEvent::Ack(_) | ProtoEvent::Leave(_)) {
                             log::info!("reply: {event} to {addr} delivered");
                         }
                     }
-                    Err(e) => {
-                        log::warn!("reply QUIC send to {addr} failed: {e}");
-                    }
+                    Err(e) => log::warn!("reply QUIC send to {addr} failed: {e}"),
                 }
             }
-            None => {
-                log::warn!(
-                    "reply: peer {addr} not in quic_conns; dropping {event} (peer not registered)"
-                );
-            }
+            None => log::warn!(
+                "reply: peer {addr} not in quic_conns; dropping {event}"
+            ),
         }
     }
 
