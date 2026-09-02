@@ -2,8 +2,6 @@
   --fg-default: #bbbbbb;
   --fg-muted: #8e8e93;
   --border: 1px solid #aaa;
-  --accent: #ff9f43;
-  --accent-soft: rgba(255, 159, 67, 0.15);
   --error: #ff6b6b;
   --shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
   --radius: 4px;
@@ -39,6 +37,24 @@ body {
   font-size: 1em;
 }
 
+.mono {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+}
+
+.card {
+  padding: 16px;
+}
+.card-title {
+  padding-bottom: 10px;
+  font-size: 1.2em;
+}
+
+h1 {
+  margin: 0;
+  padding: 20px;
+  border-bottom: var(--border);
+}
+
 /* --- inputs (some are used outside scoped styles) -------------- */
 
 input[type='text'],
@@ -63,10 +79,6 @@ input[type='text']:focus,
 input[type='number']:focus,
 select:focus {
   border-bottom-color: var(--accent);
-}
-
-.mono {
-  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
 }
 
 /* --- buttons ---------------------------------------------------- */
@@ -98,13 +110,12 @@ button:disabled {
 }
 
 button.primary {
-  background: var(--accent);
-  color: #1a1a1e;
-  border-color: var(--accent);
+  background: #636363;
+  color: #cecece;
+  border-color: #ababab;
   font-weight: 600;
 }
-
-button.primary:hover {
+w button.primary:hover {
   background: #ffb56b;
 }
 
@@ -133,16 +144,4 @@ button.danger {
 
 button.danger:hover {
   background: rgba(255, 107, 107, 0.12);
-}
-
-/* --- common helpers used across components --------------------- */
-
-.row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.faint {
-  color: #5f5f66;
 }

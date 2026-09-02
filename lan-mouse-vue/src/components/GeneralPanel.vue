@@ -115,18 +115,20 @@ async function copy(text: string, label = 'copied') {
          prominently with a copy button next to the editable
          port. If multiple NICs are live a chevron opens a
          dropdown to pick the one peers should use. -->
-    <div >
+    <div>
       <div>
         <div class="muted card-title">Hostname &amp; Port</div>
-        <div style="display: flex; gap: 8px; justify-content: flex-start; align-items: center; margin-right: 12px;">
-          <div
-            ref="ipFieldRef"
-            class="ip-field"
-          >
-            <div
-              class="mono em1 ip-display"
-              :title="displayIp || 'no address detected'"
-            >
+        <div
+          style="
+            display: flex;
+            gap: 8px;
+            justify-content: flex-start;
+            align-items: center;
+            margin-right: 12px;
+          "
+        >
+          <div ref="ipFieldRef" class="ip-field">
+            <div class="mono em1 ip-display" :title="displayIp || 'no address detected'">
               {{ displayIp || '—' }}
             </div>
 
@@ -184,13 +186,10 @@ async function copy(text: string, label = 'copied') {
     </div>
 
     <div style="margin-top: 14px">
-      <div >
+      <div>
         <div class="muted card-title">Certificate fingerprint (sha256)</div>
-        <div style="display: flex; align-items: center; margin: 0 12px;">
-          <div
-            class="mono em1"
-            style="word-break: break-all; color: var(--fg-default)"
-          >
+        <div style="display: flex; align-items: center; margin: 0 12px">
+          <div class="mono em1" style="word-break: break-all; color: var(--fg-default)">
             {{ daemonStore.fingerprint || '—' }}
           </div>
           <button
@@ -205,7 +204,7 @@ async function copy(text: string, label = 'copied') {
       </div>
     </div>
 
-    <div v-if="captureWarning || emulationWarning"  style="margin-top: 12px">
+    <div v-if="captureWarning || emulationWarning" style="margin-top: 12px">
       <div class="warning-banner" style="margin: 0; flex: 1">
         <IconWarning />
         <div class="body">
@@ -224,14 +223,6 @@ async function copy(text: string, label = 'copied') {
 </template>
 
 <style scoped>
-.card {
-  padding: 16px;
-}
-.card-title {
-  padding-bottom: 10px;
-  font-size: 1.2em;
-}
-
 /* IP picker: input-like field with an inline chevron that opens
  * a dropdown of every NIC the daemon reported. */
 .ip-field {
@@ -240,9 +231,11 @@ async function copy(text: string, label = 'copied') {
   min-width: 0;
   display: flex;
   align-items: center;
-  padding: 0 12px  ;
+  padding: 0 12px;
   height: 36px;
-  transition: border-color 0.15s, background 0.15s;
+  transition:
+    border-color 0.15s,
+    background 0.15s;
 }
 .ip-field:focus-within {
   border-color: var(--accent);
@@ -272,7 +265,10 @@ async function copy(text: string, label = 'copied') {
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  transition: transform 0.18s, background 0.15s, color 0.15s;
+  transition:
+    transform 0.18s,
+    background 0.15s,
+    color 0.15s;
 }
 .ip-chevron:hover {
   background: var(--bg-elev);
@@ -307,9 +303,8 @@ async function copy(text: string, label = 'copied') {
   color: var(--fg-default);
   padding: 7px 10px;
   border-radius: 4px;
-  font-family:
-    ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
-  font-size: 13px;
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  font-size: 1em;
   cursor: pointer;
 }
 .ip-option:hover {
