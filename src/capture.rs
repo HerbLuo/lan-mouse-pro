@@ -361,7 +361,17 @@ impl CaptureTask {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
 
-        if capture.keys_pressed(&self.release_bind.borrow()) {
+        // **DEBUG：每次事件都打印 release-bind 检测状态** ——
+        // mouse 卡住的 bug 复现时看 `keys_pressed=true` 但没触发 release
+        // 还是 release-bind 检测失败。
+        let pressed = capture.keys_pressed(&self.release_bind.borrow());
+        log::debug!(
+            "capture event: handle={handle:?} event={event:?} state={:?} active_client={:?} release_bind_pressed={pressed}",
+            self.state,
+            self.active_client,
+        );
+
+        if pressed {
             log::info!("releasing capture: release-bind pressed");
             return self.release_capture(capture).await;
         }
@@ -386,6 +396,7 @@ impl CaptureTask {
 
         // activated a new client
         if event == CaptureEvent::Begin && Some(handle) != self.active_client {
+            log::info!("capture: new client entered (handle={handle:?})");
             self.state = State::WaitingForAck;
             self.active_client.replace(handle);
             self.event_tx
@@ -407,14 +418,25 @@ impl CaptureTask {
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+            log::warn!("releasing capture: send failed: {e}");
             capture.release().await?;
         }
         Ok(())
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        log::info!(
+            "release_capture: ENTER (state={:?}, active_client={:?})",
+            self.state,
+            self.active_client,
+        );
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
+            let held_keys = capture.take_pressed_keys();
+            log::info!(
+                "release_capture: synthesizing {} key-up events to client {handle}",
+                held_keys.len()
+            );
             // Synthesize key-up events for every key still held in the
             // capture's pressed_keys set BEFORE sending Leave. Without
             // this, pressing the release-bind chord (typically all four
@@ -425,7 +447,7 @@ impl CaptureTask {
             // then runs every subsequent keystroke through those held
             // mods until its watchdog times out (1+ s) or our Leave
             // arrives — and Leave can be lost over UDP.
-            for key in capture.take_pressed_keys() {
+            for key in held_keys {
                 let key_up = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Key {
                     time: 0,
                     key: key as u32,
@@ -440,6 +462,7 @@ impl CaptureTask {
             // updated by KeyboardEvent::Modifiers, distinct from the
             // pressed_keys set drained above. Without this, an
             // already-locked CapsLock would survive the release.
+            log::info!("release_capture: sending modifiers=0 to client {handle}");
             let mods_zero = ProtoEvent::Input(Event::Keyboard(KeyboardEvent::Modifiers {
                 depressed: 0,
                 latched: 0,
@@ -450,12 +473,17 @@ impl CaptureTask {
                 log::warn!("failed to reset modifiers on client {handle}: {e}");
             }
 
-            log::info!("sending Leave event to client {handle}");
+            log::info!("release_capture: sending Leave to client {handle}");
             if let Err(e) = self.conn.send(ProtoEvent::Leave(0), handle).await {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
+        } else {
+            log::info!("release_capture: no active_client, skipping Leave send");
         }
-        capture.release().await
+        log::info!("release_capture: calling capture.release() (OS-level release)");
+        let res = capture.release().await;
+        log::info!("release_capture: capture.release() returned (ok={})", res.is_ok());
+        res
     }
 }
 
