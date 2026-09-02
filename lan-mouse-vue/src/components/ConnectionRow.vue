@@ -27,7 +27,7 @@ function setChannel(key: 'mouse_button' | 'keyboard', ev: Event) {
 
 <template>
   <div class="card" :class="{ 'is-active': connection.state.active }">
-    <div class="connection-head">
+    <div style="display: flex; justify-content: space-between;">
       <label class="switch connection-toggle">
         <input
           type="checkbox"
@@ -161,3 +161,6 @@ function setChannel(key: 'mouse_button' | 'keyboard', ev: Event) {
     </div>
   </div>
 </template>
+<style scoped>
+
+</style>
