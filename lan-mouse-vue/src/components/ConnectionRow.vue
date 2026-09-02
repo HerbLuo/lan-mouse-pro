@@ -26,59 +26,64 @@ function setChannel(key: 'mouse_button' | 'keyboard', ev: Event) {
 </script>
 
 <template>
-  <div class="card" :class="{ 'is-active': connection.state.active }">
-    <div style="display: flex; justify-content: space-between;">
-      <label class="switch connection-toggle">
-        <input
-          type="checkbox"
-          :checked="connection.state.active"
-          @change="toggleClient(connection.handle, ($event.target as HTMLInputElement).checked)"
-        />
-        <span class="slider"></span>
-      </label>
-      <div class="title">
-        <div class="name">
-          {{ connection.config.hostname || `client #${connection.handle}` }}
-        </div>
-        <div
-          class="meta"
-          :class="{
-            'meta-warn':
-              connection.state.peer_commit && connection.state.peer_commit !== '????????',
-            'meta-ok': connection.state.peer_commit && connection.state.peer_commit === '????????',
-          }"
-        >
-          <template v-if="connection.state.peer_commit">
-            Peer version: {{ connection.state.peer_commit }} ·
-            {{ connection.state.peer_commit === '????????' ? 'matched' : 'mismatch' }}
-          </template>
-          <template v-else>Peer version: unknown</template>
-          ·
-          <span v-if="connection.state.resolving">resolving…</span>
-          <span v-else-if="connection.state.ips.length === 0">no addresses</span>
-          <span v-else>{{ connection.state.ips.join(', ') }}</span>
+  <div style="margin-top: 16px" :class="{ 'is-active': connection.state.active }">
+    <div style="display: flex; justify-content: space-between">
+      <div style="display: flex; justify-content: flex-start">
+        <label class="connection-toggle" style="margin-right: 12px;">
+          <input
+            type="checkbox"
+            :checked="connection.state.active"
+            @change="toggleClient(connection.handle, ($event.target as HTMLInputElement).checked)"
+          />
+          <span class="slider"></span>
+        </label>
+        <div class="title">
+          <div class="name">
+            {{ connection.config.hostname || `client #${connection.handle}` }}
+          </div>
+          <div
+            class="meta"
+            :class="{
+              'meta-warn':
+                connection.state.peer_commit && connection.state.peer_commit !== '????????',
+              'meta-ok':
+                connection.state.peer_commit && connection.state.peer_commit === '????????',
+            }"
+          >
+            <template v-if="connection.state.peer_commit">
+              Peer version: {{ connection.state.peer_commit }} ·
+              {{ connection.state.peer_commit === '????????' ? 'matched' : 'mismatch' }}
+            </template>
+            <template v-else>Peer version: unknown</template>
+            ·
+            <span v-if="connection.state.resolving">resolving…</span>
+            <span v-else-if="connection.state.ips.length === 0">no addresses</span>
+            <span v-else>{{ connection.state.ips.join(', ') }}</span>
+          </div>
         </div>
       </div>
 
-      <button class="icon ghost" @click="resolveDns(connection.handle)" :title="'re-resolve DNS'">
-        <IconRefresh />
-      </button>
+      <div>
+        <button class="icon ghost" @click="resolveDns(connection.handle)" :title="'re-resolve DNS'">
+          <IconRefresh />
+        </button>
 
-      <button
-        class="icon ghost"
-        @click="connection.expanded = !connection.expanded"
-        :title="connection.expanded ? 'collapse' : 'expand'"
-      >
-        <span
-          :style="{
-            display: 'inline-flex',
-            transform: connection.expanded ? 'rotate(180deg)' : 'rotate(0)',
-            transition: 'transform 0.18s',
-          }"
+        <button
+          class="icon ghost"
+          @click="connection.expanded = !connection.expanded"
+          :title="connection.expanded ? 'collapse' : 'expand'"
         >
-          <IconChevron :size="16" />
-        </span>
-      </button>
+          <span
+            :style="{
+              display: 'inline-flex',
+              transform: connection.expanded ? 'rotate(180deg)' : 'rotate(0)',
+              transition: 'transform 0.18s',
+            }"
+          >
+            <IconChevron :size="16" />
+          </span>
+        </button>
+      </div>
     </div>
 
     <div v-if="connection.expanded" class="connection-body">
@@ -161,6 +166,4 @@ function setChannel(key: 'mouse_button' | 'keyboard', ev: Event) {
     </div>
   </div>
 </template>
-<style scoped>
-
-</style>
+<style scoped></style>
