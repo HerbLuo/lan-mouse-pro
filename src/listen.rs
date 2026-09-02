@@ -288,17 +288,28 @@ impl LanMouseListener {
     pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
         log::trace!("reply {event} >=>=>=>=>=> {addr}");
         let peer = self.quic_conns.borrow().get(&addr).cloned();
-        if let Some(peer) = peer {
-            // reply 走 default cfg：control 类事件自动分派到 stream A
-            use lan_mouse_ipc::InputChannelConfig;
-            if let Err(e) = peer
-                .send_input(&event, &InputChannelConfig::default())
-                .await
-            {
-                log::debug!("reply QUIC send to {addr} failed: {e}");
+        match peer {
+            Some(peer) => {
+                use lan_mouse_ipc::InputChannelConfig;
+                match peer.send_input(&event, &InputChannelConfig::default()).await {
+                    Ok(()) => {
+                        // **INFO on rising edge for Ack/Leave**：mouse 卡住排查时,
+                        // 确认 reply 是否真的成功送到对端 —— 之前是 debug 静默,
+                        // 可能漏掉关键失败信号。
+                        if matches!(event, ProtoEvent::Ack(_) | ProtoEvent::Leave(_)) {
+                            log::info!("reply: {event} to {addr} delivered");
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("reply QUIC send to {addr} failed: {e}");
+                    }
+                }
             }
-        } else {
-            log::debug!("reply: peer {addr} not in quic_conns; dropping {event}");
+            None => {
+                log::warn!(
+                    "reply: peer {addr} not in quic_conns; dropping {event} (peer not registered)"
+                );
+            }
         }
     }
 

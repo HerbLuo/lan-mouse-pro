@@ -978,6 +978,10 @@ impl PeerSession {
         log::debug!("run: main loop exited");
         let reason = self.conn.close_reason();
         let reason = reason.unwrap_or(quinn::ConnectionError::LocallyClosed);
+        // **INFO on peer.run exit** —— mouse 卡住 bug 排查:主控/被控的 peer.run
+        // 退出时打 INFO 记录原因(应只在连接真断时触发),失败原因会传给
+        // spawn_peer_supervisor → RetryState 走退避重连。
+        log::info!("peer.run({role:?}) exiting with close reason: {reason:?}");
         Err(super::Error::Handshake(reason))
     }
 }
