@@ -33,11 +33,6 @@ import { connStateRef } from '@/store'
 </template>
 
 <style scoped>
-h1 {
-  margin: 0;
-  padding: 20px;
-  border-bottom: var(--border);
-}
 .status-bar {
   display: flex;
   justify-content: space-between;

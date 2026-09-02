@@ -27,9 +27,6 @@ const emit = defineEmits<{ 'open-authorize': [] }>()
   </div>
 
   <div v-for="(description, fp) in daemonStore.authorized" :key="fp" class="card card-row">
-    <span style="flex-shrink: 0; display: inline-flex">
-      <IconMic :size="18" color="var(--accent)" />
-    </span>
     <div style="flex: 1; min-width: 0">
       <div style="font-weight: 500">{{ description }}</div>
       <div
