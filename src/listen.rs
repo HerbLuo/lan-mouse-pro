@@ -431,7 +431,20 @@ fn spawn_wake_task(
                     );
                     for (a, peer) in q.iter() {
                         log::debug!("post-wake close (QUIC): {a}");
-                        peer.connection().close(0u32.into(), b"wake");
+                        // **补丁 — Mac wake 自动重连**：用
+                        // [`crate::quic_transport::WAKE_CLOSE_CODE`] (0xCAFE)
+                        // 替代默认的 0（NO_ERROR）—— 对端
+                        // [`should_retry_after_close`] 看到 wake code 触发重试，
+                        // 不再卡在 "graceful close → 等下次 send()" 路径
+                        // （wake 后没人在动鼠标，send 不会自然来）。
+                        //
+                        // 与 Bug #9/#10 路径（`close(0u32, "peer closed stream")`）
+                        // **不冲突**：Bug #9/#10 用 code 0 走用户/网络层 close 分支
+                        // （不重试）；本 wake 路径用 0xCAFE 走 wake 分支（重试）。
+                        peer.connection().close(
+                            crate::quic_transport::session::WAKE_CLOSE_CODE.into(),
+                            b"wake",
+                        );
                     }
                 }
                 None => {

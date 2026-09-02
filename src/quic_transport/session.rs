@@ -141,11 +141,33 @@ pub enum PeerRole {
     Server,
 }
 
+/// **Wake-close sentinel code**（补丁：Mac wake 自动重连支持）。
+///
+/// macOS 系统唤醒时 [`crate::macos_power::PowerObserver`] 触发
+/// [`crate::listen::spawn_wake_task`] 对每条 peer conn 调
+/// `connection().close(WAKE_CLOSE_CODE.into(), b"wake")` —— 用这个非零
+/// sentinel 而不是默认 0（NO_ERROR）让对端在 `should_retry_after_close` 里
+/// 区分"用户主动 close（不重试）"和"系统唤醒触发的 close（要重试）"。
+///
+/// **为什么不用 `0`**：
+/// 旧代码用 `0u32`（NO_ERROR）触发 `ConnectionError::ApplicationClosed(0)`，
+/// 对端 `should_retry_after_close` 一律返 `false` → master 不重拨。
+/// 设计假设"下次 send() 会触发重拨"在 wake 后不成立（用户没在动鼠标）。
+///
+/// **为什么用 `0xCAFE`**：
+/// - 0xCAFE 是约定俗成的 sentinel magic（"coffee" 谐音 + 视觉好认）
+/// - 远在 QUIC `VarInt` 范围（≤ 2^62）内
+/// - 唯一避免和 Bug #9/#10 的 `close(0u32, "peer closed stream")` 撞码
+///   —— Bug #9/#10 仍走 0（用户/网络层断连），不进 wake 重拨分支
+pub(crate) const WAKE_CLOSE_CODE: u32 = 0xCAFE;
+
 /// 从 `quinn::ConnectionError` 判定本次关闭是否值得自动重连（STEP-5.4 引入）。
 ///
 /// **判定逻辑**（与 PLAN §5.4 + STEP-6.5 `RetryState` 衔接）：
-/// - `ApplicationClosed(_)`（带 reason code `0`）→ 是 peer 主动 close，
-///   **不**重试（peer 明确不想继续）
+/// - `ApplicationClosed(_)`（reason code = [`WAKE_CLOSE_CODE`]）→ 对端因
+///   系统唤醒主动 close，**应**重试（用户预期 wake 后立刻可用）
+/// - `ApplicationClosed(_)`（其他 code，含 `0` = NO_ERROR）→ 是 peer 主动
+///   close，**不**重试（peer 明确不想继续）
 /// - `ConnectionLost(_)` / `TimedOut` → 网络层断连，**应**重试
 /// - `TransportError(_)`（quic-level）→ 协议级错误，**不**重试（很可能是
 ///   协议 bug / 攻击信号）
@@ -160,6 +182,18 @@ pub fn should_retry_after_close(reason: &quinn::ConnectionError) -> bool {
     match reason {
         // 网络层断连 / 超时 —— 重试
         ConnectionError::TimedOut => true,
+        // Wake-close sentinel：Mac 唤醒触发的对端 close（详见
+        // [`WAKE_CLOSE_CODE`] docstring）—— 重试。
+        //
+        // **与 Bug #9/#10 关系**：STEP-8.2 Bug #9 / Bug #10 在 stream A
+        // Truncated / read IO error 时 `conn.close(0u32, b"peer closed stream")`
+        // —— code 仍是 0，不进本分支。所以 master 看到那种 close 仍走 "用户
+        // close 不重试" 路径，**只有** wake close 走重试分支。两者正交。
+        ConnectionError::ApplicationClosed(frame)
+            if frame.error_code.into_inner() as u32 == WAKE_CLOSE_CODE =>
+        {
+            true
+        }
         // quinn 0.11 实际变体：协议级 / 本端错误 / peer 主动 close / CID 耗尽
         // —— 都不重试（保守）。
         ConnectionError::ApplicationClosed(_)
