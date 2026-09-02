@@ -725,7 +725,7 @@ async fn server_datagram_reader_task(
                         continue;
                     }
                 };
-                log::debug!(
+                log::trace!(
                     "server datagram_reader: from {addr}: {event}"
                 );
                 if listen_tx
