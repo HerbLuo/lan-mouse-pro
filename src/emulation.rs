@@ -195,6 +195,7 @@ impl ListenTask {
                                     .unwrap_or_default();
                                 log::info!("releasing capture: {addr} entered this device (fp={fingerprint})");
                                 self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
+                                log::info!("emulation: sending Ack(0) to {addr} (responding to master Enter)");
                                 self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                 self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
                             }

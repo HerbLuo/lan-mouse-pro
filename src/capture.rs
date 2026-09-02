@@ -88,6 +88,7 @@ impl Capture {
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
+            release_bind_prev: false,
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -192,6 +193,10 @@ struct CaptureTask {
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
+    /// 上一次 `keys_pressed(release_bind)` 检测结果 —— 用于在 false→true
+    /// 跳变时记一条 INFO(mouse 卡住 bug 复现时只关心按下那一瞬间,持续
+    /// 按下时不刷屏)。
+    release_bind_prev: bool,
 }
 
 impl CaptureTask {
@@ -365,11 +370,18 @@ impl CaptureTask {
         // mouse 卡住的 bug 复现时看 `keys_pressed=true` 但没触发 release
         // 还是 release-bind 检测失败。
         let pressed = capture.keys_pressed(&self.release_bind.borrow());
-        log::debug!(
+        log::trace!(
             "capture event: handle={handle:?} event={event:?} state={:?} active_client={:?} release_bind_pressed={pressed}",
             self.state,
             self.active_client,
         );
+        // **INFO on rising edge** —— 持续按下 release-bind 不刷屏,只在
+        // false→true 那一刻记一条;mouse 卡住 bug 复现时用 INFO 日志精准
+        // 定位用户按下那一刻。
+        if pressed && !self.release_bind_prev {
+            log::info!("release_bind detected as PRESSED (rising edge)");
+        }
+        self.release_bind_prev = pressed;
 
         if pressed {
             log::info!("releasing capture: release-bind pressed");
