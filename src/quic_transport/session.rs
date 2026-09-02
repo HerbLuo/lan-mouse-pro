@@ -516,7 +516,16 @@ impl PeerSession {
         cfg: &InputChannelConfig,
     ) -> super::Result<()> {
         use super::protocol::{route_input, Channel};
-        match route_input(cfg, event) {
+        let routed = route_input(cfg, event);
+        // **INFO on Ack/Leave** —— 被控端发 Ack 卡住的 bug 排查用。
+        // `delivered` 出现 = send_input 真的返回 Ok;
+        // 没出现但本条 log 出现 = 卡在 send_stream_a 等对端消费。
+        if matches!(event, ProtoEvent::Ack(_) | ProtoEvent::Leave(_)) {
+            log::info!(
+                "send_input: routing {event:?} via {routed:?} (entry; awaiting send)"
+            );
+        }
+        let result = match routed {
             Channel::Datagram => self.send_motion(event).await,
             Channel::StreamA => {
                 let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
@@ -529,7 +538,14 @@ impl PeerSession {
             Channel::StreamC => Err(super::Error::HelloFailed(
                 "stream C is M2-only (clipboard metadata not in M1 ProtoEvent)".into(),
             )),
+        };
+        if matches!(event, ProtoEvent::Ack(_) | ProtoEvent::Leave(_)) {
+            log::info!(
+                "send_input: {event:?} via {routed:?} returned (ok={})",
+                result.is_ok()
+            );
         }
+        result
     }
 
     /// 发送控制流事件（Enter / Leave / Hello / Ping / Pong），开新 bidi
