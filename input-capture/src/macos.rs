@@ -52,6 +52,10 @@ struct InputCaptureState {
     active_clients: Lazy<HashSet<Position>>,
     /// the currently entered capture position, if any
     current_pos: Option<Position>,
+    /// **Pending-capture 中间态**：鼠标跨过边沿但主线程还没收到 Ack。
+    /// 与 `current_pos` 互斥。提升到 active 时清掉；取消时清掉。
+    /// 后端在等待 Ack 期间不 hide cursor、不 warp cursor，鼠标留在主机。
+    pending_pos: Option<Position>,
     /// position where the cursor was captured
     enter_position: Option<CGPoint>,
     /// bounds of the input capture area
@@ -65,7 +69,14 @@ enum ProducerEvent {
     Release,
     Create(Position),
     Destroy(Position),
+    /// macOS 旧版无 pending 时直接用 Grab。保留兼容性；新代码不再 emit。
     Grab(Position),
+    /// **Pending → Active 提升**：主线程在对端 Ack 后调 `start_capture`
+    /// 转发到这里。提升后 warp cursor + hide cursor + emit Begin。
+    StartCapture(Position),
+    /// **Pending 取消**：主线程 cancel_pending / 断网 / 500ms 超时。
+    /// emit CancelPending（如果仍 pending）。
+    CancelPending(Position),
     EventTapDisabled,
     DisplayReconfigured,
 }
@@ -75,6 +86,7 @@ impl InputCaptureState {
         let mut res = Self {
             active_clients: Lazy::new(HashSet::new),
             current_pos: None,
+            pending_pos: None,
             enter_position: None,
             bounds: Bounds::default(),
             modifier_state: Default::default(),
@@ -132,6 +144,22 @@ impl InputCaptureState {
         self.reset_cursor()
     }
 
+    /// **Pending-capture 辅助**：计算 `pos` 那条边内侧 1px 的 warp 目标。
+    /// 与 [`InputCaptureState::start_capture`] 内部逻辑等价，但**不**
+    /// 调 `reset_cursor` —— pending 阶段后端不应动 cursor（鼠标仍在主机）。
+    /// Promotion 时由 `ProducerEvent::StartCapture` 处理线程统一 warp。
+    fn compute_edge_point(&self, pos: Position) -> CGPoint {
+        let edge_offset = 1.0;
+        let mut p = CGPoint::default();
+        match pos {
+            Position::Left => p.x = self.bounds.xmin + edge_offset,
+            Position::Right => p.x = self.bounds.xmax - edge_offset,
+            Position::Top => p.y = self.bounds.ymin + edge_offset,
+            Position::Bottom => p.y = self.bounds.ymax - edge_offset,
+        }
+        p
+    }
+
     /// resets the cursor to the position, where the capture started
     fn reset_cursor(&mut self) -> Result<(), CaptureError> {
         let pos = self.enter_position.expect("capture active");
@@ -150,7 +178,7 @@ impl InputCaptureState {
     async fn handle_producer_event(
         &mut self,
         producer_event: ProducerEvent,
-    ) -> Result<(), CaptureError> {
+    ) -> Result<Option<(Position, CaptureEvent)>, CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
             ProducerEvent::Release => {
@@ -158,15 +186,52 @@ impl InputCaptureState {
                     self.show_cursor()?;
                     self.current_pos = None;
                 }
+                // Pending 状态 Release 也清掉（与 Windows 同步语义对齐）。
+                if self.pending_pos.is_some() {
+                    self.pending_pos = None;
+                }
+                Ok(None)
             }
             ProducerEvent::Grab(pos) => {
+                // 旧路径。新代码不再 emit Grab；保留兼容。
                 if self.current_pos.is_none() {
                     self.hide_cursor()?;
                     self.current_pos = Some(pos);
                 }
+                Ok(None)
+            }
+            ProducerEvent::StartCapture(pos) => {
+                // **Pending → Active 提升**。仅在 pending_pos 匹配时执
+                // 行（用户在 pending 期间换边 / 已 cancel → no-op）。
+                if self.pending_pos != Some(pos) {
+                    log::trace!(
+                        "StartCapture({pos:?}) ignored: pending_pos={:?}",
+                        self.pending_pos
+                    );
+                    return Ok(None);
+                }
+                self.pending_pos = None;
+                if self.current_pos.is_none() {
+                    self.hide_cursor()?;
+                    self.current_pos = Some(pos);
+                    // 用 enter_position（已在 tap callback 记录）warp
+                    // cursor 到边内侧 1px，与旧 Grab 路径行为对齐。
+                    self.reset_cursor()?;
+                    // 通知主线程：现在 capture 真正激活。
+                    return Ok(Some((pos, CaptureEvent::Begin)));
+                }
+                Ok(None)
+            }
+            ProducerEvent::CancelPending(pos) => {
+                if self.pending_pos == Some(pos) {
+                    self.pending_pos = None;
+                    return Ok(Some((pos, CaptureEvent::CancelPending)));
+                }
+                Ok(None)
             }
             ProducerEvent::Create(p) => {
                 self.active_clients.insert(p);
+                Ok(None)
             }
             ProducerEvent::Destroy(p) => {
                 if let Some(current) = self.current_pos {
@@ -175,7 +240,11 @@ impl InputCaptureState {
                         self.current_pos = None;
                     };
                 }
+                if self.pending_pos == Some(p) {
+                    self.pending_pos = None;
+                }
                 self.active_clients.remove(&p);
+                Ok(None)
             }
             ProducerEvent::EventTapDisabled => {
                 // Tap death can happen mid-capture (TCC Accessibility
@@ -185,6 +254,9 @@ impl InputCaptureState {
                 if self.current_pos.is_some() {
                     self.show_cursor()?;
                     self.current_pos = None;
+                }
+                if self.pending_pos.is_some() {
+                    self.pending_pos = None;
                 }
                 return Err(CaptureError::EventTapDisabled);
             }
@@ -201,9 +273,9 @@ impl InputCaptureState {
                 } else {
                     log::info!("display reconfigured: {:?}", self.bounds);
                 }
+                Ok(None)
             }
-        };
-        Ok(())
+        }
     }
 }
 
@@ -516,16 +588,53 @@ fn create_event_tap<'a>(
                 state.reset_cursor().unwrap_or_else(|e| log::warn!("{e}"));
             }
         } else if matches!(event_type, CGEventType::MouseMoved) {
-            // Did we cross a barrier?
-            if let Some(new_pos) = state.crossed(cg_ev) {
+            // **Pending-capture 中间态**：鼠标已跨过边沿但 Ack 未到。
+            // 三种 case：
+            // 1. 用户拉回屏幕内 → 取消 pending
+            // 2. 用户越另一条边 → 切 pending + 重新记 enter_position
+            // 3. 仍在同一边 → 啥都不做（pending 维持）
+            if let Some(pending_pos) = state.pending_pos {
+                let crossed = state.crossed(cg_ev);
+                match crossed {
+                    None => {
+                        // 用户拉回 → 取消 pending，emit CancelPending。
+                        log::debug!("CANCEL pending {pending_pos:?} (cursor pulled back)");
+                        state.pending_pos = None;
+                        // **立即发** CancelPending（带正确位置 pending_pos），
+                        // 不走统一的 res_events batch —— 因为后面可能还要
+                        // 继续处理其他 case。
+                        let _ = event_tx.blocking_send((pending_pos, CaptureEvent::CancelPending));
+                    }
+                    Some(other_pos) if other_pos != pending_pos => {
+                        // 换边：先取消旧 pending，再开新 pending。
+                        log::debug!(
+                            "switch pending: {pending_pos:?} -> {other_pos:?}"
+                        );
+                        // 立即发 CancelPending（带旧位置）—— 同上，单独发。
+                        let _ = event_tx.blocking_send((pending_pos, CaptureEvent::CancelPending));
+                        state.pending_pos = Some(other_pos);
+                        state.enter_position = Some(state.compute_edge_point(other_pos));
+                        // 新 pending 走统一 batch（带新位置 other_pos）。
+                        capture_position = Some(other_pos);
+                        res_events.push(CaptureEvent::BeginPending);
+                    }
+                    Some(_) => {
+                        // 仍在同一边：啥都不做。鼠标后续 move 在同一边
+                        // 不会再次 emit BeginPending（避免主线程重复
+                        // 处理）。
+                    }
+                }
+            } else if let Some(new_pos) = state.crossed(cg_ev) {
+                // 全新边沿跨越 → 进入 pending。**不要** warp cursor、
+                // **不要** hide cursor；只记 enter_position 让 promotion
+                // 阶段用。
+                log::debug!("PENDING enter {new_pos:?}");
                 capture_position = Some(new_pos);
-                state
-                    .start_capture(cg_ev, new_pos)
-                    .unwrap_or_else(|e| log::warn!("{e}"));
-                res_events.push(CaptureEvent::Begin);
-                notify_tx
-                    .blocking_send(ProducerEvent::Grab(new_pos))
-                    .expect("Failed to send notification");
+                state.pending_pos = Some(new_pos);
+                state.enter_position = Some(state.compute_edge_point(new_pos));
+                res_events.push(CaptureEvent::BeginPending);
+                // 故意**不**调 state.start_capture、**不**发 ProducerEvent::Grab
+                // —— promotion 由主线程 Ack 后调 start_capture 路径走。
             }
         }
 
@@ -661,6 +770,12 @@ impl MacOSInputCapture {
 
         let state = Arc::new(Mutex::new(InputCaptureState::new()?));
         let (event_tx, event_rx) = mpsc::channel(32);
+        // **Pending-capture 闭环**：producer task 也要往主线程推事件
+        // （`ProducerEvent::StartCapture` → Begin；CancelPending →
+        // CancelPending）。Clone 一份 event_tx 给 producer task —— tap
+        // callback 与 producer task 并发地往同一 channel 写，下游
+        // poll_next 顺序消费。Sender 是 Send + Sync 的 clone，多写安全。
+        let producer_event_tx = event_tx.clone();
         let (notify_tx, mut notify_rx) = mpsc::channel(32);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tap_exit_tx, mut tap_exit_rx) = oneshot::channel();
@@ -693,9 +808,16 @@ impl MacOSInputCapture {
                             break;
                         };
                         let mut state = state.lock().await;
-                        state.handle_producer_event(producer_event).await.unwrap_or_else(|e| {
-                            log::error!("Failed to handle producer event: {e}");
-                        })
+                        match state.handle_producer_event(producer_event).await {
+                            Err(e) => log::error!("Failed to handle producer event: {e}"),
+                            Ok(Some((pos, ev))) => {
+                                // Producer 主动 emit 的 Begin / CancelPending 走
+                                // event_tx clone，与 tap callback 的 events 合并到
+                                // 下游 stream。
+                                let _ = producer_event_tx.send((pos, ev)).await;
+                            }
+                            Ok(None) => {}
+                        }
                     }
                     _ = &mut tap_exit_rx => break,
                 }
@@ -777,6 +899,29 @@ impl Capture for MacOSInputCapture {
         tokio::task::spawn_local(async move {
             log::debug!("notifying Release");
             let _ = notify_tx.send(ProducerEvent::Release).await;
+        });
+        Ok(())
+    }
+
+    /// **Pending-capture handshake**：主线程在对端 Ack Enter 后调本方法
+    /// 把 `pos` 上的 pending 提升到 active。同步返回（消息已 spawn 到
+    /// producer task，hide cursor + warp + emit Begin 异步完成）。
+    fn start_capture(&mut self, pos: Position) -> Result<(), CaptureError> {
+        let notify_tx = self.notify_tx.clone();
+        tokio::task::spawn_local(async move {
+            log::debug!("notifying StartCapture({pos:?})");
+            let _ = notify_tx.send(ProducerEvent::StartCapture(pos)).await;
+        });
+        Ok(())
+    }
+
+    /// **Pending-capture handshake**：主线程 cancel_pending / 断网 /
+    /// 500ms 超时调本方法。同步返回。
+    fn cancel_pending(&mut self, pos: Position) -> Result<(), CaptureError> {
+        let notify_tx = self.notify_tx.clone();
+        tokio::task::spawn_local(async move {
+            log::debug!("notifying CancelPending({pos:?})");
+            let _ = notify_tx.send(ProducerEvent::CancelPending(pos)).await;
         });
         Ok(())
     }

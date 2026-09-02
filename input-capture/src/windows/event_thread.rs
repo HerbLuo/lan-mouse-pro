@@ -33,6 +33,8 @@ use input_event::{
 
 use super::{CaptureEvent, Position, display_util};
 
+use display_util::cursor_within;
+
 pub(crate) struct EventThread {
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
     thread: Option<thread::JoinHandle<()>>,
@@ -60,6 +62,25 @@ impl EventThread {
 
     pub(crate) fn destroy(&self, pos: Position) {
         self.client_update(ClientUpdate::Destroy(pos));
+    }
+
+    /// **Pending-capture handshake (主线程侧入口)**：把 `pos` 上的 pending
+    /// Begin 提升到 active。等对端 Ack 到达后由主线程调本方法。
+    ///
+    /// 走现有 `ClientUpdate` + `RequestType::ClientUpdate` 通路 —— 不新增
+    /// `RequestType` 变体。Windows thread 内串行处理，pending → active
+    /// 的跃迁是原子的（钩子线程和消息循环是同一线程，无并发写）。
+    pub(crate) fn start_capture(&self, pos: Position) {
+        self.client_update(ClientUpdate::StartCapture(pos));
+    }
+
+    /// **Pending-capture handshake (主线程侧入口)**：取消 `pos` 上的
+    /// pending Begin（如果存在）。主线程在以下场景调：
+    /// - Enter 发送失败（断网）
+    /// - 500ms tick 检测到超时
+    /// - `release_bind` 在 pending 状态被按下
+    pub(crate) fn cancel_pending(&self, pos: Position) {
+        self.client_update(ClientUpdate::CancelPending(pos));
     }
 
     fn exit(&self) {
@@ -96,6 +117,14 @@ enum RequestType {
 enum ClientUpdate {
     Create(Position),
     Destroy(Position),
+    /// Main thread says: Ack received, promote the pending Begin on
+    /// `Position` to an active capture (cursor hidden, events consumed).
+    /// No-op if no pending Begin matches.
+    StartCapture(Position),
+    /// Main thread says: cancel any pending Begin on `Position`
+    /// (Ack timeout, send failure, or release-bind pressed). No-op if
+    /// no pending Begin matches.
+    CancelPending(Position),
 }
 
 fn blocking_send_event(pos: Position, event: CaptureEvent) {
@@ -112,11 +141,27 @@ fn try_send_event(
 thread_local! {
     /// all configured clients
     static CLIENTS: RefCell<HashSet<Position>> = RefCell::new(HashSet::new());
-    /// currently active client
+    /// currently active client (cursor hidden, events consumed).
     static ACTIVE_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
+    /// Pending client (cursor still visible on the host, Enter already
+    /// sent to the remote, waiting for the Ack). Mutually exclusive with
+    /// [`ACTIVE_CLIENT`] — promotion clears pending, cancel clears
+    /// pending without setting active.
+    ///
+    /// **为什么需要这个中间态**：之前 `check_client_activation` 一旦检
+    /// 测到鼠标跨过边界就立即设 `ACTIVE_CLIENT`，导致 `mouse_proc` 同
+    /// 步开始消费事件（LRESULT(1)），主线程还没来得及等 Ack，远端断网
+    /// 时鼠标已被钩子"吞掉"。引入 pending 后，`mouse_proc` 在仅有
+    /// `PENDING_CLIENT` 时走 `CallNextHookEx` 透传 —— 鼠标留在主机；
+    /// Ack 到达由主线程调 `start_capture` 提升到 active。
+    static PENDING_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
+    /// Entry point captured at the moment of barrier crossing. Preserved
+    /// across promotion so the eventual active Begin yields the same
+    /// Motion deltas as if we'd gone active immediately.
+    static PENDING_ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
     /// input event channel
     static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
-    /// position of barrier entry
+    /// position of barrier entry (active)
     static ENTRY_POINT: Cell<(i32, i32)> = const { Cell::new((0, 0)) };
     /// previous mouse position
     static PREV_POS: Cell<Option<(i32, i32)>> = const { Cell::new(None) };
@@ -229,7 +274,14 @@ fn start_routine(
             match msg.wParam.0 {
                 x if x == RequestType::Exit as usize => break,
                 x if x == RequestType::Release as usize => {
+                    // Release 同时清掉 active 和 pending —— 主线程在
+                    // pending 状态下调 `release_capture` 时，也通过
+                    // capture.cancel_pending(...) 先发 CancelPending，
+                    // 但 belt-and-suspenders：这里再清一次防止 race
+                    // （cancel_pending 消息还没被本循环 drain 到时
+                    // release 已经进来）。
                     ACTIVE_CLIENT.take();
+                    PENDING_CLIENT.take();
                 }
                 x if x == RequestType::ClientUpdate as usize => {
                     let requests = {
@@ -266,42 +318,59 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     let prev_pos = PREV_POS.get().unwrap_or(curr_pos);
     PREV_POS.replace(Some(curr_pos));
 
-    /* next event is the first actual event */
-    let ret = ACTIVE_CLIENT.get().is_some();
-
-    /* client already active, no need to check */
+    /* 捕获中：消费事件。mouse_proc 看到这里返 true 就会走 LRESULT(1) 吞掉。 */
     if ACTIVE_CLIENT.get().is_some() {
-        return ret;
+        return true;
     }
 
-    /* check if a client was activated */
+    /* 已经有 pending 客户端 → 检查用户是否把鼠标拉回屏幕内。
+     *
+     * 拉回 → 清 pending 并通知主线程（CancelPending），进入"无客户端"
+     * 透传状态。拉回 + 再次越界 由下一次 WM_MOUSEMOVE 的 `entered_barrier`
+     * 检测到，正常进入新的 pending 流。
+     */
+    if let Some(pending_pos) = PENDING_CLIENT.get() {
+        let within = DISPLAYS.with_borrow_mut(|(displays, generation)| {
+            update_display_regions(displays, generation);
+            cursor_within(curr_pos, displays, pending_pos)
+        });
+        if within {
+            PENDING_CLIENT.take();
+            log::debug!("CANCEL pending {pending_pos:?} (cursor pulled back inside)");
+            blocking_send_event(pending_pos, CaptureEvent::CancelPending);
+        }
+        return false;
+    }
+
+    /* 无 active / 无 pending → 检查边沿跨越。 */
     let entered = DISPLAYS.with_borrow_mut(|(displays, generation)| {
         update_display_regions(displays, generation);
         display_util::entered_barrier(prev_pos, curr_pos, displays)
     });
 
     let Some(pos) = entered else {
-        return ret;
+        return false;
     };
 
     /* check if a client is registered for the barrier */
     if !CLIENTS.with_borrow(|clients| clients.contains(&pos)) {
-        return ret;
+        return false;
     }
 
-    /* update active client and entry point */
-    ACTIVE_CLIENT.replace(Some(pos));
+    /* 进入 pending —— 不要设 ACTIVE_CLIENT。
+     * mouse_proc 看到 PENDING_CLIENT 而非 ACTIVE_CLIENT 时不消费事件，
+     * 鼠标留在主机可正常移动。
+     */
+    PENDING_CLIENT.replace(Some(pos));
     let entry_point = DISPLAYS.with_borrow(|(displays, _)| {
         display_util::clamp_to_display_bounds(displays, prev_pos, curr_pos)
     });
-    ENTRY_POINT.replace(entry_point);
+    PENDING_ENTRY_POINT.replace(entry_point);
 
-    /* notify main thread */
-    log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
-    let active = ACTIVE_CLIENT.get().expect("active client");
-    blocking_send_event(active, CaptureEvent::Begin);
+    log::debug!("PENDING @ {prev_pos:?} -> {curr_pos:?}");
+    blocking_send_event(pos, CaptureEvent::BeginPending);
 
-    ret
+    false
 }
 
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -424,12 +493,41 @@ fn update_clients(request: ClientUpdate) {
             CLIENTS.with_borrow_mut(|clients| clients.insert(pos));
         }
         ClientUpdate::Destroy(pos) => {
+            // 删 pos 的 client 时，pending 和 active 都要清，
+            // 否则后面 StartCapture / mouse_proc 仍按旧 pos 操作会出 bug。
+            if PENDING_CLIENT.get() == Some(pos) {
+                PENDING_CLIENT.take();
+            }
             if let Some(active_pos) = ACTIVE_CLIENT.get() {
                 if pos == active_pos {
                     let _ = ACTIVE_CLIENT.take();
                 }
             }
             CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));
+        }
+        ClientUpdate::StartCapture(pos) => {
+            // 仅在 pending 位置匹配时才提升。位置不匹配（如用户在
+            // pending 期间换边） → no-op，让对端 Ack 路径自然走 Idle。
+            if PENDING_CLIENT.get() != Some(pos) {
+                log::trace!(
+                    "start_capture({pos:?}) ignored: pending={:?}",
+                    PENDING_CLIENT.get()
+                );
+                return;
+            }
+            PENDING_CLIENT.take();
+            ACTIVE_CLIENT.replace(Some(pos));
+            ENTRY_POINT.replace(PENDING_ENTRY_POINT.get());
+            log::debug!("promoted pending client {pos:?} to active");
+            // 主动给主线程发 Begin —— 主线程在收到 Ack 后调 start_capture，
+            // 现在 ack-to-begin 的闭环完整。
+            blocking_send_event(pos, CaptureEvent::Begin);
+        }
+        ClientUpdate::CancelPending(pos) => {
+            if PENDING_CLIENT.get() == Some(pos) {
+                PENDING_CLIENT.take();
+                log::debug!("cleared pending client {pos:?} (cancelled by main)");
+            }
         }
     }
 }

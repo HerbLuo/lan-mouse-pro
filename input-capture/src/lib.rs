@@ -39,6 +39,16 @@ pub type CaptureHandle = u64;
 pub enum CaptureEvent {
     /// capture on this capture handle is now active
     Begin,
+    /// cursor crossed a barrier but the client has not yet Acked the
+    /// Enter. The host cursor remains visible and events are NOT consumed
+    /// yet. Once the caller calls [`Capture::start_capture`] (after the
+    /// Ack arrives) the backend promotes this into a real [`CaptureEvent::Begin`].
+    BeginPending,
+    /// the pending Begin was cancelled — either the user moved the cursor
+    /// back inside the screen, the Ack timed out, or the caller invoked
+    /// [`Capture::cancel_pending`] explicitly. No further events will
+    /// arrive for the previous pending Begin.
+    CancelPending,
     /// input event coming from capture handle
     Input(Event),
 }
@@ -47,6 +57,8 @@ impl Display for CaptureEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CaptureEvent::Begin => write!(f, "begin capture"),
+            CaptureEvent::BeginPending => write!(f, "begin pending (awaiting ack)"),
+            CaptureEvent::CancelPending => write!(f, "cancel pending"),
             CaptureEvent::Input(e) => write!(f, "{e}"),
         }
     }
@@ -171,6 +183,28 @@ impl InputCapture {
         self.capture.release().await
     }
 
+    /// **Pending-capture handshake (Windows / macOS only)** — promote a
+    /// previously reported `BeginPending` on `pos` to an active capture.
+    ///
+    /// The main thread calls this after the remote client ACKs the Enter
+    /// we sent in response to `BeginPending`. Backends that don't
+    /// distinguish pending from active (libei, layer-shell, x11, dummy)
+    /// are no-ops.
+    ///
+    /// **同步**：Windows 直接 `PostThreadMessage`；macOS `spawn_local` 发
+    /// notify_tx。主线程调完无需 await。
+    pub fn start_capture(&mut self, pos: Position) -> Result<(), CaptureError> {
+        self.capture.start_capture(pos)
+    }
+
+    /// **Pending-capture handshake (Windows / macOS only)** — cancel a
+    /// pending Begin on `pos`, if any. Called when the user moves the
+    /// cursor back inside before Ack, or on Ack timeout. Default backend
+    /// implementations are no-ops.
+    pub fn cancel_pending(&mut self, pos: Position) -> Result<(), CaptureError> {
+        self.capture.cancel_pending(pos)
+    }
+
     /// Drain and return every key the capture has forwarded as
     /// down-but-not-up. The caller is expected to synthesize key-up
     /// events to the remote peer for each — otherwise the peer
@@ -289,6 +323,27 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;
+
+    /// Promote the pending Begin on `pos` to an active capture. Called by
+    /// the main thread after the remote client has Acked the Enter.
+    /// Idempotent: a no-op if there is no pending Begin, the pending
+    /// position does not match, or the capture is already active.
+    ///
+    /// **Synchronous** (no `async`) so the caller doesn't have to await
+    /// — Windows just posts a message and macOS fires a `spawn_local`.
+    /// Default is a no-op for backends (libei, layer-shell, x11, dummy)
+    /// that don't distinguish pending from active. Only the synchronous
+    /// Windows / macOS backends need to override this.
+    fn start_capture(&mut self, _pos: Position) -> Result<(), CaptureError> {
+        Ok(())
+    }
+
+    /// Cancel the pending Begin on `pos`, if any. Called when the user
+    /// moves the cursor back inside before the Ack arrives, on Ack
+    /// timeout, or when the caller wants to abort. Default is a no-op.
+    fn cancel_pending(&mut self, _pos: Position) -> Result<(), CaptureError> {
+        Ok(())
+    }
 }
 
 async fn create_backend(

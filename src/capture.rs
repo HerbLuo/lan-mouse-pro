@@ -4,6 +4,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// **Pending-capture 握手超时**：主线程发了 `ProtoEvent::Enter` 后等对
+/// 端 `Ack` 的最大时长。LAN 内 Ack 通常 <50ms；500ms 给 10× 缓冲，超时
+/// 后取消 pending（鼠标留在主机）。
+///
+/// **为什么不阻塞等更长**：用户感受优先 —— 移过边沿 0.5s 还不见鼠标切
+/// 走就已经觉得"卡了"，再长直接归类为故障。可作为后续可配置项（M2）。
+const PENDING_ACK_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Pending 超时检测 tick 周期。100ms 给超时判定最多 100ms 抖动（worst
+/// case：500ms 整边界 → 实际 500–600ms 才触发取消）。
+const PENDING_TICK_INTERVAL: Duration = Duration::from_millis(100);
+
 use futures::StreamExt;
 use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
@@ -302,6 +314,14 @@ impl CaptureTask {
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
+        // **Pending 超时 tick**：100ms 周期检查 `State::Pending` 的
+        // `started.elapsed()`，超过 500ms 主动 cancel_pending。
+        // `MissedTickBehavior::Skip` 防止累积延迟（back-pressure）。
+        let mut pending_tick = tokio::time::interval(PENDING_TICK_INTERVAL);
+        pending_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // 跳过初始立即触发的 tick —— session 启动时还没 pending 可查。
+        pending_tick.tick().await;
+
         loop {
             tokio::select! {
                 event = capture.next() => match event {
@@ -318,10 +338,50 @@ impl CaptureTask {
                     }
 
                     match event {
-                        // connection acknowlegded => set state to Sending
+                        // **Pending-capture 握手 Ack**：
+                        // - 当前是 Pending 且 handle 匹配 → 让后端提升
+                        //   pending → active，然后等后端 emit Begin →
+                        //   在 handle_capture_event 里切到 Sending。
+                        // - 当前是 Idle（libei 异步路径或 Begin 已先到）
+                        //   → 走老逻辑，直接转 Sending。
+                        // - handle 不匹配 → ignore（Ack 跟我们无关）。
                         ProtoEvent::Ack(_) => {
-                            log::info!("client {handle} acknowledged the connection!");
-                            self.state = State::Sending;
+                            match self.state {
+                                State::Pending { handle: pending_h, started } => {
+                                    if pending_h == handle {
+                                        log::info!(
+                                            "client {handle} acknowledged Enter after {:?}",
+                                            started.elapsed()
+                                        );
+                                        // 让 Windows / macOS 后端把 pending
+                                        // 提升为 active；后端会在自己的消息
+                                        // 循环里 emit Begin，主线程收到 Begin
+                                        // 时切 Sending（见 handle_capture_event）。
+                                        // 注：start_capture 是 idempotent，如
+                                        // 果期间被 cancel（用户回退）则 no-op。
+                                        if let Err(e) =
+                                            capture.start_capture(self.get_pos(handle))
+                                        {
+                                            log::warn!(
+                                                "start_capture after Ack failed: {e} \
+                                                 (cancelling pending)"
+                                            );
+                                            let _ =
+                                                capture.cancel_pending(self.get_pos(handle));
+                                            self.state = State::Idle;
+                                        }
+                                        // 保持 Pending，等后端 Begin 切 Sending。
+                                    } else {
+                                        log::trace!(
+                                            "Ack for handle {handle} ignored: pending handle is {pending_h:?}"
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    log::info!("client {handle} acknowledged the connection!");
+                                    self.state = State::Sending;
+                                }
+                            }
                         }
                         // client disconnected
                         ProtoEvent::Leave(_) => {
@@ -352,6 +412,29 @@ impl CaptureTask {
                         let _ = self.conn.dial(handle).await;
                     }
                 },
+                // **Pending 超时 tick**：Pending 状态下超过 500ms 没收到
+                // Ack → 主动取消 pending，鼠标留在主机。
+                _ = pending_tick.tick() => {
+                    if let State::Pending { handle, started } = self.state {
+                        let elapsed = started.elapsed();
+                        if elapsed >= PENDING_ACK_TIMEOUT {
+                            log::warn!(
+                                "capture: BeginPending timed out after {elapsed:?} for handle {handle} \
+                                 - cancelling (host cursor stays visible)"
+                            );
+                            if let Err(e) =
+                                capture.cancel_pending(self.get_pos(handle))
+                            {
+                                log::warn!("cancel_pending on timeout: {e}");
+                            }
+                            self.state = State::Idle;
+                            // 注意：timeout 分支不需要走 capture.release()。
+                            // pending 状态下后端没真正激活，ACTIVE_CLIENT
+                            // 本来就没设；cancel_pending 已经把后端 PENDING
+                            // 清掉。release_bind / Leave 等路径才需要 release。
+                        }
+                    }
+                },
                 _ = self.cancellation_token.cancelled() => break,
             }
         }
@@ -379,6 +462,8 @@ impl CaptureTask {
             return self.release_capture(capture).await;
         }
 
+        // 通知 service 层有 hook 事件。CaptureBegin 对 Begin 也发（旧逻辑），
+        // 对 BeginPending 不发（还没真捕获）。
         if event == CaptureEvent::Begin {
             self.event_tx
                 .send(ICaptureEvent::CaptureBegin(handle))
@@ -397,34 +482,107 @@ impl CaptureTask {
             return Ok(());
         }
 
-        // activated a new client
-        if event == CaptureEvent::Begin && Some(handle) != self.active_client {
-            log::info!("capture: new client entered (handle={handle:?})");
-            self.state = State::WaitingForAck;
-            self.active_client.replace(handle);
-            self.event_tx
-                .send(ICaptureEvent::ClientEntered(handle))
-                .expect("channel closed");
-        }
+        // ── 按 event 变体分支 ──────────────────────────────────────────────
+        match event {
+            // **Pending-capture 握手入口**：Windows / macOS 后端检测到鼠
+            // 标跨过边沿 → 设 pending（光标仍可见）→ 发 BeginPending。
+            // 我们发 Enter 给对端，等 Ack。Send 失败直接取消 pending。
+            CaptureEvent::BeginPending => {
+                self.state = State::Pending {
+                    handle,
+                    started: Instant::now(),
+                };
+                log::info!(
+                    "capture: BeginPending (handle={handle:?}) - awaiting Ack within {PENDING_ACK_TIMEOUT:?}"
+                );
+                let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+                if let Err(e) = self.conn.send(ProtoEvent::Enter(opposite_pos), handle).await {
+                    log::warn!(
+                        "releasing capture: BeginPending send failed: {e} \
+                         (cancelling pending, host cursor stays visible)"
+                    );
+                    // send 失败 → 取消 pending。注意：主线程发的 cancel
+                    // 是异步消息到 Windows thread；即便 cancel_pending
+                    // 失败，500ms tick 也会兜底清掉 PENDING_CLIENT。
+                    if let Err(e) = capture.cancel_pending(self.get_pos(handle)) {
+                        log::warn!("cancel_pending after send failure: {e}");
+                    }
+                    self.state = State::Idle;
+                    // 不要走 capture.release()：pending 状态后端本来就没
+                    // 激活，无 Leave 要发。
+                    return Ok(());
+                }
+                Ok(())
+            }
 
-        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+            // **Pending-capture 取消**：用户把鼠标移回屏幕内、Windows
+            // 后端自动取消，或 cancel_pending 失败后的兜底。我们已不在
+            // 等 Ack；只把状态归 Idle。如果当前不是 Pending（已切换或
+            // 还在 Idle）也不报错 —— CancelPending 可能重复到达。
+            CaptureEvent::CancelPending => {
+                log::info!("capture: CancelPending (handle={handle:?})");
+                if let Err(e) = capture.cancel_pending(self.get_pos(handle)) {
+                    log::warn!("cancel_pending: {e}");
+                }
+                if let State::Pending { handle: h, .. } = self.state {
+                    if h == handle {
+                        self.state = State::Idle;
+                    }
+                }
+                Ok(())
+            }
 
-        let event = match event {
-            CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
+            // **普通 Begin**：libei 等异步后端的路径（compositor 已经捕
+            // 获了 cursor，我们只是被通知）。行为与旧版几乎一致：
+            // 设 Sending 状态 + 发 Enter。
+            //
+            // **为什么有 BeginPending 还要保留 Begin 路径**：libei 模
+            // 型是 compositor 端先捕获，主线程从 `Activated` 信号才知
+            // 道。Begin 直接对应"已经在捕获中"。Windows / macOS 的
+            // BeginPending 后 Ack 到达 → capture.start_capture → 后端
+            // 主动 emit Begin（见 event_thread.rs::update_clients 的
+            // StartCapture 分支）。
+            CaptureEvent::Begin => {
+                if Some(handle) != self.active_client {
+                    log::info!("capture: new client entered (handle={handle:?})");
+                    self.active_client.replace(handle);
+                    self.event_tx
+                        .send(ICaptureEvent::ClientEntered(handle))
+                        .expect("channel closed");
+                }
+                self.state = State::Sending;
+                let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+                if let Err(e) = self.conn.send(ProtoEvent::Enter(opposite_pos), handle).await {
+                    const DUR: Duration = Duration::from_millis(500);
+                    debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+                    log::warn!("releasing capture: send failed: {e}");
+                    capture.release().await?;
+                }
+                Ok(())
+            }
+
+            // **普通输入事件**：仅在 Sending 状态转发。Pending / Idle 时
+            // 是"鼠标还没真切走"，不应当出现在这里（如果出现，说明后端
+            // 在不该吞事件时吞了 —— 记 warning 便于诊断，正常 drop）。
             CaptureEvent::Input(e) => match self.state {
-                // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
-                State::Sending => ProtoEvent::Input(e),
+                State::Sending => {
+                    if let Err(err) = self.conn.send(ProtoEvent::Input(e), handle).await {
+                        const DUR: Duration = Duration::from_millis(500);
+                        debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {err}"));
+                        log::warn!("releasing capture: send failed: {err}");
+                        capture.release().await?;
+                    }
+                    Ok(())
+                }
+                State::Pending { .. } | State::Idle => {
+                    log::warn!(
+                        "capture: Input event arrived while state={:?} — dropping (host capture inactive)",
+                        self.state
+                    );
+                    Ok(())
+                }
             },
-        };
-
-        if let Err(e) = self.conn.send(event, handle).await {
-            const DUR: Duration = Duration::from_millis(500);
-            debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-            log::warn!("releasing capture: send failed: {e}");
-            capture.release().await?;
         }
-        Ok(())
     }
 
     async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
@@ -433,6 +591,33 @@ impl CaptureTask {
             self.state,
             self.active_client,
         );
+
+        // **Pending-capture 特殊路径**：如果当前还在等 Ack，宿主端还没
+        // 真正捕获过鼠标（active_client = None，pressed_keys 仍可能为
+        // 空），不需要发 Leave / key-ups / modifiers=0 —— 因为从没发过
+        // 被 Ack 的 Enter。仅通知后端清 PENDING_CLIENT。
+        //
+        // **触发场景**：
+        // 1. release-bind 在 pending 状态被按下
+        // 2. service.rs 主动 release（用户操作）
+        // 3. capture::Capture 的 Drop / destroy
+        if let State::Pending { handle, .. } = self.state {
+            log::info!(
+                "release_capture: was in Pending for handle {handle} - \
+                 cancel_pending (no Leave to send)"
+            );
+            if let Err(e) = capture.cancel_pending(self.get_pos(handle)) {
+                log::warn!("cancel_pending in release_capture: {e}");
+            }
+            self.state = State::Idle;
+            // 后端 Windows 消息循环顺带清 PENDING（`RequestType::Release`
+            // 分支 belt-and-suspenders 已加），无需再调 capture.release()。
+            // 但为 macOS 兜底，这里也调一次 —— 后端 `release()` 在
+            // pending 状态下是 no-op（macOS pending_pos 不依赖 ACTIVE
+            // 状态，已被 StartCapture/CancelPending 异步处理过）。
+            return capture.release().await;
+        }
+
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             let held_keys = capture.take_pressed_keys();
@@ -497,7 +682,19 @@ thread_local! {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum State {
     #[default]
-    WaitingForAck,
+    Idle,
+    /// Mouse crossed barrier, [`ProtoEvent::Enter`] sent, waiting for
+    /// the client's [`ProtoEvent::Ack`]. Capture is NOT yet active on the
+    /// backend (the host cursor is still visible). After 500ms without
+    /// Ack the [`crate::capture::CaptureTask`] cancels and goes back to
+    /// [`State::Idle`].
+    Pending {
+        handle: CaptureHandle,
+        started: Instant,
+    },
+    /// Capture is active (backend has promoted pending → active on Ack,
+    /// or backend is libei-style async). Input events are forwarded to
+    /// the remote.
     Sending,
 }
 
