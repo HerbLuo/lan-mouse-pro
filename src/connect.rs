@@ -323,9 +323,9 @@ impl LanMouseConnection {
 ///   切换），所以 retry gate 的"输入集变化则跳过退避"语义不需要
 /// - `Clone` derive 让测试断言可借出 entry 副本
 ///
-/// **退避算法**：失败 → `backoff *= 2`，上限 `MAX_RETRY_BACKOFF = 30s`。
-/// 起始 `INITIAL_RETRY_BACKOFF = 500ms`（PLAN §6.5 prompt：500ms → 1s → 2s
-/// → 4s → 8s → 16s → 30s 上限）。
+/// **退避算法**：失败 → `backoff *= 2`，上限 `MAX_RETRY_BACKOFF = 8s`。
+/// 起始 `INITIAL_RETRY_BACKOFF = 1s`（1s → 2s → 4s → 8s 上限；详见下方
+/// 常量 docstring 的 Mac/wake UX 调整理由）。
 ///
 /// **熔断阈值 `MAX_RETRY_FAILURES_BEFORE_OFFLINE = 5`**：连续失败 ≥ 5 次
 /// → log error 提示"对端真离线"。**不**推 IPC `TransportEvent::PeerLost` —
@@ -338,11 +338,21 @@ struct RetryState {
     failure_count: u32,
 }
 
-/// **STEP-6.5 RetryState 常量**（与 PLAN §6.5 500ms → 1s → 2s 退避曲线
-/// + 与 bak `mousehop/src/connect.rs:59-75 INITIAL_RETRY_BACKOFF /
-/// MAX_RETRY_BACKOFF / MAX_RETRY_FAILURES_BEFORE_OFFLINE` 对齐）。
-const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(500);
-const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+/// **STEP-6.5 RetryState 常量** + **Mac/wake 重连调整**。
+///
+/// **退避曲线**：1s → 2s → 4s → 8s (cap) → 8s → 8s → ... 永远循环。
+///
+/// **与原 500ms→30s 对比**：原 PLAN §6.5 的 30s 上限对 mouse-sharing
+/// UX 太慢 —— Mac wake 后用户要等 30s 才看到反应。8s cap 让用户在
+/// peer 唤醒后**最多等 8s**就有下一次重试（实际更快：peer 醒的瞬间
+/// 下一次 retry 就成功）。fail count=5 触发 log error 的阈值不变
+/// （约 t=15s，能区分"短断网"和"对端真离线"）。
+///
+/// **与 bak 对齐**：原对齐 `mousehop/src/connect.rs:59-75` 的 500ms→30s
+/// 曲线。**本次调整打破 bak 对齐**，理由是 mouse-sharing 场景对延迟
+/// 敏感（用户实时等鼠标），bak 的 30s 是给一般 P2P 应用设计的。
+const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(8);
 const MAX_RETRY_FAILURES_BEFORE_OFFLINE: u32 = 5;
 
 /// **应用层心跳周期**：主控端周期性向被控端发 `ProtoEvent::Ping`，刷新
@@ -737,53 +747,67 @@ mod tests {
     /// 序列累加，cap 在 `MAX_RETRY_BACKOFF`。`failure_count` 累加到 5 时
     /// 触发熔断（仅 log，无 panic —— 测试不依赖日志断言）。
     ///
+    /// **2026-09 调整**：INITIAL = 1s、MAX = 8s —— 与上方常量 docstring 同源。
+    /// 实际跑出来的退避序列：
+    /// - 1st fail: backoff = 2s (INITIAL × 2), count = 1
+    /// - 2nd fail: backoff = 4s (INITIAL × 4), count = 2
+    /// - 3rd fail: backoff = 8s (INITIAL × 8 = MAX, **撞 cap**), count = 3
+    /// - 4th fail: backoff = 8s (cap stays), count = 4
+    /// - 5th fail: backoff = 8s, count = 5 (触发熔断 log)
+    /// - 6th fail: backoff = 8s, count = 6
+    /// - 7th fail: backoff = 8s, count = 7
+    ///
     /// **不依赖 QUIC** —— 纯 RetryState 数据结构单测，可立即跑通。
     #[test]
     fn backoff_doubles_on_each_failure() {
         let retry_state: Rc<RefCell<HashMap<ClientHandle, RetryState>>> = Default::default();
         let handle: ClientHandle = 42;
 
-        // 第一次失败：backoff 翻到 INITIAL (500ms)，failure_count=1
+        // 1st fail: backoff = 2 × INITIAL = 2s; count = 1
         record_retry_failure(&retry_state, handle);
         let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
-        assert_eq!(entry.backoff, INITIAL_RETRY_BACKOFF * 2, "第一次失败后 backoff 应翻倍");
-        assert_eq!(entry.failure_count, 1, "failure_count 应累加到 1");
+        assert_eq!(entry.backoff, INITIAL_RETRY_BACKOFF * 2, "1st fail: backoff = 2x INITIAL = 2s");
+        assert_eq!(entry.failure_count, 1);
 
-        // 第二次失败：backoff 翻到 4x INITIAL (2s)
+        // 2nd fail: backoff = 4 × INITIAL = 4s; count = 2
         record_retry_failure(&retry_state, handle);
         let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
-        assert_eq!(entry.backoff, INITIAL_RETRY_BACKOFF * 4, "第二次失败后 backoff 应再次翻倍");
+        assert_eq!(entry.backoff, INITIAL_RETRY_BACKOFF * 4, "2nd fail: backoff = 4x INITIAL = 4s");
         assert_eq!(entry.failure_count, 2);
 
-        // 第三次失败：backoff 翻到 8x INITIAL (4s)
+        // 3rd fail: backoff = 8 × INITIAL = 8s = MAX，撞 cap；count = 3
         record_retry_failure(&retry_state, handle);
         let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
-        assert_eq!(entry.backoff, INITIAL_RETRY_BACKOFF * 8);
+        assert_eq!(
+            entry.backoff,
+            MAX_RETRY_BACKOFF,
+            "3rd fail: backoff = 8x INITIAL = 8s = MAX, hit cap"
+        );
         assert_eq!(entry.failure_count, 3);
 
-        // 第四次失败：backoff 翻到 16x INITIAL (8s)
+        // 4th fail: backoff 已被 cap 在 MAX, 不再翻倍；count = 4
         record_retry_failure(&retry_state, handle);
         let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
-        assert_eq!(entry.backoff, INITIAL_RETRY_BACKOFF * 16);
+        assert_eq!(entry.backoff, MAX_RETRY_BACKOFF, "4th fail: cap stays at MAX");
         assert_eq!(entry.failure_count, 4);
 
-        // 第五次失败：触发熔断阈值 —— backoff 翻到 32x INITIAL (16s)；count=5
-        record_retry_failure(&retry_state, handle);
-        let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
-        assert_eq!(entry.backoff, INITIAL_RETRY_BACKOFF * 32, "第五次失败后 backoff 应为 32x INITIAL = 16s");
-        assert_eq!(entry.failure_count, 5, "failure_count 应累加到 5（熔断阈值）");
-
-        // 第六次失败：backoff 翻到 32x INITIAL，但被 cap 在 MAX_RETRY_BACKOFF (30s)；count=6
-        record_retry_failure(&retry_state, handle);
-        let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
-        assert_eq!(entry.backoff, MAX_RETRY_BACKOFF, "backoff 应被 cap 在 MAX_RETRY_BACKOFF");
-        assert_eq!(entry.failure_count, 6, "failure_count 应累加到 6");
-
-        // 第七次失败：backoff 已 cap 不变；failure_count=7
+        // 5th fail: count = 5 触发熔断 log（仅 log 不 panic），backoff 不变
         record_retry_failure(&retry_state, handle);
         let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
         assert_eq!(entry.backoff, MAX_RETRY_BACKOFF);
-        assert_eq!(entry.failure_count, 7, "failure_count 应累加到 7");
+        assert_eq!(entry.failure_count, 5, "5th fail: 触发熔断阈值");
+
+        // 6th fail: backoff 仍 cap, count = 6
+        record_retry_failure(&retry_state, handle);
+        let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
+        assert_eq!(entry.backoff, MAX_RETRY_BACKOFF);
+        assert_eq!(entry.failure_count, 6);
+
+        // 7th fail: cap 不变, count = 7
+        record_retry_failure(&retry_state, handle);
+        let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
+        assert_eq!(entry.backoff, MAX_RETRY_BACKOFF);
+        assert_eq!(entry.failure_count, 7);
     }
 
     /// **STEP-6.5 验收 (2/2) `reconnect_on_peer_close` —— retry gate + clear**：
