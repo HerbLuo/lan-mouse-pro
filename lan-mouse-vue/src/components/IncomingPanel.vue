@@ -10,9 +10,6 @@ const emit = defineEmits<{ 'open-authorize': [] }>()
   <div class="card">
     <div style="margin-bottom: 12px;">
       <button @click="emit('open-authorize')">
-        <span style="display: inline-flex">
-          <IconMic :size="16" />
-        </span>
         Authorize
       </button>
     </div>
