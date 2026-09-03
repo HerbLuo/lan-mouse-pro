@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -15,6 +16,50 @@ const PENDING_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 /// Pending 超时检测 tick 周期。100ms 给超时判定最多 100ms 抖动（worst
 /// case：500ms 整边界 → 实际 500–600ms 才触发取消）。
 const PENDING_TICK_INTERVAL: Duration = Duration::from_millis(100);
+
+// === FIX 4 — Watchdog 自愈 ====================================================
+//
+// **背景**：1+2 修复覆盖了"`release_capture` 后 State::Sending 残留"和"迟
+// 到 Ack 切错状态"两类 bug；剩余失败场景（网络抖动后 `active_client` 与
+// backend 状态错位、用户反复跨边但都走重试 gate、连续 `send_input` 失败
+// 但 release 路径竞态未触发）需要主动检测 + 自愈。本节加 watchdog。
+//
+// **设计原则**：
+// - **不改协议**：纯本地状态自检，不新增 ProtoEvent。
+// - **分层检测**：light (200ms) 跑无 IO 的 ghost-active 检测，heavy (3s)
+//   跑带状态聚合的 storm / failures / no-progress 检测，分摊开销。
+// - **可关闭**：环境变量 `LAN_MOUSE_WATCHDOG=off` 一键关，方便调试。
+// - **可观测**：命中后 WARN 一条；触发恢复后 INFO 记一条结果。
+//
+// **不做**的事：
+// - 不修协议层（无新增 ProtoEvent 字段）。
+// - 不强依赖具体后端（OS-agnostic，只调 `InputCapture::release`）。
+// - 不替代 release-bind —— 用户主动按键永远是最高优先级。
+
+/// Watchdog light 检测周期。无 IO 状态自检。
+const WATCHDOG_LIGHT_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Watchdog heavy 检测周期。带状态聚合（crossings 计数、send_failures 累
+/// 计、no-progress 时间窗），允许大窗口。
+const WATCHDOG_HEAVY_INTERVAL: Duration = Duration::from_secs(3);
+
+/// 连续 `conn.send` 失败次数阈值；`State::Sending` 期间累计到该值 → 强制
+/// release。选 3 是因为 LAN 内连续 3 次失败已经能区分"瞬时网络抖动"与"对
+/// 端真挂"，前者 1~2 次就恢复，后者需 3+ 次后才好真正判定。
+const WATCHDOG_SEND_FAILURES_THRESHOLD: u32 = 3;
+
+/// "跨边风暴"窗口大小。窗口内跨边次数 ≥ 阈值即触发。
+const WATCHDOG_CROSSING_WINDOW: Duration = Duration::from_secs(5);
+
+/// 窗口内允许的最大"未成功推进"的跨边次数。5s 内 5 次意味着用户每次跨过去
+/// 都在反复 retry 都失败 —— 大概率是状态机冻住了。轻量场景（用户正常来回
+/// 切）下不会触达：5s 内最多 1~2 次有效跨边。
+const WATCHDOG_CROSSING_STORM_THRESHOLD: usize = 5;
+
+/// "无进度"超时：从最近一次成功状态推进（Pending→Sending、send_input ok
+/// 等）算起，超此时长仍停留在非 Idle 状态 → 强制 release。8s 远大于正常
+/// LAN jitter（<10ms），也不会让用户卡超过这个时间。
+const WATCHDOG_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(8);
 
 use futures::StreamExt;
 use input_capture::{
@@ -101,6 +146,8 @@ impl Capture {
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
             release_bind_prev: false,
+            // FIX 4：watchdog 自愈状态初始化。
+            watchdog: WatchdogState::new(),
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -209,6 +256,56 @@ struct CaptureTask {
     /// 跳变时记一条 INFO(mouse 卡住 bug 复现时只关心按下那一瞬间,持续
     /// 按下时不刷屏)。
     release_bind_prev: bool,
+    /// **FIX 4 — Watchdog 自愈状态**：见下方 `WatchdogState` docstring。
+    watchdog: WatchdogState,
+}
+
+/// **FIX 4 — Watchdog 自愈状态**：
+///
+/// 用于在 `do_capture_session` 主循环被动 select 不到异常时主动检测一
+/// 类无法被现有事件流捕获的"状态机冻住"场景。具体三类 detection 需要
+/// 不同的状态：
+///
+/// 1. **Ghost-active**：`state == State::Sending` 但 `active_client ==
+///    None`（修复 1 没覆盖的镜像 bug —— `active_client.take()` 之后忘了
+///    重置 state）。light tick 检测。
+/// 2. **Send-failure storm**：连续 `conn.send` 失败次数累计。input 事
+///    件发送失败时累加，发送成功或离开 Sending 时清零。heavy tick 检测。
+/// 3. **Crossing storm**：滑动窗口 [`WATCHDOG_CROSSING_WINDOW`] 内的
+///    `BeginPending` 时间戳。`do_capture_session` 进入 `BeginPending`
+///    handler 时 push。heavy tick 清理过期条目 + 检测风暴。
+/// 4. **No-progress**：`last_progress_at` 上次"状态成功推进"时间戳。包
+///    含 Pending→Sending 提升、`send_input` ok、`release_capture` 完
+///    成。heavy tick 检测距此时长超 [`WATCHDOG_NO_PROGRESS_TIMEOUT`]
+///    且 state 非 Idle → 强 release。
+///
+/// **reset 触发点**：
+/// - `release_capture` 末尾：清零 `consecutive_send_failures`、刷新
+///   `last_progress_at = now`、清 `recent_crossings`。
+/// - `handle_capture_event::Input(e)` State::Sending Ok 时：清零 + 刷新。
+/// - `Begin` 命中 pending→active 分支时：刷新 `last_progress_at`。
+struct WatchdogState {
+    /// `State::Sending` 期间连续 `conn.send` 失败次数。
+    consecutive_send_failures: u32,
+    /// 滑动窗口 `BeginPending` 时间戳。push 在 `handle_capture_event` 入
+    /// `BeginPending` 分支处；heavy tick 清理 [`WATCHDOG_CROSSING_WINDOW`]
+    /// 之前的旧条目。
+    recent_crossings: VecDeque<Instant>,
+    /// 上次"状态推进成功"时间戳。`release_capture` 完成 / Pending→Sending
+    /// 提升 / `send_input` ok 三处刷新。
+    last_progress_at: Instant,
+}
+
+impl WatchdogState {
+    fn new() -> Self {
+        Self {
+            consecutive_send_failures: 0,
+            recent_crossings: VecDeque::new(),
+            // 初值 = `do_capture_session` 启动时间；后续三处刷新点保持
+            // 最新。
+            last_progress_at: Instant::now(),
+        }
+    }
 }
 
 impl CaptureTask {
@@ -321,6 +418,33 @@ impl CaptureTask {
         pending_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // 跳过初始立即触发的 tick —— session 启动时还没 pending 可查。
         pending_tick.tick().await;
+
+        // **FIX 4 — Watchdog ticks**：
+        //
+        // - `watchdog_light_tick` (200ms) —— 无 IO 的 ghost-active 检测。
+        //   频次高但成本低，命中后立即 force-reset。
+        // - `watchdog_heavy_tick` (3s) —— 跨边窗口清理 + send-failures
+        //   累计 + no-progress 超时，频次低但需要状态聚合。
+        //
+        // **环境变量关停**：`LAN_MOUSE_WATCHDOG=off` 时两个 tick 都不
+        // 创建，loop 永远不命中这两个分支 —— 等价于禁用。开发调试时用。
+        let watchdog_enabled = std::env::var("LAN_MOUSE_WATCHDOG")
+            .map(|v| v.to_ascii_lowercase() != "off")
+            .unwrap_or(true);
+        let (mut watchdog_light_tick, mut watchdog_heavy_tick) = if watchdog_enabled {
+            let mut light = tokio::time::interval(WATCHDOG_LIGHT_INTERVAL);
+            light.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // 跳过初始立即 tick，避免启动瞬时 false-positive
+            // （CaptureTask 内字段刚初始化）。
+            light.tick().await;
+            let mut heavy = tokio::time::interval(WATCHDOG_HEAVY_INTERVAL);
+            heavy.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            heavy.tick().await;
+            (Some(light), Some(heavy))
+        } else {
+            log::info!("watchdog disabled by LAN_MOUSE_WATCHDOG=off");
+            (None, None)
+        };
 
         loop {
             tokio::select! {
@@ -456,10 +580,174 @@ impl CaptureTask {
                         }
                     }
                 },
+                // **FIX 4 — Watchdog light tick**：ghost-active 检测。
+                //
+                // **触发条件**：`state == State::Sending` 且
+                // `active_client.is_none()` —— 状态机说"我们在 active"但
+                // 实际上没有任何 active client。这是修复 1 没覆盖的镜像
+                // bug（`active_client.take()` 之后忘了 `state = Idle`）。
+                //
+                // **修复**：把 state 强制回 Idle、调 `capture.release()`。
+                // 即使本分支命中频繁，因为命中后立即 reset state，下次
+                // tick 不会再次触发。
+                //
+                // **不做**：不重建 peer、不主动 dial —— 仅本地状态对齐，
+                // 让下一轮 `BeginPending` 自然从 Idle 开始。
+                _ = async {
+                    if let Some(t) = watchdog_light_tick.as_mut() {
+                        t.tick().await;
+                    } else {
+                        // 永不 resolve（旁路分支）
+                        std::future::pending::<()>().await
+                    }
+                } => {
+                    self.run_watchdog_light(capture).await;
+                }
+                // **FIX 4 — Watchdog heavy tick**：跨边窗口清理 +
+                // send-failures 累计 + no-progress 超时。
+                _ = async {
+                    if let Some(t) = watchdog_heavy_tick.as_mut() {
+                        t.tick().await;
+                    } else {
+                        std::future::pending::<()>().await
+                    }
+                } => {
+                    self.run_watchdog_heavy(capture).await;
+                }
                 _ = self.cancellation_token.cancelled() => break,
             }
         }
         Ok(())
+    }
+
+    // === FIX 4 — Watchdog 检测函数 ============================================
+
+    /// **Watchdog light check**：无 IO 检测，仅 ghost-active 一种条件。
+    ///
+    /// 调频 [`WATCHDOG_LIGHT_INTERVAL`] = 200ms。设计原则是"便宜到随时
+    /// 可跑"——只看 `self.state` 和 `self.active_client` 两个字段，不触
+    /// 任何 peer / send / select。
+    ///
+    /// **ghost-active**：原逻辑 `release_capture` 的 Pending 分支显式置
+    /// `state = Idle`，但 Sending 分支只 `active_client.take()` 即发送
+    /// Leave + 调 `capture.release()`，**没有同步置 state**（这是修复
+    /// 1 的内容；但当前 fix 4 单独 ship 时此路径仍残留）。watchdog 在
+    /// 此处兜底。
+    ///
+    /// **命中后**：state 强制回 Idle，`capture.release()` 兜底（清 OS
+    /// 层 ACTIVE_CLIENT），刷新 `last_progress_at = now` 让 heavy tick
+    /// 不再视为 no-progress。
+    async fn run_watchdog_light(
+        &mut self,
+        capture: &mut InputCapture,
+    ) {
+        // 仅在 state == Sending 且 active_client == None 时命中。
+        // 不打 Sending 但 active_client 还有 / Idle 状态：前者是正常
+        // active 状态，后者本来就该 idle。
+        if matches!(self.state, State::Sending) && self.active_client.is_none() {
+            log::warn!(
+                "watchdog[light]: ghost-active detected (State::Sending + active_client=None) \
+                 -- force-resetting to Idle"
+            );
+            self.state = State::Idle;
+            // best-effort: 这一步让 OS 层真释放 ACTIVE_CLIENT，避免
+            // hook 还在吞事件但 state 已经说 idle。
+            if let Err(e) = capture.release().await {
+                log::warn!("watchdog[light]: capture.release() failed: {e}");
+            }
+            // 重置 watchdog 状态：刚刚"恢复"一次，从 now 起算。
+            self.watchdog.consecutive_send_failures = 0;
+            self.watchdog.last_progress_at = Instant::now();
+        }
+    }
+
+    /// **Watchdog heavy check**：跨边窗口清理 + send-failures 累计 +
+    /// no-progress 超时三种检测。调频 [`WATCHDOG_HEAVY_INTERVAL`] = 3s。
+    ///
+    /// **三类检测独立判断**：
+    /// 1. **Crossing storm**：清理 [`WATCHDOG_CROSSING_WINDOW`] 之前的旧
+    ///    条目，再看 `recent_crossings.len()` 是否 ≥
+    ///    [`WATCHDOG_CROSSING_STORM_THRESHOLD`] 且当前 Idle + 无 active。
+    ///    → 用户反复跨过去但都失败，状态机卡住。强制 release 让下一轮
+    ///    Begin 从 Idle 自然开始。
+    /// 2. **Send-failure storm**：`State::Sending` 期间累计连续 send 失
+    ///    败达 [`WATCHDOG_SEND_FAILURES_THRESHOLD`] → 强制 release。
+    ///    与 `release_capture` 的"send 失败 → release"路径互补，处理
+    ///    `conn.send` 在 retry gate 内返 NotConnected 但 release 路径竞
+    ///    态未触发的场景。
+    /// 3. **No-progress**：距 `last_progress_at` 超
+    ///    [`WATCHDOG_NO_PROGRESS_TIMEOUT`] 且 state 非 Idle → 状态机
+    ///    "冻住"，强制 release。
+    ///
+    /// **顺序**：先做 (1)，再做 (2)，最后 (3)。每一项独立判断、独立记日志。
+    /// 一次 tick 命中多个时全部触发（各自 `release_capture` 是幂等的）。
+    async fn run_watchdog_heavy(
+        &mut self,
+        capture: &mut InputCapture,
+    ) {
+        let now = Instant::now();
+
+        // ── (1) Crossing storm ────────────────────────────────────────────
+        // 清理过期 entries（早于窗口的）。
+        while let Some(&front) = self.watchdog.recent_crossings.front() {
+            if now - front > WATCHDOG_CROSSING_WINDOW {
+                self.watchdog.recent_crossings.pop_front();
+            } else {
+                break;
+            }
+        }
+        if self.watchdog.recent_crossings.len() >= WATCHDOG_CROSSING_STORM_THRESHOLD
+            && matches!(self.state, State::Idle)
+            && self.active_client.is_none()
+        {
+            log::warn!(
+                "watchdog[heavy]: crossing storm ({} in {:?}) without state advance \
+                 -- force release",
+                self.watchdog.recent_crossings.len(),
+                WATCHDOG_CROSSING_WINDOW,
+            );
+            if let Err(e) = self.release_capture(capture).await {
+                log::warn!("watchdog[heavy]: release_capture during storm clear failed: {e}");
+            }
+            self.watchdog.recent_crossings.clear();
+            self.watchdog.last_progress_at = now;
+            // 跳过后续两个检测：本轮已释放，状态已 reset。
+            return;
+        }
+
+        // ── (2) Send-failure storm ────────────────────────────────────────
+        if matches!(self.state, State::Sending)
+            && self.watchdog.consecutive_send_failures >= WATCHDOG_SEND_FAILURES_THRESHOLD
+        {
+            log::warn!(
+                "watchdog[heavy]: {} consecutive send-input failures in Sending \
+                 -- force release",
+                self.watchdog.consecutive_send_failures,
+            );
+            self.watchdog.consecutive_send_failures = 0;
+            if let Err(e) = self.release_capture(capture).await {
+                log::warn!("watchdog[heavy]: release_capture during send-failure clear failed: {e}");
+            }
+            self.watchdog.last_progress_at = now;
+            return;
+        }
+
+        // ── (3) No-progress ────────────────────────────────────────────────
+        // 仅在非 Idle 状态检查（Idle 本来就没"进展"可言）。
+        if !matches!(self.state, State::Idle)
+            && now - self.watchdog.last_progress_at > WATCHDOG_NO_PROGRESS_TIMEOUT
+        {
+            log::warn!(
+                "watchdog[heavy]: no progress for >{:?} in state {:?} \
+                 -- force release",
+                WATCHDOG_NO_PROGRESS_TIMEOUT,
+                self.state,
+            );
+            if let Err(e) = self.release_capture(capture).await {
+                log::warn!("watchdog[heavy]: release_capture during no-progress clear failed: {e}");
+            }
+            self.watchdog.last_progress_at = now;
+        }
     }
 
     async fn handle_capture_event(
@@ -544,6 +832,11 @@ impl CaptureTask {
                 log::info!(
                     "capture: BeginPending (handle={handle:?}) - awaiting Ack within {PENDING_ACK_TIMEOUT:?}"
                 );
+                // **FIX 4**：watchdog 跨边风暴检测 —— 每次 BeginPending
+                // 都记一次。heavy tick 在 5s 窗口内看到 ≥ 5 次且 state
+                // 仍 Idle → 判定状态机卡住，强制 release 后让下一轮自
+                // 然从头来。
+                self.watchdog.recent_crossings.push_back(Instant::now());
                 let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
                 if let Err(e) = self.conn.send(ProtoEvent::Enter(opposite_pos), handle).await {
                     log::warn!(
@@ -557,10 +850,21 @@ impl CaptureTask {
                         log::warn!("cancel_pending after send failure: {e}");
                     }
                     self.state = State::Idle;
+                    // **FIX 4**：BeginPending 内的 send 失败也计入
+                    // consecutive failures，让 watchdog heavy 把
+                    // "反复 Begin→send 失败"识别为跨边风暴前的征兆。
+                    self.watchdog.consecutive_send_failures = self
+                        .watchdog
+                        .consecutive_send_failures
+                        .saturating_add(1);
                     // 不要走 capture.release()：pending 状态后端本来就没
                     // 激活，无 Leave 要发。
                     return Ok(());
                 }
+                // send 成功 → 重置失败计数 + 记录推进（Pending 已建
+                // 立，下一步等 Ack 是预期路径不视作 no-progress）。
+                self.watchdog.consecutive_send_failures = 0;
+                self.watchdog.last_progress_at = Instant::now();
                 Ok(())
             }
 
@@ -617,6 +921,11 @@ impl CaptureTask {
                         }
                         // **不**发 Enter —— 见上方路径 1 说明。
                         self.state = State::Sending;
+                        // **FIX 4**：Pending → Sending 是 happy path 主
+                        // 推进点之一；刷新 last_progress_at 让 heavy
+                        // tick 不把它当 no-progress。
+                        self.watchdog.last_progress_at = Instant::now();
+                        self.watchdog.consecutive_send_failures = 0;
                         Ok(())
                     }
                     _ => {
@@ -633,7 +942,16 @@ impl CaptureTask {
                             const DUR: Duration = Duration::from_millis(500);
                             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
                             log::warn!("releasing capture: send failed: {e}");
+                            self.watchdog.consecutive_send_failures = self
+                                .watchdog
+                                .consecutive_send_failures
+                                .saturating_add(1);
                             capture.release().await?;
+                        } else {
+                            // **FIX 4**：Begin 路径（同进程内第 2 次
+                            // Enter）发送成功也算一次进度推进。
+                            self.watchdog.consecutive_send_failures = 0;
+                            self.watchdog.last_progress_at = Instant::now();
                         }
                         Ok(())
                     }
@@ -649,7 +967,20 @@ impl CaptureTask {
                         const DUR: Duration = Duration::from_millis(500);
                         debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {err}"));
                         log::warn!("releasing capture: send failed: {err}");
+                        // **FIX 4**：连续 send 失败累加；heavy tick
+                        // 在 ≥ 3 次时强制 release（即使本路径 release
+                        // 已调），做兜底。
+                        self.watchdog.consecutive_send_failures = self
+                            .watchdog
+                            .consecutive_send_failures
+                            .saturating_add(1);
                         capture.release().await?;
+                    } else {
+                        // **FIX 4**：成功 send 视为"还在干活"——清零失
+                        // 败计数、刷新 last_progress_at 让 no-progress
+                        // 不会误触发。
+                        self.watchdog.consecutive_send_failures = 0;
+                        self.watchdog.last_progress_at = Instant::now();
                     }
                     Ok(())
                 }
@@ -694,7 +1025,14 @@ impl CaptureTask {
             // 但为 macOS 兜底，这里也调一次 —— 后端 `release()` 在
             // pending 状态下是 no-op（macOS pending_pos 不依赖 ACTIVE
             // 状态，已被 StartCapture/CancelPending 异步处理过）。
-            return capture.release().await;
+            let res = capture.release().await;
+            // **FIX 4**：Pending 早返回路径也要清 watchdog（避免
+            // 用户在 pending 期间按 release-bind → 立刻又跨过去 →
+            // recent_crossings 含旧条目被误判为风暴）。
+            self.watchdog.consecutive_send_failures = 0;
+            self.watchdog.recent_crossings.clear();
+            self.watchdog.last_progress_at = Instant::now();
+            return res;
         }
 
         // If we have an active client, notify them we're leaving
@@ -764,6 +1102,21 @@ impl CaptureTask {
         log::info!("release_capture: calling capture.release() (OS-level release)");
         let res = capture.release().await;
         log::info!("release_capture: capture.release() returned (ok={})", res.is_ok());
+
+        // **FIX 4**：release_capture 完成 → 重置 watchdog 状态。
+        //
+        // - 清零 `consecutive_send_failures`：下次 BeginPending / Input
+        //   重新计数。
+        // - 清空 `recent_crossings`：跨边风暴的滑动窗口从 now 起重新计。
+        // - 刷新 `last_progress_at`：刚释放完成视作一次进度（no-progress
+        //   超时从 now 重新算）。
+        //
+        // 任何分支（Pending 早返回 / Sending 路径 / leave/send-failure）
+        // 走完 release 都重置 —— watchdog 的"已恢复"哨兵。
+        self.watchdog.consecutive_send_failures = 0;
+        self.watchdog.recent_crossings.clear();
+        self.watchdog.last_progress_at = Instant::now();
+
         res
     }
 }
