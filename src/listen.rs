@@ -656,14 +656,26 @@ async fn handle_quic_peer_supervisor(
     // 堆在 quinn 的 accept 队列里没人消费，按键静默丢光。这就是"鼠标能动
     // （走 datagram，有 Bug #8 的 reader）但键盘完全不通"的直接原因。
     //
-    // **为什么是 accept 循环而不是只 accept 一次**：发送端虽然已改成缓存
-    // 单条 stream B（见 `session.rs::cached_send_b`），但写失败时会弃掉旧
-    // 流重开一条；`send_stream_a` 的 fallback 分支也可能开新 bidi。循环
-    // accept + per-stream reader task 对两种情形都兼容。
+    // **bunch bidi 兼容**：client 端 `peer.run(PeerRole::Client)` 在 hello
+    // 完成后会 `open_bi()` × 3 装配 StreamBunch（见 `session.rs:832-865`），
+    // 这 3 条 bidi server 端没有对应的 reader 消费（server 端不跑 peer.run）。
+    // 它们的特点是 **被 open 但从未 write** —— 任何 read 都立即 EOF。
+    // 我们的策略：accept → 读第一帧 → EOF 则把这条的 recv **park**（塞进
+    // supervisor 持有的 Vec，不 drop），这样不会向 client 发 STOP_SENDING，
+    // 不会影响 client 端 peer.run 持有的 stream_bunch。当 conn 关闭时
+    // park Vec 随之 drop，所有 parked recvs 一并清理（此时已 conn-closed，
+    // STOP_SENDING 无害）。
+    //
+    // **真实 stream B 怎么识别**：client `send_stream_b` 第一次被调时
+    // `open_bi()` + `write_u32(len)` + `write_all(body)` 同步完成才返回
+    // —— server accept 时数据已在 quinn buffer 里，read_u32 立即返回
+    // 合法长度。这就是"有数据 vs 无数据"的可靠区分信号。
+    let parked_recvs: Rc<RefCell<Vec<quinn::RecvStream>>> = Rc::new(RefCell::new(Vec::new()));
     spawn_local(server_accept_bi_task(
         peer.clone(),
         listen_tx.clone(),
         addr,
+        parked_recvs.clone(),
     ));
 
     // (6) 循环 read_frame(recv_a) → ListenEvent::Msg
@@ -753,46 +765,95 @@ impl Drop for QuicConnGuard {
 
 /// **键盘不通修复**：server 侧 `accept_bi()` 循环 —— 接收 client 端在
 /// stream A / datagram 之外新开的 bidi（当前唯一来源是 stream B 的按键
-/// 事件流），每条流交给一个独立的 frame reader task。
+/// 事件流）。
 ///
-/// 与 [`server_datagram_reader_task`] 对称：解出的 `ProtoEvent` 同样包成
-/// `ListenEvent::Msg { event, addr }` 推 `listen_tx`，由 emulation.rs 的
-/// ListenTask 分派到本地 emulation。**不**走 `route_input` 反向分派 ——
-/// receiver 端不感知发送端 cfg（PLAN §3.1.4），物理通道到事件的转译就够了。
+/// **bunch bidi 识别 + park**：client 端 `peer.run(PeerRole::Client)` 在
+/// hello 后会 `open_bi()` × 3 装配 StreamBunch（`session.rs:832-865`），
+/// 这 3 条 bidi server 端没有对应 reader。区分方式：尝试读第一帧
+/// `read_u32(len)` —— bunch bidi 从未被 write，立即 EOF；真实 stream B
+/// 已被 `send_stream_b` 同步写入首帧，read_u32 立即返回合法长度。
 ///
-/// **生命周期**：`accept_bi()` 在 conn 关闭时返 Err → 本 task 退出；已
-/// spawn 的子 reader task 各自在流 EOF / conn 关闭时退出。
+/// EOF 时把这条 recv **park** 进 `parked_recvs`（不 drop）—— 避免向
+/// client 发 STOP_SENDING 进而影响 client 端 peer.run 持有的
+/// stream_bunch。parked recvs 在 supervisor 退出时随 `parked_recvs`
+/// 一起 drop（conn 已关，STOP_SENDING 无害）。
+///
+/// **真实 stream B**：read_u32 拿到合法长度 → `read_exact(body)` → 解码
+/// → 推 `listen_tx` → spawn reader task 继续读后续帧（用 `read_frame`）。
 async fn server_accept_bi_task(
     peer: Rc<PeerSession>,
     listen_tx: Sender<ListenEvent>,
     addr: SocketAddr,
+    parked_recvs: Rc<RefCell<Vec<quinn::RecvStream>>>,
 ) {
     loop {
-        match peer.connection().accept_bi().await {
-            Ok((send, recv)) => {
-                // send 半边不用（stream B 是单向数据流：client 写、server 读）
-                drop(send);
-                log::debug!("server accept_bi: 接到来自 {addr} 的新 stream，启动 reader");
-                spawn_local(server_stream_reader_task(recv, listen_tx.clone(), addr));
-            }
+        let (send, mut recv) = match peer.connection().accept_bi().await {
+            Ok(pair) => pair,
             Err(e) => {
                 log::info!("server accept_bi: 退出（conn 关闭）: {e}");
                 return;
             }
+        };
+        // send 半边不用（stream B 单向数据流：client 写、server 读）
+        drop(send);
+
+        // 试读首帧长度 —— 区分 bunch bidi（EOF）与真实 stream B（合法 u32）
+        use tokio::io::AsyncReadExt;
+        let len: u32 = match recv.read_u32().await {
+            Ok(n) => n,
+            Err(e) => {
+                // EOF / IO 错误 = bunch bidi 或 peer 关连。park 让 recv 持
+                // 有直到 supervisor 退出，不向 client 发 STOP_SENDING。
+                log::debug!("server accept_bi: 接到的 stream 立即 EOF/IO 错误，按 bunch 忽略并 park: {e}");
+                parked_recvs.borrow_mut().push(recv);
+                continue;
+            }
+        };
+
+        // 真实 stream B —— 读 body、解码、首帧推 listen_tx
+        let mut body = vec![0u8; len as usize];
+        if let Err(e) = recv.read_exact(&mut body).await {
+            // 长度读到了但 body 读失败 —— 仍按 bunch 行为 park（不破坏 client）
+            log::debug!("server accept_bi: 首帧 body 读失败，按 bunch park: {e}");
+            parked_recvs.borrow_mut().push(recv);
+            continue;
         }
+        let mut buf = [0u8; lan_mouse_proto::MAX_EVENT_SIZE];
+        if len as usize > buf.len() {
+            log::warn!(
+                "server accept_bi: 首帧长度 {len} 超过 MAX_EVENT_SIZE={}，按 bunch park",
+                lan_mouse_proto::MAX_EVENT_SIZE
+            );
+            parked_recvs.borrow_mut().push(recv);
+            continue;
+        }
+        buf[..len as usize].copy_from_slice(&body);
+        let event = match lan_mouse_proto::ProtoEvent::try_from(buf) {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!("server accept_bi: 首帧解码失败，按 bunch park: {e}");
+                parked_recvs.borrow_mut().push(recv);
+                continue;
+            }
+        };
+        log::debug!("server accept_bi: 真实 stream B 首帧 from {addr}: {event}");
+        if listen_tx
+            .send(ListenEvent::Msg { event, addr })
+            .is_err()
+        {
+            log::debug!("server accept_bi: listen_tx closed, exiting");
+            return;
+        }
+        // 后续帧交给 reader task
+        spawn_local(server_stream_reader_task(recv, listen_tx.clone(), addr));
     }
 }
 
-/// 单条 accepted stream 的帧读循环（[`server_accept_bi_task`] 的子 task）。
+/// 真实 stream B 后续帧 reader task —— 由 [`server_accept_bi_task`] 在
+/// 确认首帧合法后 spawn。
 ///
-/// 错误分流与 `handle_quic_peer_supervisor` 的 stream A 循环一致：
-/// `FrameTooLarge` / decode 错误 → skip frame 续读（单帧损坏不致命，
-/// 丢一个按键好过整条流断掉）；`Truncated` / IO 错误 → 流结束，退出。
-///
-/// **为何 FrameTooLarge 这里不 fatal**：stream A 上它意味着控制面协议
-/// 失同步（必须关连）；stream B 上只是一帧输入事件坏了，下一帧仍可能
-/// 正常 —— 但长度前缀已读错会导致后续帧边界全乱，所以仍然退出该流，
-/// 由发送端的写失败重开新流恢复（见 `session.rs::send_stream_b`）。
+/// 错误分流与 supervisor 的 stream A 循环一致：decode 错误 → skip frame
+/// 续读；EOF / IO 错误 → 流结束，退出 task（不影响其他流）。
 async fn server_stream_reader_task(
     mut recv: quinn::RecvStream,
     listen_tx: Sender<ListenEvent>,
