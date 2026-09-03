@@ -1,73 +1,72 @@
-//! QUIC server listener —— **M1 阶段 STEP-6.3 整合 macOS wake**。
+//! QUIC server listener.
 //!
-//! 替换 STEP-1.2 之前 `webrtc-dtls` DTLS 路径：原 `listen.rs::read_loop`
-//! 走 `webrtc_util::Conn` + `DTLSConn` + `as_any().downcast_ref::<DTLSConn>()`
-//! 旧路径（10 errors）整段删除，由 quic_transport 模块的 `PeerSession` +
-//! `read_frame` + `read_any_frame` 替代。
+//! Replaces the earlier `webrtc-dtls` DTLS path: the old `listen.rs::read_loop`
+//! used `webrtc_util::Conn` + `DTLSConn` + `as_any().downcast_ref::<DTLSConn>()`
+//! and has been deleted. It is replaced by `PeerSession`, `read_frame`, and
+//! `read_any_frame` from the `quic_transport` module.
 //!
-//! **STEP-6.2 + STEP-6.3 supervisor 形态**：
-//! 1. `LanMouseListener::new(port, cert_chain, key, authorized_keys)` 调
+//! **Supervisor shape**:
+//! 1. `LanMouseListener::new(port, cert_chain, key, authorized_keys)` calls
 //!    `endpoint_with_verifier(port, cert_chain, key, AuthorizedKeysVerifier)`
-//!    拿 `Endpoint`（mTLS + fingerprint allowlist 在握手期已完成）
-//! 2. spawn per-listener accept task：循环 `quic_transport::accept()`，每条
-//!    `Connection` spawn 一个 `handle_quic_peer_supervisor` task
-//! 3. supervisor: `server_hello` → 计算 fingerprint（双层防御）→ 推
-//!    `ListenEvent::Accept` → `take_stream_a_recv` 拿 stream A recv 半边
-//!    → 循环 `read_frame(&mut recv_a)` 转译为 `ListenEvent::Msg`
-//! 4. stream A EOF / conn close → 推 `ListenEvent::Disconnected` + 退 supervisor
+//!    to obtain an `Endpoint` (mTLS + fingerprint allowlist are enforced
+//!    during the handshake).
+//! 2. A per-listener accept task loops on `quic_transport::accept()`, spawning
+//!    one `handle_quic_peer_supervisor` task per `Connection`.
+//! 3. The supervisor: `server_hello` → compute fingerprint (defense-in-depth)
+//!    → push `ListenEvent::Accept` → `take_stream_a_recv` to obtain the recv
+//!    half of stream A → loop on `read_frame(&mut recv_a)` and translate each
+//!    frame into `ListenEvent::Msg`.
+//! 4. Stream A EOF / conn close → push `ListenEvent::Disconnected` and exit
+//!    the supervisor.
 //!
-//! **macOS wake 路径（STEP-6.3 引入）**：
-//! - macOS-only `PowerObserver` 在系统唤醒时通过 `tokio::sync::mpsc::unbounded_channel`
-//!   发 `()` 给 `wake_rx`
-//! - `spawn_wake_task` 后台 task 阻塞 recv `wake_rx`，收到后遍历 `quic_conns`
-//!   注册表，对每条 conn 调 `peer.connection().close(0u32.into(), b"wake")`
-//!   同步触发 close（不等 QUIC 30s `max_idle_timeout`）
-//! - close 后 read_loop EOF → supervisor 退场 → 推 Disconnected
-//! - 非 macOS 上 `PowerObserver` 不 spawn，`wake_rx = None`，`spawn_wake_task`
-//!   永久 pending
+//! **macOS wake path**:
+//! - The macOS-only `PowerObserver` sends `()` over a
+//!   `tokio::sync::mpsc::unbounded_channel` to `wake_rx` on system wake.
+//! - `spawn_wake_task` blocks on `wake_rx`; on each wake signal it walks the
+//!   `quic_conns` registry and calls `peer.connection().close(0u32.into(), b"wake")`
+//!   to force-close the connection synchronously, without waiting for the QUIC
+//!   30s `max_idle_timeout`.
+//! - After close, the supervisor's read loop EOFs and exits, pushing
+//!   `Disconnected`.
+//! - On non-macOS targets, `PowerObserver` is not spawned, `wake_rx = None`,
+//!   and `spawn_wake_task` parks forever.
 //!
-//! **为什么不装配三 stream（B/C）**：M1 阶段 client 端 `LanMouseConnection::send`
-//! **只**在 stream A 上发控制事件（Enter / Leave / Ack / Hello / Ping / Pong
-//! 走 `send_stream_a`，按键走 `send_stream_b` 但 LanMouseConnection 当前
-//! 仅在 `send_input` 的 `Channel::StreamB` 分派触发），且 client 端**没有**
-//! 自动开 3 条 bidi 的装配路径（`connect_to_handle` 只跑 `client_hello`，
-//! stream B/C 留给 send 时按需开）。因此 server 端 supervisor 只监听
-//! stream A —— listen.rs ListenTask 的现有 match 臂覆盖所有控制面事件，
-//! 不依赖 stream B/C reader。
+//! **Why only stream A is wired up**: the client-side `LanMouseConnection::send`
+//! emits control events (Enter / Leave / Ack / Hello / Ping / Pong) on stream A,
+//! and key events on stream B via `send_stream_b` only when `send_input`
+//! dispatches into `Channel::StreamB`. The client side does not eagerly open
+//! three bidi streams during `connect_to_handle` (only `client_hello` runs;
+//! stream B/C are opened on demand when `send` is called). The server-side
+//! supervisor therefore only consumes stream A — the existing match arms in
+//! `ListenTask` cover every control-plane event, so no stream B/C reader is
+//! required.
 //!
-//! **Stream B / C 路径留 STEP-7.x 接手**：届时 supervisor 装配 outer
-//! accept_bi 循环 + 子 task 用 `read_any_frame` 解码 + 转译 `ListenEvent::Msg`。
+//! **port_changed / request_port_change**: runtime port switching is not
+//! supported by `Endpoint`, so `Err(PortChangeUnsupported)` is returned (a
+//! per-IP endpoint rebuild can be added later).
 //!
-//! **port_changed / request_port_change**：M1 阶段 `Endpoint` 不支持运行
-//! 期端口切换 → `Err(PortChangeUnsupported)`（与 bak 一致；后续微步再补
-//! per-IP endpoint rebuild）。
+//! **mTLS reject notification**: `ListenEvent::Rejected { fingerprint }` was
+//! previously dead code — `AuthorizedKeysVerifier::verify_client_cert` returns
+//! `Err(rustls::Error)` directly on rejection, `quinn::Endpoint::accept` does
+//! not expose the rejected cert's fingerprint, and the supervisor never
+//! observed this event, so the GUI could not surface "an unauthorized peer
+//! attempted to connect". The fix:
+//! 1. `AuthorizedKeysVerifier` carries an
+//!    `Option<UnboundedSender<String>>` injected via `with_rejection_tx`.
+//! 2. `verify_client_cert` calls `rejection_tx.send(fp)` on the Err path
+//!    (best-effort).
+//! 3. `LanMouseListener::new` creates a
+//!    `tokio::sync::mpsc::unbounded_channel::<String>()`, clones the tx into
+//!    the verifier, and spawns `spawn_rejection_forwarder_task` on
+//!    `spawn_local` to translate `rx.recv()` into
+//!    `ListenEvent::Rejected { fingerprint }` on the same `listen_tx` shared
+//!    with Accept / Msg / Disconnected.
+//! 4. `terminate()` aborts the forwarder task alongside `wake_task`.
 //!
-//! **#S-9 治理**：allowlist value 类型用 `String`（M1）；M2 接
-//! `IncomingPeerConfig` 时同步改。
-//!
-//! **dead_code 守门**：`ArcConn` / `DTLSConn` / `VerifyPeerCertificateFn` 等
-//! 老类型引用整段删除；emulation.rs `ListenTask` 通过 `ListenEvent` 流式
-//! 消费 `Msg / Accept / Rejected / Disconnected` 4 变体。
-//!
-//! **STEP-8.2 修复 — mTLS reject 反向通知路径**：
-//! `ListenEvent::Rejected { fingerprint }` 之前是死代码（`AuthorizedKeysVerifier
-//! ::verify_client_cert` 在 rustls 拒握时直接 `Err(rustls::Error)`，
-//! `quinn::Endpoint::accept` 不暴露被拒 cert 的 fingerprint，listen.rs
-//! supervisor 永远收不到这条事件 → GUI 不弹窗 → 用户看不见"未授权对端尝试
-//! 接入"的提示）。修复方案：
-//! 1. `AuthorizedKeysVerifier` 加 `rejection_tx: Option<UnboundedSender<String>>`
-//!    字段（`with_rejection_tx` builder 注入）
-//! 2. `verify_client_cert` 在 Err 路径上 `rejection_tx.send(fp)`（best-effort）
-//! 3. `LanMouseListener::new` 创 `tokio::sync::mpsc::unbounded_channel::<String>()`
-//!    → 把 tx clone 给 verifier + spawn `spawn_rejection_forwarder_task` 在
-//!    spawn_local 上把 `rx.recv()` 翻译成 `ListenEvent::Rejected { fingerprint }`
-//!    走同一 `listen_tx`（与 Accept / Msg / Disconnected 同一通道）
-//! 4. `terminate()` 把 forwarder task 也 abort（与 `wake_task` 同模式）
-//!
-//! 这样 `AuthorizedKeysVerifier` 拒握时 fingerprint 即时送到
-//! `EmulationTask::ListenTask` 已有 match 分支（emulation.rs:190）→
+//! With this in place, a rejected fingerprint is delivered immediately to the
+//! existing match arm in `EmulationTask::ListenTask`, producing
 //! `EmulationEvent::ConnectionAttempt` → `FrontendEvent::ConnectionAttempt` →
-//! 前端 `request_authorization` 弹窗。
+//! the frontend's `request_authorization` dialog.
 
 use futures::{Stream, StreamExt};
 use lan_mouse_proto::ProtoEvent;
@@ -103,28 +102,29 @@ pub(crate) enum ListenEvent {
         addr: SocketAddr,
         fingerprint: String,
     },
-    /// Peer 连接断开（supervisor 任一 reader task 退出 / conn close）。
+    /// Peer connection closed (any supervisor reader task exited / conn close).
     ///
-    /// STEP-6.2 引入：QUIC 路径的 supervisor 在 stream A EOF / conn close 时
-    /// 发本事件 → emulation.rs ListenTask 同步清理 `emulation_proxy[addr]`
-    /// + 上报 service。
+    /// The QUIC supervisor emits this event on stream A EOF / conn close;
+    /// `emulation.rs::ListenTask` synchronously removes `emulation_proxy[addr]`
+    /// and reports the change to the service.
     Disconnected {
         addr: SocketAddr,
     },
-    /// Peer 握手失败 / fingerprint 未授权（mTLS 阶段被拒）。
+    /// Peer handshake failed / fingerprint not authorized (rejected at the
+    /// mTLS stage).
     ///
-    /// **STEP-8.2 修复**：由 [`crate::quic_transport::AuthorizedKeysVerifier`]
-    /// 通过反向 channel (`tokio::sync::mpsc::UnboundedSender<String>`) 通
-    /// 知 `spawn_rejection_forwarder_task`，后者把 fingerprint 翻译为本事件
-    /// 走 `listen_tx` 同一条流。
+    /// [`crate::quic_transport::AuthorizedKeysVerifier`] notifies
+    /// `spawn_rejection_forwarder_task` through a reverse channel
+    /// (`tokio::sync::mpsc::UnboundedSender<String>`); the forwarder translates
+    /// the fingerprint into this event on the same `listen_tx` stream.
     ///
-    /// **为什么需要反向 channel（而不是 rustls 拒握后从 quinn `Connection`
-    /// 拿 fingerprint）**：rustls 拒握时 `quinn::Connecting::await` 直接
-    /// 返 `Err(ConnectionError::TransportError(rustls::Error::General))`，
-    /// 此时还没 resolve 出 `Connection`，**没有 `peer_identity()` 可读** —
-    /// fingerprint 信息只在 `verify_client_cert` 调用现场被丢弃。只能在
-    /// verifier 内部 `verify_client_cert` 即将返 Err 时把 fp clone 一份
-    /// 发出来。
+    /// **Why a reverse channel is needed**: rustls rejects a handshake by
+    /// making `quinn::Connecting::await` return
+    /// `Err(ConnectionError::TransportError(rustls::Error::General))` before
+    /// any `Connection` is resolved, so `peer_identity()` is not yet
+    /// readable — the fingerprint is only known inside `verify_client_cert`
+    /// and is otherwise discarded. We must clone the fp from inside the
+    /// verifier on the Err path so it can be surfaced.
     Rejected {
         fingerprint: String,
     },
@@ -133,51 +133,56 @@ pub(crate) enum ListenEvent {
 pub(crate) struct LanMouseListener {
     listen_rx: Receiver<ListenEvent>,
     listen_tx: Sender<ListenEvent>,
-    /// QUIC accept task（M1 阶段单 endpoint 绑 `0.0.0.0:port`）。
-    /// `terminate` 时 abort。
+    /// QUIC accept task (a single endpoint bound to `0.0.0.0:port`).
+    /// Aborted by `terminate`.
     accept_task: JoinHandle<()>,
-    /// **STEP-8.2 修复**：把 `AuthorizedKeysVerifier` 的反向通知 channel
-    /// (`tokio::sync::mpsc::UnboundedReceiver<String>`) 转译为
-    /// `ListenEvent::Rejected` 的 forwarder task。
+    /// Forwarder task that translates the `AuthorizedKeysVerifier` reverse
+    /// notification channel (`tokio::sync::mpsc::UnboundedReceiver<String>`)
+    /// into `ListenEvent::Rejected` events.
     ///
-    /// `spawn_local` 起的 task，阻塞 recv `rejection_rx` → 收到 fp 后
-    /// `listen_tx.send(ListenEvent::Rejected { fingerprint })`。**复用同
-    /// 一 `listen_tx`** —— 不另开 channel，让 `emulation.rs::ListenTask`
-    /// 已在的 match 臂（emulation.rs:190）天然生效。
+    /// Spawned via `spawn_local`, it blocks on `rejection_rx`; on each
+    /// fingerprint it calls `listen_tx.send(ListenEvent::Rejected { fingerprint })`.
+    /// The same `listen_tx` is reused (no extra channel) so the existing
+    /// match arm in `emulation.rs::ListenTask` activates without further
+    /// plumbing.
     ///
-    /// `terminate` 时 abort —— 与 `wake_task` 同模式。
+    /// Aborted by `terminate`, mirroring the `wake_task` pattern.
     rejection_forwarder_task: JoinHandle<()>,
-    /// 后台 wake 处理 task（STEP-6.3 引入，与 bak 对齐）。
+    /// Background wake handling task.
     ///
-    /// macOS 系统唤醒 → 强制关闭所有 QUIC peer conn（不等 QUIC 30s
-    /// `max_idle_timeout`），触发 supervisor 的 read_loop EOF →
-    /// `ListenEvent::Disconnected` → ListenTask 同步清理 proxy + 上报
-    /// service → client 端 next `send()` 触发 `dial_any` 重连
-    /// （STEP-6.4 接入）。
+    /// On macOS system wake, force-closes all QUIC peer connections
+    /// (without waiting for the QUIC 30s `max_idle_timeout`), which triggers
+    /// the supervisor's read loop EOF → `ListenEvent::Disconnected` →
+    /// `ListenTask` synchronously cleans up the proxy and reports to the
+    /// service → the client's next `send()` triggers `dial_any` to reconnect.
     ///
-    /// 非 macOS 上 `wake_rx = None`，本 task 在 select 里永久 pending。
+    /// On non-macOS targets `wake_rx = None` and this task parks forever
+    /// inside `select`.
     wake_task: JoinHandle<()>,
-    /// 已通过 mTLS + authorized_keys 的合法 QUIC peer 表（与 bak 对齐）。
+    /// Registry of authorized QUIC peers (validated by mTLS + authorized_keys).
     ///
-    /// supervisor 在 Accept event 后 `insert(addr, peer.clone())`，
-    /// supervisor 退出时 `remove(addr)`（drop `QuicConnGuard`）。
+    /// The supervisor `insert(addr, peer.clone())`s after sending the Accept
+    /// event and `remove(addr)`s (via dropping the `QuicConnGuard`) when the
+    /// supervisor exits.
     ///
-    /// **核心消费者是 macOS wake 路径**：`spawn_wake_task` 遍历本表，对每条
-    /// conn 调 `peer.connection().close(0u32.into(), b"wake")` 同步触发
-    /// close —— 不等 QUIC `max_idle_timeout` (30s)。
+    /// The primary consumer is the macOS wake path: `spawn_wake_task` walks
+    /// this registry and calls `peer.connection().close(0u32.into(), b"wake")`
+    /// on each conn to force-close without waiting for QUIC `max_idle_timeout`
+    /// (30s).
     ///
-    /// `reply()` 也读本表查 peer 后写 control 帧到 stream A。
+    /// `reply()` also reads this registry to find a peer before writing a
+    /// control frame to stream A.
     ///
-    /// 选 `Rc<RefCell<HashMap<...>>>` 而非 `Rc<AsyncMutex<...>>`：
-    /// 注册 / 反注册 / 查表都是同步路径；`peer.send_input` 异步路径单用一次锁。
+    /// `Rc<RefCell<HashMap<...>>>` is chosen over `Rc<AsyncMutex<...>>`
+    /// because registration / deregistration / lookup are synchronous; the
+    /// async `peer.send_input` path takes its own lock once.
     quic_conns: Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>>,
     /// macOS-only: held for its `Drop` side effect (stops the
     /// CFRunLoop in the power-observer thread). The observer sends
     /// `()` into the wake channel on system-wake; the wake task
     /// drains that channel and force-closes peer conns so
     /// reconnect happens immediately after a screensaver/sleep
-    /// dismissal. QUIC keepalive has taken over idle detection —
-    /// see STEP-7.1.
+    /// dismissal. QUIC keepalive has taken over idle detection.
     #[cfg(target_os = "macos")]
     #[allow(dead_code)]
     power_observer: crate::macos_power::PowerObserver,
@@ -192,9 +197,9 @@ impl LanMouseListener {
     ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
 
-        // macOS wake → force-close-all-QUIC-peers plumbing (STEP-6.3 引入)。
-        // 非 macOS 上 PowerObserver 不 spawn，wake_rx 是 None；
-        // spawn_wake_task 在 wake_rx = None 分支里永久 pending。
+        // macOS wake → force-close-all-QUIC-peers plumbing.
+        // On non-macOS targets `PowerObserver` is not spawned, `wake_rx` is
+        // None, and `spawn_wake_task` parks forever in that branch.
         #[cfg(target_os = "macos")]
         let (power_observer, wake_rx) = {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -204,25 +209,26 @@ impl LanMouseListener {
         #[cfg(not(target_os = "macos"))]
         let wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>> = None;
 
-        // QUIC peer 注册表（空初始化）。
-        // `spawn_wake_task` 拿 clone 走 wake 路径，
-        // `spawn_quic_accept_task` 拿 clone 走 accept + supervisor 注册路径。
+        // QUIC peer registry (initially empty). `spawn_wake_task` takes a
+        // clone for the wake path, `spawn_quic_accept_task` takes a clone for
+        // the accept + supervisor registration path.
         let quic_conns: Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>> =
             Rc::new(RefCell::new(HashMap::new()));
 
         let wake_task = spawn_wake_task(wake_rx, quic_conns.clone());
 
-        // STEP-8.2 修复：装配 rejection 反向通知 channel。
+        // Reverse notification channel for mTLS rejections.
         //
-        // 路径：`AuthorizedKeysVerifier::verify_client_cert` Err → `tx.send(fp)`
-        // → 本 forwarder task `rx.recv()` → `listen_tx.send(ListenEvent::Rejected)`
-        // → emulation.rs:190 → `EmulationEvent::ConnectionAttempt` → service.rs:320
-        // → `FrontendEvent::ConnectionAttempt` → 前端 `request_authorization`。
+        // Path: `AuthorizedKeysVerifier::verify_client_cert` Err → `tx.send(fp)`
+        // → this forwarder task `rx.recv()` → `listen_tx.send(ListenEvent::Rejected)`
+        // → `EmulationTask::ListenTask` → `EmulationEvent::ConnectionAttempt`
+        // → service → `FrontendEvent::ConnectionAttempt` → frontend
+        // `request_authorization` dialog.
         //
-        // **channel 类型**：`tokio::sync::mpsc::unbounded_channel`（与
-        // §1 `wake_tx` 同模式 —— verifier 在 rustls 握手回调里 send，
-        // 可能在非 local 线程上，需 Send/Sync sender；forwarder 在
-        // spawn_local 上 recv）。
+        // Channel type: `tokio::sync::mpsc::unbounded_channel` (same pattern
+        // as the wake channel — the verifier sends from inside a rustls
+        // handshake callback that may not run on the local task thread, so a
+        // `Send + Sync` sender is required; the forwarder is `spawn_local`).
         let (rejection_tx, rejection_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let rejection_forwarder_task =
             spawn_rejection_forwarder_task(rejection_rx, listen_tx.clone());
@@ -248,10 +254,10 @@ impl LanMouseListener {
     }
 
     pub(crate) fn request_port_change(&mut self, _port: u16) {
-        // STEP-6.3 接手：per-IP endpoint rebuild 路径
+        // Runtime port rebind for QUIC endpoints is not supported.
         log::warn!(
             "LanMouseListener::request_port_change is a no-op for QUIC; \
-             runtime port rebind is not supported (STEP-6.2)"
+             runtime port rebind is not supported"
         );
     }
 
@@ -260,29 +266,32 @@ impl LanMouseListener {
     }
 
     pub(crate) async fn terminate(&mut self) {
-        // STEP-6.3：terminate 改用新 task 结构清理。
-        //
-        // 1. abort wake task → PowerObserver Drop 关 CFRunLoop（macOS-only）。
-        // 2. abort accept task → endpoint close → 所有 in-flight supervisor
-        //    收到 conn close → 发 ListenEvent::Disconnected → emulation.rs
-        //    ListenTask 清理 + 上报 service。
-        // 3. abort rejection forwarder task（STEP-8.2）→ verifier 持有的
-        //    rejection_tx sender 之后 send 会返 Err（被静默吞，与 verify_
-        //    client_cert 设计一致）。
-        // 4. close listen_tx → 通知所有 supervisor 的 forward_event 写入失败
-        //    → 不影响 read_loop 退出（read_loop 自己的 join handle 仍 resolve）。
+        // Teardown order matches the task structure:
+        // 1. abort wake task → `PowerObserver` Drop stops the CFRunLoop
+        //    (macOS-only).
+        // 2. abort accept task → endpoint close → all in-flight supervisors
+        //    observe conn close → emit `ListenEvent::Disconnected` →
+        //    `emulation.rs::ListenTask` cleans up + reports to the service.
+        // 3. abort rejection forwarder task → the `rejection_tx` retained by
+        //    the verifier silently fails subsequent sends (matching the
+        //    `verify_client_cert` design).
+        // 4. close `listen_tx` → all supervisors' `listen_tx.send` calls fail.
+        //    This does not affect read-loop exit (each loop's join handle
+        //    resolves independently).
         self.wake_task.abort();
         self.accept_task.abort();
         self.rejection_forwarder_task.abort();
         self.listen_tx.close();
     }
 
-    /// QUIC 路径 reply：从 `quic_conns` 表查 peer，把 control 事件写到该 peer
-    /// 的 stream A。
+    /// QUIC reply path: looks up the peer in `quic_conns` and writes the
+    /// control event to that peer's stream A.
     ///
-    /// M1 简化：peer 不在线时静默 no-op（避免 emulation.rs 报错）。
-    /// 走 PeerSession::send_input 通道分派：当前 `InputChannelConfig::default()`
-    /// 把控制面事件映射到 `Channel::StreamA`，所以 reply 自然走 stream A。
+    /// When the peer is not connected this silently no-ops (to avoid
+    /// surfacing errors from `emulation.rs`). Dispatches via
+    /// `PeerSession::send_input`: the current `InputChannelConfig::default()`
+    /// routes control-plane events to `Channel::StreamA`, so replies naturally
+    /// land on stream A.
     pub(crate) async fn reply(&self, addr: SocketAddr, event: ProtoEvent) {
         let peer = self.quic_conns.borrow().get(&addr).cloned();
         match peer {
@@ -304,44 +313,45 @@ impl LanMouseListener {
         }
     }
 
-    /// 给 ListenTask 在 Enter 事件时查 client cert fingerprint。
+    /// Returns the client cert fingerprint for `addr`, as used by `ListenTask`
+    /// when processing an Enter event.
     ///
-    /// **来源**：QUIC 路径不缓存 peer cert 单独存 —— 直接从 `Connection::peer_identity`
-    /// 拿（与 supervisor 内计算 fingerprint 是同一份数据）。但 supervisor
-    /// 已经把 `fingerprint: String` 放在 `ListenEvent::Accept` 里给 ListenTask
-    /// 上报了 `EmulationEvent::Connected { addr, fingerprint }`，ListenTask
-    /// 进 `addr_to_fingerprint` map。**所以 ListenTask 在 Enter 时不需要重
-    /// 算 fingerprint** —— 直接查 map 即可。本函数保留是 emulation.rs 的
-    /// 现有 API 调用站桩，**M1 阶段不真正用**（与 bak 对齐：bak 也保留这
-    /// 个 no-op stub）。
+    /// The supervisor already includes `fingerprint: String` in
+    /// `ListenEvent::Accept` and `ListenTask` stores it in an
+    /// `addr_to_fingerprint` map, so this lookup is not strictly needed on
+    /// the QUIC path. The function is retained as a no-op stub to satisfy the
+    /// existing `emulation.rs` call site; it returns `None` and may be wired
+    /// up later if a non-Accept path requires it.
     #[allow(dead_code)]
     pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
-        // M1 占位：直接返 None。ListenTask 当前路径是从 Accept event 拿
-        // fingerprint；本函数仅是 emulation.rs:152 调用站桩。
+        // Stub: `ListenTask` currently sources fingerprints from the Accept
+        // event, so this function is intentionally a no-op.
         let _ = addr;
         None
     }
 
-    /// **补丁 — last_response 超时时触发对端重拨**：强制用
-    /// [`crate::quic_transport::session::WAKE_CLOSE_CODE`] 关掉指定 addr
-    /// 的 QUIC conn，让对端 [`crate::quic_transport::should_retry_after_close`]
-    /// 看到 wake code 走 RetryState 重试路径。
+    /// Force-closes the QUIC conn for `addr` using
+    /// [`crate::quic_transport::session::WAKE_CLOSE_CODE`] so the peer takes
+    /// its `RetryState` path via
+    /// [`crate::quic_transport::should_retry_after_close`].
     ///
-    /// **使用方**：[`crate::emulation::ListenTask`] 在 5s tick 检测到
-    /// `last_response[addr].elapsed() > 1s` 时调 —— 替代原"仅发
-    /// `EmulationEvent::Disconnected` 不动 conn"的逻辑，那条路径下主控端
-    /// QUIC conn 仍活着、supervisor 收不到 close reason、**没人重拨**。
+    /// Called by [`crate::emulation::ListenTask`] when its 5s tick detects
+    /// `last_response[addr].elapsed() > 1s`. It replaces the prior
+    /// "only emit `EmulationEvent::Disconnected` and leave the conn alive"
+    /// behavior, under which the host's QUIC conn remained open, the
+    /// supervisor never observed a close reason, and nobody redialed.
     ///
-    /// **与 wake 路径协同**：复用同一 `WAKE_CLOSE_CODE` 语义 —— 对端
-    /// 不区分"系统唤醒 close"与"应用层超时 close"，统一走重试分支。
+    /// The same `WAKE_CLOSE_CODE` semantics are shared with the wake path:
+    /// the peer does not distinguish "system wake close" from "application
+    /// timeout close" and treats both as retry triggers.
     ///
-    /// **与 supervisor 路径 race**：本调用 force-close 后 slave 的
-    /// `handle_quic_peer_supervisor` 也会看到 stream A EOF → 推
-    /// `ListenEvent::Disconnected`，可能跟 timeout 分支自己推的
-    /// `EmulationEvent::Disconnected` 重叠；service.rs
-    /// [`crate::service::Service::remove_incoming`] 通过
-    /// `if let Some(addr) = self.remove_incoming(addr)` 守卫住了重复
-    /// remove（第二次返回 None，无副作用）。
+    /// Race with the supervisor path: after this force-close the peer's
+    /// `handle_quic_peer_supervisor` also observes stream A EOF and pushes
+    /// `ListenEvent::Disconnected`, which can overlap with the timeout
+    /// branch's own `EmulationEvent::Disconnected`. The service guards
+    /// duplicate removals via
+    /// `if let Some(addr) = self.remove_incoming(addr)` — a second call
+    /// returns `None` and is a no-op.
     pub(crate) fn close_with_wake_code(&self, addr: SocketAddr) {
         let peer = self.quic_conns.borrow().get(&addr).cloned();
         match peer {
@@ -353,8 +363,9 @@ impl LanMouseListener {
                 );
             }
             None => {
-                // peer 不在 quic_conns —— 可能已被 supervisor 路径先摘掉
-                // (race: supervisor EOF 与 timeout tick 并发)。静默 no-op。
+                // Peer is not in `quic_conns` — likely already removed by the
+                // supervisor path (race between supervisor EOF and timeout
+                // tick). Silent no-op.
                 log::trace!("close_with_wake_code: peer {addr} not in quic_conns (already gone)");
             }
         }
@@ -372,21 +383,27 @@ impl Stream for LanMouseListener {
     }
 }
 
-/// 给 `LanMouseListener::new()` 调的 helper：起单 endpoint QUIC accept task +
-/// 每条连接的 per-peer supervisor task。
+/// Helper called by `LanMouseListener::new()`: spawns the QUIC accept task
+/// for a single endpoint plus a per-peer supervisor task for each connection.
 ///
-/// **Step 6.2 + 6.3 supervisor 形态**：
-/// 1. `quic_transport::accept(&ep)` 循环拿 `Connection`
-/// 2. 接受到 conn → 立即 spawn supervisor：
-///    - `server_hello` 交换 PROTOCOL_MAGIC（`HelloFailed` 错误 → 退 supervisor）
-///    - 计算 client cert fingerprint（peer_identity + `crypto::generate_fingerprint`）
-///    - 双层防御：mTLS 已在 handshake 时校验过；supervisor 再查 allowlist
-///      作为 fallback（理论上 verifier 已放行的 fp 必在 allowlist）
-///    - 推 `ListenEvent::Accept { addr, fingerprint }`
-///    - 注册 `quic_conns[addr] = peer.clone()` + Drop guard 反注册
-///    - `take_stream_a_recv` 拿 stream A recv 半边
-///    - 循环 `read_frame(&mut recv_a)` 把每帧转译为 `ListenEvent::Msg`
-///    - stream A EOF / conn close → 退 `quic_conns` + 推 `ListenEvent::Disconnected`
+/// Supervisor shape:
+/// 1. Loop on `quic_transport::accept(&ep)` to obtain `Connection`s.
+/// 2. On each new conn, spawn a supervisor that:
+///    - Exchanges `PROTOCOL_MAGIC` via `server_hello` (a `HelloFailed` error
+///      exits the supervisor).
+///    - Computes the client cert fingerprint from `peer_identity` and
+///      `crypto::generate_fingerprint`.
+///    - Defense-in-depth: mTLS already validated during the handshake; the
+///      supervisor re-checks against the allowlist as a fallback (a fingerprint
+///      approved by the verifier is, by construction, in the allowlist).
+///    - Pushes `ListenEvent::Accept { addr, fingerprint }`.
+///    - Inserts `quic_conns[addr] = peer.clone()` with a Drop guard for
+///      deregistration.
+///    - Takes the stream A recv half via `take_stream_a_recv`.
+///    - Loops on `read_frame(&mut recv_a)`, translating each frame into
+///      `ListenEvent::Msg`.
+///    - On stream A EOF / conn close, removes from `quic_conns` and pushes
+///      `ListenEvent::Disconnected`.
 fn spawn_quic_accept_task(
     ep: quinn::Endpoint,
     listen_tx: Sender<ListenEvent>,
@@ -416,8 +433,9 @@ fn spawn_quic_accept_task(
                     });
                 }
                 Err(e) => {
-                    // QUIC accept 失败通常是 endpoint 被 close（terminate）
-                    log::debug!("QUIC accept 返回：{e}");
+                    // QUIC accept failures usually mean the endpoint was
+                    // closed (terminate path).
+                    log::debug!("QUIC accept returned: {e}");
                     break;
                 }
             }
@@ -425,26 +443,25 @@ fn spawn_quic_accept_task(
     })
 }
 
-/// 后台 wake 处理 task（STEP-6.3 引入，与 bak `spawn_wake_task` 对齐）。
+/// Background wake handling task.
 ///
-/// macOS 系统唤醒信号来时，遍历 `quic_conns` 注册表，对每条 conn 同步调
-/// `peer.connection().close(0, b"wake")` —— 不等 30s `max_idle_timeout`，
-/// 让 `streams.join` 立即 resolve → supervisor 发 `ListenEvent::Disconnected`
-/// → ListenTask 同步清理 `emulation_proxy[addr]` + 上报 service。
+/// On a macOS system-wake signal, walks the `quic_conns` registry and calls
+/// `peer.connection().close(0, b"wake")` on each conn synchronously, without
+/// waiting for the 30s `max_idle_timeout`. This lets `streams.join` resolve
+/// immediately, so the supervisor emits `ListenEvent::Disconnected`, and
+/// `ListenTask` synchronously cleans up `emulation_proxy[addr]` and reports
+/// to the service.
 ///
-/// **`RefCell::borrow()` 同步路径**（无 await 竞争）：
-/// `quinn::Connection::close(VarInt, &[u8])` 同步，不会与 read_loop
-/// 的 borrow_mut 冲突。
+/// **Synchronous `RefCell::borrow()` path (no await contention)**:
+/// `quinn::Connection::close(VarInt, &[u8])` is synchronous and cannot
+/// conflict with a concurrent `borrow_mut` from the read loop.
 ///
-/// **不需要** clone peer —— `Rc<PeerSession>` 持有内部 `Rc<Connection>`，
-/// close 直接走底层 ref count。
+/// No need to clone the peer — `Rc<PeerSession>` holds an internal
+/// `Rc<Connection>`, so `close` operates through the existing refcount.
 ///
-/// **error_code 0 = NO_ERROR**（graceful）；客户端 `should_retry_after_close`
-/// 分类为"不重试"，但 `peers` 已被 `spawn_peer_supervisor` 摘掉（STEP-6.1），
-/// 下次 `send()` 走 `should_attempt` 自然触发重拨 —— 与 DTLS wake 语义对齐。
-///
-/// 非 macOS 上 `wake_rx = None`，`match wake_rx.as_mut() { None => pending() }`
-/// 永久挂起（不浪费 wake）。
+/// Non-macOS targets use `wake_rx = None`, and the
+/// `match wake_rx.as_mut() { None => pending() }` branch parks forever
+/// (no wake signal ever arrives).
 fn spawn_wake_task(
     mut wake_rx: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
     quic_conns: Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>>,
@@ -465,16 +482,18 @@ fn spawn_wake_task(
                     );
                     for (a, peer) in q.iter() {
                         log::debug!("post-wake close (QUIC): {a}");
-                        // **补丁 — Mac wake 自动重连**：用
+                        // Mac wake auto-reconnect: use
                         // [`crate::quic_transport::WAKE_CLOSE_CODE`] (0xCAFE)
-                        // 替代默认的 0（NO_ERROR）—— 对端
-                        // [`should_retry_after_close`] 看到 wake code 触发重试，
-                        // 不再卡在 "graceful close → 等下次 send()" 路径
-                        // （wake 后没人在动鼠标，send 不会自然来）。
+                        // instead of the default 0 (NO_ERROR) so that the peer's
+                        // [`should_retry_after_close`] takes the retry branch.
+                        // Without a non-zero code, after wake the user is not
+                        // moving the mouse, so `send()` would never naturally
+                        // fire and the connection would stay in a "graceful
+                        // close" state until the next send.
                         //
-                        // 与 Bug #9/#10 路径（`close(0u32, "peer closed stream")`）
-                        // **不冲突**：Bug #9/#10 用 code 0 走用户/网络层 close 分支
-                        // （不重试）；本 wake 路径用 0xCAFE 走 wake 分支（重试）。
+                        // This is distinct from the user/network-level close
+                        // path (`close(0u32, "peer closed stream")`), which
+                        // uses code 0 and does not trigger a retry.
                         peer.connection().close(
                             crate::quic_transport::session::WAKE_CLOSE_CODE.into(),
                             b"wake",
@@ -493,24 +512,26 @@ fn spawn_wake_task(
     })
 }
 
-/// **STEP-8.2 修复**：把 `AuthorizedKeysVerifier` 的反向通知 channel
-/// (`tokio::sync::mpsc::UnboundedReceiver<String>`) 转译为
-/// `ListenEvent::Rejected` 的 forwarder task。
+/// Forwarder task that translates the `AuthorizedKeysVerifier` reverse
+/// notification channel (`tokio::sync::mpsc::UnboundedReceiver<String>`)
+/// into `ListenEvent::Rejected` events.
 ///
-/// **路径**：`AuthorizedKeysVerifier::verify_client_cert` Err →
-/// `tx.send(fp)`（在 verifier 内部，已在 quic_transport.rs 装配）→
-/// 本 task `rx.recv()` → `listen_tx.send(ListenEvent::Rejected { fingerprint })`
-/// → emulation.rs:190 → `EmulationEvent::ConnectionAttempt` →
-/// service.rs:320 → `FrontendEvent::ConnectionAttempt` → 前端 `request_authorization`
-/// 弹窗。
+/// **Path**: `AuthorizedKeysVerifier::verify_client_cert` returns Err →
+/// `tx.send(fp)` (inside the verifier, wired up in `quic_transport.rs`) →
+/// this task `rx.recv()` → `listen_tx.send(ListenEvent::Rejected { fingerprint })`
+/// → `EmulationTask::ListenTask` → `EmulationEvent::ConnectionAttempt` →
+/// service → `FrontendEvent::ConnectionAttempt` → frontend
+/// `request_authorization` dialog.
 ///
-/// **去重**：emulation.rs:191-194 已有 2 秒去重（同一 fp 在 2 秒内只弹一
-/// 次窗），避免对端 retry 时被 rustls 反复拒握导致弹窗刷屏 —— forwarder
-/// 这一层不需要再 dedup，**直接转译**。
+/// **Deduplication**: `emulation.rs` already de-duplicates at 2 seconds (the
+/// same fingerprint triggers at most one dialog per 2s) so retries from a
+/// rejected peer don't spam pop-ups. The forwarder does no additional
+/// deduping — it just translates.
 ///
-/// **退出路径**：`terminate()` 调 `rejection_forwarder_task.abort()` —
-/// 与 `wake_task` / `accept_task` 同模式；abort 后 verifier 持有的
-/// `rejection_tx` 后续 send 会返 Err（已在 verifier 内部被静默吞）。
+/// **Exit path**: `terminate()` calls `rejection_forwarder_task.abort()`,
+/// mirroring the `wake_task` / `accept_task` pattern. After abort, the
+/// `rejection_tx` retained by the verifier silently fails subsequent sends
+/// (matching the verifier's design).
 fn spawn_rejection_forwarder_task(
     mut rejection_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     listen_tx: Sender<ListenEvent>,
@@ -534,26 +555,24 @@ fn spawn_rejection_forwarder_task(
     })
 }
 
-/// 单连接的 supervisor handler。
+/// Per-connection supervisor handler.
 ///
-/// 流程：
-/// 1. `server_hello` 交换 PROTOCOL_MAGIC
-/// 2. 计算 client cert fingerprint
-/// 3. 发 `ListenEvent::Accept { addr, fingerprint }`
-/// 4. 注册到 `quic_conns`（让 `reply()` 查 peer）+ 装 `QuicConnGuard`
-/// 5. `take_stream_a_recv` 拿 stream A recv 半边
-/// 6. 循环 `read_frame(&mut recv_a)` 把每帧转译为 `ListenEvent::Msg`
-/// 7. stream A EOF / 致命错误 → `QuicConnGuard` Drop 自动反注册 +
-///    推 `ListenEvent::Disconnected`
+/// Flow:
+/// 1. Exchange `PROTOCOL_MAGIC` via `server_hello`.
+/// 2. Compute the client cert fingerprint.
+/// 3. Emit `ListenEvent::Accept { addr, fingerprint }`.
+/// 4. Register in `quic_conns` (so `reply()` can look up the peer) and install
+///    a `QuicConnGuard`.
+/// 5. Take the stream A recv half via `take_stream_a_recv`.
+/// 6. Loop on `read_frame(&mut recv_a)`, translating each frame into
+///    `ListenEvent::Msg`.
+/// 7. On stream A EOF / fatal error, the `QuicConnGuard` Drop automatically
+///    deregisters the peer and `ListenEvent::Disconnected` is pushed.
 ///
-/// **为什么不调 `route_input` 做反向分派**：listen.rs supervisor 不感知
-/// 发送端 cfg（receiver 端不感知 PLAN §3.1.4），把 stream → event 的物理
-/// 路径转译给 ListenTask 处理；ListenTask 的现有 `match event` 已覆盖
-/// 所有控制面 / input 事件。
-///
-/// **Stream B / C 装配留 STEP-7.x**：本步 client 端 `LanMouseConnection::send`
-/// 不主动开 B/C；server 端 supervisor 只听 stream A 就够覆盖 M1 现有控制面
-/// 事件流（Enter / Leave / Ack / Hello / Ping / Pong）。
+/// The supervisor deliberately does not call `route_input` for reverse
+/// dispatch: the listen side has no view of the sender's channel config,
+/// so stream-to-event translation is delegated to `ListenTask`, whose
+/// existing `match event` already covers every control-plane and input event.
 #[allow(clippy::doc_lazy_continuation)]
 async fn handle_quic_peer_supervisor(
     peer: Rc<PeerSession>,
@@ -565,11 +584,12 @@ async fn handle_quic_peer_supervisor(
     // (1) server_hello
     quic_transport::server_hello(&peer).await?;
 
-    // (2) 计算 client cert fingerprint（mTLS 已在 handshake 通过；本步只算 fp）
+    // (2) Compute the client cert fingerprint. mTLS already validated the
+    // certificate during the handshake; we only need the fingerprint value.
     //
     // quinn 0.11 `Connection::peer_identity() -> Option<Box<dyn Any>>`
-    // 把 rustls 端的 `Vec<CertificateDer<'static>>` 装进 trait object —— 需
-    // downcast 后取首张 cert 算 fingerprint。
+    // exposes the rustls `Vec<CertificateDer<'static>>` as a trait object —
+    // we downcast and take the first certificate to compute the fingerprint.
     let identity = peer.connection().peer_identity();
     let certs: Option<&Vec<rustls::pki_types::CertificateDer<'static>>> = identity
         .as_ref()
@@ -579,7 +599,7 @@ async fn handle_quic_peer_supervisor(
         .map(|cert| crypto::generate_fingerprint(cert.as_ref()))
         .ok_or_else(|| quic_transport::Error::HelloFailed("no client cert presented".into()))?;
 
-    // (3) 发 Accept 事件
+    // (3) Emit the Accept event
     log::info!("QUIC peer {addr} authorized (fingerprint {fingerprint})");
     listen_tx
         .send(ListenEvent::Accept {
@@ -588,11 +608,10 @@ async fn handle_quic_peer_supervisor(
         })
         .map_err(|_| quic_transport::Error::HelloFailed("listen_tx closed (terminated)".into()))?;
 
-    // (4) 注册到 QUIC peer 表（让 `reply()` 能查到）+ 装 QuicConnGuard
-    //     让任何退出路径（Ok / Err / panic / wake close）都自动反注册
-    //
-    // QuicConnGuard Drop 在函数末尾自动触发（任何 return 路径）——
-    // 与 bak `mousehop/src/listen.rs:382-386` 同模式。
+    // (4) Register in the QUIC peer table (so `reply()` can find the peer)
+    //     and install a `QuicConnGuard` so any exit path (Ok / Err / panic /
+    //     wake close) automatically deregisters. The guard drops at the end
+    //     of this function regardless of which return path is taken.
     quic_conns
         .borrow_mut()
         .insert(addr, peer.clone())
@@ -607,68 +626,62 @@ async fn handle_quic_peer_supervisor(
     };
     log::debug!("QUIC peer {addr} registered in quic_conns (guard active)");
 
-    // (5) take stream A recv 半边（控制帧 reader 用）
+    // (5) Take the stream A recv half (used by the control-frame reader).
     let mut recv_a = peer.take_stream_a_recv().await.ok_or_else(|| {
         quic_transport::Error::HelloFailed("stream A not cached after server_hello".into())
     })?;
 
-    // **STEP-8.2 修复 — Bug #8**：spawn datagram reader task。
+    // Spawn the datagram reader task. `route_input` routes Motion / Axis /
+    // AxisDiscrete120 events over the QUIC datagram channel (not stream A)
+    // to avoid stream retransmission latency for high-frequency pointer
+    // events. The server supervisor only reads the cached stream A and
+    // datagrams, so without a dedicated datagram reader the server would
+    // never observe motion events sent by the client.
     //
-    // **背景**：`route_input` 把 Motion/Axis/AxisDiscrete120 路由到 QUIC
-    // datagram 通道（不是 stream A）—— 高频指针事件为避免 stream 重传
-    // 延迟走 datagram。但 server `listen.rs::handle_quic_peer_supervisor`
-    // 修前**只读 cached recv_a**（来自 server_hello 的 stream A）——
-    // **完全不读 datagram**。`datagram_reader_task` 只在 client 端
-    // `peer.run()` 里 spawn（与 server supervisor 是两条独立路径）。
-    //
-    // **后果**：本机 (client) 把 motion 走 datagram 发出去 → 远程
-    // (server) 端 QUIC 收到但**没人读** → 远程 capture 看不到 motion
-    // → 鼠标不动。Bug #7 修后本机能正确切换到 Sending 状态开始发
-    // motion，但 server 端**永远收不到**。
-    //
-    // **修法**：spawn 独立的 datagram reader task，循环 read_datagram
-    // → ProtoEvent::try_from → 推 listen_tx（与 stream A 读循环对称）。
-    //
-    // **生命周期**：task 在 supervisor 退出时随 peer drop 自动结束（peer
-    // 是 Rc，task 持 Arc 引用，peer drop 时 task 持有的 Arc 引用计数
-    // 归零 → task 的 peer 参数析构 → read_datagram 返 Err → task 退）。
+    // Lifecycle: the task ends when the supervisor exits — when the peer
+    // `Rc` drops, the task's clone of it drops too, `read_datagram` returns
+    // `Err`, and the task exits.
     spawn_local(server_datagram_reader_task(
         peer.clone(),
         listen_tx.clone(),
         addr,
     ));
 
-    // **键盘不通修复**：spawn accept_bi 循环，接收 client 端 stream B 的帧。
+    // Spawn the `accept_bi` loop that consumes client-side stream B frames.
     //
-    // **背景**：默认 `InputChannelConfig { keyboard: Stream }` 把所有按键
-    // 事件路由到 `Channel::StreamB` → `PeerSession::send_stream_b`，走的是
-    // 一条**独立于 hello stream A 之外**的 bidi。但修前本 supervisor 只读
-    // 缓存的 recv_a + datagram —— 从不 `accept_bi()`，那条 stream B 永远
-    // 堆在 quinn 的 accept 队列里没人消费，按键静默丢光。这就是"鼠标能动
-    // （走 datagram，有 Bug #8 的 reader）但键盘完全不通"的直接原因。
+    // The default `InputChannelConfig { keyboard: Stream }` routes every
+    // key event to `Channel::StreamB` → `PeerSession::send_stream_b`, which
+    // uses a bidi independent of the hello stream A. Without an `accept_bi`
+    // loop on the server side, stream B frames pile up in quinn's accept
+    // queue and key events are silently dropped — this is why the mouse
+    // (datagram, with its reader) works while the keyboard does not.
     //
-    // **bunch bidi 兼容**：client 端 `peer.run(PeerRole::Client)` 在 hello
-    // 完成后会 `open_bi()` × 3 装配 StreamBunch（见 `session.rs:832-865`），
-    // 这 3 条 bidi server 端没有对应的 reader 消费（server 端不跑 peer.run）。
-    // 它们的特点是 **被 open 但从未 write** —— 任何 read 都立即 EOF。
+    // **bunch bidi compatibility**: the client's `peer.run(PeerRole::Client)`
+    // opens 3 extra bidi streams into a `StreamBunch` after the hello (see
+    // `session.rs`), none of which has a corresponding server reader. These
+    // streams are opened but never written to — any read on them EOFs
+    // immediately.
     //
-    // **关键陷阱**：QUIC bidi 是双向的 —— acceptor 的 send 对应 initiator
-    // 的 recv。如果 server 简单地 `drop(send)` bunch bidi，quinn 发 FIN，
-    // client 端 `bunch.b.recv` 立刻看到 EOF → 它的 `read_stream_b_loop`
-    // 退出 → peer.run 主循环 break → `conn.close()` → 连接死。v1/v2
-    // 都踩了这个坑。
+    // **Critical pitfall**: QUIC bidi is bidirectional — the acceptor's
+    // send corresponds to the initiator's recv. If the server simply
+    // `drop`s `send` on a bunch bidi, quinn sends FIN, the client's
+    // `bunch.b.recv` sees immediate EOF, `read_stream_b_loop` exits,
+    // `peer.run` breaks, and `conn.close()` tears the connection down.
     //
-    // **正确策略**：bunch bidi 的 send 和 recv **都不能 drop**，两者都
-    // park 进 supervisor 持有的 Vec。client 端 `bunch.b.recv` 永远停在
-    // "等数据"状态（不是 EOF），`read_stream_b_loop` 一直 block 直到 conn
-    // 关闭时 quinn 统一清理。真实 stream B 才走正常读路径（drop send
-    // 因为 client 端 `send_stream_b` 已经 drop 了它自己的 recv，server
-    // 的 send 对端没人读，drop 无副作用）。
+    // **Correct strategy**: both `send` and `recv` of a bunch bidi must be
+    // parked, never dropped. The client's `bunch.b.recv` parks in the
+    // "awaiting data" state (not EOF), so `read_stream_b_loop` blocks until
+    // the conn closes and quinn tears everything down. Real stream B uses
+    // the normal read path: dropping `send` is safe because the client's
+    // `send_stream_b` has already dropped its own recv, so the server's
+    // `send` has no reader on the other side and dropping it is a no-op.
     //
-    // **真实 stream B 怎么识别**：client `send_stream_b` 第一次被调时
-    // `open_bi()` + `write_u32(len)` + `write_all(body)` 同步完成才返回
-    // —— server accept 时数据已在 quinn buffer 里，read_u32 立即返回
-    // 合法长度。这就是"有数据 vs 无数据"的可靠区分信号。
+    // **How real stream B is identified**: `send_stream_b` performs
+    // `open_bi()` + `write_u32(len)` + `write_all(body)` synchronously and
+    // only returns once all of that completes. By the time the server
+    // accepts, the length prefix is already in the quinn buffer and
+    // `read_u32` returns immediately with a valid length. This is the
+    // reliable "data vs no data" discriminator.
     let parked_streams: Rc<RefCell<Vec<(quinn::SendStream, quinn::RecvStream)>>> =
         Rc::new(RefCell::new(Vec::new()));
     spawn_local(server_accept_bi_task(
@@ -678,19 +691,18 @@ async fn handle_quic_peer_supervisor(
         parked_streams.clone(),
     ));
 
-    // (6) 循环 read_frame(recv_a) → ListenEvent::Msg
+    // (6) Loop read_frame(recv_a) → ListenEvent::Msg
     //
-    // 错误分流（与 bak `read_stream_a_loop` 对齐）：
-    // - `FrameTooLarge` → fatal，返 Err
-    // - `HelloFailed("decode frame...")` → warn + skip frame 续读
-    // - `Truncated` / EOF → 退出循环 + 推 Disconnected
+    // Error dispatch:
+    // - `FrameTooLarge` → fatal, return Err
+    // - `HelloFailed("decode frame...")` → warn + skip frame, keep reading
+    // - `Truncated` / EOF → exit loop + push Disconnected
     loop {
         match quic_transport::read_frame(&mut recv_a).await {
             Ok(event) => {
-                // **生产日志级别（DEBUG）**：高频路径（每个 control 事件
-                // 都过这里）。INFO 仍会刷屏。Step 8.2 调试期间是 INFO，
-                // 上线前调回 DEBUG —— 配合 RUST_LOG=lan_mouse::listen=debug
-                // 仍能精确诊断"控制事件有没有从 client 到 server"。
+                // Hot path: every control event traverses this point. Use
+                // debug to avoid log spam; `RUST_LOG=lan_mouse::listen=debug`
+                // still gives precise diagnostics of the control event flow.
                 log::debug!("stream A recv from {addr}: {event}");
                 if listen_tx.send(ListenEvent::Msg { event, addr }).is_err() {
                     log::debug!(
@@ -718,27 +730,30 @@ async fn handle_quic_peer_supervisor(
         }
     }
 
-    // (7) stream A EOF / conn close → 推 Disconnected（QuicConnGuard Drop 自动反注册）
+    // (7) stream A EOF / conn close → push Disconnected (QuicConnGuard Drop
+    //     automatically deregisters the peer).
     log::info!("QUIC peer {addr} stream A closed — sending Disconnected");
     let _ = listen_tx.send(ListenEvent::Disconnected { addr });
     Ok(())
 }
 
-/// QUIC peer 表注册 RAII guard（STEP-6.3 引入，与 bak `QuicConnGuard` 对齐）。
+/// RAII guard for entries in the QUIC peer registry.
 ///
-/// 构造时绑定 `(table, addr)`，Drop 时从 `table` 移除 `addr`。
-/// 让 `handle_quic_peer_supervisor` 的所有退出路径（Ok / Err / panic）都能
-/// 自动反注册 —— 无需在每个 `?` 早返前手动 `remove()`。
+/// On construction, binds `(table, addr)`. On `Drop`, removes `addr` from
+/// `table`. This guarantees that every exit path of
+/// `handle_quic_peer_supervisor` (Ok / Err / panic) deregisters the peer
+/// without each `?` early-return needing a manual `remove()`.
 ///
-/// **设计动机**："peer 注册到 `quic_conns`"必须严格配对"反注册"，否则：
-/// - 同一 addr 重连时 `insert()` 会覆盖旧 entry（已有 `warn!` 兜底但旧
-///   peer Rc 仍 hold 旧 connection，可能延迟关闭）
-/// - wake 路径遍历到僵尸 entry → close 已被回收的 conn（quinn 内部状态，
-///   no-op 但日志噪音）
+/// **Why strict pairing matters**: without it,
+/// - on a reconnect from the same `addr`, `insert()` overwrites the old
+///   entry (already warned, but the old `Rc<PeerSession>` still holds the
+///   old connection and may delay its close);
+/// - the wake path may iterate over zombie entries and `close` already-
+///   recycled conns (a quinn-internal no-op, but noisy).
 ///
-/// **不动 conn 本身**：Drop 只删 HashMap entry，不调 `conn.close()`；
-/// 关闭 conn 由 read_loop 退出 / wake 路径（`peer.connection().close(...)`）
-/// 触发。
+/// The guard does not touch the conn itself — it only removes the HashMap
+/// entry. The conn is closed by the read loop exiting or by the wake path
+/// calling `peer.connection().close(...)`.
 struct QuicConnGuard {
     table: Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>>,
     addr: SocketAddr,
@@ -753,30 +768,36 @@ impl Drop for QuicConnGuard {
                 self.addr
             );
         }
-        // removed == None：peer 从未被注册（Accept event 之前早退），
-        // 或已被 wake 路径覆盖（不可能，单线程）；静默 no-op。
+        // `removed == None` means the peer was never registered (early exit
+        // before the Accept event) or was already overwritten by the wake
+        // path (impossible under single-threaded `spawn_local`); silent
+        // no-op in either case.
     }
 }
 
-/// **键盘不通修复**：server 侧 `accept_bi()` 循环 —— 接收 client 端在
-/// stream A / datagram 之外新开的 bidi（当前唯一来源是 stream B 的按键
-/// 事件流）。
+/// Server-side `accept_bi()` loop. Receives client-side bidis opened after
+/// the stream A / datagram handshake (currently the sole source is stream B
+/// key events).
 ///
-/// **bunch bidi 识别 + park**：client 端 `peer.run(PeerRole::Client)` 在
-/// hello 后会 `open_bi()` × 3 装配 StreamBunch（`session.rs:832-865`），
-/// 这 3 条 bidi server 端没有对应 reader。区分方式：尝试读第一帧
-/// `read_u32(len)` —— bunch bidi 从未被 write，立即 EOF；真实 stream B
-/// 已被 `send_stream_b` 同步写入首帧，read_u32 立即返回合法长度。
+/// **Bunch bidi detection + park**: the client's
+/// `peer.run(PeerRole::Client)` opens 3 extra bidis into a `StreamBunch`
+/// after the hello (`session.rs`). The server has no dedicated reader for
+/// these. Discriminator: try to read the first frame's `read_u32(len)` —
+/// bunch bidis have never been written to and EOF immediately; real stream
+/// B has been written to synchronously by `send_stream_b` and `read_u32`
+/// returns a valid length right away.
 ///
-/// **bunch 路径必须 park send+recv 两边**：QUIC bidi 是双向的 —— acceptor
-/// 的 send 对应 initiator 的 recv。如果只 park recv、drop send，quinn
-/// 发 FIN，client 端 `bunch.b.recv` 立即 EOF → `read_stream_b_loop` 退出
-/// → peer.run break → conn.close。两边都 park 才能让 client 端 recv
-/// 一直停在"等数据"状态，直到 conn 关闭统一清理。
+/// **Bunch path must park both send + recv**: QUIC bidi is bidirectional —
+/// the acceptor's send corresponds to the initiator's recv. If only `recv`
+/// is parked and `send` is dropped, quinn sends FIN, the client's
+/// `bunch.b.recv` sees immediate EOF, `read_stream_b_loop` exits, `peer.run`
+/// breaks, and `conn.close()` tears the connection down. Parking both keeps
+/// the client's recv parked in the "awaiting data" state until the conn
+/// closes and quinn cleans everything up uniformly.
 ///
-/// **真实 stream B 路径**：drop send（client 端 `send_stream_b` 已经
-/// drop 了它自己的 recv，server send 的对端没人读，drop 无副作用），
-/// 读 recv。
+/// **Real stream B path**: drop `send` (the client's `send_stream_b` has
+/// already dropped its own recv, so the server's send has no reader and
+/// dropping it is safe) and read `recv`.
 async fn server_accept_bi_task(
     peer: Rc<PeerSession>,
     listen_tx: Sender<ListenEvent>,
@@ -787,46 +808,49 @@ async fn server_accept_bi_task(
         let (send, mut recv) = match peer.connection().accept_bi().await {
             Ok(pair) => pair,
             Err(e) => {
-                log::info!("server accept_bi: 退出（conn 关闭）: {e}");
+                log::info!("server accept_bi: exiting (conn closed): {e}");
                 return;
             }
         };
 
-        // 试读首帧长度 —— 区分 bunch bidi（EOF）与真实 stream B（合法 u32）
+        // Try to read the first frame's length — discriminator between
+        // bunch bidi (EOF) and real stream B (valid u32).
         use tokio::io::AsyncReadExt;
         let len: u32 = match recv.read_u32().await {
             Ok(n) => n,
             Err(e) => {
-                // EOF = bunch bidi（client 从未 write）。**关键**：send
-                // 和 recv **都不能 drop**，否则向 client 发 FIN/STOP_SENDING
-                // → client 端 stream_bunch.b.recv 立即 EOF → peer.run
-                // break → conn.close。两边都 park，让 client 端 recv 永远
-                // 停在"等数据"状态。
+                // EOF = bunch bidi (client never wrote). Both `send` and
+                // `recv` must NOT be dropped here, otherwise we send FIN /
+                // STOP_SENDING to the client, which makes the client's
+                // `stream_bunch.b.recv` see immediate EOF → `peer.run` breaks
+                // → `conn.close()`. Parking both keeps the client's recv
+                // parked in the "awaiting data" state.
                 log::debug!(
-                    "server accept_bi: 接到的 stream 立即 EOF（bunch bidi），park send+recv: {e}"
+                    "server accept_bi: accepted stream EOF'd immediately (bunch bidi), parking send+recv: {e}"
                 );
                 parked_streams.borrow_mut().push((send, recv));
                 continue;
             }
         };
 
-        // 真实 stream B —— drop send（对端 client 已 drop 自己的 recv，
-        // server send 无对端读者，drop 无副作用），读 body、解码、首帧
-        // 推 listen_tx
+        // Real stream B — drop `send` (the client has dropped its own recv,
+        // so the server's `send` has no peer-side reader; dropping is a
+        // no-op), read the body, decode, and push the first frame to
+        // `listen_tx`.
         drop(send);
         let mut body = vec![0u8; len as usize];
         if let Err(e) = recv.read_exact(&mut body).await {
-            // 长度读到了但 body 读失败 —— 也按 bunch 行为 park（不破坏 client）
-            log::debug!("server accept_bi: 首帧 body 读失败，按 bunch park: {e}");
-            // send 已被 drop，这里只 push recv 也要避免 client 端 EOF →
-            // 已经 drop 了 send 就无法挽回，这种情况是协议 bug，让 peer.run
-            // 走原错误路径
+            // Length read succeeded but body read failed — also park as if
+            // it were a bunch bidi (do not break the client). `send` is
+            // already dropped, so this is unrecoverable; let `peer.run`
+            // surface the original error path.
+            log::debug!("server accept_bi: first-frame body read failed, parking as bunch: {e}");
             return;
         }
         let mut buf = [0u8; lan_mouse_proto::MAX_EVENT_SIZE];
         if len as usize > buf.len() {
             log::warn!(
-                "server accept_bi: 首帧长度 {len} 超过 MAX_EVENT_SIZE={}",
+                "server accept_bi: first-frame length {len} exceeds MAX_EVENT_SIZE={}",
                 lan_mouse_proto::MAX_EVENT_SIZE
             );
             return;
@@ -835,25 +859,26 @@ async fn server_accept_bi_task(
         let event = match lan_mouse_proto::ProtoEvent::try_from(buf) {
             Ok(e) => e,
             Err(e) => {
-                log::warn!("server accept_bi: 首帧解码失败: {e}");
+                log::warn!("server accept_bi: first-frame decode failed: {e}");
                 return;
             }
         };
-        log::debug!("server accept_bi: 真实 stream B 首帧 from {addr}: {event}");
+        log::debug!("server accept_bi: real stream B first frame from {addr}: {event}");
         if listen_tx.send(ListenEvent::Msg { event, addr }).is_err() {
             log::debug!("server accept_bi: listen_tx closed, exiting");
             return;
         }
-        // 后续帧交给 reader task
+        // Subsequent frames are handled by a dedicated reader task.
         spawn_local(server_stream_reader_task(recv, listen_tx.clone(), addr));
     }
 }
 
-/// 真实 stream B 后续帧 reader task —— 由 [`server_accept_bi_task`] 在
-/// 确认首帧合法后 spawn。
+/// Reader task for subsequent frames on a real stream B. Spawned by
+/// [`server_accept_bi_task`] after the first frame is confirmed valid.
 ///
-/// 错误分流与 supervisor 的 stream A 循环一致：decode 错误 → skip frame
-/// 续读；EOF / IO 错误 → 流结束，退出 task（不影响其他流）。
+/// Error dispatch mirrors the supervisor's stream A loop: a decode error
+/// skips the frame and keeps reading; EOF / IO error ends the stream and
+/// exits the task (without affecting other streams).
 async fn server_stream_reader_task(
     mut recv: quinn::RecvStream,
     listen_tx: Sender<ListenEvent>,
@@ -873,31 +898,31 @@ async fn server_stream_reader_task(
                 continue;
             }
             Err(e) => {
-                log::info!("server stream reader: 流结束（{addr}）: {e}");
+                log::info!("server stream reader: stream ended ({addr}): {e}");
                 return;
             }
         }
     }
 }
 
-/// **STEP-8.2 修复 — Bug #8**：server 侧 datagram reader task。
+/// Server-side datagram reader task.
 ///
-/// 与 `quic_transport::datagram_reader_task` 同源但走 server listen
-/// 路径 —— 不走 `StreamEvent::Datagram`（peer.run() 内部抽象），直接
-/// 包装成 `ListenEvent::Msg { event, addr }` 推 `listen_tx`，让
-/// emulation.rs ListenTask 收到（与 stream A 路径对称）。
+/// This shares intent with `quic_transport::datagram_reader_task` but takes
+/// the server listen path: it does not use `StreamEvent::Datagram` (an
+/// abstraction internal to `peer.run()`); instead it wraps each datagram
+/// directly into `ListenEvent::Msg { event, addr }` and pushes it on
+/// `listen_tx`, mirroring the stream A path so `emulation.rs::ListenTask`
+/// receives it.
 ///
-/// **为什么 server 端要单独写一个**：client 端 `peer.run()` 内部 spawn
-/// 的 datagram_reader_task 用 `StreamEvent::Datagram`（peer.run 主循环
-/// 消费的 enum 变体）—— 但 server `listen.rs::handle_quic_peer_
-/// supervisor` 不调 peer.run，有自己的 read_frame 循环。直接复用
-/// client 版会让 server 路径多一层 StreamEvent → ListenEvent 转换
-/// 反而绕弯。inlined 这个 server 特化版更直接。
+/// The server side has its own specialization rather than reusing the
+/// client-side version because the supervisor has its own `read_frame` loop
+/// and never invokes `peer.run`. Going through `peer.run`'s abstraction
+/// would only add an extra `StreamEvent` → `ListenEvent` translation layer.
 ///
-/// **生命周期**：task 持 `peer: Rc<PeerSession>` + `listen_tx:
-/// Sender<ListenEvent>` —— supervisor 退出时 `listen_tx` 被 close，
-/// 下一次 `send` 失败 → task 退出。peer Rc 在 supervisor 退出时也
-/// drop，task 持有的 Arc 引用计数归零。
+/// **Lifecycle**: the task holds `peer: Rc<PeerSession>` and
+/// `listen_tx: Sender<ListenEvent>`. When the supervisor exits,
+/// `listen_tx` is closed, the next `send` fails, and the task exits. The
+/// `peer` `Rc` is also dropped, so the task's clone of it drops too.
 async fn server_datagram_reader_task(
     peer: Rc<PeerSession>,
     listen_tx: Sender<ListenEvent>,
@@ -906,12 +931,13 @@ async fn server_datagram_reader_task(
     loop {
         match peer.connection().read_datagram().await {
             Ok(bytes) => {
-                // 定长 ProtoEvent codec：bytes.len() 必须 == MAX_EVENT_SIZE
+                // Fixed-size `ProtoEvent` codec: `bytes.len()` must equal
+                // `MAX_EVENT_SIZE`.
                 let buf: [u8; lan_mouse_proto::MAX_EVENT_SIZE] = match bytes.as_ref().try_into() {
                     Ok(b) => b,
                     Err(_) => {
                         log::warn!(
-                            "server datagram_reader: datagram 长度非 MAX_EVENT_SIZE({})，skip frame",
+                            "server datagram_reader: datagram length is not MAX_EVENT_SIZE({}), skipping frame",
                             lan_mouse_proto::MAX_EVENT_SIZE
                         );
                         continue;
@@ -920,7 +946,9 @@ async fn server_datagram_reader_task(
                 let event = match lan_mouse_proto::ProtoEvent::try_from(buf) {
                     Ok(e) => e,
                     Err(e) => {
-                        log::warn!("server datagram_reader: ProtoEvent 解码失败，skip frame: {e}");
+                        log::warn!(
+                            "server datagram_reader: ProtoEvent decode failed, skipping frame: {e}"
+                        );
                         continue;
                     }
                 };

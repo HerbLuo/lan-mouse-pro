@@ -35,9 +35,11 @@ enum LanMouseError {
 }
 
 fn main() {
-    // STEP-2.1: 早于任何 rustls ClientConfig::builder / ServerConfig::builder
-    // 装配，必须在 main() 顶层第一句（早于 logging / config / service）；
-    // 见 next/STEP-2.1.md。OnceLock 守护，多进程 / 多次 install 均安全。
+    // Install the rustls crypto provider before any
+    // `rustls::ClientConfig::builder` / `ServerConfig::builder` runs. Must be
+    // the first statement of `main()` (before logging, config, or service
+    // startup). `OnceLock` makes the call safe under repeated invocation and
+    // multi-process scenarios.
     lan_mouse::install_crypto_provider();
 
     // init logging

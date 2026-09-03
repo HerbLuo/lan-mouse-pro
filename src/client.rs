@@ -33,14 +33,9 @@ impl ClientManager {
             port: config_client.port,
             pos: config_client.pos,
             cmd: config_client.enter_hook,
-            // STEP-4.5a: forward the per-handle input-channel
-            // selection. Without this line the `ConfigClient` →
-            // `ClientConfig` conversion silently drops the field, so
-            // whatever the user wrote in `config.toml`
-            // (`input_channels = { ... }`) never reaches the frontend
-            // editor / runtime. Half-link bug introduced by STEP-4.2
-            // (which only stored the field on disk). Mirrored from
-            // bak `mousehop/src/client.rs:1-50 add_with_config`.
+            // Forward the per-handle input-channel selection from
+            // `ConfigClient` to `ClientConfig` so the value reaches
+            // the frontend editor and runtime.
             input_channels: config_client.input_channels,
         };
         let state = ClientState {
@@ -327,16 +322,16 @@ impl ClientManager {
             .map(|(_, s)| s.ips.clone())
     }
 
-    /// STEP-6.1: per-handle 输入通道配置（mouse_button / keyboard 各选
-    /// datagram 或 stream）。`None` 仅出现在 handle 越界（无效）；正常
-    /// handle 总是 `Some(InputChannelConfig)`（STEP-4.5a 已落实
-    /// `ConfigClient.input_channels` 透传到 `ClientConfig`）。
+    /// Per-handle input-channel configuration (datagram vs. stream for
+    /// mouse-button and keyboard). `None` is only returned for an
+    /// out-of-range (invalid) handle; a valid handle always returns
+    /// `Some(InputChannelConfig)`.
     ///
-    /// **`LanMouseConnection::send` 消费** —— 拿到本返回值后传给
-    /// [`crate::quic_transport::PeerSession::send_input`] 作为
-    /// `route_input` 分派的 key。`None` 在 caller 处走
-    /// `unwrap_or_default()` 兜底（与 STEP-4.1 `InputChannelConfig::default()`
-    /// 一致）。
+    /// Consumed by `LanMouseConnection::send`: the result is passed to
+    /// [`crate::quic_transport::PeerSession::send_input`] as the key
+    /// for `route_input` dispatch. Callers fall back to
+    /// `unwrap_or_default()` on `None`, matching
+    /// `InputChannelConfig::default()`.
     pub(crate) fn input_channels(&self, handle: ClientHandle) -> Option<InputChannelConfig> {
         self.clients
             .borrow()
@@ -350,12 +345,9 @@ mod client_input_channels_tests {
     use super::*;
     use lan_mouse_ipc::{ChannelMode, DEFAULT_PORT};
 
-    /// STEP-4.5a: regression test for the half-link bug STEP-4.2 left
-    /// behind. `ConfigClient` was carrying `input_channels` on disk
-    /// (STEP-4.2), but `add_with_config` was discarding the field on
-    /// the way into `ClientConfig`. This test asserts the field now
-    /// survives the conversion. Will fail (compile or assert) if
-    /// `add_with_config` reverts to dropping `input_channels`.
+    /// Asserts that `add_with_config` preserves `input_channels` across
+    /// the `ConfigClient` -> `ClientConfig` conversion. Fails (compile
+    /// or assert) if the field is dropped again.
     #[test]
     fn add_with_config_preserves_input_channels() {
         let cm = ClientManager::default();
@@ -377,11 +369,10 @@ mod client_input_channels_tests {
         assert_eq!(c.input_channels.keyboard, ChannelMode::Datagram);
     }
 
-    /// STEP-4.5a: setter on `ClientManager`. Returns `true` only when
-    /// the value actually changed — used by the service.rs handler to
-    /// skip the `broadcast_client` + `save_config` round-trip on no-op
-    /// writes (matches the bak mousehop `set_input_channels` contract
-    /// and the project-wide `set_*` family pattern).
+    /// `set_input_channels` returns `true` only when the value actually
+    /// changed. The service.rs handler uses this to skip the
+    /// `broadcast_client` + `save_config` round-trip on no-op writes,
+    /// matching the project-wide `set_*` family pattern.
     #[test]
     fn set_input_channels_returns_true_only_on_change() {
         let cm = ClientManager::default();

@@ -1,22 +1,24 @@
-//! `PeerSession` —— 与对端的一条 QUIC 会话（client / server 共用）。
+//! `PeerSession` — a single QUIC session with a peer (shared by client and server).
 //!
-//! 本模块承担 QUIC 链路中间层的所有 per-peer 状态：
+//! This module owns all per-peer state in the QUIC mid-layer:
 //!
-//! - [`PeerSession`] struct —— 持有 `quinn::Connection` + hello 标志 +
-//!   stream A cache + 3 stream 集合缓存 + outgoing events sender
-//! - `impl PeerSession` block 1 —— 状态 / IO 助手（`from_connection` /
+//! - [`PeerSession`] struct — holds `quinn::Connection` + hello flag +
+//!   stream A cache + 3-stream bunch cache + outgoing events sender
+//! - `impl PeerSession` block 1 — state / IO helpers (`from_connection` /
 //!   `take_stream_a_*` / `set_stream_bunch` / `send_input` / `send_motion` /
-//!   `send_stream_a` / `send_stream_b` / `send_outgoing_event` 等）
-//! - `impl PeerSession` block 2 —— `PeerSession::run()` 主循环
-//! - [`PeerRole`] Client / Server 角色枚举
-//! - [`should_retry_after_close`] 关闭原因判定
+//!   `send_stream_a` / `send_stream_b` / `send_outgoing_event`, etc.)
+//! - `impl PeerSession` block 2 — `PeerSession::run()` main loop
+//! - [`PeerRole`] Client / Server role enum
+//! - [`should_retry_after_close`] close-reason classifier
 //!
-//! 与 [`super::protocol`] 的关系：`run()` 调 [`super::protocol::client_hello`]
-//! [`super::protocol::server_hello`] / [`super::protocol::read_frame`]；
-//! [`super::protocol::hello_watchdog`] 反过来被 `run()` spawn。
+//! Relationship with [`super::protocol`]: `run()` calls
+//! [`super::protocol::client_hello`], [`super::protocol::server_hello`], and
+//! [`super::protocol::read_frame`]; [`super::protocol::hello_watchdog`] is
+//! spawned by `run()`.
 //!
-//! 与 [`super::streams`] 的关系：`run()` spawn [`super::streams::datagram_reader_task`]
-//! 与 [`super::streams::read_loop`]；后者 take 走 `stream_bunch`。
+//! Relationship with [`super::streams`]: `run()` spawns
+//! [`super::streams::datagram_reader_task`] and [`super::streams::read_loop`];
+//! the latter takes the `stream_bunch`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,186 +43,195 @@ use super::streams::{Bidi, StreamBunch, StreamEvent, datagram_reader_task, read_
 
 use lan_mouse_proto::MAX_EVENT_SIZE;
 
-/// 与对端的一条 QUIC 会话（client / server 共用）—— STEP-5.4 起承担端到端 IO。
+/// A single QUIC session with a peer (shared by client and server).
 ///
-/// STEP-1.4 占位为单字段 `_private`；STEP-3.2 起扩展为：
-/// - `conn` —— `quinn::Connection`，所有 stream / datagram IO 入口
-/// - `hello_ok: AtomicBool` —— Hello 握手成功标志（`Ordering::Release` 置
-///   / `Acquire` 读）
-/// - `stream_a_cache: Mutex<Option<StreamPair>>` —— `server_hello()` /
-///   `client_hello()` 缓存 Hello 用的那条 stream A 给 STEP-5.x read_loop
-///   接手
-///
-/// STEP-5.2 起增字段：
-/// - `stream_bunch: Arc<Mutex<Option<StreamBunch>>>` —— STEP-5.3 read_loop
-///   装配三 stream 时填充（暂留 `None`）；与 `stream_a_cache` 对称
-///   守护所有权交接的 "整对 take" 语义
-///
-/// `StreamPair` 与 `stream_b` / `stream_c` 缓存字段留 STEP-5.1 / 5.2 落地，
-/// 本步不引入。
+/// Fields:
+/// - `conn` — `quinn::Connection`, entry point for all stream / datagram IO
+/// - `hello_ok: AtomicBool` — application-layer Hello handshake completion flag
+///   (set with `Ordering::Release`, loaded with `Ordering::Acquire`)
+/// - `stream_a_cache: Mutex<Option<StreamPair>>` — `server_hello()` /
+///   `client_hello()` caches the stream A used for Hello; later handed off
+///   to the read loop
+/// - `cached_send_a` / `cached_send_b` — long-lived send halves reused across
+///   the peer's lifetime
+/// - `outgoing_events` — optional sender that forwards stream A control events
+///   out to the local capture task
+/// - `stream_bunch: Arc<Mutex<Option<StreamBunch>>>` — populated by the
+///   read loop when the three bidi streams are assembled; symmetric with
+///   `stream_a_cache` to guard the "whole-pair take" ownership transfer.
 pub struct PeerSession {
     pub(crate) conn: QuinnConnection,
-    /// 应用层 Hello 成功标志。初始 `false`，`client_hello()` /
-    /// `server_hello()` 任一端成功置 `true`（`Ordering::Release`）。
-    /// 业务路径必须先 `load(Ordering::Acquire)` 确认 `true` 再发事件。
+    /// Application-layer Hello success flag. Initial `false`; set to `true`
+    /// (`Ordering::Release`) by whichever side completes Hello first via
+    /// `client_hello()` / `server_hello()`. Business code paths must
+    /// `load(Ordering::Acquire)` this and confirm it is `true` before sending
+    /// events.
     pub(crate) hello_ok: AtomicBool,
-    /// Stream A（control 流）缓存：`server_hello()` / `client_hello()` 写入；
-    /// STEP-5.4 `read_loop` 通过 `take_stream_a_recv()` 拿 `RecvStream` 半
-    /// 边给控制帧读循环，`SendStream` 半边留给后续 `send_stream_a()` 复用。
+    /// Stream A (control stream) cache. `server_hello()` / `client_hello()`
+    /// writes into it; the read loop calls `take_stream_a_recv()` to obtain
+    /// the `RecvStream` half for the control-frame read loop, while the
+    /// `SendStream` half is left for `send_stream_a()` to reuse.
     ///
-    /// **为什么用 `Mutex<Option<StreamPair>>` 而不是 `OnceCell`**：STEP-5.x
-    /// 接手控制帧循环时需要 take recv 半边但保留 send 半边 —— `Option::take`
-    /// 配合 `StreamPair::recv.take()` 的两步语义最干净。`OnceCell` 无法表达
-    /// "已设置过但 recv 已被 take" 的状态。
+    /// **Why `Mutex<Option<StreamPair>>` rather than `OnceCell`**: the
+    /// control-frame loop needs to take the recv half while retaining the
+    /// send half. `Option::take` combined with `StreamPair::recv.take()`
+    /// expresses the two-step semantics cleanly; `OnceCell` cannot express
+    /// "set once, but recv already taken".
     pub(crate) stream_a_cache: Mutex<Option<StreamPair>>,
-    /// **STEP-8.2 修复**：hello 完成后从 `stream_a_cache.send` 搬过来
-    /// 的 send 半边，给 [`Self::send_stream_a`] 复用 —— **不再每次
-    /// `open_bi` 开新 bidi**。
+    /// Cached send half of stream A. After Hello completes, the send half is
+    /// moved here from `stream_a_cache.send` and reused by
+    /// [`Self::send_stream_a`] — no longer opening a new bidi on every call.
     ///
-    /// **为什么独立字段而不是复用 stream_a_cache**：与 recv 半边的
-    /// take_stream_a_recv 不同，`send_stream_a` 是一次调用写一帧但
-    /// **整个 peer 生命周期内被多次调用**（Enter / Ack / Ping / Pong /
-    /// 每次进 capture 重发 Enter ...），需要持有同一 `SendStream` 重复
-    /// write。`Mutex<Option<_>>` + 持锁写 + 写完不释放（同一个 Mutex
-    /// guard 内 await）是 QUIC 流的常规模式（本 peer 独占，无锁竞争）。
+    /// **Why a separate field rather than reusing `stream_a_cache`**: unlike
+    /// `take_stream_a_recv` (one-shot recv take), `send_stream_a` is invoked
+    /// many times across the peer's lifetime (Enter / Ack / Ping / Pong /
+    /// repeated Enter on every capture re-entry...) and must reuse the same
+    /// `SendStream`. Holding the lock across `write` (await inside the same
+    /// `Mutex` guard) is the standard pattern for QUIC streams — there is no
+    /// lock contention because this peer owns the stream exclusively.
     ///
-    /// **调用顺序**：`client_hello` / `server_hello` 完成 → 从
-    /// `stream_a_cache.send` 拿 send → 存本字段。listen.rs supervisor /
-    /// peer.run 调 `take_stream_a_recv` 拿 recv（来自 `stream_a_cache`
-    /// 的同一 `StreamPair`）—— client 写 send_a ↔ server 读 recv_a 是
-    /// **同一条 bidi**。
+    /// **Call order**: `client_hello` / `server_hello` completes → take
+    /// `send` from `stream_a_cache.send` → store it here. The listen.rs
+    /// supervisor / `peer.run` calls `take_stream_a_recv` to obtain the
+    /// `recv` half (from the same `StreamPair` in `stream_a_cache`) — the
+    /// client's `send_a` write and the server's `recv_a` read operate on
+    /// **the same bidi**.
     pub(crate) cached_send_a: Mutex<Option<SendStream>>,
-    /// **键盘不通修复**：stream B（input 流）的 send 半边缓存 —— 与
-    /// [`Self::cached_send_a`] 同模式。
+    /// Cached send half of stream B (input stream). Same pattern as
+    /// [`Self::cached_send_a`].
     ///
-    /// **背景**：修前 [`Self::send_stream_b`] **每帧 `open_bi()` 开一条新
-    /// bidi**，而 server 端 `listen.rs::handle_quic_peer_supervisor` 只读
-    /// hello 缓存的 stream A recv + datagram，**没有 `accept_bi()` 循环**
-    /// —— 每条新开的 stream B 都堆在 quinn 的 accept 队列里没人消费。
-    /// 默认 `InputChannelConfig { keyboard: Stream }` 让所有按键走这条
-    /// 路，于是"鼠标通、键盘不通"：Motion/Button/Axis 走 datagram 有
-    /// reader，按键走 stream B 全丢。发送端 `send_stream_b` 还返 `Ok(())`
-    /// （quinn 缓冲小写入），日志里看不出错。
+    /// **Background**: previously, [`Self::send_stream_b`] opened a new bidi
+    /// via `open_bi()` for every frame, while the server-side
+    /// `listen.rs::handle_quic_peer_supervisor` only reads the cached
+    /// Hello stream A recv plus datagrams — there is no `accept_bi()` loop.
+    /// Each newly opened stream B therefore piles up in quinn's accept queue
+    /// unconsumed. The default `InputChannelConfig { keyboard: Stream }`
+    /// routes all key events through this path, producing "mouse works,
+    /// keyboard does not": Motion/Button/Axis travel over datagrams with a
+    /// reader, while keystrokes on stream B are dropped. The sender
+    /// `send_stream_b` still returns `Ok(())` (quinn buffers small writes),
+    /// so the log shows no error.
     ///
-    /// **修法（发送端半边）**：首次调用 `open_bi()` 拿一条 bidi，send 半
-    /// 边存本字段长期复用，后续每次只 `write_frame` 不 `finish` ——
-    /// 整个 peer 生命周期只有**一条** stream B。接收端只需一次
-    /// `accept_bi()` 就能拿到它并持续读（见 `listen.rs::
-    /// server_stream_reader_task`）。
+    /// **Fix (sender side)**: on the first call, `open_bi()` once and cache
+    /// the send half here for long-term reuse. Subsequent calls only
+    /// `write_frame` without `finish` — only one stream B exists for the
+    /// peer's entire lifetime. The receiver needs a single `accept_bi()` to
+    /// obtain it and keep reading (see
+    /// `listen.rs::server_stream_reader_task`).
     ///
-    /// **写失败即失效**：任何 write 错误都把本字段置回 `None`，下次调用
-    /// 重开一条（对端仍会通过 accept_bi 循环接到新流）。
+    /// **Write failure invalidates**: any write error resets this field back
+    /// to `None` so the next call reopens a stream (the peer still receives
+    /// the new stream through its `accept_bi` loop).
     pub(crate) cached_send_b: Mutex<Option<SendStream>>,
-    /// **STEP-8.2 修复 — Bug #7**：可选的 stream A 事件出向 channel。
+    /// Optional outgoing channel for stream A events.
     ///
-    /// **背景**：peer.run 主循环从 stream A 读 control 事件（Ack /
-    /// Pong / Leave），但修前只 log debug —— `recv_tx` 死字段（见
-    /// Bug #4），capture.rs 永远收不到 server 的响应 → 本地卡
-    /// WaitingForAck、反复 send Enter。
+    /// When the `run` main loop reads a control event from stream A
+    /// (Ack / Pong / Leave), if this field has a sender set, it sends
+    /// `(remote_addr, event)` out; the client-side `connect_to_handle` sets
+    /// this before spawning `peer.run`, and spawns a forwarder task that maps
+    /// `(addr, event)` through `client_manager.get_client(addr)` to
+    /// `(handle, event)` and pushes it onto `recv_tx`.
     ///
-    /// **修法**：peer.run 读到 stream A 事件时，若本字段设了 sender，
-    /// send `(remote_addr, event)` 出去；client 端 `connect_to_handle`
-    /// 在 spawn peer.run 之前设上 + spawn 一个 forwarder task 把
-    /// `(addr, event)` 通过 `client_manager.get_client(addr)` 映射
-    /// 到 `(handle, event)` 再推到 `recv_tx`。
-    ///
-    /// **为何 server 端不用设**：server 端 `listen.rs::handle_quic_
-    /// peer_supervisor` 不调 peer.run，自己 accept_bi + read_frame
-    /// + 推 listen_tx，forwarding 路径已存在。
+    /// **Why the server side does not set this**: the server-side
+    /// `listen.rs::handle_quic_peer_supervisor` does not call `peer.run`;
+    /// it does its own `accept_bi` + `read_frame` + `listen_tx` push, so the
+    /// forwarding path already exists.
     pub(crate) outgoing_events: Arc<Mutex<Option<OutgoingEventSender>>>,
-    /// 3 条 bidi stream 集合缓存（STEP-5.2 引入）。
+    /// Cache for the three bidi streams. Populated by the read loop when it
+    /// assembles them: server-side `accept_bi()` three times + client-side
+    /// `open_bi()` three times (`client_hello` / `server_hello` already used
+    /// stream A). Once populated, the whole `Some(StreamBunch)` is handed
+    /// off to the read loop (recv halves go to the reader tasks, send halves
+    /// are reused by `send_stream_a/b/c`).
     ///
-    /// STEP-5.3 / 5.4 `read_loop` 装配时填充 —— 装配路径：server 端
-    /// `accept_bi()` 三条 + client 端 `open_bi()` 三条（client_hello /
-    /// server_hello 已用 stream A），完成后整个 `Some(StreamBunch)` 移交
-    /// `read_loop` 接管（recv 半边给 reader task，send 半边由
-    /// `send_stream_a/b/c` 复用）。
-    ///
-    /// **为什么用 `Arc<Mutex<Option<_>>>` 而不是裸 `Mutex<Option<_>>`**：
-    /// `PeerSession` 当前是直接持有 `Connection`（不是 `Arc<Connection>`），
-    /// 但 `read_loop` 需要 spawn 进独立 task 后 `&self` 借用 session 之外
-    /// 还能再次拿 stream_bunch —— `Arc` 让两个 `PeerSession` 引用共享
-    /// 同一份 `Mutex<Option<StreamBunch>>`，避免所有权切割问题。
-    /// 与 `stream_a_cache` 的"裸 `Mutex<Option<_>>`"不同是因为
-    /// `stream_a_cache` 所有权不跨 task 转移（`client_hello` /
-    /// `server_hello` 单 task 内填 + `take_stream_a_recv` 单 task 内拿），
-    /// `stream_bunch` 跨 task 移交。
-    ///
-    /// dead_code chain：STEP-5.2 引入字段占位（默认 `None`），STEP-5.3
-    /// 接入 `read_loop` 时消费。
+    /// **Why `Arc<Mutex<Option<_>>>` rather than plain `Mutex<Option<_>>`**:
+    /// `PeerSession` currently owns `Connection` directly (not
+    /// `Arc<Connection>`), but `read_loop` needs to spawn into a separate
+    /// task and still reach `stream_bunch` after taking `&self` — `Arc` lets
+    /// two `PeerSession` references share the same
+    /// `Mutex<Option<StreamBunch>>` without ownership-splitting problems.
+    /// `stream_a_cache` differs because its ownership never crosses tasks
+    /// (`client_hello` / `server_hello` fill it in a single task, and
+    /// `take_stream_a_recv` reads it in a single task), whereas `stream_bunch`
+    /// crosses task boundaries.
     pub(crate) stream_bunch: Arc<Mutex<Option<StreamBunch>>>,
 }
 
-/// `PeerSession::run()` 角色标识（STEP-5.4 引入）。
+/// Role identifier for `PeerSession::run()`.
 ///
-/// **为什么需要 role 参数**：Hello 握手不对称 —— client 端走
-/// [`super::protocol::client_hello`]（`open_bi()` + 发 Hello），server 端走
-/// [`super::protocol::server_hello`]（`accept_bi()` + 回 echo）。三 stream 装配
-/// 也不对称 —— client 端 `open_bi()` 三次拿三条 bidi；server 端
-/// `accept_bi()` 三次等三条 bidi。`run()` 用 [`PeerRole`] 决定哪条路径。
+/// **Why a role parameter is needed**: the Hello handshake is asymmetric —
+/// the client side runs [`super::protocol::client_hello`] (`open_bi()` + send
+/// Hello) while the server side runs [`super::protocol::server_hello`]
+/// (`accept_bi()` + echo back). The three-stream assembly is also
+/// asymmetric — the client calls `open_bi()` three times to obtain three
+/// bidi streams, while the server calls `accept_bi()` three times to wait
+/// for three bidi streams. `run()` uses [`PeerRole`] to pick the right path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerRole {
-    /// 主动拨号端 —— 走 [`super::protocol::client_hello`] + `open_bi()` 三次
+    /// Active dialer — uses [`super::protocol::client_hello`] + three
+    /// `open_bi()` calls.
     Client,
-    /// 被动接受端 —— 走 [`super::protocol::server_hello`] + `accept_bi()` 三次
+    /// Passive acceptor — uses [`super::protocol::server_hello`] + three
+    /// `accept_bi()` calls.
     Server,
 }
 
-/// **Wake-close sentinel code**（补丁：Mac wake 自动重连支持）。
+/// Wake-close sentinel code (patch: macOS wake auto-reconnect support).
 ///
-/// macOS 系统唤醒时 [`crate::macos_power::PowerObserver`] 触发
-/// [`crate::listen::spawn_wake_task`] 对每条 peer conn 调
-/// `connection().close(WAKE_CLOSE_CODE.into(), b"wake")` —— 用这个非零
-/// sentinel 而不是默认 0（NO_ERROR）让对端在 `should_retry_after_close` 里
-/// 区分"用户主动 close（不重试）"和"系统唤醒触发的 close（要重试）"。
+/// When macOS wakes from sleep, [`crate::macos_power::PowerObserver`] triggers
+/// [`crate::listen::spawn_wake_task`] which calls
+/// `connection().close(WAKE_CLOSE_CODE.into(), b"wake")` for each peer conn.
+/// Using this non-zero sentinel (rather than the default `0` / `NO_ERROR`)
+/// lets the peer distinguish in `should_retry_after_close` between
+/// "user-initiated close (no retry)" and "system-wake-triggered close
+/// (retry)".
 ///
-/// **为什么不用 `0`**：
-/// 旧代码用 `0u32`（NO_ERROR）触发 `ConnectionError::ApplicationClosed(0)`，
-/// 对端 `should_retry_after_close` 一律返 `false` → master 不重拨。
-/// 设计假设"下次 send() 会触发重拨"在 wake 后不成立（用户没在动鼠标）。
+/// **Why not `0`**: the old code used `0u32` (`NO_ERROR`), producing
+/// `ConnectionError::ApplicationClosed(0)`, which made
+/// `should_retry_after_close` always return `false`, so the master never
+/// redialed. The assumption that "the next send() will trigger a redial"
+/// does not hold after wake — the user is not moving the mouse.
 ///
-/// **为什么用 `0xCAFE`**：
-/// - 0xCAFE 是约定俗成的 sentinel magic（"coffee" 谐音 + 视觉好认）
-/// - 远在 QUIC `VarInt` 范围（≤ 2^62）内
-/// - 唯一避免和 Bug #9/#10 的 `close(0u32, "peer closed stream")` 撞码
-///   —— Bug #9/#10 仍走 0（用户/网络层断连），不进 wake 重拨分支
+/// **Why `0xCAFE`**:
+/// - `0xCAFE` is the conventional sentinel magic ("coffee" pun + easy to spot)
+/// - well within the QUIC `VarInt` range (≤ 2^62)
+/// - the only way to avoid colliding with the `close(0u32, "peer closed stream")`
+///   calls in the stream A Truncated / read IO error paths — those still use
+///   code 0 (user / network-initiated disconnect) and do not enter the wake
+///   retry branch.
 pub(crate) const WAKE_CLOSE_CODE: u32 = 0xCAFE;
 
-/// 从 `quinn::ConnectionError` 判定本次关闭是否值得自动重连（STEP-5.4 引入）。
+/// Classify a `quinn::ConnectionError` to decide whether this close is worth
+/// auto-reconnecting.
 ///
-/// **判定逻辑**（与 PLAN §5.4 + STEP-6.5 `RetryState` 衔接）：
-/// - `ApplicationClosed(_)`（reason code = [`WAKE_CLOSE_CODE`]）→ 对端因
-///   系统唤醒主动 close，**应**重试（用户预期 wake 后立刻可用）
-/// - `ApplicationClosed(_)`（其他 code，含 `0` = NO_ERROR）→ 是 peer 主动
-///   close，**不**重试（peer 明确不想继续）
-/// - `ConnectionLost(_)` / `TimedOut` → 网络层断连，**应**重试
-/// - `TransportError(_)`（quic-level）→ 协议级错误，**不**重试（很可能是
-///   协议 bug / 攻击信号）
-/// - `Reset` / `VersionMismatch` / `LocalError(_)` → 本端错误，不重试
-/// - `IdleTimeout` → QUIC idle 超时（30s 无），），**不**重试（peer 真离线
-///   信号；重试只会浪费资源）
-///
-/// M1 阶段本函数仅作为 `run()` 退出时的判定提示；STEP-6.5
-/// `connect.rs::RetryState` 会消费这个判定做退避重连。
+/// **Decision rules**:
+/// - `ApplicationClosed(_)` with reason code = [`WAKE_CLOSE_CODE`] → peer
+///   closed because of a system wake event — **retry** (the user expects the
+///   link to be usable immediately after wake)
+/// - `ApplicationClosed(_)` with any other code, including `0` = `NO_ERROR`
+///   → peer-initiated close — **do not retry** (the peer explicitly does
+///   not want to continue)
+/// - `ConnectionLost(_)` / `TimedOut` → network-layer disconnect — **retry**
+/// - `TransportError(_)` (QUIC-level) → protocol-level error — **do not
+///   retry** (likely a protocol bug or attack signal)
+/// - `Reset` / `VersionMismatch` / `LocalError(_)` → local error — do not
+///   retry
+/// - `IdleTimeout` → QUIC idle timeout (30s of silence) — **do not retry**
+///   (peer really is offline; retrying only wastes resources)
 pub fn should_retry_after_close(reason: &quinn::ConnectionError) -> bool {
     use quinn::ConnectionError;
     match reason {
-        // 网络层断连 / 超时 —— 重试
+        // Network-layer disconnect / timeout — retry.
         ConnectionError::TimedOut => true,
-        // Wake-close sentinel：Mac 唤醒触发的对端 close（详见
-        // [`WAKE_CLOSE_CODE`] docstring）—— 重试。
-        //
-        // **与 Bug #9/#10 关系**：STEP-8.2 Bug #9 / Bug #10 在 stream A
-        // Truncated / read IO error 时 `conn.close(0u32, b"peer closed stream")`
-        // —— code 仍是 0，不进本分支。所以 master 看到那种 close 仍走 "用户
-        // close 不重试" 路径，**只有** wake close 走重试分支。两者正交。
+        // Wake-close sentinel: peer close triggered by macOS wake (see the
+        // [`WAKE_CLOSE_CODE`] docstring) — retry.
         ConnectionError::ApplicationClosed(frame)
             if frame.error_code.into_inner() as u32 == WAKE_CLOSE_CODE =>
         {
             true
         }
-        // quinn 0.11 实际变体：协议级 / 本端错误 / peer 主动 close / CID 耗尽
-        // —— 都不重试（保守）。
+        // quinn 0.11 actual variants: protocol-level / local error /
+        // peer-initiated close / CID exhaustion — none retry (conservative).
         ConnectionError::ApplicationClosed(_)
         | ConnectionError::TransportError(_)
         | ConnectionError::ConnectionClosed(_)
@@ -232,209 +243,198 @@ pub fn should_retry_after_close(reason: &quinn::ConnectionError) -> bool {
 }
 
 impl PeerSession {
-    /// 构造：从 `quinn::Connection` 包成 `PeerSession`（STEP-3.2 引入）。
+    /// Construct: wrap a `quinn::Connection` into a `PeerSession`.
     ///
-    /// STEP-3.2 起所有 `PeerSession` 构造都走这个 helper：
-    /// - `accept()` caller → `PeerSession::from_connection(conn)`
-    /// - `dial()` caller → `PeerSession::from_connection(conn)`
-    /// - 测试 → 直接调
-    ///
-    /// 保证 `hello_ok = false` + `stream_a_cache` 空初始这两个不变式集中在
-    /// 一处（与 bak `Mousehop::PeerSession::from_connection` 对齐）。
-    ///
-    /// STEP-5.x 接 `route_input` / `input_channels` 时再加 `with_config`
-    /// builder；本步不引入（M1 不触碰 ChannelMode，STEP-4.1 引入
-    /// `InputChannelConfig` 后再加）。
+    /// All `PeerSession` construction goes through this helper, which
+    /// centralizes the two invariants `hello_ok = false` and an empty
+    /// `stream_a_cache`.
     pub fn from_connection(conn: QuinnConnection) -> Self {
         Self {
             conn,
             hello_ok: AtomicBool::new(false),
             stream_a_cache: Mutex::new(None),
-            // STEP-8.2 修复 — `cached_send_a`：hello 完成后从
-            // `stream_a_cache.send` 搬过来，让 [`Self::send_stream_a`]
-            // 复用同一 bidi 的 send 半边（与 server 端
-            // `take_stream_a_recv` 拿到的 recv 半边是**同一条** bidi），
-            // 不再每次开新 bidi。
-            //
-            // **历史**：修前 `send_stream_a` 每次 `open_bi()` 开新
-            // stream 写控制事件（Enter / Leave / Ack / Ping / Pong），
-            // 但 server `listen.rs` supervisor 只读缓存的 recv_a（即
-            // hello 时的同一条 bidi）—— 控制事件走新 stream、server
-            // 不读新 stream → Enter 永远到不了 server → server 不
-            // release capture、不 inject input，用户看到"连上了但键
-            // 鼠不通"。
+            // `cached_send_a`: after Hello completes, the send half of the
+            // Hello bidi is moved here from `stream_a_cache.send`, letting
+            // [`Self::send_stream_a`] reuse the same bidi's send half (the
+            // same bidi whose recv half the server-side `take_stream_a_recv`
+            // will obtain) instead of opening a new bidi on every call.
             cached_send_a: Mutex::new(None),
-            // 键盘不通修复：stream B send 半边缓存，首次 send_stream_b
-            // 时惰性 open_bi 填充（详见字段 docstring）。
+            // stream B send half cache; lazily filled by the first
+            // `send_stream_b` call (see field docstring).
             cached_send_b: Mutex::new(None),
-            // STEP-8.2 修复 — Bug #7：stream A 事件出向 channel
-            // 初始 None；client 端 connect_to_handle 在 spawn peer.run
-            // 之前调 `set_outgoing_events` 设上。详见字段 docstring。
+            // stream A event outgoing channel; initial `None`. The client
+            // side's `connect_to_handle` sets this via `set_outgoing_events`
+            // before spawning `peer.run` (see field docstring).
             outgoing_events: Arc::new(Mutex::new(None)),
-            // STEP-5.2 引入 `stream_bunch` 字段占位 —— 默认 `None`，
-            // STEP-5.3 `read_loop` 装配时填充。`Arc` 包装让 read_loop
-            // task 与 caller (`peer.send_stream_*`) 共用同一份
-            // `Mutex<Option<StreamBunch>>` 所有权。
+            // `stream_bunch` field placeholder — default `None`, filled when
+            // the read loop assembles the three streams. The `Arc` wrapper
+            // lets the read loop task and the caller (`peer.send_stream_*`)
+            // share ownership of the same `Mutex<Option<StreamBunch>>`.
             stream_bunch: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// 暴露底层 `quinn::Connection`，给 STEP-5.x 读 `peer_identity()` /
-    /// datagram / stream B/C 用。STEP-6.x 接入 `LanMouseConnection` 后这
-    /// 一步会被 `send()` / `recv()` 高阶方法盖掉。
+    /// Expose the underlying `quinn::Connection` for `peer_identity()` /
+    /// datagram / stream B/C access.
     pub fn connection(&self) -> &QuinnConnection {
         &self.conn
     }
 
-    /// Hello 握手是否已完成（STEP-3.2 引入）。
+    /// Whether the Hello handshake has completed.
     ///
-    /// 业务路径（`send_motion()` / 开 stream B / 业务事件循环 —— 这些是
-    /// STEP-5.x 的范畴）必须先调此方法确认 `true` 再发事件；否则 QUIC TLS
-    /// 1.3 之后没有应用层验证过的对端（可能是 LAN spoofing 残余），
-    /// 不允许注入键鼠。
-    #[allow(dead_code)] // 测试 + STEP-5.x / STEP-6.x 接入时移除
+    /// Business paths (`send_motion()` / opening stream B / event loops)
+    /// must call this and confirm it is `true` before sending events;
+    /// otherwise there is no application-layer-validated peer (could be
+    /// LAN-spoofing residue after QUIC TLS 1.3), and injection of input is
+    /// not permitted.
+    #[allow(dead_code)]
     pub fn hello_ok(&self) -> bool {
         self.hello_ok.load(Ordering::Acquire)
     }
 
-    /// 取出 stream A 的 `(SendStream, RecvStream)` **整对**（STEP-3.2 引入）。
+    /// Take the entire `(SendStream, RecvStream)` pair of stream A.
     ///
-    /// **消费性语义**：调用后 `stream_a_cache` 缓存被清空（`Option::take`）。
-    /// 设计意图：STEP-5.4 `read_loop` 启动时拿走 server 端 Hello 时缓存
-    /// 的 stream，转交给控制帧循环的所有权。本步暂无 main-code caller
-    /// （STEP-5.4 才接），仅测试或 STEP-5.x 设计参考。
+    /// **Consuming semantics**: after this call, the `stream_a_cache`
+    /// is cleared (`Option::take`). Designed for the read loop to take
+    /// ownership of the stream cached during Hello and hand it to the
+    /// control-frame loop.
     ///
-    /// 返回 `None` 说明 Hello 还没跑过（典型 client 端场景，client_hello
-    /// 完成同样有 cache，server_hello 也一样 —— STEP-3.2 起两端对称缓存）。
+    /// Returns `None` if Hello has not yet completed (also valid for both
+    /// the client-side `client_hello` and the server-side `server_hello`
+    /// completion paths — both cache symmetrically).
     #[allow(dead_code)]
     pub async fn take_stream_a_cache(&self) -> Option<(SendStream, quinn::RecvStream)> {
         let mut g = self.stream_a_cache.lock().await;
         g.take().and_then(|p| match (p.send, p.recv) {
             (Some(s), Some(r)) => Some((s, r)),
-            // 半边缺失（已被 take_recv）—— 整对无法重建，返 None
+            // Half missing (already taken) — the pair cannot be rebuilt;
+            // return None.
             _ => None,
         })
     }
 
-    /// 取出 stream A 的 `RecvStream` 半边，**保留** `SendStream` 半边在
-    /// cache（STEP-5.4 接 read_loop 时用）。
+    /// Take the `RecvStream` half of stream A, leaving the `SendStream`
+    /// half in the cache.
     ///
-    /// 与 [`Self::take_stream_a_cache`]（整对 take）语义不同：本方法只拿
-    /// recv 半边，让 send 半边留给写路径复用。STEP-3.2 暂未使用，
-    /// STEP-5.4 由 read_loop 接手控制帧循环所有权时消费。
+    /// Differs from [`Self::take_stream_a_cache`] (which takes the whole
+    /// pair): this method only takes the recv half so the send half can be
+    /// reused by the write path.
     #[allow(dead_code)]
     pub async fn take_stream_a_recv(&self) -> Option<quinn::RecvStream> {
         let mut g = self.stream_a_cache.lock().await;
         g.as_mut().and_then(|p| p.recv.take())
     }
 
-    /// **STEP-8.2 修复**：取出 stream A 的 `SendStream` 半边，**保留**
-    /// `RecvStream` 半边在 cache（给 `take_stream_a_recv` 用）。
+    /// Take the `SendStream` half of stream A, leaving the `RecvStream`
+    /// half in the cache (for `take_stream_a_recv`).
     ///
-    /// 与 `take_stream_a_recv` 对称 —— 设计用途：
-    /// - `client_hello` / `server_hello` 完成后 put `Pair { send, recv }`
-    ///   进 `stream_a_cache`，**然后**调本方法把 `send` 搬到
-    ///   `cached_send_a` 供 `send_stream_a` 复用
-    /// - 与 supervisor / peer.run 后续调 `take_stream_a_recv` 拿
-    ///   `recv` 不冲突（双方各自 take 自己的半边）
+    /// Symmetric with `take_stream_a_recv`. Intended usage:
+    /// - After `client_hello` / `server_hello` puts `Pair { send, recv }`
+    ///   into `stream_a_cache`, this method is called to move `send` into
+    ///   `cached_send_a` for `send_stream_a` to reuse.
+    /// - Does not conflict with a subsequent `take_stream_a_recv` call by
+    ///   the supervisor / `peer.run` (each takes its own half).
     ///
-    /// **设计动机**（详见 `cached_send_a` 字段 docstring）：
-    /// `send_stream_a` 一次调用写一帧但整个 peer 生命周期被多次调用
-    /// （Enter / Ack / Ping / Pong / 重复 Enter ...），需要持有同一
-    /// `SendStream` 重复 write —— 必须从 `stream_a_cache` 取出 send
-    /// 独立存放。
+    /// **Motivation** (see the `cached_send_a` field docstring):
+    /// `send_stream_a` writes one frame per call but is invoked many times
+    /// across the peer's lifetime (Enter / Ack / Ping / Pong / repeated
+    /// Enter ...), so it must hold the same `SendStream` to repeatedly
+    /// `write`. This requires extracting the send half from `stream_a_cache`
+    /// into a standalone field.
     #[allow(dead_code)]
     pub async fn take_stream_a_send(&self) -> Option<SendStream> {
         let mut g = self.stream_a_cache.lock().await;
         g.as_mut().and_then(|p| p.send.take())
     }
 
-    /// **STEP-8.2 修复 — Bug #7**：设置 stream A 事件出向 sender。
+    /// Set the stream A event outgoing sender.
     ///
-    /// `connect_to_handle` 在 spawn peer.run 之前调用本方法把 sender
-    /// 设到 `outgoing_events`，让 peer.run 主循环从 stream A 读到
-    /// Ack / Pong / Leave 时能 forward 出去（详见字段 docstring）。
-    /// `Some(_)` 覆盖旧值；`None` 关闭 forwarding（兜底用，理论上
-    /// 不需要 —— client 路径应保持设上）。
+    /// `connect_to_handle` calls this before spawning `peer.run` so that the
+    /// main loop, when reading Ack / Pong / Leave from stream A, can forward
+    /// them out (see the field docstring). Passing `Some(_)` overwrites the
+    /// previous value; `None` disables forwarding (fallback; not normally
+    /// needed — the client path should keep it set).
     pub async fn set_outgoing_events(&self, tx: Option<OutgoingEventSender>) {
         *self.outgoing_events.lock().await = tx;
     }
 
-    /// **STEP-8.2 修复 — Bug #9**：把 ProtoEvent 推给 outgoing_events（如
-    /// 设了）→ forwarder → capture.rs。专门用于 peer.run 主循环在
-    /// 检测到 peer 关闭时主动推 Leave 让本地 capture 立即 release。
+    /// Push a `ProtoEvent` to `outgoing_events` (if set) → forwarder →
+    /// capture.rs. Used by the `peer.run` main loop to push a `Leave` when
+    /// it detects peer close, so the local capture releases immediately.
     ///
-    /// **为何不直接 send 而封一个 helper**：send 失败静默吞 + 集中
-    /// log `peer closed push Leave` 让用户复测时能看到完整释放路径。
+    /// **Why wrap rather than send directly**: centralized error swallowing
+    /// plus a single log line `peer closed push Leave` so users retesting
+    /// can see the full release path.
     async fn send_outgoing_event(&self, event: ProtoEvent, addr: std::net::SocketAddr) {
         if let Some(tx) = self.outgoing_events.lock().await.as_ref() {
             if let Err(e) = tx.send((addr, event)) {
-                log::debug!("send_outgoing_event: outgoing_events 已退（forwarder 不在）: {e}");
+                log::debug!("send_outgoing_event: outgoing_events has exited (forwarder gone): {e}");
             }
         }
     }
 
-    /// 发送高频 motion 输入事件（STEP-5.1 引入）。
+    /// Send a high-frequency motion input event.
     ///
-    /// **通道选择** —— 优先 QUIC datagram；超 [`MAX_SAFE_DATAGRAM`] /
-    /// 对端不支持 datagram / datagram 发送失败时降级到 stream B
-    /// （[`Self::send_datagram_or_stream_b`]）。
+    /// **Channel selection**: prefer QUIC datagram; on payload exceeding
+    /// [`MAX_SAFE_DATAGRAM`] / peer not supporting datagrams / datagram send
+    /// failure, fall back to stream B via [`Self::send_datagram_or_stream_b`].
     ///
-    /// **前置条件**：`hello_ok == true`（应用层 Hello 握手已完成）。若
-    /// `hello_ok == false`，返回 [`Error::HelloFailed`]，**不**碰
-    /// datagram / stream —— 这是 PLAN §3 "mTLS 通了不等于对端是
-    /// lan-mouse" 信任模型的守护（与 bak
-    /// `mousehop/src/quic_transport.rs:471-486 send_motion` 完全对齐）。
-    ///
-    /// **dead_code chain**：STEP-5.4 `PeerSession::run()` 接管读循环后，
-    /// STEP-6.x `LanMouseConnection::send()` 会消费此函数。当前 main-code
-    /// 无 caller，仅测试 + 即将到来的 STEP-6.x caller。
+    /// **Precondition**: `hello_ok == true` (the application-layer Hello
+    /// handshake has completed). If `hello_ok == false`, returns
+    /// [`Error::HelloFailed`] without touching datagrams / streams — this
+    /// guards the trust model that "mTLS connected does not equal the peer
+    /// is lan-mouse".
     #[allow(dead_code)]
     pub async fn send_motion(&self, event: &ProtoEvent) -> super::Result<()> {
         if !self.hello_ok.load(Ordering::Acquire) {
             return Err(super::Error::HelloFailed("hello not complete".into()));
         }
-        // 定长 codec 编码到 `[u8; MAX_EVENT_SIZE]`（21 字节）—— 与 stream B
-        // 读端的 `read_frame` 走同一个定长 `MAX_EVENT_SIZE` 解码路径（datagram
-        // 自带长度，但解码入口统一在 `ProtoEvent::try_from`）。
+        // Fixed-size codec into `[u8; MAX_EVENT_SIZE]` (21 bytes) — uses the
+        // same fixed-length `MAX_EVENT_SIZE` decoding path as the stream B
+        // reader (`read_frame`). Datagrams carry their own length, but
+        // decoding always goes through `ProtoEvent::try_from`.
         let (buf, _len): ([u8; MAX_EVENT_SIZE], usize) = (*event).into();
         self.send_datagram_or_stream_b(&buf).await
     }
 
-    /// datagram 优先 + stream B 降级（STEP-5.1 引入，STEP-5.2 替换降级路径）。
+    /// Datagram-first with stream B fallback.
     ///
-    /// **判定顺序**：
-    /// 1. `conn.max_datagram_size()` **每次重读**（STEP-0.1 结论 D：值随
-    ///    路径 MTU 探测变化，缓存会导致要么白白降级、要么超限发送失败）。
-    ///    返回 `None` 表示对端不支持 / 本端禁用 datagram → 直接降级。
-    /// 2. 与 [`MAX_SAFE_DATAGRAM`] 取 `min` 作为实际上限 —— 防止 MTU
-    ///    探测完成后 `max_datagram_size()` 报告一个**陈旧**的更大值（quinn
-    ///    内部 path validation 完成后才会扩到 1414，但本端只能读到
-    ///    `Some(>1162)` 时仍应保守地 cap 在 1162 以避免 TooLarge）。
-    /// 3. `conn.send_datagram(...)` —— quinn 0.11 的这个方法本身是
-    ///    **非阻塞**的（拥塞时丢最旧排队 datagram，正是 motion 语义
-    ///    想要的）。返回 `Err` 只有四种：`TooLarge` / `Disabled` /
-    ///    `UnsupportedByPeer` / `ConnectionLost`。前三种是"这条路走不通"
-    ///    → 降级到 stream B；`ConnectionLost` 是连接已死 → 直接上报
-    ///    （降级也救不回来，stream B 上再失败一次也没意义）。
+    /// **Decision order**:
+    /// 1. `conn.max_datagram_size()` is **re-read on every call**: the value
+    ///    changes as path MTU probing progresses, and caching would cause
+    ///    either needless fallback or oversized send failures. `None` means
+    ///    the peer does not support datagrams or we have them disabled —
+    ///    fall back immediately.
+    /// 2. Take `min` with [`MAX_SAFE_DATAGRAM`] as the effective cap — this
+    ///    prevents `max_datagram_size()` reporting a **stale** larger value
+    ///    after MTU probing completes (quinn only widens to 1414 after
+    ///    internal path validation, but when we see `Some(>1162)` we still
+    ///    cap conservatively at 1162 to avoid `TooLarge`).
+    /// 3. `conn.send_datagram(...)` — in quinn 0.11 this method is
+    ///    **non-blocking** (under congestion it drops the oldest queued
+    ///    datagram, which is exactly the motion semantics we want). It can
+    ///    only return four errors: `TooLarge` / `Disabled` /
+    ///    `UnsupportedByPeer` / `ConnectionLost`. The first three mean
+    ///    "this path is not viable" — fall back to stream B; `ConnectionLost`
+    ///    means the connection is dead — surface the error directly
+    ///    (fallback cannot recover it; failing again on stream B is pointless).
     ///
-    /// **签名 `&[u8]` 而不是 `&ProtoEvent`**：STEP-5.2 [`Self::send_stream_b`]
-    /// 收到"已编码字节"时复用同一份 buffer（datagram 失败后复用 buf），
-    /// 且未来 `motion_oversize_falls_back_to_stream` 测试要构造超限裸
-    /// 字节验证降级管道本身（与 bak
-    /// `mousehop/src/quic_transport.rs:507` 签名完全一致）。
+    /// **Why the signature is `&[u8]` rather than `&ProtoEvent`**: it lets
+    /// [`Self::send_stream_b`] consume the already-encoded buffer (reusing
+    /// `buf` after datagram failure), and lets tests build oversized raw
+    /// bytes to exercise the fallback path itself.
     ///
-    /// **`bytes.to_vec().into()`**：`send_datagram` 收 `bytes::Bytes`，
-    /// `Vec<u8> → Bytes` 零拷贝（接管 Vec 的堆分配）。无需在主仓加
-    /// `bytes` crate 依赖 —— 类型由 quinn 0.11 的 `send_datagram` 签名
-    /// 反向推断。
+    /// **`bytes.to_vec().into()`**: `send_datagram` takes `bytes::Bytes`;
+    /// `Vec<u8> → Bytes` is zero-copy (takes ownership of the Vec's heap
+    /// allocation). No need to add a `bytes` crate dependency in the main
+    /// crate — the type is reverse-inferred from the quinn 0.11 signature.
     ///
-    /// **STEP-5.2 关键改造**：降级路径从 inline `open_uni() + write_all() +
-    /// finish()`（不带长度前缀、不复用）改为 [`Self::send_stream_b`]
-    /// —— 缓存 bidi stream、长度前缀帧 [`super::protocol::write_frame`]、统一错误归到
-    /// [`Error::StreamB`]。**SUGGESTION #S-14 完全消化**。
+    /// The fallback path was reworked to route through [`Self::send_stream_b`]
+    /// (cache + length-prefixed frames) instead of the original inline
+    /// `open_uni() + write_all() + finish()` (no length prefix, no reuse).
+    /// All errors funnel into [`Error::StreamB`].
     async fn send_datagram_or_stream_b(&self, bytes: &[u8]) -> super::Result<()> {
-        // 每次重读 max_datagram_size —— 严格遵守 STEP-0.1 结论 D。
+        // Re-read `max_datagram_size` on every call.
         let limit = self
             .conn
             .max_datagram_size()
@@ -444,58 +444,50 @@ impl PeerSession {
             if bytes.len() <= limit {
                 match self.conn.send_datagram(bytes.to_vec().into()) {
                     Ok(()) => return Ok(()),
-                    // 连接已死：降级也救不回来，直接上报
+                    // Connection dead: fallback cannot recover; surface the
+                    // error directly.
                     Err(e @ quinn::SendDatagramError::ConnectionLost(_)) => {
                         return Err(super::Error::Datagram(e));
                     }
-                    // TooLarge / Disabled / UnsupportedByPeer：这条路走不通 → 降级
+                    // TooLarge / Disabled / UnsupportedByPeer: this path is
+                    // not viable — fall back.
                     Err(e) => {
-                        log::debug!("datagram 发送失败（{e}），降级到 stream B");
+                        log::debug!("datagram send failed ({e}), falling back to stream B");
                     }
                 }
             }
         }
 
-        // 降级路径 —— STEP-5.2 替换为 `send_stream_b`（cache + 长度前缀帧）
+        // Fallback path: route through `send_stream_b` (cache + length-prefixed
+        // frames).
         self.send_stream_b(bytes).await
     }
 
-    /// Stream B（input 流，可靠有序）写入（STEP-5.2 引入，**替换** STEP-5.1
-    /// 的 inline uni stream 降级路径）。
+    /// Stream B (input stream, reliable and ordered) write path.
     ///
-    /// **惰性 cache**：首次调用时 `conn.open_bi()` 拿一条 bidi stream，
-    /// 存入 `peer.stream_bunch` 字段（虽然本方法目前用独立的
-    /// `stream_b_cache: Mutex<Option<StreamPair>>` 临时缓存 —— STEP-5.3
-    /// read_loop 接手时把 cache 内容统一迁移到 `stream_bunch`）。
-    /// 后续调用复用同一条 stream 的 `send` 半边，recv 半边留给 STEP-5.3
-    /// reader task 接管。
+    /// **Lazy cache**: on the first call, `conn.open_bi()` obtains a bidi
+    /// stream. Subsequent calls reuse the same stream's `send` half; the
+    /// recv half is left for the reader task to take over.
     ///
-    /// **in-lock 借用**：`Mutex` 临界区覆盖 "open + write" 全段 —— 同一条
-    /// stream 上并发写会交错字节、破坏帧边界。这与 bak
-    /// `mousehop/src/quic_transport.rs:557-579 send_stream_b` 形态完全对齐。
+    /// **In-lock borrow**: the `Mutex` critical section covers the entire
+    /// "open + write" span — concurrent writes on the same stream would
+    /// interleave bytes and break frame boundaries.
     ///
-    /// **长度前缀帧**：走 [`super::protocol::write_frame`]（`[u32 BE len][body...]`），与
-    /// 对端 STEP-5.3 reader task 的 [`super::protocol::read_frame`] codec 对齐。
+    /// **Length-prefixed frames**: uses [`super::protocol::write_frame`]
+    /// (`[u32 BE len][body...]`) aligned with the peer reader task's
+    /// [`super::protocol::read_frame`] codec.
     ///
-    /// **错误归一**：所有 IO 错误收敛到 [`super::Error::StreamB(String)`]
-    ///（消息前缀区分 `"open_bi"` / `"write frame length"` / `"write"`），
-    /// 与 bak `mousehop/src/quic_transport.rs:1035-1040` 完全对齐。
-    ///
-    /// dead_code chain：本方法当前仅被 [`Self::send_datagram_or_stream_b`]
-    /// 降级路径消费；STEP-5.3 接入后由 [`Self::send`] 路由层
-    /// `Channel::StreamB` 直接消费（不经过 datagram 试探）。
-    ///
-    /// STEP-6.1 升级为 `pub`：供 [`Self::send_input`] 在 `Channel::StreamB`
-    /// 分派时直接消费（不经过 datagram 试探）。
+    /// **Error normalization**: all IO errors funnel into
+    /// [`super::Error::StreamB(String)`] (message prefix distinguishes
+    /// `"open_bi"` / `"write frame length"` / `"write frame body"`).
     pub async fn send_stream_b(&self, bytes: &[u8]) -> super::Result<()> {
-        // **键盘不通修复**：复用缓存的 stream B send 半边，**不**再每帧
-        // `open_bi()` 开新流。详见 [`Self::cached_send_b`] 字段 docstring
-        // —— 修前每个按键都开一条新 bidi，而 server 端 supervisor 没有
-        // `accept_bi()` 循环，这些流全部堆在 accept 队列里没人读。
+        // Reuse the cached stream B send half — no longer opening a new
+        // stream per frame. See [`Self::cached_send_b`] docstring.
         //
-        // **持锁 await 设计**：与 [`Self::send_stream_a`] 一致 ——
-        // `send_stream_b` 是 stream B 的唯一写路径，持锁期间并发 caller
-        // 排队串行，避免两帧字节交错破坏帧边界。
+        // **Lock-held await design**: matches [`Self::send_stream_a`].
+        // `send_stream_b` is stream B's only write path; concurrent callers
+        // queue and serialize during the lock-held section, preventing two
+        // frames from interleaving and breaking frame boundaries.
         use tokio::io::AsyncWriteExt;
 
         let mut g = self.cached_send_b.lock().await;
@@ -505,17 +497,18 @@ impl PeerSession {
                 .open_bi()
                 .await
                 .map_err(|e| super::Error::StreamB(format!("open_bi: {e}")))?;
-            // recv 半边 drop —— stream B 是单向数据流（本端写、对端读），
-            // 反向读能力不需要。
+            // Drop the recv half — stream B is one-way (we write, peer reads);
+            // the reverse read capability is not needed.
             drop(recv);
             *g = Some(send);
-            log::debug!("send_stream_b: 新建并缓存 stream B（后续帧复用同一条）");
+            log::debug!("send_stream_b: created and cached stream B (subsequent frames reuse the same one)");
         }
 
-        // 写失败时把 cache 置回 None，下次调用重开一条（对端 accept_bi
-        // 循环会接到新流）—— 避免一次瞬时错误让 stream B 永久失效。
+        // On write failure, reset the cache back to `None` so the next call
+        // reopens a stream (the peer's accept_bi loop will pick it up) —
+        // this prevents a transient error from permanently disabling stream B.
         let result = {
-            let send = g.as_mut().expect("cached_send_b 刚填充");
+            let send = g.as_mut().expect("cached_send_b was just filled");
             match send.write_u32(bytes.len() as u32).await {
                 Err(e) => Err(super::Error::StreamB(format!("write frame length: {e}"))),
                 Ok(()) => send
@@ -530,35 +523,36 @@ impl PeerSession {
         result
     }
 
-    /// 通道分发入口（STEP-6.1 引入）—— 按 per-handle [`InputChannelConfig`]
-    /// 把 [`ProtoEvent`] 派到 [`super::protocol::Channel`] 对应的底层通道。
+    /// Channel dispatch entry point — routes a [`ProtoEvent`] to the
+    /// underlying channel indicated by the per-handle [`InputChannelConfig`].
     ///
-    /// **调用方**：`src/connect.rs::LanMouseConnection::send()`。
-    /// LanMouseConnection 不持有 cfg（cfg 在 `ClientManager` 里 per-handle
-    /// 存），所以 caller 通过本方法签名把 cfg 传进来；本方法**不**缓存 cfg，
-    /// 也不改 peer 状态。
+    /// **Caller**: `src/connect.rs::LanMouseConnection::send()`.
+    /// `LanMouseConnection` does not own the cfg (it lives in `ClientManager`
+    /// per handle), so the caller passes the cfg through this method's
+    /// signature; this method does **not** cache the cfg and does not
+    /// mutate peer state.
     ///
-    /// **分派**（与 STEP-4.4 [`super::protocol::route_input`] 完全对齐）：
-    /// | Channel | 底层调用 |
+    /// **Dispatch**:
+    /// | Channel | Underlying call |
     /// |---|---|
-    /// | `Datagram` | [`Self::send_motion`]（datagram 优先 + 超限降级 stream B） |
-    /// | `StreamA`  | [`Self::send_stream_a`]（开新 bidi + write_frame + finish） |
-    /// | `StreamB`  | [`Self::send_stream_b`]（开新 bidi + write_frame + finish） |
+    /// | `Datagram` | [`Self::send_motion`] (datagram-first + fallback to stream B) |
+    /// | `StreamA`  | [`Self::send_stream_a`] (write cached `cached_send_a`) |
+    /// | `StreamB`  | [`Self::send_stream_b`] (write cached `cached_send_b`) |
     /// | `StreamC`  | `Err(super::Error::HelloFailed("stream C is M2-only"))` |
     ///
-    /// **M2 守门**：`ProtoEvent` 在主仓不含 `Clipboard` 变体（PLAN §9），
-    /// 所以 `route_input` 永远不会返 `Channel::StreamC`；但本方法显式判
-    /// `StreamC` 返 `Err` 防止 `unreachable!()` 在 ProtoEvent 加 M2 变体
-    /// 时意外落入（编译期 + 运行期双护栏）。
+    /// **M2 gate**: `ProtoEvent` does not include a `Clipboard` variant in
+    /// the main crate, so `route_input` will never return
+    /// `Channel::StreamC`. This method still explicitly handles `StreamC`
+    /// by returning `Err`, guarding against an `unreachable!()` being
+    /// triggered by accident when an M2 variant is added to `ProtoEvent`
+    /// (compile-time + runtime double guard).
     ///
-    /// **前置门禁**：复用 `send_motion` 内部的 `hello_ok` 检查；`StreamA`
-    /// / `StreamB` 路径不显式检查（`hello_ok == false` 时 `send_motion`
-    /// 返 `HelloFailed`，其它通道理论上不应被调用 —— LanMouseConnection
-    /// 拨号流程是 "dial → client_hello → register_peer → 后续 send"，所
-    /// 以 peers 表里的 peer 都已过 hello）。
-    ///
-    /// **dead_code chain**：STEP-6.1 `LanMouseConnection::send()` 接入
-    /// 后立刻消费；STEP-6.2 listen.rs 同模式复用。
+    /// **Pre-flight check**: reuses `send_motion`'s internal `hello_ok`
+    /// check. `StreamA` / `StreamB` paths do not explicitly check
+    /// (`hello_ok == false` makes `send_motion` return `HelloFailed`;
+    /// other channels should not be called in that state — `LanMouseConnection`'s
+    /// dial flow is "dial → client_hello → register_peer → subsequent send",
+    /// so every peer in the peers table has already passed hello).
     #[allow(dead_code)]
     pub async fn send_input(
         &self,
@@ -567,9 +561,10 @@ impl PeerSession {
     ) -> super::Result<()> {
         use super::protocol::{Channel, route_input};
         let routed = route_input(cfg, event);
-        // **INFO on Ack/Leave** —— 被控端发 Ack 卡住的 bug 排查用。
-        // `delivered` 出现 = send_input 真的返回 Ok;
-        // 没出现但本条 log 出现 = 卡在 send_stream_a 等对端消费。
+        // **INFO on Ack/Leave** — diagnostics for the "controlled side Ack
+        // stuck" bug. `delivered` appears = send_input actually returned Ok;
+        // no `delivered` but this log line appears = blocked in
+        // `send_stream_a` waiting for the peer to consume.
         if matches!(event, ProtoEvent::Ack(_) | ProtoEvent::Leave(_)) {
             log::info!("send_input: routing {event:?} via {routed:?} (entry; awaiting send)");
         }
@@ -596,50 +591,50 @@ impl PeerSession {
         result
     }
 
-    /// 发送控制流事件（Enter / Leave / Hello / Ping / Pong），开新 bidi
-    /// stream 写一帧后 finish（STEP-6.1 引入）。
+    /// Send a control-stream event (Enter / Leave / Hello / Ping / Pong).
     ///
-    /// **为什么不复用 `stream_a_cache`**：
-    /// - `client_hello` / `server_hello` 已经把 stream A 的 send/recv 双半
-    ///   边缓存进 `peer.stream_a_cache`（cache 设计意图是 hello 用过的
-    ///   stream 给后续控制帧复用）
-    /// - 但 LanMouseConnection 当前**未**持 receiver task 来读 recv 半边
-    ///   —— 缓存的 recv 半边 drop 才是常态，这会拖 `take_stream_a_recv`
-    ///   进入 `None` 分支
-    /// - 本步（STEP-6.1）采取**保守实现**：每条控制事件开一条新 bidi
-    ///   stream，写完 finish（peer 不需要 recv 半边 → drop 即可）。Ping
-    ///   每 500ms × 4 ≈ 2s 流密度的额外 stream 开销在在 M1 范围内可接受
+    /// **Why not reuse `stream_a_cache` for the recv side**:
+    /// - `client_hello` / `server_hello` has already cached stream A's
+    ///   send/recv halves in `peer.stream_a_cache` (the cache's intent is
+    ///   to let later control frames reuse the Hello stream).
+    /// - However, `LanMouseConnection` currently does **not** hold a
+    ///   receiver task to read the recv half — dropping the cached recv
+    ///   half is the norm, which forces `take_stream_a_recv` into the
+    ///   `None` branch.
+    /// - The conservative implementation reuses the send half via
+    ///   `cached_send_a` (see its docstring) and falls back to opening a
+    ///   new bidi if the cache is empty. The extra stream overhead from
+    ///   `open_bi` on cache miss is acceptable within M1.
     ///
-    /// **后续优化空间**（STEP-6.x 之外）：
-    /// - 与 bak `mousehop/src/quic_transport.rs::send_stream_a` 对齐（缓存
-    ///   + in-place write）—— 本步已**部分实现**：send 路径走
-    ///     `cached_send_a` 复用 hello 同 bidi（详见 `cached_send_a`
-    ///     docstring），但仍持锁 await（无锁优化空间）
-    /// - M1 阶段不做进一步优化（保持单步范围可控）
+    /// **Future optimization**: caching + in-place writes are partially
+    /// implemented (the send path uses `cached_send_a`); a lock-free
+    /// write is a possible follow-up.
     ///
-    /// **错误归一**：与 [`Self::send_stream_b`] 对称 —— IO 错误归到
-    /// `super::Error::HelloFailed(...)`（避免新增 `super::Error::StreamA` 变体；HELLO
-    /// 握手期错误变体也是这个名，语义复用——"stream A 写失败" ≈ "Hello
-    /// 后续帧写失败"，与 M1 阶段语义匹配）。
-    ///
-    /// **dead_code chain**：本步由 [`Self::send_input`] 内部消费；
-    /// `send_input` 又被 STEP-6.1 `LanMouseConnection::send()` 消费。
+    /// **Error normalization**: symmetric with [`Self::send_stream_b`] —
+    /// IO errors funnel into `super::Error::HelloFailed(...)` (no need
+    /// to add a new `super::Error::StreamA` variant; the Hello-handshake
+    /// error variant already carries the same semantics for M1: "stream A
+    /// write failure" ≈ "Hello follow-up frame write failure").
     #[allow(dead_code)]
     async fn send_stream_a(&self, bytes: &[u8]) -> super::Result<()> {
-        // **STEP-8.2 修复 — Bug #5**：优先用 `cached_send_a`（hello 时
-        // 缓存的同一条 bidi send 半边）。**不**再每次 `open_bi` 开新
-        // stream —— 那条新 stream server 端 supervisor 不会读（它只
-        // 读 `take_stream_a_recv` 拿到的 recv 半边 = hello 时的同条
-        // bidi），控制事件（Enter / Ack / Ping / Pong）永远到不了
-        // server，看起来"连上了但键鼠不通"。
+        // Prefer `cached_send_a` (the send half of the same bidi cached at
+        // Hello time). No longer opening a new bidi on every call — the new
+        // stream would not be read by the server-side supervisor (which
+        // only reads the recv half obtained via `take_stream_a_recv`, i.e.
+        // the same bidi used at Hello), so control events (Enter / Ack /
+        // Ping / Pong) would never reach the server, appearing as
+        // "connected but keyboard / mouse not working".
         //
-        // **持锁 await 设计**：`send_stream_a` 是 stream A 的唯一写
-        // 路径（无其他 caller），持锁期间并发 caller 排队串行 —— 与
-        // QUIC stream write 的"一帧一帧"语义对齐（避免两帧交错）。
+        // **Lock-held await design**: `send_stream_a` is stream A's only
+        // write path (no other callers); concurrent callers queue and
+        // serialize during the lock-held section, matching QUIC stream
+        // writes' "one frame at a time" semantics.
         //
-        // **Fallback**：`cached_send_a` 为 `None` 时（hello 未完成 / 已
-        // 被 take）走旧的 open_bi 路径 —— 保留兜底兼容早期 caller /
-        // 测试（单测可能直接 `open_bi` + `peer.send_input` 不走 hello）。
+        // **Fallback**: when `cached_send_a` is `None` (Hello not done /
+        // already taken), fall back to the old `open_bi` path — preserves
+        // compatibility with early callers / tests (a unit test may call
+        // `open_bi` + `peer.send_input` directly without going through
+        // Hello).
         let mut g = self.cached_send_a.lock().await;
         if let Some(send) = g.as_mut() {
             use tokio::io::AsyncWriteExt;
@@ -657,8 +652,9 @@ impl PeerSession {
         }
         drop(g);
 
-        // Fallback path —— cached_send_a 不可用时开新 bidi（旧行为）
-        log::debug!("send_stream_a: cached_send_a 不可用，fallback 开新 bidi");
+        // Fallback path — open a new bidi when `cached_send_a` is unavailable
+        // (legacy behavior).
+        log::debug!("send_stream_a: cached_send_a unavailable, fallback to open new bidi");
         use tokio::io::AsyncWriteExt;
         let pair = self
             .conn
@@ -666,7 +662,7 @@ impl PeerSession {
             .await
             .map_err(|e| super::Error::HelloFailed(format!("send_stream_a open_bi: {e}")))?;
         let (mut send, recv) = (pair.0, pair.1);
-        drop(recv); // 不读 recv 半边 → drop 释放反向流
+        drop(recv); // Not reading the recv half — drop to release the reverse stream.
 
         send.write_u32(bytes.len() as u32)
             .await
@@ -679,167 +675,150 @@ impl PeerSession {
         Ok(())
     }
 
-    /// PeerSession 取出 stream_bunch 所有权（STEP-5.3 引入）。
+    /// Take ownership of the `stream_bunch` from `PeerSession`.
     ///
-    /// **消费性语义**：调用后 `peer.stream_bunch` 字段回到 `None`。设计
-    /// 意图：[`super::streams::read_loop`] 装配 reader 时一次性 take 走
-    /// `Some(StreamBunch)`，把 `a` / `b` / `c` 三个字段分别处理（a 留给
-    /// caller / b 喂 reader task / c drop）。
+    /// **Consuming semantics**: after the call, `peer.stream_bunch` is
+    /// back to `None`. Designed for [`super::streams::read_loop`] to take
+    /// `Some(StreamBunch)` once during reader assembly and process its
+    /// `a` / `b` / `c` fields separately (a kept by the caller / b fed
+    /// to the reader task / c dropped).
     ///
-    /// **返回 `None`**：说明 caller 还没装配 stream_bunch（典型场景：
-    /// read_loop 在 STEP-5.4 `run()` 装配前就被调用）。当前 main-code 无
-    /// caller，本步加 `#[allow(dead_code)]` 守护。
+    /// **Returns `None`**: the caller has not yet assembled `stream_bunch`.
     ///
-    /// **可见性 `pub(crate)`**：[`super::streams::read_loop`] 调。
+    /// **Visibility `pub(crate)`**: called by [`super::streams::read_loop`].
     #[allow(dead_code)]
     pub(crate) async fn take_stream_bunch(&self) -> Option<StreamBunch> {
         let mut g = self.stream_bunch.lock().await;
         g.take()
     }
 
-    /// PeerSession 装配 stream_bunch（STEP-5.3 引入，STEP-5.4 `run()` 装配
-    /// 入口消费）。
+    /// PeerSession assembles `stream_bunch`.
     ///
-    /// **写入语义**：调用前 `peer.stream_bunch` 应为 `None`（首次装配）
-    /// 或已被 [`Self::take_stream_bunch`] take 后回 `None`（重新装配）。
-    /// 本方法直接覆盖（lock + assign Some），不做 "已 Some 拒覆盖" 检查
-    /// —— caller 责任保证调用时机。
+    /// **Write semantics**: before calling, `peer.stream_bunch` should be
+    /// `None` (first assembly) or have been taken by
+    /// [`Self::take_stream_bunch`] back to `None` (reassembly). This method
+    /// overwrites directly (lock + assign `Some`) without checking "already
+    /// `Some`, refuse overwrite" — the caller is responsible for the call
+    /// timing.
     ///
-    /// **dead_code chain**：本方法由 STEP-5.4 `PeerSession::run()` 在
-    /// [`Self::read_loop`] 之前调用；本步加 `#[allow(dead_code)]` 守护。
-    ///
-    /// **可见性 `pub(crate)`**：仅 `Self::run()` 调。
+    /// **Visibility `pub(crate)`**: only `Self::run()` calls it.
     #[allow(dead_code)]
     pub(crate) async fn set_stream_bunch(&self, bunch: StreamBunch) {
         let mut g = self.stream_bunch.lock().await;
         *g = Some(bunch);
     }
 
-    /// PeerSession 主循环（STEP-5.4 引入 + STEP-6.5 改造 close reason 返回）。
+    /// `PeerSession` main loop.
     ///
-    /// **流程**（与 PLAN §5.4 + Leader prompt 完全对齐）：
+    /// **Flow**:
     ///
-    /// 1. **启 hello_watchdog** —— [`super::protocol::hello_watchdog`] 是 STEP-3.2
-    ///    引入的 3s 超时兜底（对端不发起 stream A 时主动关连）；本步接 `run()`
-    ///    后此 `#[allow]` 移除
-    /// 2. **启 datagram_reader_task** —— [`super::streams::datagram_reader_task`]
-    ///    是本步新增的 datagram 事件源（产生 `StreamEvent::Datagram`）
-    /// 3. **调 Hello 握手** —— client 端 [`super::protocol::client_hello`] /
-    ///    server 端 [`super::protocol::server_hello`]（由 `role` 决定）；
-    ///    成功后 `peer.hello_ok() == true` + `peer.stream_a_cache` 缓存
-    ///    stream A 的 send/recv 半边
-    /// 4. **取 stream_a_recv 半边** —— 留给主循环 `read_frame(recv_a)` 用
-    /// 5. **装配三 stream** —— client 端 `open_bi()` 三次 / server 端
-    ///    `accept_bi()` 三次；填入 `peer.stream_bunch` 让 [`Self::read_loop`]
-    ///    接管 reader task
-    /// 6. **主循环 `tokio::select!`** —— 合并 4 路 reader（stream A recv /
-    ///    stream B mpsc / datagram mpsc / conn closed）+ 处理 `StreamEvent`
-    ///    按类别分派（Reliable/Datagram 走 `route_input` cfg 分派 → 本步
-    ///    **不**调 `route_input`（本步是 in-process 端到端验证，业务分派留
-    ///    STEP-6.x LanMouseConnection）；Control 类仅日志）
-    /// 7. **conn.closed() 触发退出** —— 主循环等到 `closed` future 完成
-    ///    后退出；本步返 `Ok(())`（视为"对端关连"，caller 决定是否重连）；
-    ///    [`Self::should_retry_after_close`] 可由 caller 评估是否重连
+    /// 1. **Start `hello_watchdog`** — [`super::protocol::hello_watchdog`]
+    ///    is a 3-second timeout fallback (actively closes the connection
+    ///    when the peer never opens stream A).
+    /// 2. **Start `datagram_reader_task`** —
+    ///    [`super::streams::datagram_reader_task`] is the datagram event
+    ///    source (produces `StreamEvent::Datagram`).
+    /// 3. **Run the Hello handshake** — client side
+    ///    [`super::protocol::client_hello`] / server side
+    ///    [`super::protocol::server_hello`] (chosen by `role`); on success
+    ///    `peer.hello_ok() == true` and `peer.stream_a_cache` holds the
+    ///    send/recv halves of stream A.
+    /// 4. **Take the `stream_a_recv` half** — for the main loop's
+    ///    `read_frame(recv_a)` calls.
+    /// 5. **Assemble three streams** — client `open_bi()` three times /
+    ///    server `accept_bi()` three times; fill `peer.stream_bunch` so
+    ///    [`Self::read_loop`] can take over the reader tasks.
+    /// 6. **Main `tokio::select!` loop** — merges four reader paths
+    ///    (stream A recv / stream B mpsc / datagram mpsc / conn closed).
+    ///    `StreamEvent`s are dispatched by category (Reliable/Datagram
+    ///    would go through `route_input` cfg dispatch; Control events
+    ///    are only logged at this level — business dispatch lives in the
+    ///    higher-level connection wrapper).
+    /// 7. **`conn.closed()` triggers exit** — the main loop exits when
+    ///    the `closed` future completes. Returns
+    ///    `Err(super::Error::Handshake(reason))` where `reason` is
+    ///    `conn.close_reason()`; [`Self::should_retry_after_close`] is
+    ///    available to the caller to decide whether to reconnect.
     ///
-    /// **dead 入口**：本步不接 `connect.rs` / `listen.rs`，仅被单测
-    /// `peer_session_round_trip_motion_keyboard` 直接调；STEP-6.1
-    /// `connect.rs::connect_to_handle` 接入时一并移除 `#[allow]`。
+    /// **Why `Arc<Self>` rather than `&self`**: the internal spawned
+    /// reader tasks (`datagram_reader_task` and the stream B reader
+    /// inside `read_loop`) need `'static + Send` borrows — they require
+    /// a `'static` lifetime (a temporary `&self` borrow cannot satisfy
+    /// this). `hello_watchdog` also receives an `Arc<PeerSession>`.
+    /// `Arc<Self>` lets the caller's `Arc` and `run()`'s `Arc` merge into
+    /// the same reference count.
     ///
-    /// **STEP-6.5 改造**：主循环退出时取 `conn.close_reason()` 转成
-    /// `Err(super::Error::Handshake(reason))` —— [`should_retry_after_close`]
-    /// 由 `connect.rs::spawn_peer_supervisor` 评估，决定是否触发 RetryState
-    /// 退避重连。`#[allow(dead_code)]` 移除（main-code 接入后消费）。
-    ///
-    /// **为什么 `Arc<Self>` 而非 `&self`**：内部 spawn 两个 reader task
-    /// （`datagram_reader_task` / `read_loop` 内的 stream B reader）都需要
-    /// `'static + Send` 借用 —— 必须有 `'static` 生命周期（不能是临时
-    /// `&self` 借用）。`hello_watchdog` 同样收 `Arc<PeerSession>`。`Arc<Self>`
-    /// 把"caller 持 Arc + run() 持 Arc"两个引用合并到同一份计数。
-    ///
-    /// **错误路径**：
-    /// - `client_hello` / `server_hello` 失败 → 立即返 Err（Hello 没成功则
-    ///   后续 stream A 装配无意义）
-    /// - `accept_bi()` 三次任一失败 → 返 [`super::Error::HelloFailed`]（client 端
-    ///   `open_bi` 失败 → 同）
-    /// - `read_loop` 失败 → 返 [`super::Error::HelloFailed`]（stream_bunch 未装配）
-    /// - 主循环内 `StreamEvent` 处理失败 → `log::warn` + continue（单帧损坏
-    ///   不致命；与 STEP-5.3 `read_stream_b_loop` 的"skip-frame"语义对称）
-    /// - `conn.closed()` → 返 `Ok(())`（正常关连）
+    /// **Error paths**:
+    /// - `client_hello` / `server_hello` fails → return `Err` immediately
+    ///   (Hello failure makes later stream A assembly meaningless)
+    /// - any of the three `accept_bi()` calls fails → return
+    ///   [`super::Error::HelloFailed`] (same for client-side `open_bi`)
+    /// - `read_loop` fails → return [`super::Error::HelloFailed`]
+    ///   (`stream_bunch` not assembled)
+    /// - `StreamEvent` handling inside the main loop fails → `log::warn`
+    ///   + continue (a single bad frame is not fatal; matches the
+    ///   "skip-frame" semantics of the stream B reader)
+    /// - `conn.closed()` → return `Err(super::Error::Handshake(reason))`
+    ///   (graceful disconnect, with the close reason propagated to the
+    ///   caller)
     pub async fn run(self: Arc<Self>, role: PeerRole) -> std::result::Result<(), super::Error> {
-        // (1) 启 hello_watchdog —— 3s 超时兜底；对端不发起 stream A 时主动关连
+        // (1) Start `hello_watchdog` — 3s timeout fallback; actively closes
+        // the connection when the peer never opens stream A.
         hello_watchdog(self.clone());
 
-        // (2) 启 datagram_reader_task —— 产生 StreamEvent::Datagram
-        //     本步新增：详见下面 datagram_reader_task 函数
+        // (2) Start `datagram_reader_task` — produces `StreamEvent::Datagram`.
         let (tx_d, mut rx_d) =
             tokio_mpsc::channel::<StreamEvent>(super::streams::READ_STREAM_BUFFER_CAP);
         spawn_local(datagram_reader_task(self.clone(), tx_d));
 
-        // (3) Hello 握手 —— role 决定走 client_hello / server_hello
+        // (3) Hello handshake — `role` decides whether to run
+        // `client_hello` / `server_hello`.
         //
-        // **STEP-8.2 修复（Bug #3 — Hello 重复调用）**：
+        // **Hello skip-if-already-done guard**: if `hello_ok` is already
+        // `true` (set by an early `client_hello` / `server_hello` call from
+        // the caller before `peer.run()` was invoked), skip the handshake
+        // block entirely. Otherwise `peer.run()` would unconditionally
+        // perform a second `client_hello` that opens a new bidi, waits 3s
+        // for a Hello reply (which never comes — the server only
+        // `accept_bi`s once during its own `server_hello`), times out, and
+        // closes the connection. That produced the "hello handshake timed
+        // out after 3s — RetryState not triggered" error.
         //
-        // **根因**：本仓 client 路径 `connect_to_handle` 在 `dial_any` 成功
-        // 后**先**调一次 `client_hello`（这一步是 STEP-6.1 引入的早期语义），
-        // 再 `spawn_local(spawn_peer_supervisor → peer.run(PeerRole::Client))`
-        // —— 而 `peer.run()` 内部**又**无条件调 `client_hello`（这是 STEP-5.4
-        // 引入 `run()` 时的原始语义）。两次 `client_hello` 的后果：
-        // - 第一次：`open_bi()` 开 stream A + 写 Hello + 读 Hello 回包 + 缓存
-        //   stream_a + `hello_ok = true`
-        // - 第二次（run() 内）：`open_bi()` 又开一条 stream D + 写 Hello + 等
-        //   Hello 回包 3s —— 但 server 端 `server_hello` 只 `accept_bi()` 一
-        //   次（接的是 stream A），accept 完就进 stream A 读循环，**永远不会**
-        //   accept stream D
-        // - 客户端第二次 client_hello 等 3s 超时 → `peer.conn.close(...)` 关
-        //   连 → server stream A 的 `read_frame()` 报 "connection lost"
-        //   → 整个 peer.run() 返 `Err(HelloTimeout)`
-        //   → "client (0) peer.run() 返了非预期 Err: hello handshake timed out
-        //   after 3s — 不触发 RetryState"
-        //
-        // **修复**：peer.run() 在调 hello 前查 `hello_ok.load(Acquire)` ——
-        // 已置位则跳过整个 hello 块（open_bi / accept_bi 也不会跑），让 caller
-        // （`connect_to_handle` / `handle_quic_peer_supervisor`）做的早期 hello
-        // 结果继续生效。
-        //
-        // **为什么 caller 路径还要保留早期 hello**：是历史顺序决定的 ——
-        // `connect_to_handle` 早期把 client_hello 放在 peer 生命周期注册到
-        // `peers` 表**之前**（失败则不注册，便于 retry 不影响其他 caller），
-        // `spawn_peer_supervisor` 只接管 peer 死后的 RetryState。`peer.run()`
-        // 设计为"既可独立跑（单测）也可被外部 caller 提前 partial-init 后接
-        // 管"——本步用 hello_ok 守卫表达后者语义。
-        //
-        // **不破坏单测 `peer_session_round_trip_motion_keyboard`**：单测直接调
-        // `peer.run(PeerRole::Client/Server)`，无早期 hello，hello_ok 初始 false
-        // → 走原始 hello 路径，行为不变。
+        // The single-test path that calls `peer.run(PeerRole::Client/Server)`
+        // directly without an early hello has `hello_ok == false` and
+        // therefore runs the handshake as before — test behavior unchanged.
         match role {
             PeerRole::Client => {
                 if !self.hello_ok.load(Ordering::Acquire) {
                     client_hello(&self).await?;
                 } else {
-                    log::debug!("peer.run(Client): hello_ok 已置位，跳过重复 client_hello");
+                    log::debug!("peer.run(Client): hello_ok already set, skipping duplicate client_hello");
                 }
             }
             PeerRole::Server => {
                 if !self.hello_ok.load(Ordering::Acquire) {
                     server_hello(&self).await?;
                 } else {
-                    log::debug!("peer.run(Server): hello_ok 已置位，跳过重复 server_hello");
+                    log::debug!("peer.run(Server): hello_ok already set, skipping duplicate server_hello");
                 }
             }
         }
 
-        // (4) 取 stream A recv 半边 —— 留给主循环 read_frame(recv_a)
+        // (4) Take the stream A recv half — for the main loop's
+        // `read_frame(recv_a)` calls.
         let mut recv_a = self
             .take_stream_a_recv()
             .await
             .ok_or_else(|| super::Error::HelloFailed("stream A recv missing after hello".into()))?;
 
-        // (5) 装配三 stream（client: open_bi() / server: accept_bi()）
-        //     —— 填入 peer.stream_bunch 让 read_loop 接管
+        // (5) Assemble three streams (client: open_bi() / server:
+        // accept_bi()) — fill `peer.stream_bunch` so `read_loop` can take
+        // over the reader tasks.
         //
-        //     **为什么 3 次**”：A / B / C 三条（PLAN §3 "A/B/C 各开 1 条长期
-        //     复用"）。M1 阶段 Stream C 装配后 read_loop 立即 drop recv 半边
-        //     （守 §9），但仍需先 open/accept 拿到 stream C 的所有权再 drop。
+        // Three iterations correspond to streams A / B / C (each opened
+        // once for long-term reuse). In M1 the stream C recv half is
+        // immediately dropped by `read_loop`, but the stream C bidi must
+        // still be opened/accepted first to acquire its ownership.
         let mut pairs = Vec::with_capacity(3);
         for i in 0..3u8 {
             let pair = match role {
@@ -856,18 +835,20 @@ impl PeerSession {
             };
             pairs.push(pair);
         }
-        // pairs[0] = stream A（保留 send 半边给后续 send_stream_a；recv 半边
-        //                   已被 take_stream_a_recv 拿走 —— pair.1 即 stream A 的
-        //                   recv，是 redundant dup；无害 drop 即可）
+        // pairs[0] = stream A (keep the send half for `send_stream_a`; the recv
+        //                   half was already taken by `take_stream_a_recv` —
+        //                   `pair.1` is a redundant dup; safe to drop)
         // pairs[1] = stream B
-        // pairs[2] = stream C（read_loop 立即 drop —— 守 §9）
+        // pairs[2] = stream C (dropped immediately by `read_loop` in M1)
         let mut pairs_iter = pairs.into_iter();
         let (s_a, r_a_dup) = pairs_iter.next().expect("pairs[0]");
         let (s_b, r_b) = pairs_iter.next().expect("pairs[1]");
         let (s_c, r_c_dup) = pairs_iter.next().expect("pairs[2]");
-        // stream A recv half 已被 take_stream_a_recv 拿走 —— r_a_dup 是
-        // redundant dup，交给 StreamBunch.a.recv 占位（read_loop 不读它）
-        // stream C recv 也不被 M1 reader task 读（守 §9）—— 同上 r_c_dup 占位
+        // Stream A's recv half was taken by `take_stream_a_recv` — `r_a_dup`
+        // is a redundant dup; place it at `StreamBunch.a.recv` (read_loop
+        // does not read it).
+        // Stream C's recv is also not read by the M1 reader task — same
+        // `r_c_dup` placeholder.
         let bunch = StreamBunch {
             a: Bidi::new(s_a, r_a_dup),
             b: Bidi::new(s_b, r_b),
@@ -875,34 +856,32 @@ impl PeerSession {
         };
         self.set_stream_bunch(bunch).await;
 
-        // (6) read_loop 装配 stream B reader task；stream C 在 read_loop 内 drop
+        // (6) `read_loop` assembles the stream B reader task; stream C is
+        // dropped inside `read_loop`.
         let mut read_streams = read_loop(&self, &mut recv_a).await?;
 
-        // (7) 主循环 select! —— 4 路 reader + conn.closed() 超时
+        // (7) Main loop `select!` — 4-way reader + conn.closed() fallback.
         let closed = self.conn.closed();
         tokio::pin!(closed);
-        let mut out_event_log = 0u32; // 仅日志用，避免 log spam
+        let mut out_event_log = 0u32; // log-only counter to avoid log spam.
         loop {
             tokio::select! {
-                // 路 A：stream A 控制面 —— 由 run() 持有 recv_a
+                // Path A: stream A control plane — `run()` owns `recv_a`.
                 res = read_frame(&mut recv_a) => {
                     match res {
                         Ok(event) => {
-                            // Control 类 —— 本步**转发**到 outgoing_events
-                            // （client 端 connect_to_handle 设的 sender），
-                            // 让 `LanMouseConnection::recv()` 通过 recv_tx
-                            // 收到 Ack / Pong / Leave 等响应，capture.rs 据
-                            // 此切到 Sending 状态或释放 capture。
-                            //
-                            // **STEP-8.2 修复 — Bug #7**：修前只 log debug，
-                            // recv_tx 是死字段（Bug #4 同源），server 响应
-                            // 永远到不了本地 capture。
+                            // Forward Control events to `outgoing_events`
+                            // (set by the client-side `connect_to_handle`),
+                            // so `LanMouseConnection::recv()` can receive
+                            // Ack / Pong / Leave responses via `recv_tx`,
+                            // letting `capture.rs` transition to Sending or
+                            // release capture.
                             log::debug!("run: stream A read event: {event:?}");
                             if let Some(tx) = self.outgoing_events.lock().await.as_ref() {
                                 let remote = self.conn.remote_address();
                                 if let Err(e) = tx.send((remote, event)) {
                                     log::debug!(
-                                        "run: outgoing_events send failed (forwarder 已退): {e}"
+                                        "run: outgoing_events send failed (forwarder has exited): {e}"
                                     );
                                 }
                             }
@@ -912,107 +891,124 @@ impl PeerSession {
                             return Err(super::Error::FrameTooLarge(len));
                         }
                         Err(super::Error::Truncated) => {
-                            log::info!("run: stream A truncated — peer closed (Bug #9 path)");
-                            // **STEP-8.2 修复 — Bug #9**：peer 单方面关闭
-                            // 时主动 `conn.close()`，让 quinn `closed()` future
-                            // 立刻 fire（quinn 默认要双向 close 才 fire，
-                            // 等 30s idle_timeout）→
-                            // supervisor 立刻收到 peer.run 退出 → set_active_
-                            // addr(None) + remove peer → capture 下次 send
-                            // 触发 release（user-noticeable 立即恢复）。
+                            log::info!("run: stream A truncated — peer closed");
+                            // Peer one-sided close: actively call
+                            // `conn.close()` so quinn's `closed()` future
+                            // fires immediately (by default quinn waits for a
+                            // bidirectional close, falling back to a 30s idle
+                            // timeout). The supervisor sees `peer.run` exit
+                            // right away, clears the active addr and removes
+                            // the peer, and capture releases on the next
+                            // send.
                             //
-                            // 同时推一个 Leave 到 outgoing_events → forwarder
-                            // → capture.rs 立即 release_capture（不等下次
-                            // mouse event 触发 send）。
+                            // Also push a `Leave` to `outgoing_events` →
+                            // forwarder → `capture.rs` so it calls
+                            // `release_capture` immediately (without waiting
+                            // for the next mouse event to trigger a send).
                             self.conn.close(0u32.into(), b"peer closed stream");
                             let remote = self.conn.remote_address();
                             self.send_outgoing_event(ProtoEvent::Leave(0), remote).await;
                             break;
                         }
                         Err(super::Error::HelloFailed(msg)) if msg.starts_with("read frame") => {
-                            // **STEP-8.2 修复 — Bug #10**：read_u32 / read_exact
-                            // 的 IO 错误（如 "connection lost"、"closed stream"）
-                            // —— peer 已关 / conn 死。本应是 stream 结束信号，
-                            // 走与 Truncated 相同的"主动 close + 推 Leave"路径
-                            // 让 capture 立即 release。
+                            // IO error from `read_u32` / `read_exact` (e.g.
+                            // "connection lost", "closed stream") — peer is
+                            // gone / conn is dead. This is a stream-end
+                            // signal, so take the same "active close + push
+                            // Leave" path as Truncated to release capture
+                            // immediately.
                             //
-                            // **修前**：这条路径误归为 "decode error → skip-frame
-                            // 续读"，但 read IO 错误不是 decode 错误（数据未到
-                            // 达解码阶段）—— 主循环**永远 continue待**
-                            // 每次都同一错 + 30s idle_timeout 才让 closed()
-                            // fire，期间 capture 不 release（用户 30s 延迟
-                            // 看到 mouse 恢复）。
+                            // Previously this was misclassified as a
+                            // "decode error → skip-frame and continue"
+                            // case, but read IO errors are not decode
+                            // errors (the data never reaches the decoder) —
+                            // the main loop would log the same error on
+                            // every iteration until the 30s idle timeout
+                            // finally fired `closed()`, with no capture
+                            // release during that time (user-noticeable 30s
+                            // delay before recovery).
                             //
-                            // **对照 listen.rs supervisor**（旧路径）：
-                            // `Err(e) => return Err(e)` —— 任何 IO 错误立刻
-                            // 退出，与本 fix 语义一致。
-                            log::info!("run: stream A read IO error (Bug #10 path): {msg}");
+                            // Mirrors the listen.rs supervisor's behavior
+                            // (`Err(e) => return Err(e)`): any IO error
+                            // exits immediately.
+                            log::info!("run: stream A read IO error: {msg}");
                             self.conn.close(0u32.into(), b"peer read IO error");
                             let remote = self.conn.remote_address();
                             self.send_outgoing_event(ProtoEvent::Leave(0), remote).await;
                             break;
                         }
                         Err(e) => {
-                            // decode frame 失败 → 单帧损坏，skip-frame 续读
+                            // Frame decode failed → single bad frame; skip
+                            // the frame and keep reading.
                             log::warn!("run: stream A read_frame error (skip frame): {e}");
                         }
                     }
                 }
 
-                // 路 B：stream B mpsc —— Reliable 类（按键 / Modifier）
+                // Path B: stream B mpsc — Reliable events (keystrokes /
+                // modifier state).
                 evt = read_streams.b.recv() => {
                     match evt {
                         Some(StreamEvent::Reliable(event)) => {
                             log::debug!("run: stream B Reliable event: {event:?}");
-                            // 本步**不**做业务分派（不调 route_input）；
-                            // STEP-6.x LanMouseConnection 接入时按 cfg 分派
-                            // → 本地 emulation
+                            // No business dispatch at this level (no
+                            // `route_input`); the higher-level connection
+                            // wrapper will dispatch by cfg to local
+                            // emulation.
                         }
                         Some(other) => {
-                            // stream B reader task 不应产生 Control/Datagram；
-                            // 防御性记录（warn 但不退出 —— reader task 内已
-                            // 严格包 Reliable；这里多一道兜底）
+                            // The stream B reader task should only produce
+                            // Reliable events; this is a defensive log
+                            // (warn but do not exit — the reader task
+                            // already strictly produces Reliable; this is
+                            // a redundant safety net).
                             log::warn!("run: stream B produced non-Reliable event: {other:?}");
                         }
                         None => {
-                            // stream B reader task 已退出（peer closed / fatal）
+                            // The stream B reader task has exited (peer
+                            // closed / fatal).
                             log::info!("run: stream B reader closed, exiting main loop");
                             break;
                         }
                     }
                 }
 
-                // 路 D：datagram mpsc —— Datagram 类（高频指针事件）
+                // Path D: datagram mpsc — Datagram events (high-frequency
+                // pointer events).
                 evt = rx_d.recv() => {
                     match evt {
                         Some(StreamEvent::Datagram(event)) => {
-                            // 防 log spam：本步每 64 帧记一条
+                            // Anti-log-spam: log every 64 frames.
                             out_event_log = out_event_log.wrapping_add(1);
                             if out_event_log % 64 == 1 {
                                 log::debug!("run: datagram Datagram event (count={out_event_log}): {event:?}");
                             }
-                            // 本步**不**做业务分派（同上 stream B）
+                            // No business dispatch at this level (same as
+                            // stream B above).
                         }
                         Some(other) => {
-                            // datagram_reader_task 不应产生 Control/Reliable；
-                            // 防御性记录
+                            // The datagram_reader_task should only produce
+                            // Datagram events; defensive log.
                             log::warn!("run: datagram_reader produced non-Datagram event: {other:?}");
                         }
                         None => {
-                            // datagram_reader task 已退出（conn.closed / read_datagram 返 Err）
+                            // The datagram_reader task has exited
+                            // (conn.closed / read_datagram returned Err).
                             log::info!("run: datagram_reader closed, exiting main loop");
                             break;
                         }
                     }
                 }
 
-                // 路 C：conn closed 兜底 —— 任意源触发关闭都退出主循环
+                // Path C: `conn.closed()` fallback — any source of close
+                // exits the main loop.
                 closed_res = &mut closed => {
                     log::info!("run: conn.closed() fired: {closed_res:?}");
-                    // **STEP-8.2 修复 — Bug #9**：closed() fire 通常意味
-                    // 着 peer 已发 close 帧（双向 close 路径）。推一个
-                    // Leave 让本地 capture 立即 release（不等下次 mouse
-                    // event 触发 send）。
+                    // `closed()` firing usually means the peer has sent a
+                    // close frame (bidirectional close path). Push a
+                    // `Leave` so the local capture releases immediately
+                    // (without waiting for the next mouse event to
+                    // trigger a send).
                     let remote = self.conn.remote_address();
                     self.send_outgoing_event(ProtoEvent::Leave(0), remote).await;
                     break;
@@ -1020,22 +1016,22 @@ impl PeerSession {
             }
         }
 
-        // (8) 退出主循环 —— 取 close reason 并转成 `super::Error::Handshake(reason)`
+        // (8) Exit main loop — read `conn.close_reason()` and convert it
+        // into `Err(super::Error::Handshake(reason))`.
         //
-        // **STEP-6.5 改造**：原返回 `Ok(())` —— caller 看不到"为什么关"的语义。
-        // 现取 `conn.close_reason()` (quinn 0.11 公开 API)：peer 主动 close 时
-        // 返 `Some(ConnectionError::ApplicationClosed(_))`；网络层断连时返
-        // `Some(ConnectionError::ConnectionLost(_))` / `TimedOut` 等；本地主动
-        // close 时返 `Some(ConnectionError::LocallyClosed)`；从未关闭过则
-        // 返 `None` —— 这种情形极少（说明主循环是别的原因 break 的，比如
-        // stream A/B/D 异常），此时返回 `super::Error::Handshake(LocallyClosed)`
-        // 让 caller 走 `should_retry_after_close` 判定（保守不重试）。
+        // `conn.close_reason()` is a quinn 0.11 public API: it returns
+        // `Some(ConnectionError::ApplicationClosed(_))` for peer-initiated
+        // close, `Some(ConnectionError::ConnectionLost(_))` / `TimedOut`
+        // for network-layer disconnect, `Some(LocallyClosed)` for
+        // local-initiated close, and `None` if the connection was never
+        // closed. The `None` case is rare (it means the main loop broke
+        // out for some other reason — e.g. a stream A/B/D anomaly); in
+        // that case we synthesize `LocallyClosed` so the caller can still
+        // consult `should_retry_after_close` (conservative: do not retry).
         //
-        // **为什么用 `super::Error::Handshake(ConnectionError)` 复用现有变体**：
-        // `super::Error::Handshake` 在 STEP-2.2 已定义成 `#[from] quinn::ConnectionError`，
-        // 复用零成本。`super::Error::Closed` 是 bak 命名，本仓不引入（保持现有变体集
-        // 最小）。`should_retry_after_close(&reason)` 是 free function，caller
-        // 自己判 retry 决策。
+        // We reuse the existing `super::Error::Handshake(ConnectionError)`
+        // variant (already `#[from] quinn::ConnectionError`); no new
+        // `super::Error::Closed` variant is introduced.
         log::debug!("run: main loop exited");
         let reason = self.conn.close_reason();
         let reason = reason.unwrap_or(quinn::ConnectionError::LocallyClosed);
@@ -1044,22 +1040,22 @@ impl PeerSession {
     }
 }
 
-/// 单个 datagram 的"安全上限"（STEP-5.1 引入）。
+/// Conservative upper bound for a single datagram, in bytes.
 ///
-/// 取 STEP-0.1 spike 实测的 QUIC 握手初期下限 `1162` 字节 —— MTU 探测完成前
-/// `max_datagram_size()` 可能先报这个保守值，避免在此期间用误
-/// `max_datagram_size()` 触发 `SendDatagramError::TooLarge`。SPIKE 后值
-/// 可升到 `1414`（路径 MTU 探测完成）但**不缓存**——本常量仅作为
-/// `max_datagram_size().map(|m| m.min(MAX_SAFE_DATAGRAM))` 的取 min 边界，
-/// 防止上层用任何"陈旧的更大值"绕过 cap。
-///
-/// 与 bak `mousehop/src/quic_transport.rs:121-123 MAX_SAFE_DATAGRAM`
-/// 完全对齐（PLAN-v4 Step 0.1 结论 D）。
+/// The QUIC handshake initially reports a low datagram cap (1162 bytes)
+/// before path MTU probing widens it. Before probing completes,
+/// `max_datagram_size()` may already return this conservative value;
+/// using a raw `max_datagram_size()` directly could trigger
+/// `SendDatagramError::TooLarge` for that early window. After probing
+/// the value can grow to ~1414, but is **not cached** — this constant
+/// is the `min` bound applied as `max_datagram_size().map(|m| m.min(MAX_SAFE_DATAGRAM))`
+/// to prevent any caller from bypassing the cap with a "stale larger value".
 const MAX_SAFE_DATAGRAM: usize = 1162;
 
-// 抑制 `use` 中的 `Ordering` 警告（client_hello / server_hello 内部
-// 引用了 self.hello_ok.store(..., Ordering::Release)，但本文件 import
-// 没直接用）。
+// Silence the unused-import warning on `Ordering`. `client_hello` /
+// `server_hello` (defined in `super::protocol`) use
+// `self.hello_ok.store(..., Ordering::Release)`, but this file does not
+// reference `Ordering` directly.
 #[allow(unused_imports)]
 use std::sync::atomic::Ordering as _Ordering;
 
@@ -1080,8 +1076,9 @@ mod tests {
 
     use super::*;
 
-    /// STEP-5.1 验收 (1/1)：端到端 send_motion 走 datagram 路径，对端
-    /// recv_datagram 收到事件并解码回原字段。
+    /// End-to-end `send_motion` over the datagram path: the peer receives
+    /// the event via `recv_datagram` and decodes it back to the original
+    /// fields.
     #[tokio::test]
     async fn motion_datagram_round_trip() {
         use crate::quic_transport::endpoint::install_crypto_provider;
@@ -1107,26 +1104,26 @@ mod tests {
                 session.connection().read_datagram(),
             )
             .await
-            .expect("read_datagram 超时（datagram 路径没走通？）")
+            .expect("read_datagram timed out (datagram path failed?)")
             .expect("read_datagram");
 
             assert_eq!(
                 datagram.len(),
                 MAX_EVENT_SIZE,
-                "send_motion 写满定长缓冲，对端应收到 {MAX_EVENT_SIZE} 字节"
+                "send_motion filled the fixed-size buffer, peer should receive {MAX_EVENT_SIZE} bytes"
             );
             let buf: [u8; MAX_EVENT_SIZE] =
-                datagram.as_ref().try_into().expect("datagram 长度应匹配");
-            let decoded = ProtoEvent::try_from(buf).expect("datagram 应解码为 ProtoEvent");
+                datagram.as_ref().try_into().expect("datagram length should match");
+            let decoded = ProtoEvent::try_from(buf).expect("datagram should decode as ProtoEvent");
             match decoded {
                 ProtoEvent::Input(input_event::Event::Pointer(
                     input_event::PointerEvent::Motion { time, dx, dy },
                 )) => {
-                    assert_eq!(time, 4242, "Motion.time round-trip 一致");
-                    assert_eq!(dx, 12.5, "Motion.dx round-trip 一致");
-                    assert_eq!(dy, -7.25, "Motion.dy round-trip 一致");
+                    assert_eq!(time, 4242, "Motion.time round-trip consistent");
+                    assert_eq!(dx, 12.5, "Motion.dx round-trip consistent");
+                    assert_eq!(dy, -7.25, "Motion.dy round-trip consistent");
                 }
-                other => panic!("解码结果应为 Motion，实际：{other:?}"),
+                other => panic!("decoded result should be Motion, actually: {other:?}"),
             }
         });
 
@@ -1163,13 +1160,13 @@ mod tests {
 
         assert!(
             client_session.connection().max_datagram_size().is_some(),
-            "握手完成后 max_datagram_size() 应为 Some（quinn 默认启用 datagram）"
+            "after handshake complete, max_datagram_size() should be Some (quinn enables datagram by default)"
         );
 
         client_session
             .send_motion(&motion_event())
             .await
-            .expect("send_motion 应走 datagram 成功");
+            .expect("send_motion should succeed via datagram");
 
         server_task.await.expect("server task");
         drop(client_session);
@@ -1177,8 +1174,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&pins_dir);
     }
 
-    /// STEP-5.4 验收 (1/1)：两端都跑 `Arc<PeerSession>::run(role)`，双向各发 1 帧
-    /// Motion → 双端 datagram_reader 各收 1 帧 → 双方都成功退出。
+    /// Acceptance test for end-to-end datagram round-trip: both ends run
+    /// `Arc<PeerSession>::run(role)`, each sends one Motion frame → both
+    /// `datagram_reader`s receive one frame each → both sides exit
+    /// successfully.
     #[tokio::test(flavor = "multi_thread")]
     async fn peer_session_round_trip_motion_keyboard() {
         local_set_test!(peer_session_round_trip_motion_keyboard, {
@@ -1264,8 +1263,9 @@ mod tests {
         });
     }
 
-    /// STEP-8.2 验收 — Bug #3 回归：先 `client_hello` 置 `hello_ok=true`，
-    /// 再 `peer.run(Client)` —— `peer.run()` 必须跳过 `client_hello`。
+    /// Bug #3 regression: first call `client_hello` to set `hello_ok=true`,
+    /// then `peer.run(Client)` — `peer.run()` must skip its own
+    /// `client_hello`.
     #[tokio::test(flavor = "multi_thread")]
     async fn peer_run_skips_hello_if_already_done() {
         local_set_test!(peer_run_skips_hello_if_already_done, {
@@ -1327,7 +1327,7 @@ mod tests {
                 .await
                 .expect("client_hello timeout")
                 .expect("client_hello");
-            assert!(client_arc.hello_ok(), "client_hello 后 hello_ok 应已置位");
+            assert!(client_arc.hello_ok(), "hello_ok should be set after client_hello");
 
             let client_for_run = std::sync::Arc::clone(&client_arc);
             let run_task =
@@ -1341,15 +1341,15 @@ mod tests {
 
             let run_result = tokio::time::timeout(std::time::Duration::from_secs(2), run_task)
                 .await
-                .expect("peer.run 未在 2s 内退出")
-                .expect("peer.run task 未 panic");
+                .expect("peer.run did not exit within 2s")
+                .expect("peer.run task did not panic");
 
             match run_result {
                 Err(crate::quic_transport::Error::HelloTimeout(_)) => {
-                    panic!("Bug #3 回归");
+                    panic!("Bug #3 regression");
                 }
                 Err(crate::quic_transport::Error::HelloFailed(msg)) => {
-                    panic!("Bug #3 回归: {msg}");
+                    panic!("Bug #3 regression: {msg}");
                 }
                 Err(crate::quic_transport::Error::Handshake(reason)) => {
                     log::debug!("peer.run exited with Handshake({reason:?})");
@@ -1370,7 +1370,7 @@ mod tests {
         });
     }
 
-    /// STEP-8.2 验收 — Bug #5 回归：stream A 控制事件端到端可达。
+    /// Regression test: stream A control events are reachable end-to-end.
     #[tokio::test(flavor = "multi_thread")]
     async fn send_stream_a_round_trip_control_event() {
         local_set_test!(send_stream_a_round_trip_control_event, {
@@ -1402,18 +1402,18 @@ mod tests {
                 let mut recv_a = session
                     .take_stream_a_recv()
                     .await
-                    .expect("server_hello 后 stream_a_recv 应已缓存");
+                    .expect("stream_a_recv should be cached after server_hello");
                 let event = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
                     super::super::protocol::read_hello_frame(&mut recv_a),
                 )
                 .await
-                .expect("server stream A read 3s 超时")
-                .expect("server stream A read 应成功");
+                .expect("server stream A read 3s timed out")
+                .expect("server stream A read should succeed");
 
                 assert!(
                     matches!(event, ProtoEvent::Ping),
-                    "server 应收到 client 发的 Ping，实际: {event:?}"
+                    "server should receive Ping sent by client, actually: {event:?}"
                 );
 
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1447,8 +1447,8 @@ mod tests {
                 client_arc.send_input(&ProtoEvent::Ping, &InputChannelConfig::default()),
             )
             .await
-            .expect("client send_input(Ping) 超时")
-            .expect("client send_input(Ping) 应成功");
+            .expect("client send_input(Ping) timed out")
+            .expect("client send_input(Ping) should succeed");
 
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server_task).await;
 

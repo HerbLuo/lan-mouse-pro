@@ -103,10 +103,10 @@ in the project's `README.md` under the **Configuration** section:
 - The full example config (release bind, port, `authorized_fingerprints`,
   each `[[clients]]` block) is reproduced there verbatim.
 - Per-client input channel modes (`input_channels.mouse_button`,
-  `input_channels.keyboard`) — the trade-off between **Stream 模式不丢操作**
-  and **Datagram 模式丢操作** — are also described there, alongside the
-  fact that **mouse motion always uses datagrams regardless of this
-  setting**.
+  `input_channels.keyboard`) — the trade-off between **stream mode (no
+  event loss)** and **datagram mode (events may drop)** — are also
+  described there, alongside the fact that **mouse motion always uses
+  datagrams regardless of this setting**.
 
 If you change `config.toml` while lan-mouse is running, restart the
 daemon (or click the GTK frontend's refresh, when available) for the

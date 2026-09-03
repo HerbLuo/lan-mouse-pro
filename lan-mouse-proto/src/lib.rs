@@ -17,8 +17,8 @@ pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_
 /// mTLS handshake authenticates; a peer that fails to present this exact
 /// magic within the handshake window is not a lan-mouse instance and
 /// has its connection refused at the [`crate::quic_transport`] layer
-/// (see STEP-3.2 `client_hello` / `server_hello`). lan-mouse is
-/// deliberately **not** wire-compatible with mousehop or any other
+/// (see the `client_hello` / `server_hello` exchange there). lan-mouse
+/// is deliberately **not** wire-compatible with mousehop or any other
 /// fork — change this magic to force a hard break against a future
 /// divergence.
 ///
@@ -86,9 +86,9 @@ pub enum ProtoEvent {
     /// `magic` must equal [`PROTOCOL_MAGIC`]; a peer that does not
     /// present this magic within the handshake window is not a
     /// lan-mouse instance and has its connection refused at the
-    /// [`crate::quic_transport`] layer (STEP-3.2). The
-    /// type-level decode here still succeeds for any 8-byte magic —
-    /// the connection layer is what enforces the value.
+    /// [`crate::quic_transport`] layer. The type-level decode here
+    /// still succeeds for any 8-byte magic — the connection layer
+    /// is what enforces the value.
     ///
     /// `commit` is the 8-byte ASCII short commit hash from
     /// `shadow_rs`'s `SHORT_COMMIT`. Old peers that don't
@@ -146,7 +146,7 @@ impl ProtoEvent {
     /// Construct a [`ProtoEvent::Hello`] stamped with this build's
     /// [`PROTOCOL_MAGIC`] and the given short commit hash.
     ///
-    /// STEP-3.2: used by [`crate::quic_transport::client_hello`] /
+    /// Used by [`crate::quic_transport::client_hello`] /
     /// [`crate::quic_transport::server_hello`] to emit the magic-bearing
     /// Hello frame on stream A — `magic` is auto-filled with `PROTOCOL_MAGIC`
     /// so callers cannot accidentally send a foreign magic on the wire.
@@ -243,7 +243,7 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 // Type-level decode always succeeds: any 8-byte magic
                 // yields a syntactically-valid Hello. The connection
                 // layer (`crate::quic_transport::client_hello` /
-                // `server_hello`, STEP-3.2) is what enforces that
+                // `server_hello`) is what enforces that
                 // `magic == PROTOCOL_MAGIC` and rejects foreign
                 // peers.
                 Ok(Self::Hello { magic, commit })
@@ -395,8 +395,8 @@ mod tests {
 
     /// Foreign / wrong magic must still decode at the type level —
     /// the connection-layer enforcement of `magic == PROTOCOL_MAGIC`
-    /// is what rejects the peer (see STEP-3.2 `client_hello` /
-    /// `server_hello`).
+    /// is what rejects the peer (see `client_hello` / `server_hello`
+    /// in `crate::quic_transport`).
     #[test]
     fn hello_wrong_magic_decodes_but_typed() {
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::Hello {
@@ -436,11 +436,11 @@ mod tests {
         assert!(PROTOCOL_MAGIC.iter().all(|b| b.is_ascii_graphic()));
     }
 
-    /// STEP-3.2: `ProtoEvent::hello(commit)` must always stamp
-    /// `PROTOCOL_MAGIC` on the wire regardless of the caller-supplied
-    /// commit. This is the only legal way for quic_transport to build a
-    /// Hello frame, so an off-by-one in the constructor would silently
-    /// ship a foreign magic and break wire compatibility.
+    /// `ProtoEvent::hello(commit)` must always stamp `PROTOCOL_MAGIC`
+    /// on the wire regardless of the caller-supplied commit. This is
+    /// the only legal way for quic_transport to build a Hello frame,
+    /// so an off-by-one in the constructor would silently ship a
+    /// foreign magic and break wire compatibility.
     #[test]
     fn hello_constructor_stamps_protocol_magic() {
         let event = ProtoEvent::hello(*b"deadbeef");

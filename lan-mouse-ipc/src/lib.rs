@@ -134,7 +134,7 @@ pub struct ClientConfig {
     pub hostname: Option<String>,
     /// fix ips, determined by the user
     pub fix_ips: Vec<IpAddr>,
-    /// both active_addr and addrs can be None / empty so port needs to be stored seperately
+    /// both active_addr and addrs can be None / empty so port needs to be stored separately
     pub port: u16,
     /// position of a client on screen
     pub pos: Position,
@@ -142,16 +142,16 @@ pub struct ClientConfig {
     pub cmd: Option<String>,
     /// Per-input-event transport selection (datagram vs reliable stream).
     /// Sender-side preference; the receiver has no parallel concept. See
-    /// [`InputChannelConfig`] and STEP-4.4 `route_input` for the routing
-    /// side. The frontend writes this when the user flips the
-    /// mouse-button / keyboard channel dropdowns.
+    /// [`InputChannelConfig`] for the routing side. The frontend writes
+    /// this when the user flips the mouse-button / keyboard channel
+    /// dropdowns.
     ///
     /// `#[serde(default)]` makes the field backward-compatible: existing
     /// frontend / daemon wire payloads that don't carry this field
     /// deserialize as `InputChannelConfig::default()` (mouse →
     /// datagram, keyboard → stream). Required because the wire is
-    /// consumed by older daemons that pre-date ChannelMode (STEP-4.1)
-    /// and would otherwise fail with "missing field `input_channels`".
+    /// consumed by older daemons that pre-date ChannelMode and would
+    /// otherwise fail with "missing field `input_channels`".
     #[serde(default)]
     pub input_channels: InputChannelConfig,
 }
@@ -182,9 +182,8 @@ pub type ClientHandle = u64;
 ///   button-down events and motion, where low latency matters more than
 ///   per-event delivery.
 ///
-/// M1: this enum is only the *configuration* surface. The actual routing is
-/// implemented in `crate::quic_transport::route_input` (STEP-4.4). M2 will
-/// introduce a `TransportEvent` enum on this crate — out of scope here.
+/// This enum is only the *configuration* surface. The actual routing is
+/// implemented in `crate::quic_transport::route_input`.
 #[derive(Debug, Eq, Hash, PartialEq, Copy, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChannelMode {
@@ -200,7 +199,7 @@ pub enum ChannelMode {
 /// The defaults match the long-standing behavior of `lan-mouse` (mouse button
 /// → datagram for low latency; keyboard → stream so modifier releases
 /// cannot be dropped). Users can switch either field via `config.toml` /
-/// the frontend; see STEP-4.3 / STEP-4.5.
+/// the frontend.
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Serialize, Deserialize)]
 pub struct InputChannelConfig {
     /// Channel used for mouse button press / release events.

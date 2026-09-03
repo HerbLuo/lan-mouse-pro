@@ -1,4 +1,4 @@
-//! End-to-end QUIC smoke test (PLAN-M1 §STEP-7.2)
+//! End-to-end QUIC smoke test
 //!
 //! **Goal**: stand up an in-process listener + connector pair on localhost,
 //! complete mTLS + Hello, and verify a small batch of Motion + KeyboardKey
@@ -10,7 +10,7 @@
 //!
 //! **Plus** a separate test verifies QUIC keepalive — after ≥ 10s of
 //! silence on both endpoints, the connection must remain alive. This
-//! codifies the only un-automated check from STEP-7.1.
+//! codifies the only previously un-automated keepalive check.
 //!
 //! **Style**: each test brings its own self-signed cert + ephemeral port,
 //! so parallel `cargo test` runs do not collide. Cert/key paths live under

@@ -1,17 +1,15 @@
-//! 证书与 TLS 配置（rustls 路径）。
+//! Certificates and TLS configuration (rustls path).
 //!
-//! STEP-1.1（PLAN-M1.md）把对 `webrtc_dtls::crypto::Certificate` 的依赖
-//! 解耦：本模块只暴露 rustls 类型 —— `Vec<CertificateDer<'static>>` +
-//! `PrivateKeyDer<'static>`。`Error` 枚举移除 `Dtls(webrtc_dtls::Error)` 变体。
+//! Cert persistence is split into two files (`cert.pem` + `key.pem`) so the
+//! key can be tightened to `0o400` on Unix / `FILE_ATTRIBUTE_READONLY` on
+//! Windows. `key_path()` and `cert_path()` mirror each other, and
+//! `load_or_create_server_cert()` is the zero-argument entry point used by
+//! production callers.
 //!
-//! STEP-2.4 把 `cert.pem` + `key.pem` 拆成两个文件（#S-4 已解）；
-//! `key_path()` 与 `cert_path()` 对称，`load_or_create_server_cert()` 是
-//! 公共别名，内部调 `load_or_generate_key_and_cert_der(cert_path(), key_path())`。
-//! 同时把"plan §1.1 别名"对齐到 `load_or_create_server_cert` 命名。
-//!
-//! cert 路径：与 bak 设计对齐 —— `$XDG_DATA_HOME/lan-mouse/{cert,key}.pem`，
-//! 回退 `$HOME/.local/share/lan-mouse/{cert,key}.pem`，Windows 走 `%APPDATA%`。
-//! key 文件 0o400（Unix）/`FILE_ATTRIBUTE_READONLY`（Windows）保持。
+//! cert path: `$XDG_DATA_HOME/lan-mouse/cert.pem`, falling back to
+//! `$HOME/.local/share/lan-mouse/cert.pem`, or `%APPDATA%\lan-mouse\cert.pem`
+//! on Windows. The key file mode (`0o400` / read-only) is enforced at write
+//! time.
 
 use std::fs;
 use std::io::{self, Write};
@@ -40,10 +38,12 @@ pub enum Error {
     Rcgen(#[from] rcgen::Error),
 }
 
-/// SHA-256 指纹（hex，用 `:` 分隔），小写。接受任意 DER 字节。
+/// SHA-256 fingerprint (hex, `:` separated, lowercase). Accepts arbitrary
+/// DER bytes.
 ///
-/// 与 listen.rs（`Accept { fingerprint }`）+ service.rs（`public_key_fingerprint`）
-/// 一致：两条路径只要 DER 字节相同，指纹必然一致。
+/// Consistent with `listen.rs` (`Accept { fingerprint }`) and
+/// `service.rs` (`public_key_fingerprint`): as long as both code paths see
+/// the same DER bytes, the fingerprint will match.
 pub fn generate_fingerprint(cert: &[u8]) -> String {
     let mut hash = Sha256::new();
     hash.update(cert);
@@ -56,9 +56,10 @@ pub fn generate_fingerprint(cert: &[u8]) -> String {
         .to_lowercase()
 }
 
-// === rustls API（Phase 1 / Phase 2 正式使用）============================
+// === rustls API ===================================================
 
-/// 从 PEM 文件加载证书链，返回 `Vec<CertificateDer<'static>>`。
+/// Load a certificate chain from a PEM file and return
+/// `Vec<CertificateDer<'static>>`.
 pub fn load_cert_der(path: &Path) -> Result<Vec<CertificateDer<'static>>, Error> {
     let pem = fs::read(path)?;
     let der_bytes = rustls_pemfile::certs(&mut pem.as_slice())
@@ -66,7 +67,8 @@ pub fn load_cert_der(path: &Path) -> Result<Vec<CertificateDer<'static>>, Error>
     Ok(der_bytes.into_iter().map(CertificateDer::from).collect())
 }
 
-/// 从 PEM 文件加载 PKCS#8 私钥，返回 `PrivateKeyDer<'static>`。
+/// Load a PKCS#8 private key from a PEM file and return
+/// `PrivateKeyDer<'static>`.
 pub fn load_key_der(path: &Path) -> Result<PrivateKeyDer<'static>, Error> {
     let pem = fs::read(path)?;
     let mut keys = rustls_pemfile::pkcs8_private_keys(&mut pem.as_slice())
@@ -75,49 +77,51 @@ pub fn load_key_der(path: &Path) -> Result<PrivateKeyDer<'static>, Error> {
     Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)))
 }
 
-/// OS 感知的 server cert 持久化路径。
+/// OS-aware server cert persistence path.
 ///
-/// - Unix：`$XDG_DATA_HOME/lan-mouse/cert.pem`，回退到
-///   `$HOME/.local/share/lan-mouse/cert.pem`，最后回退到当前目录
-/// - Windows：`%APPDATA%\lan-mouse\cert.pem`，回退到当前目录
+/// - Unix: `$XDG_DATA_HOME/lan-mouse/cert.pem`, falling back to
+///   `$HOME/.local/share/lan-mouse/cert.pem`, finally the current directory.
+/// - Windows: `%APPDATA%\lan-mouse\cert.pem`, falling back to the current
+///   directory.
 pub fn cert_path() -> PathBuf {
     lan_mouse_data_dir().join("cert.pem")
 }
 
-/// OS 感知的 server private key 持久化路径（与 [`cert_path`] 对称）。
+/// OS-aware server private key persistence path (mirrors [`cert_path`]).
 ///
-/// - Unix：`$XDG_DATA_HOME/lan-mouse/key.pem`
-/// - Windows：`%APPDATA%\lan-mouse\key.pem`
+/// - Unix: `$XDG_DATA_HOME/lan-mouse/key.pem`
+/// - Windows: `%APPDATA%\lan-mouse\key.pem`
 ///
-/// STEP-2.4 拆分 `cert.pem` + `key.pem` 后引入（#S-4）；文件权限
-/// `0o400`（Unix）/`FILE_ATTRIBUTE_READONLY`（Windows）由
-/// [`generate_self_signed`] 在落盘时收紧。
+/// File permissions (`0o400` on Unix / `FILE_ATTRIBUTE_READONLY` on Windows)
+/// are tightened by [`generate_self_signed`] when the key is written.
 pub fn key_path() -> PathBuf {
     lan_mouse_data_dir().join("key.pem")
 }
 
-/// QUIC 客户端 TOFU 指纹缓存目录（STEP-6.1 引入，与 bak
-/// `mousehop/src/crypto.rs:264-272 cert_pins_dir` 对齐）。
+/// TOFU fingerprint cache directory for QUIC clients.
 ///
-/// - Unix：`$XDG_DATA_HOME/lan-mouse/known_peers/`
-/// - Windows：`%APPDATA%\lan-mouse\known_peers\`
+/// - Unix: `$XDG_DATA_HOME/lan-mouse/known_peers/`
+/// - Windows: `%APPDATA%\lan-mouse\known_peers\`
 ///
-/// **不**在此函数内 `create_dir_all` —— 由 caller（quic_transport 的
-/// `TofuVerifier::new`）按需创建。本函数只返回路径。
+/// This function does **not** call `create_dir_all`; the caller
+/// (`quic_transport::TofuVerifier::new`) creates the directory on demand.
+/// This function only returns the path.
 ///
-/// **为什么独立于 `cert_path` / `key_path`**：
-/// - TOFU 缓存是 *per-peer* 持久化（每个对端一个 `<fp>.pin` 文件），
-///   与 server 自身的 cert/key 生命周期独立
-/// - 用户清掉 `known_peers/` 只触发"重新信任对端"语义（首次连接会
-///   落新的 pin），不会丢 server 自身的 cert
+/// **Why this lives separately from `cert_path` / `key_path`:**
+/// - The TOFU cache is per-peer persistence (one `<fp>.pin` file per peer)
+///   and has its own lifetime, independent of the server's own cert/key.
+/// - Clearing `known_peers/` only resets peer trust — the next connection
+///   drops a fresh pin — without touching the server's own cert.
 pub fn cert_pins_dir() -> PathBuf {
     lan_mouse_data_dir().join("known_peers")
 }
 
-/// 共享的"应用数据目录"OS 解析逻辑（[`cert_path`] / [`key_path`] 共用）。
+/// Shared OS-resolution for the application data directory. Used by both
+/// [`cert_path`] and [`key_path`].
 ///
-/// - Unix：`$XDG_DATA_HOME`，回退 `$HOME/.local/share`，最后回退当前目录
-/// - Windows：`%APPDATA%`，回退当前目录
+/// - Unix: `$XDG_DATA_HOME`, falling back to `$HOME/.local/share`, finally
+///   the current directory.
+/// - Windows: `%APPDATA%`, falling back to the current directory.
 fn lan_mouse_data_dir() -> PathBuf {
     #[cfg(unix)]
     {
@@ -142,12 +146,11 @@ fn lan_mouse_data_dir() -> PathBuf {
     }
 }
 
-/// 加载已落盘的 server cert + key（分别从 `cert_path` / `key_path` 读）；
-/// 任一缺失则自签生成并落盘到对应文件。
+/// Load an existing server cert + key (from `cert_path` / `key_path`); if
+/// either file is missing, generate a self-signed pair and persist them to
+/// the matching locations.
 ///
-/// 返回 `(cert_chain, key)`，给 `quic_transport::endpoint_with_cert()` 注入
-/// 使用。STEP-2.4 起本函数只接受拆开的双路径（#S-4）；零参数 caller 一律
-/// 改走 [`load_or_create_server_cert`]。
+/// Returns `(cert_chain, key)`, intended for `quic_transport::endpoint_with_cert()`.
 pub fn load_or_generate_key_and_cert_der(
     cert_path: &Path,
     key_path: &Path,
@@ -161,16 +164,17 @@ pub fn load_or_generate_key_and_cert_der(
     }
 }
 
-/// `load_or_generate_key_and_cert_der(cert_path(), key_path())` 的零参数别名
-/// （PLAN §1.1 + STEP-2.4 caller 一致性）。这是 service.rs / quic_transport
-/// 生产路径的入口。
+/// Zero-argument alias for
+/// `load_or_generate_key_and_cert_der(cert_path(), key_path())`. This is
+/// the entry point used by `service.rs` and `quic_transport` in production.
 pub fn load_or_create_server_cert()
 -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Error> {
     load_or_generate_key_and_cert_der(&cert_path(), &key_path())
 }
 
-/// 自签生成。返回 `(cert_chain, key)`。落盘拆为 `cert_path` (cert PEM) +
-/// `key_path` (key PEM) 两个文件（STEP-2.4 / #S-4）；key 文件 Unix 权限 0o400。
+/// Generate a self-signed cert and key. Returns `(cert_chain, key)`. The
+/// files are split across `cert_path` (cert PEM) and `key_path` (key PEM);
+/// the key file is tightened to `0o400` on Unix.
 pub fn generate_self_signed(
     common_name: &str,
     cert_path: &Path,
@@ -180,7 +184,7 @@ pub fn generate_self_signed(
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
     let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
 
-    // 落 cert PEM
+    // write the cert PEM
     if let Some(parent) = cert_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -197,7 +201,7 @@ pub fn generate_self_signed(
         writer.write_all(pem.as_bytes())?;
     }
 
-    // 落 key PEM（0o400，比 cert 更紧）
+    // write the key PEM (0o400 — tighter than the cert)
     if let Some(parent) = key_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -217,11 +221,11 @@ pub fn generate_self_signed(
     Ok((vec![cert_der], key_der))
 }
 
-/// 构造 `Arc<rustls::ServerConfig>`（单证书，no client auth）。
+/// Build `Arc<rustls::ServerConfig>` (single cert, no client auth).
 ///
-/// STEP-2.5 引入 mTLS 后由 `rustls_server_config_with_verifier` 替代；本函数
-/// 先以"no client auth"形态对外，作为 STEP-1.4 `endpoint()` 喂给
-/// `quinn::ServerConfig` 的最小可用封装。
+/// mTLS-aware callers should use [`rustls_server_config_with_verifier`]
+/// instead; this entry point is the minimal "no client auth" form, kept
+/// for tests and for callers that explicitly don't need mTLS.
 pub fn rustls_server_config(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
@@ -234,18 +238,16 @@ pub fn rustls_server_config(
     Ok(Arc::new(cfg))
 }
 
-/// STEP-2.5 mTLS 强制 client cert 校验入口 —— 与 `rustls_server_config` 形态
-/// 对称，唯一差别是 `with_no_client_auth()` → `with_client_cert_verifier(verifier)`：
-/// 前者走 rustls 内置 `NoClientAuth`（不验证 client cert），后者走应用层提供
-/// 的 `ClientCertVerifier` 实现（STEP-2.7 `AuthorizedKeysVerifier`，本步仅
-/// 装配入口）。`quic_transport::endpoint_with_verifier(...)` 调本函数。
+/// mTLS-enforcing server config builder. Mirrors [`rustls_server_config`],
+/// but swaps `with_no_client_auth()` for `with_client_cert_verifier(verifier)`:
+/// the former uses rustls' built-in `NoClientAuth` (no client-cert
+/// validation), the latter delegates to an application-provided
+/// `ClientCertVerifier` implementation. `quic_transport::endpoint_with_verifier(...)`
+/// calls this entry point.
 ///
-/// **verifier 必须 `Send + Sync + 'static`**（rustls 0.23 trait 约束）——
-/// `Arc<dyn rustls::server::danger::ClientCertVerifier>` 自动满足。
-///
-/// 与 `bak/mousehop/src/crypto.rs:238-249 rustls_server_config_with_verifier`
-/// 完全对齐；差异仅在 `/// dead_code` 注释（本仓不做 dead_code 守护 —— 单测
-/// 与 `endpoint_with_verifier` 接入后自然消费）。
+/// The `verifier` must be `Send + Sync + 'static` (rustls 0.23 trait
+/// bound); `Arc<dyn rustls::server::danger::ClientCertVerifier>` satisfies
+/// that automatically.
 pub fn rustls_server_config_with_verifier(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
@@ -259,16 +261,12 @@ pub fn rustls_server_config_with_verifier(
     Ok(Arc::new(cfg))
 }
 
-/// 构造 `Arc<rustls::ClientConfig>`（带根证书，无 mTLS）。
+/// Build `Arc<rustls::ClientConfig>` (with root certs, no mTLS).
 ///
-/// server cert 校验下沉到 `quic_transport::TofuVerifier`（STEP-2.6），本函数
-/// 只负责 root cert store + 默认 chain 校验 + 无 client auth。
-///
-/// **STEP-7.3 守护**：虽然 `build_quic_client_config` 不再调本函数（生产路径
-/// 已用 TofuVerifier），但 `crypto::tests::round_trip_generate_and_load` 仍用
-/// 本函数做"ClientConfig 可构造" 单测契约 —— 证明 cert/key DER 同时能作为
-/// server cert 和 client root。保留 + `#[allow(dead_code)]` 让 lib build
-/// 不报 dead warning（test build 会用上）。
+/// Server cert validation is handled by `quic_transport::TofuVerifier` on
+/// the QUIC path; this function only handles the root cert store +
+/// default chain validation + no-client-auth. Kept for tests that verify
+/// a cert/key pair can simultaneously act as server cert and client root.
 #[allow(dead_code)]
 pub fn rustls_client_config(
     root_cert_der: Vec<CertificateDer<'static>>,
@@ -286,7 +284,7 @@ pub fn rustls_client_config(
     Ok(Arc::new(cfg))
 }
 
-// === 单元测试 ================================================================
+// === Unit tests ====================================================
 
 #[cfg(test)]
 mod tests {
@@ -302,7 +300,7 @@ mod tests {
 
     #[test]
     fn fingerprint_format_is_colon_separated_hex() {
-        // SHA-256("hello world") → 标准指纹（95 字符：32 bytes × 3 - 1）
+        // SHA-256("hello world") → canonical fingerprint (95 chars: 32 bytes × 3 − 1)
         let fp = generate_fingerprint(b"hello world");
         assert_eq!(
             fp,
@@ -317,28 +315,28 @@ mod tests {
         let cp = dir.join("cert.pem");
         let kp = dir.join("key.pem");
 
-        // 自签 + 落盘（双文件）
+        // self-sign + persist (two files)
         let (cert_gen, key_gen) = generate_self_signed("lan-mouse-test", &cp, &kp).unwrap();
 
-        // 落盘后再读，DER 应一致
+        // read back from disk; DER should match
         let cert_loaded = load_cert_der(&cp).unwrap();
         let key_loaded = load_key_der(&kp).unwrap();
 
-        // 指纹一致
+        // fingerprints match
         let fp_gen = generate_fingerprint(cert_gen[0].as_ref());
         let fp_loaded = generate_fingerprint(cert_loaded[0].as_ref());
         assert_eq!(fp_gen, fp_loaded);
         assert_eq!(fp_loaded.len(), 95);
 
-        // ServerConfig 可构造
+        // ServerConfig can be built
         let server_cfg = rustls_server_config(cert_loaded.clone(), key_loaded).unwrap();
         assert!(Arc::strong_count(&server_cfg) >= 1);
 
-        // ClientConfig 可构造（同 cert 当 root）
+        // ClientConfig can be built (same cert as root)
         let client_cfg = rustls_client_config(cert_loaded).unwrap();
         assert!(Arc::strong_count(&client_cfg) >= 1);
 
-        // key 不可丢弃
+        // keep the key around so the compiler doesn't drop it
         let _ = key_gen;
 
         let _ = fs::remove_dir_all(&dir);
@@ -373,49 +371,58 @@ mod tests {
 
         let _ = generate_self_signed("lan-mouse-perm-test", &cp, &kp).unwrap();
 
-        // cert 0o600，key 0o400
+        // cert 0o600, key 0o400
         let cert_mode = fs::metadata(&cp).unwrap().permissions().mode() & 0o777;
         let key_mode = fs::metadata(&kp).unwrap().permissions().mode() & 0o777;
-        assert_eq!(cert_mode, 0o600, "cert 0o600, got {cert_mode:o}");
-        assert_eq!(key_mode, 0o400, "key 0o400, got {key_mode:o}");
+        assert_eq!(cert_mode, 0o600, "cert must be 0o600, got {cert_mode:o}");
+        assert_eq!(key_mode, 0o400, "key must be 0o400, got {key_mode:o}");
 
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// STEP-2.4 验收 #1：首次落盘 → 二次加载 → 指纹一致（持久化 identity 稳定）。
+    /// Persisted identity is stable across reloads: the first self-sign
+    /// followed by a reload must produce the same fingerprint.
     #[test]
     fn load_or_generate_key_and_cert_der_persists_identity() {
         let dir = tmp_subdir("persist");
         let cp = dir.join("cert.pem");
         let kp = dir.join("key.pem");
 
-        // 首次：自签 + 落盘
+        // first call: self-sign + persist
         let (c1, k1) = load_or_generate_key_and_cert_der(&cp, &kp).unwrap();
         let fp1 = generate_fingerprint(c1[0].as_ref());
 
-        // 二次：从磁盘读；不应该重新自签
+        // second call: read from disk; must NOT re-generate
         let (c2, k2) = load_or_generate_key_and_cert_der(&cp, &kp).unwrap();
         let fp2 = generate_fingerprint(c2[0].as_ref());
 
-        assert_eq!(fp1, fp2, "二次加载 fingerprint 应一致");
-        assert_eq!(c1[0].as_ref(), c2[0].as_ref(), "二次加载 cert DER 应一致");
-        assert_eq!(k1.secret_der(), k2.secret_der(), "二次加载 key DER 应一致");
+        assert_eq!(fp1, fp2, "fingerprint should be stable across reloads");
+        assert_eq!(
+            c1[0].as_ref(),
+            c2[0].as_ref(),
+            "cert DER should be stable across reloads"
+        );
+        assert_eq!(
+            k1.secret_der(),
+            k2.secret_der(),
+            "key DER should be stable across reloads"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 钉契约：M1 STEP-7.3 起整个 workspace **不应** 再依赖 webrtc-dtls / webrtc-util。
-    /// 任何后续 PR 加回这俩依赖时该测试立即红。
+    /// Pin contract: the workspace must NOT depend on `webrtc-dtls` /
+    /// `webrtc-util`; any PR that re-adds them will fail this test.
     #[test]
     fn workspace_has_no_webrtc_dtls_or_webrtc_util() {
         const ROOT_TOML: &str = include_str!("../Cargo.toml");
         assert!(
             !ROOT_TOML.contains("webrtc-dtls"),
-            "workspace Cargo.toml 不应出现 webrtc-dtls（M1 STEP-7.3 已下线 DTLS）"
+            "workspace Cargo.toml must not reference webrtc-dtls (DTLS is no longer used)"
         );
         assert!(
             !ROOT_TOML.contains("webrtc-util"),
-            "workspace Cargo.toml 不应出现 webrtc-util（M1 STEP-7.3 已下线）"
+            "workspace Cargo.toml must not reference webrtc-util"
         );
     }
 }

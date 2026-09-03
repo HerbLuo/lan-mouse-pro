@@ -83,19 +83,12 @@ impl Service {
             client_manager.add_with_config(client);
         }
 
-        // load certificate (STEP-1.1 + STEP-2.4)
-        //
-        // STEP-2.4 起直接调 `crypto::load_or_create_server_cert()` —— 零参数
-        // 形式，内部解析 `crypto::cert_path()` / `key_path()` 双文件路径
-        // 并自签 + 落盘到 `$XDG_DATA_HOME/lan-mouse/{cert,key}.pem`（#S-4
-        // 已解）。`public_key_fingerprint` 仍按 SHA-256 over cert DER 算
-        // 出，与历史 webrtc-dtls 路径指纹算法一致（同一 DER 字节 → 同一指纹，
-        // 保证存量 `authorized_keys` 条目在 v4 切到 QUIC 后仍可被对端复用）。
-        //
-        // STEP-6.2 落实：listener 路径也切到 rustls 元组 —— 同一份
-        // `(cert_chain, key)` 既喂 listener 也喂 connection；旧的
-        // `crypto::load_certificate_compat(...)` 调用整段删除（SUGGESTION #S-1
-        // 闭合：listener 路径不再返回 `webrtc_dtls::crypto::Certificate`）。
+        // Load (or self-sign) the server certificate and compute the
+        // public-key fingerprint as SHA-256 over the cert DER. The
+        // fingerprint algorithm matches the legacy WebRTC-DTLS path so
+        // existing `authorized_keys` entries remain valid across the
+        // QUIC migration. The same `(cert_chain, key)` is reused for
+        // both the listener and outgoing connections.
         let cert_der = crypto::load_or_create_server_cert()?;
         let public_key_fingerprint = crypto::generate_fingerprint(cert_der.0[0].as_ref());
 
@@ -103,7 +96,6 @@ impl Service {
         let frontend_listener = AsyncFrontendListener::new().await?;
 
         let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
-        // listener 切到 QUIC PeerSession 路径（STEP-6.2）
         let listener = LanMouseListener::new(
             config.port(),
             cert_der.0.clone(),
@@ -111,8 +103,6 @@ impl Service {
             authorized_keys.clone(),
         )
         .await?;
-        // connection 走新 QUIC 路径 —— 复用同一份 rustls 落盘 cert/key + 一个
-        // client endpoint（v4 任意本地端口）+ pins_dir（client TOFU 缓存位置）。
         let client_endpoint =
             crate::quic_transport::endpoint(std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
                 .map_err(|e| {
@@ -266,13 +256,6 @@ impl Service {
                 pos: c.pos,
                 active: s.active,
                 enter_hook: c.cmd,
-                // STEP-4.5a: forward the per-handle input-channel
-                // selection from runtime `ClientConfig` back to
-                // `ConfigClient` for `From<ConfigClient> for TomlClient`
-                // to write (or omit if == default). Closes the disk ↔
-                // runtime loop: STEP-4.2 stored the field on disk,
-                // STEP-4.5a (this step) reads it back from disk; this
-                // line ensures writes go the other way too.
                 input_channels: c.input_channels,
             })
             .collect();
@@ -337,37 +320,34 @@ impl Service {
                 }
             }
             EmulationEvent::Disconnected { addr } => {
-                // **补丁 — 保留 barrier 跨 disconnect**：让"网络断 → 恢复"
-                // 后用户移动鼠标到屏幕边能立即触发 Leave（CaptureBegin handler
-                // 通过 incoming_conn_info 查 addr 发 Leave）。详见下方完整注释。
+                // Preserve the capture barrier across transient
+                // disconnects so the user can immediately trigger
+                // Leave again after the network recovers. We only
+                // notify the frontend here; the barrier, conn_info
+                // entry, and addr stay in place so:
+                //   - the barrier in the capture module keeps
+                //     firing CaptureBegin on edge crossings;
+                //   - the CaptureBegin handler can look up the
+                //     addr via incoming_conn_info and call
+                //     send_leave_event(addr);
+                //   - the next Enter takes the update_incoming
+                //     path (no-op if pos/fp unchanged; remove+add
+                //     rebuild otherwise, leaving one orphan).
                 //
-                // **修前**：调 `self.remove_incoming(addr)` 走完整清理路径
-                // —— `capture.destroy(handle)` 销毁屏障 + `incoming_conns.
-                // remove(&addr)` + `incoming_conn_info.remove(&handle)`。
-                // 后果：网络断后从控端 capture barrier 不在了，主控端 reconnect
-                // 后不会主动重发 Enter（Enter 语义是"鼠标刚跨边"），
-                // barrier 永远不重建，用户鼠标"回不去"。
+                // Resource trade-off: each Disconnected leaks one
+                // orphan barrier handle. Handles are numbered
+                // `ENTER_HANDLE_BEGIN + next_trigger_handle` with
+                // cap `u64::MAX/2`, so ordinary workloads will
+                // never approach the limit; a GC pass
+                // ("sweep orphans when incoming_conns is empty")
+                // can be added later if heavy churn becomes a
+                // problem.
                 //
-                // **修后**：仅发 frontend 通知，**不**调 remove_incoming。
-                // - barrier 留在 capture module → 鼠标跨边时 CaptureBegin
-                //   正常 fire
-                // - conn_info 保留 entry → CaptureBegin handler 查得到 addr
-                //   → 调 send_leave_event(addr)
-                // - incoming_conns 保留 addr → 下次 Enter 走 update_incoming
-                //   路径（pos/fp 不变则 no-op，barrier 完全保留；变了走
-                //   remove + add 重建，旧的留 orphan）
-                //
-                // **资源泄漏**：每次 Disconnected 留 1 个 orphan barrier
-                // handle（CREATE 后不 destroy）。handle 编号 = `ENTER_HANDLE_
-                // BEGIN + next_trigger_handle`，上限 `u64::MAX/2`，一般场景
-                // 跑一辈子都打不到。**严重资源压力场景**（如反复断连几百次）
-                // 才会显形，那时再加清理机制（"incoming_conns 空时 GC 旧
-                // barrier"）即可。
-                //
-                // **何时仍会真清理**：pos/fingerprint 变化时 update_incoming
-                // 主动 remove + add（destroy 旧 + 建新，orphan 自然消解）；
-                // 用户主动 disable client 的路径走 deactivate_client 也不
-                // 走本 Disconnected handler（不同事件流）。
+                // Cleanup still happens organically when pos or
+                // fingerprint changes (update_incoming destroys
+                // and rebuilds) and when the user disables a
+                // client (deactivate_client runs on a different
+                // event flow and never reaches this handler).
                 log::info!(
                     "peer {addr} transiently disconnected — barrier preserved for fast recovery"
                 );
@@ -596,20 +576,17 @@ impl Service {
             self.broadcast_client(handle);
             log::info!("activated client {handle} ({pos})");
 
-            // STEP-8.2 修复 — `connect_on_activate`：
+            // Fire-and-forget dial so an active client establishes
+            // its connection immediately, even if no mouse movement
+            // reaches the screen edge. Independent of the
+            // capture-triggered dial path; `connect.rs` deduplicates
+            // via `RetryState` + the connecting set.
             //
-            // 之前 activate 仅置 ClientState.active=true，不触发拨号 —— 只有
-            // 鼠标移到屏边（capture 触发 `conn.send()`）才 dial。两侧 daemon
-            // 启动后没人移鼠标 → 永远不建连。修复：activate 成功路径末尾立即
-            // fire-and-forget 触发拨号，与 capture 触发的 send()-触发-dial 路
-            // 径完全独立。RetryState + connecting set 去重由 connect.rs 保证。
-            //
-            // **必须在 `client_manager.activate_client` 返 true 之后调**：
-            // - 之前调 → connect_to_handle 拿不到 active handle → 直接返
-            //   NotConnected + retry（虽然 RetryState 退避会拦住，但逻辑上
-            //   是先有 active 状态再有 dial）
-            // - 在 `broadcast_client` 之后调 → 通知 GUI 之后再 dial，GUI 显
-            //   示 client 状态为 active 时拨号已在途（更符合直觉）
+            // Order matters: must run after `client_manager.
+            // activate_client` returns true (otherwise the handle
+            // isn't active yet) and after `broadcast_client` so the
+            // GUI sees the client as `active` while the dial is
+            // already in flight.
             self.capture.dial(handle);
         }
     }
@@ -670,8 +647,8 @@ impl Service {
     /// stream) for the given outgoing client. Sender-side only — the
     /// receiver doesn't see this preference. Mirrors the
     /// `update_enter_hook` flow: setter → broadcast → save_config.
-    /// No mid-session hot reload yet (STEP-5.x wires
-    /// `PeerSession::with_config` at dial time).
+    /// Mid-session hot reload is not yet wired — the transport
+    /// choice is locked in at dial time via `PeerSession::with_config`.
     fn update_input_channels(&mut self, handle: ClientHandle, cfg: InputChannelConfig) {
         if self.client_manager.set_input_channels(handle, cfg) {
             self.broadcast_client(handle);

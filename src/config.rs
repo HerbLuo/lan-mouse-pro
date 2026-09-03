@@ -83,10 +83,10 @@ struct TomlClient {
     position: Option<Position>,
     activate_on_startup: Option<bool>,
     enter_hook: Option<String>,
-    /// M1 STEP-4.2: per-peer input-event-class transport preference
-    /// (mouse button / keyboard → stream or datagram). Optional on disk so
-    /// that the default is omitted from the written TOML (back-compat with
-    /// pre-M1 config files). Missing → `InputChannelConfig::default()`.
+    /// Per-peer input-event-class transport preference (mouse button /
+    /// keyboard → stream or datagram). Optional on disk so that the
+    /// default is omitted from the written TOML (back-compat with older
+    /// config files). Missing → `InputChannelConfig::default()`.
     #[serde(default)]
     input_channels: Option<InputChannelConfig>,
 }
@@ -284,11 +284,10 @@ pub struct ConfigClient {
     pub pos: Position,
     pub active: bool,
     pub enter_hook: Option<String>,
-    /// M1 STEP-4.2: per-peer choice of stream vs. datagram for
-    /// mouse button / keyboard. Always populated in memory; the on-disk
-    /// `TomlClient` keeps it as `Option<...>` so that the default is
-    /// omitted when writing back (preserves back-compat with pre-M1
-    /// config files).
+    /// Per-peer choice of stream vs. datagram for mouse button /
+    /// keyboard. Always populated in memory; the on-disk `TomlClient`
+    /// keeps it as `Option<...>` so that the default is omitted when
+    /// writing back (preserves back-compat with older config files).
     pub input_channels: InputChannelConfig,
 }
 
@@ -328,7 +327,7 @@ impl From<ConfigClient> for TomlClient {
         let position = Some(client.pos);
         let activate_on_startup = if client.active { Some(true) } else { None };
         let enter_hook = client.enter_hook;
-        // Omit the field when it equals the default: keeps pre-M1 config
+        // Omit the field when it equals the default: keeps older config
         // files untouched on save (no spurious new field appears), and
         // round-trips a non-default choice back to disk verbatim.
         let input_channels = if client.input_channels == InputChannelConfig::default() {

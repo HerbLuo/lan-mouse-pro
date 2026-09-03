@@ -52,9 +52,12 @@ struct InputCaptureState {
     active_clients: Lazy<HashSet<Position>>,
     /// the currently entered capture position, if any
     current_pos: Option<Position>,
-    /// **Pending-capture 中间态**：鼠标跨过边沿但主线程还没收到 Ack。
-    /// 与 `current_pos` 互斥。提升到 active 时清掉；取消时清掉。
-    /// 后端在等待 Ack 期间不 hide cursor、不 warp cursor，鼠标留在主机。
+    /// Intermediate pending-capture state: the mouse has crossed an edge
+    /// but the main thread has not yet received the Ack.
+    /// Mutually exclusive with `current_pos`. Cleared on promotion to
+    /// active and on cancel. While the backend is awaiting Ack it does
+    /// not hide the cursor and does not warp it — the cursor stays on
+    /// the host.
     pending_pos: Option<Position>,
     /// position where the cursor was captured
     enter_position: Option<CGPoint>,
@@ -69,14 +72,17 @@ enum ProducerEvent {
     Release,
     Create(Position),
     Destroy(Position),
-    /// macOS 旧版无 pending 时直接用 Grab。保留兼容性；新代码不再 emit。
+    /// Legacy macOS path used `Grab` directly when there was no pending
+    /// state. Retained for compatibility; new code no longer emits it.
     #[allow(dead_code)]
     Grab(Position),
-    /// **Pending → Active 提升**：主线程在对端 Ack 后调 `start_capture`
-    /// 转发到这里。提升后 warp cursor + hide cursor + emit Begin。
+    /// Promotes a pending capture to active: the main thread calls
+    /// `start_capture` after receiving the remote Ack and forwards it
+    /// here. On promotion: warp the cursor, hide the cursor, emit Begin.
     StartCapture(Position),
-    /// **Pending 取消**：主线程 cancel_pending / 断网 / 500ms 超时。
-    /// emit CancelPending（如果仍 pending）。
+    /// Pending cancel: triggered by main-thread `cancel_pending`,
+    /// network loss, or the 500ms timeout. Emits `CancelPending` if
+    /// the position is still pending.
     CancelPending(Position),
     EventTapDisabled,
     DisplayReconfigured,
@@ -132,10 +138,12 @@ impl InputCaptureState {
 
     /// start the input capture by
     ///
-    /// **当前未调用**：pending-capture 改造后 promotion 由 tap thread 通过
-    /// [`ProducerEvent::StartCapture`] 统一处理（见下文 `handle_producer_event`
-    /// 与 [`InputCaptureState::compute_edge_point`] 注释）。保留本方法作为
-    /// 直观的"激活 capture 时该做什么"参考实现，避免后续回归。
+    /// Note: this method is no longer called. After the pending-capture
+    /// refactor, promotion is handled by the tap thread via
+    /// [`ProducerEvent::StartCapture`] (see `handle_producer_event` and
+    /// [`InputCaptureState::compute_edge_point`] below). This method is
+    /// retained as a clear reference implementation of "what to do when
+    /// a capture becomes active" and to guard against regressions.
     #[allow(dead_code)]
     fn start_capture(&mut self, event: &CGEvent, position: Position) -> Result<(), CaptureError> {
         let mut location = event.location();
@@ -151,10 +159,13 @@ impl InputCaptureState {
         self.reset_cursor()
     }
 
-    /// **Pending-capture 辅助**：计算 `pos` 那条边内侧 1px 的 warp 目标。
-    /// 与 [`InputCaptureState::start_capture`] 内部逻辑等价，但**不**
-    /// 调 `reset_cursor` —— pending 阶段后端不应动 cursor（鼠标仍在主机）。
-    /// Promotion 时由 `ProducerEvent::StartCapture` 处理线程统一 warp。
+    /// Pending-capture helper: computes the 1px-inside warp target for the
+    /// edge identified by `pos`. Equivalent to the internal logic of
+    /// [`InputCaptureState::start_capture`], but does NOT call
+    /// `reset_cursor` — during the pending phase the backend must not
+    /// move the cursor (it still belongs to the host). On promotion,
+    /// the warp is performed by the thread handling
+    /// `ProducerEvent::StartCapture`.
     fn compute_edge_point(&self, pos: Position) -> CGPoint {
         let edge_offset = 1.0;
         let mut p = CGPoint::default();
@@ -193,14 +204,16 @@ impl InputCaptureState {
                     self.show_cursor()?;
                     self.current_pos = None;
                 }
-                // Pending 状态 Release 也清掉（与 Windows 同步语义对齐）。
+                // Release must also clear any pending state (kept in
+                // sync with the Windows semantics).
                 if self.pending_pos.is_some() {
                     self.pending_pos = None;
                 }
                 Ok(None)
             }
             ProducerEvent::Grab(pos) => {
-                // 旧路径。新代码不再 emit Grab；保留兼容。
+                // Legacy path. New code no longer emits Grab; kept for
+                // compatibility.
                 if self.current_pos.is_none() {
                     self.hide_cursor()?;
                     self.current_pos = Some(pos);
@@ -208,8 +221,9 @@ impl InputCaptureState {
                 Ok(None)
             }
             ProducerEvent::StartCapture(pos) => {
-                // **Pending → Active 提升**。仅在 pending_pos 匹配时执
-                // 行（用户在 pending 期间换边 / 已 cancel → no-op）。
+                // Pending -> Active promotion. Only runs when
+                // pending_pos matches (the user crossing a different
+                // edge, or having already cancelled, becomes a no-op).
                 if self.pending_pos != Some(pos) {
                     log::trace!(
                         "StartCapture({pos:?}) ignored: pending_pos={:?}",
@@ -221,10 +235,11 @@ impl InputCaptureState {
                 if self.current_pos.is_none() {
                     self.hide_cursor()?;
                     self.current_pos = Some(pos);
-                    // 用 enter_position（已在 tap callback 记录）warp
-                    // cursor 到边内侧 1px，与旧 Grab 路径行为对齐。
+                    // Use enter_position (recorded earlier in the tap
+                    // callback) to warp the cursor 1px inside the edge,
+                    // matching the behavior of the legacy Grab path.
                     self.reset_cursor()?;
-                    // 通知主线程：现在 capture 真正激活。
+                    // Notify the main thread: capture is now active.
                     return Ok(Some((pos, CaptureEvent::Begin)));
                 }
                 Ok(None)
@@ -595,51 +610,61 @@ fn create_event_tap<'a>(
                 state.reset_cursor().unwrap_or_else(|e| log::warn!("{e}"));
             }
         } else if matches!(event_type, CGEventType::MouseMoved) {
-            // **Pending-capture 中间态**：鼠标已跨过边沿但 Ack 未到。
-            // 三种 case：
-            // 1. 用户拉回屏幕内 → 取消 pending
-            // 2. 用户越另一条边 → 切 pending + 重新记 enter_position
-            // 3. 仍在同一边 → 啥都不做（pending 维持）
+            // Pending-capture intermediate state: the mouse has crossed
+            // an edge but the Ack has not arrived yet. Three cases:
+            // 1. User pulled back inside the screen -> cancel pending.
+            // 2. User crossed a different edge -> switch pending and
+            //    re-record enter_position.
+            // 3. Still on the same edge -> do nothing (pending stands).
             if let Some(pending_pos) = state.pending_pos {
                 let crossed = state.crossed(cg_ev);
                 match crossed {
                     None => {
-                        // 用户拉回 → 取消 pending，emit CancelPending。
+                        // User pulled back -> cancel pending and emit
+                        // CancelPending.
                         log::debug!("CANCEL pending {pending_pos:?} (cursor pulled back)");
                         state.pending_pos = None;
-                        // **立即发** CancelPending（带正确位置 pending_pos），
-                        // 不走统一的 res_events batch —— 因为后面可能还要
-                        // 继续处理其他 case。
+                        // Send CancelPending immediately (with the
+                        // correct pending_pos). Bypass the unified
+                        // res_events batch because other cases below
+                        // may still need to run on this same callback.
                         let _ = event_tx.blocking_send((pending_pos, CaptureEvent::CancelPending));
                     }
                     Some(other_pos) if other_pos != pending_pos => {
-                        // 换边：先取消旧 pending，再开新 pending。
+                        // Switched edge: cancel the old pending first,
+                        // then start a new pending.
                         log::debug!("switch pending: {pending_pos:?} -> {other_pos:?}");
-                        // 立即发 CancelPending（带旧位置）—— 同上，单独发。
+                        // Send CancelPending immediately (with the old
+                        // position). Same reasoning as above: send it
+                        // out-of-band rather than batching.
                         let _ = event_tx.blocking_send((pending_pos, CaptureEvent::CancelPending));
                         state.pending_pos = Some(other_pos);
                         state.enter_position = Some(state.compute_edge_point(other_pos));
-                        // 新 pending 走统一 batch（带新位置 other_pos）。
+                        // The new pending goes through the unified
+                        // batch (with the new position other_pos).
                         capture_position = Some(other_pos);
                         res_events.push(CaptureEvent::BeginPending);
                     }
                     Some(_) => {
-                        // 仍在同一边：啥都不做。鼠标后续 move 在同一边
-                        // 不会再次 emit BeginPending（避免主线程重复
-                        // 处理）。
+                        // Still on the same edge: do nothing. Subsequent
+                        // moves on the same edge must not re-emit
+                        // BeginPending (which would cause the main
+                        // thread to handle the same pending twice).
                     }
                 }
             } else if let Some(new_pos) = state.crossed(cg_ev) {
-                // 全新边沿跨越 → 进入 pending。**不要** warp cursor、
-                // **不要** hide cursor；只记 enter_position 让 promotion
-                // 阶段用。
+                // Brand-new edge crossing -> enter pending. Do NOT
+                // warp the cursor, do NOT hide the cursor; only record
+                // enter_position for use during the promotion phase.
                 log::debug!("PENDING enter {new_pos:?}");
                 capture_position = Some(new_pos);
                 state.pending_pos = Some(new_pos);
                 state.enter_position = Some(state.compute_edge_point(new_pos));
                 res_events.push(CaptureEvent::BeginPending);
-                // 故意**不**调 state.start_capture、**不**发 ProducerEvent::Grab
-                // —— promotion 由主线程 Ack 后调 start_capture 路径走。
+                // Intentionally NOT calling state.start_capture, and
+                // intentionally NOT sending ProducerEvent::Grab —
+                // promotion happens after the main thread Acks via the
+                // start_capture path.
             }
         }
 
@@ -650,7 +675,7 @@ fn create_event_tap<'a>(
                 let _ = event_tx.blocking_send((pos, *e));
             });
             // Returning Drop should stop the event from being processed
-            // but core fundation still returns the event
+            // but core foundation still returns the event
             cg_ev.set_type(CGEventType::Null);
             CallbackResult::Drop
         } else {
@@ -775,11 +800,13 @@ impl MacOSInputCapture {
 
         let state = Arc::new(Mutex::new(InputCaptureState::new()?));
         let (event_tx, event_rx) = mpsc::channel(32);
-        // **Pending-capture 闭环**：producer task 也要往主线程推事件
-        // （`ProducerEvent::StartCapture` → Begin；CancelPending →
-        // CancelPending）。Clone 一份 event_tx 给 producer task —— tap
-        // callback 与 producer task 并发地往同一 channel 写，下游
-        // poll_next 顺序消费。Sender 是 Send + Sync 的 clone，多写安全。
+        // Pending-capture close the loop: the producer task also
+        // forwards events to the main thread (ProducerEvent::StartCapture
+        // -> Begin; CancelPending -> CancelPending). Clone event_tx for
+        // the producer task — the tap callback and the producer task
+        // write concurrently to the same channel, consumed in order by
+        // the downstream poll_next. Sender is Send + Sync, so multiple
+        // writers are safe.
         let producer_event_tx = event_tx.clone();
         let (notify_tx, mut notify_rx) = mpsc::channel(32);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -816,9 +843,10 @@ impl MacOSInputCapture {
                         match state.handle_producer_event(producer_event).await {
                             Err(e) => log::error!("Failed to handle producer event: {e}"),
                             Ok(Some((pos, ev))) => {
-                                // Producer 主动 emit 的 Begin / CancelPending 走
-                                // event_tx clone，与 tap callback 的 events 合并到
-                                // 下游 stream。
+                                // Begin / CancelPending events emitted by the producer go through
+                                // the cloned event_tx and are merged into
+                                // the same downstream stream as the tap
+                                // callback's events.
                                 let _ = producer_event_tx.send((pos, ev)).await;
                             }
                             Ok(None) => {}
@@ -908,9 +936,11 @@ impl Capture for MacOSInputCapture {
         Ok(())
     }
 
-    /// **Pending-capture handshake**：主线程在对端 Ack Enter 后调本方法
-    /// 把 `pos` 上的 pending 提升到 active。同步返回（消息已 spawn 到
-    /// producer task，hide cursor + warp + emit Begin 异步完成）。
+    /// Pending-capture handshake: the main thread calls this after the
+    /// remote Ack for Enter to promote the pending capture at `pos`
+    /// to active. Returns synchronously — the message is dispatched
+    /// to the producer task, and hide cursor + warp + emit Begin
+    /// complete asynchronously.
     fn start_capture(&mut self, pos: Position) -> Result<(), CaptureError> {
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
@@ -920,8 +950,9 @@ impl Capture for MacOSInputCapture {
         Ok(())
     }
 
-    /// **Pending-capture handshake**：主线程 cancel_pending / 断网 /
-    /// 500ms 超时调本方法。同步返回。
+    /// Pending-capture handshake: called by the main thread on
+    /// `cancel_pending`, network loss, or the 500ms timeout.
+    /// Returns synchronously.
     fn cancel_pending(&mut self, pos: Position) -> Result<(), CaptureError> {
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
@@ -993,8 +1024,8 @@ extern "C" {
 
 unsafe fn configure_cf_settings() -> Result<(), MacosCaptureCreationError> {
     // When we warp the cursor using CGWarpMouseCursorPosition local events are suppressed for a short time
-    // this leeds to the cursor not flowing when crossing back from a clinet, set this to to 0 stops the warp
-    // from working, set a low value by trial and error, 0.05s seems good. 0.25s is the default
+    // this leads to the cursor not flowing when crossing back from a client; setting this to 0 stops the warp
+    // from working, so we set a low value by trial and error. 0.05s seems good. 0.25s is the default
     let event_source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
         .map_err(|_| MacosCaptureCreationError::EventSourceCreation)?;
     CGEventSourceSetLocalEventsSuppressionInterval(event_source, 0.05);

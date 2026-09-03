@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# quic_smoke.sh — end-to-end shell smoke for PLAN-M1 §STEP-7.2
+# quic_smoke.sh — end-to-end shell smoke (placeholder)
 #
 # Design intent: spawn two `lan-mouse-cli` processes (or two daemons + daemons),
 # have them exchange a small batch of Motion + KeyboardKey events on localhost,
@@ -17,7 +17,7 @@
 #   transport-level round-trip in-process with deterministic assertions.
 #
 # Until the GUI / CLI is wired to actually exercise the QUIC peer-session
-# path end-to-end (planned for STEP-7.x / post-M1), this script **SKIPs**
+# path end-to-end (planned for a future post-M1 wiring pass), this script **SKIPs**
 # with an informative message rather than falsely passing or falsely
 # failing CI. Leader is encouraged to run `cargo test -p lan-mouse --test
 # quic_smoke` as the source of truth for §7.2 acceptance.
@@ -47,7 +47,7 @@ cat <<'NOTE'
 
 The end-to-end shell smoke requires a CLI/daemon top-loop that drives the
 QUIC peer-session path against a real input source. That wiring is queued
-for STEP-7.x; the authoritative transport-level coverage today lives in:
+for a future wiring pass; the authoritative transport-level coverage today lives in:
 
     cargo test -p lan-mouse --test quic_smoke         # 2 tests
     cargo test -p lan-mouse --test input_channel_routing   # 7 tests

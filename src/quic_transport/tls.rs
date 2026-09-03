@@ -1,20 +1,20 @@
-//! TLS / mTLS 信任配置（STEP-2.5 / 2.6 / 2.7）。
+//! TLS / mTLS trust configuration.
 //!
-//! 本模块承担 QUIC 链路的 TLS 信任决策：
+//! This module owns the TLS trust decisions for the QUIC link:
 //!
-//! - [`build_quic_client_config`] 装配 `quinn::ClientConfig`（rustls +
-//!   ring + [`TofuVerifier`] + mTLS 出示 client cert + ALPN）
-//! - [`default_transport_config`] server/client 共享的 `TransportConfig`
-//!   （5s keepalive / 30s idle）
-//! - [`TofuVerifier`] 客户端 TOFU（Trust On First Use）fingerprint pinning
-//! - [`PermissiveClientCertVerifier`] STEP-2.5 占位 verifier（接受任意
-//!   通过 TLS 1.3 内置链校验的 client cert）
-//! - [`AuthorizedKeysVerifier`] STEP-2.7 server 端 fingerprint allowlist
+//! - [`build_quic_client_config`] assembles a `quinn::ClientConfig` (rustls +
+//!   ring + [`TofuVerifier`] + mTLS client cert presentation + ALPN)
+//! - [`default_transport_config`] shared server/client `TransportConfig`
+//!   (5s keepalive / 10s idle)
+//! - [`TofuVerifier`] client-side TOFU (Trust On First Use) fingerprint pinning
+//! - [`PermissiveClientCertVerifier`] placeholder verifier that accepts any
+//!   client cert passing the TLS 1.3 built-in chain check
+//! - [`AuthorizedKeysVerifier`] server-side fingerprint allowlist
 //!
-//! 与 [`super::endpoint`] 的关系：本模块的 `build_quic_client_config` 被
-//! `endpoint::dial` / `endpoint::dial_any` 调用装配 client config；server
-//! 端 `endpoint_with_verifier` 直接接受 caller 提供的 verifier（`PermissiveClientCertVerifier`
-//! 或 `AuthorizedKeysVerifier`）。
+//! Relationship with [`super::endpoint`]: `build_quic_client_config` is invoked
+//! by `endpoint::dial` / `endpoint::dial_any` to assemble the client config;
+//! on the server side `endpoint_with_verifier` directly accepts a caller-
+//! provided verifier (`PermissiveClientCertVerifier` or `AuthorizedKeysVerifier`).
 
 use std::collections::HashMap;
 use std::fs;
@@ -31,69 +31,75 @@ use crate::crypto;
 
 use super::{ALPN_LAN_MOUSE, Error, Result};
 
-/// server / client 共享的 `TransportConfig`：
+/// Shared server/client `TransportConfig`:
 ///
-/// - `keep_alive_interval = 5s` —— QUIC 主动探活，配合 PLAN §7 "Wi-Fi
-///   切换恢复 < 1s" 预算；与 bak Step 0.1 spike 实测一致。
-/// - `max_idle_timeout = 10s` —— 2026-09 调整：原 30s 太慢，应用层
-///   post-connect 握手（connect.rs Enter/Ack）已经把"主动 reconnect
-///   秒级验证"做掉，10s 是 QUIC 自身兜底；健康链路上 5s keepalive
-///   永远先到，10s 只在 send/ping 主动 force-close 失败的边界场景生效。
+/// - `keep_alive_interval = 5s` — QUIC active probe.
+/// - `max_idle_timeout = 10s` — adjusted (the original 30s was too slow; the
+///   application-layer post-connect handshake already handles sub-second
+///   reconnect validation). 10s is the QUIC-level fallback; on healthy links
+///   the 5s keepalive always fires first, and the 10s idle timeout only
+///   applies on edge cases where send/ping force-close fails.
 ///
-/// `IdleTimeout::try_from(Duration)` 失败当且仅当 Duration 超 VarInt
-/// 2^30 ms 上限（≈ 12.4 天），10s 远在范围内 —— `expect` 注明理由。
+/// `IdleTimeout::try_from(Duration)` fails if and only if `Duration` exceeds
+/// the VarInt 2^30 ms upper bound (≈ 12.4 days), and 10s is well within that
+/// range — the `expect` documents the reasoning.
 ///
-/// **可见性**：`pub(super)` —— 仅 `endpoint.rs` 通过 `super::tls::default_transport_config`
-/// 调。`endpoint_inner`（在 endpoint.rs）需要它做 server transport 配置；
-/// `build_quic_client_config`（本文件）直接调它。
+/// **Visibility**: `pub(super)` — only `endpoint.rs` calls
+/// `super::tls::default_transport_config`. `endpoint_inner` (in endpoint.rs)
+/// needs it for server transport configuration; `build_quic_client_config`
+/// (in this file) calls it directly.
 pub(super) fn default_transport_config() -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
     t.keep_alive_interval(Some(Duration::from_secs(5)));
     t.max_idle_timeout(Some(
         IdleTimeout::try_from(Duration::from_secs(10))
-            .expect("10s 远小于 VarInt 2^30 ms 上限（≈ 12.4 天）"),
+            .expect("10s is far below the VarInt 2^30 ms upper bound (≈ 12.4 days)"),
     ));
     Arc::new(t)
 }
 
-/// 装配 `quinn::ClientConfig`：rustls + ring + TofuVerifier（**STEP-2.6
-/// 替换 WebPkiServerVerifier**）+ mTLS 出示 client cert chain + ALPN
-/// `lan-mouse`。
+/// Assemble a `quinn::ClientConfig`: rustls + ring + TofuVerifier (replaces
+/// `WebPkiServerVerifier`) + mTLS client cert chain presentation + ALPN
+/// `lan-mouse`.
 ///
-/// 当前形态（STEP-2.6）：
-/// - `crypto_provider = ring` —— 由 [`super::endpoint::install_crypto_provider`]
-///   早于本调用预装（本函数不主动 install，main 启动期唯一入口在 main.rs）
-/// - **TofuVerifier server cert 校验**（STEP-2.6 起）：`.dangerous().with_
-///   custom_certificate_verifier(Arc::new(TofuVerifier::new(pins_dir)))`
-///   替代 STEP-2.5 的 `WebPkiServerVerifier` 占位 verifier；`TofuVerifier`
-///   按 server cert SHA-256 fingerprint + `$pins_dir/<sanitized_fp>.pin`
-///   文件系统缓存做"首次见到自动 pin / 已知 mismatch 拒绝"的三态判定（与
-///   bak `mousehop/src/quic_transport.rs:1799` 路径完全对齐；#S-6 已解）
-/// - **mTLS 出示 client cert chain**（STEP-2.5 起）：`with_client_auth_cert(
-///   cert_chain, key)` 同步装上；与 server [`super::endpoint::endpoint_with_verifier`]
-///   的 `with_client_cert_verifier(...)` 对称。`key` 字段不再是占位
-///   —— #S-7 已解
-/// - ALPN：`b"lan-mouse"` —— 与对端 server 协商协议；STEP-3.2 之上
-///   另有应用层 `PROTOCOL_MAGIC` 二次握手（PLAN §3.1）
-/// - transport：`default_transport_config()` 5s keepalive + 30s idle
+/// - `crypto_provider = ring` — installed earlier by
+///   [`super::endpoint::install_crypto_provider`] (this function does not
+///   install it itself; the only install point at startup is main.rs).
+/// - **TofuVerifier for server cert validation**:
+///   `.dangerous().with_custom_certificate_verifier(Arc::new(TofuVerifier::new(pins_dir)))`.
+///   `TofuVerifier` performs a three-state decision based on the server cert
+///   SHA-256 fingerprint and the `$pins_dir/<sanitized_fp>.pin` on-disk
+///   cache: "auto-pin on first sight / known-match accept / known-mismatch
+///   reject".
+/// - **mTLS client cert chain presentation**:
+///   `with_client_auth_cert(cert_chain, key)` is installed synchronously;
+///   symmetric with `with_client_cert_verifier(...)` on the server side.
+/// - ALPN: `b"lan-mouse"` — protocol negotiated with the peer server.
+///   Above this, the application layer has a secondary `PROTOCOL_MAGIC`
+///   handshake.
+/// - transport: `default_transport_config()` 5s keepalive + 10s idle.
 ///
-/// **`cert_chain` 语义扩为双用**：mTLS 出示链；不再作为 root store 信任
-/// anchor（自定义 verifier 全权负责 server cert 校验）。M1 双方都跑在同一
-/// 台主机的同一进程，用同一私钥自签（生产路径 `dial()` 内部调
-/// `crypto::load_or_create_server_cert()` 拿持久化 cert），双用同一 chain 不
-/// 引安全风险。STEP-6.x 接入 connect.rs 时若需要 server trust anchor 与
-/// 本端 client cert 不同，再拆参数（暂不拆 —— §9 M1 边界）。
+/// **`cert_chain` dual-purpose semantics**: used as the mTLS presentation
+/// chain; no longer used as a root-store trust anchor (the custom verifier is
+/// fully responsible for server cert validation). In M1 both peers run in
+/// the same process on the same host and use the same self-signed key
+/// (production path: `dial()` internally calls
+/// `crypto::load_or_create_server_cert()` to get the persisted cert), so
+/// sharing the same chain does not introduce a security risk.
 ///
-/// **`pins_dir` 注入**（STEP-2.6 新增参数）：生产路径走 `crypto::known_peers_dir()`
-/// （待 STEP-7.1 引入）；测试用 `tempfile::tempdir().path()` 隔离避免污染用户
-/// 路径。TOFU 落盘逻辑由 `TofuVerifier` 全权负责 —— 本函数只构造 verifier
-/// 注入 rustls builder。
+/// **`pins_dir` injection**: production path uses
+/// `crypto::known_peers_dir()`; tests use `tempfile::tempdir().path()` to
+/// isolate and avoid polluting the user path. The TOFU disk-write logic is
+/// the sole responsibility of `TofuVerifier` — this function only constructs
+/// the verifier and injects it into the rustls builder.
 ///
-/// **不**主动 install crypto provider：本函数被 [`super::endpoint::install_crypto_provider`]
-/// 调用者（main.rs）守护；`#[test]` 单测则在第一句调一次 install。
+/// **Does not** install the crypto provider itself: this function is guarded
+/// by the caller of [`super::endpoint::install_crypto_provider`] (main.rs);
+/// `#[test]` unit tests call `install` once on the first line.
 ///
-/// **错误归一**：所有 rustls / quinn 装配错误统一包到 [`Error::ClientConfig`]
-/// （带底层 `Display`）；不引入 `From<rustls::Error>` / `From<quinn_proto::Error>`。
+/// **Error normalization**: all rustls / quinn assembly errors are wrapped
+/// into [`Error::ClientConfig`] (carrying the underlying `Display`); no
+/// `From<rustls::Error>` / `From<quinn_proto::Error>` impls are introduced.
 pub fn build_quic_client_config(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
@@ -106,17 +112,17 @@ pub fn build_quic_client_config(
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::ClientConfig(format!("protocol versions: {e}")))?;
 
-    // STEP-2.6：TofuVerifier 替换 STEP-2.5 占位的 WebPkiServerVerifier。
-    // custom verifier 全权负责 server cert 校验 —— 不再装 root store（与
-    // bak `mousehop/src/quic_transport.rs:1822-1829 build_quic_client_config`
-    // 完全对齐）。
+    // TofuVerifier replaces the placeholder WebPkiServerVerifier. The custom
+    // verifier is fully responsible for server cert validation — no root
+    // store is installed.
     let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
         Arc::new(TofuVerifier::new(pins_dir));
 
-    // STEP-2.5 起 mTLS 出示 client cert chain —— `with_client_auth_cert`
-    // 是 terminal builder（返回 `Result<ClientConfig, Error>`，不像
-    // `with_no_client_auth` 是中间 builder），出错走 `?` 经 `crypto::Error::Rustls`
-    // 收口到 `Error::ClientConfig`（`.map_err` 避免引入 From impl）
+    // mTLS client cert chain presentation — `with_client_auth_cert` is a
+    // terminal builder (returns `Result<ClientConfig, Error>`, unlike
+    // `with_no_client_auth` which is an intermediate builder). Errors flow
+    // through `?` and are wrapped into `Error::ClientConfig` via `.map_err`
+    // (avoids introducing a `From` impl).
     let mut rustls_client = builder
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -124,9 +130,10 @@ pub fn build_quic_client_config(
         .map_err(|e| Error::ClientConfig(format!("with_client_auth_cert: {e}")))?;
     rustls_client.alpn_protocols = vec![ALPN_LAN_MOUSE.to_vec()];
 
-    // wrap 进 quinn::ClientConfig —— quinn 0.11 通过 `quinn::crypto::rustls`
-    // re-export 暴露 `QuicClientConfig`（顶层 `quinn_proto::*` 不是稳定
-    // 公开路径，避免直接依赖 `quinn_proto` crate）
+    // Wrap into quinn::ClientConfig — quinn 0.11 exposes `QuicClientConfig`
+    // through the `quinn::crypto::rustls` re-export. The top-level
+    // `quinn_proto::*` is not a stable public path, so we avoid depending on
+    // the `quinn_proto` crate directly.
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client))
         .map_err(|e| Error::ClientConfig(format!("QuicClientConfig::try_from: {e}")))?;
     let mut client_cfg = QuinnClientConfig::new(Arc::new(quic_client));
@@ -135,51 +142,51 @@ pub fn build_quic_client_config(
     Ok(client_cfg)
 }
 
-/// **STEP-2.6 客户端 TOFU（Trust On First Use）fingerprint pinning verifier**。
+/// Client-side TOFU (Trust On First Use) fingerprint pinning verifier.
 ///
-/// 把 server cert 的 SHA-256 fingerprint 与 `$pins_dir/<sanitized_fp>.pin`
-/// 文件系统缓存做比对：
+/// Compares the server cert SHA-256 fingerprint against the
+/// `$pins_dir/<sanitized_fp>.pin` on-disk cache:
 ///
-/// | 判定 | 触发 | 行为 |
+/// | Decision | Trigger | Behavior |
 /// |---|---|---|
-/// | **Known Match** | pin 文件存在 | `Ok(ServerCertVerified::assertion())` |
-/// | **Known Mismatch** | `pins_dir` 内存在任意 `.pin` 文件但当前 fingerprint 的 pin 不存在 | `Err(rustls::Error::General("TOFU mismatch: ..."))` |
-/// | **First Connect** | `pins_dir` 不存在 / 不含任何 `.pin` | 落盘占位 `b"trusted\n"` + `log::info!("paired with {fp}")` + `Ok(ServerCertVerified::assertion())` |
+/// | **Known Match** | pin file exists | `Ok(ServerCertVerified::assertion())` |
+/// | **Known Mismatch** | some `.pin` exists in `pins_dir` but the current fingerprint's pin does not | `Err(rustls::Error::General("TOFU mismatch: ..."))` |
+/// | **First Connect** | `pins_dir` does not exist / contains no `.pin` | write placeholder `b"trusted\n"` + `log::info!("paired with {fp}")` + `Ok(ServerCertVerified::assertion())` |
 ///
-/// **三态判定的语义**：区分"首次见到" vs "已知对端换了 cert"。前者是 TOFU
-/// 合法路径（LAN 上第一次连新对端），后者是攻击信号（有人伪造了对端）。
-/// `pins_dir` 空时走 First Connect（任何对端都接受）；`pins_dir` 非空但当前
-/// fingerprint 未 pin 时拒绝 —— 这是 LAN 攻击防护的核心约束。
+/// **Three-state semantics**: distinguishes "first sight" from "known peer
+/// rotated its cert". The former is a legitimate TOFU path (first connection
+/// to a new peer on the LAN), the latter is an attack signal (someone is
+/// impersonating the peer). When `pins_dir` is empty, the verifier follows
+/// First Connect (any peer is accepted); when `pins_dir` is non-empty but the
+/// current fingerprint is not pinned, it rejects — this is the core LAN
+/// attack-protection invariant.
 ///
-/// **`pins_dir` 跨平台兼容**：把 `aa:bb:cc:...` 替换为 `aa_bb_cc_...`（`:` 在
-/// Windows 上不是合法文件名字符）后拼 `<sanitized_fp>.pin`。与 bak
-/// `mousehop/src/quic_transport.rs:1384-1442 TofuVerifier` 完全对齐；差异仅
-/// 在 `known_peers` 子目录 vs 直用 `pins_dir`（PLAN §2.6 直接传 `pins_dir`，
-/// 不再嵌子目录 —— 测试路径 tempdir 已隔离）。
+/// **`pins_dir` cross-platform compatibility**: replace `aa:bb:cc:...` with
+/// `aa_bb_cc_...` (`:` is not a legal filename character on Windows) and
+/// append `<sanitized_fp>.pin`.
 ///
-/// **`Send + Sync + 'static`**：rustls 0.23 trait 约束 —— `TofuVerifier` 持有
-/// `PathBuf` + `Arc<CryptoProvider>`，自动满足。
+/// **`Send + Sync + 'static`**: rustls 0.23 trait constraint —
+/// `TofuVerifier` holds `PathBuf` + `Arc<CryptoProvider>`, which satisfies
+/// the bound automatically.
 ///
-/// **`provider` 字段**：`verify_tls12_signature` / `verify_tls13_signature`
-/// 转发到 `rustls::crypto::verify_*_signature` 需要 `signature_verification_algorithms`
-/// 列表 —— 必须持有 provider 引用。与 bak `TofuVerifier` 对称。
-///
-/// **dead_code chain**：本类型被 `build_quic_client_config`（接收 `pins_dir`）
-/// 消费 → 再被 `dial()` 间接消费 → 测试也直接调 `verify_server_cert`。
-/// main-code 路径在 STEP-6.1 `connect.rs::connect_to_handle` 接入时一并消化。
+/// **`provider` field**: forwarding `verify_tls12_signature` /
+/// `verify_tls13_signature` to `rustls::crypto::verify_*_signature` requires
+/// the `signature_verification_algorithms` list — a provider reference must
+/// be held.
 #[derive(Debug)]
 pub struct TofuVerifier {
     pins_dir: PathBuf,
-    /// 签名验签需要的 provider（`verify_tls12_signature` / `verify_tls13_signature`
-    /// 转发到 `rustls::crypto::verify_*_signature` 时拿它的 `signature_verification_algorithms`）。
+    /// Crypto provider needed for signature verification; its
+    /// `signature_verification_algorithms` is forwarded by
+    /// `verify_tls12_signature` / `verify_tls13_signature`.
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
 impl TofuVerifier {
-    /// 构造：首次连接状态。
+    /// Construct in the "first connection" state.
     ///
-    /// `pins_dir` 可以不存在 —— `verify_server_cert` 在 First Connect 分支会
-    /// 先 `create_dir_all` 再 `fs::write`。
+    /// `pins_dir` may not exist — `verify_server_cert` runs `create_dir_all`
+    /// then `fs::write` in the First Connect branch.
     pub fn new(pins_dir: &Path) -> Self {
         Self {
             pins_dir: pins_dir.to_path_buf(),
@@ -187,13 +194,15 @@ impl TofuVerifier {
         }
     }
 
-    /// 构造：已知 peer 状态（预落盘 `<known_fp>.pin`，让后续 verify 走
-    /// "已知匹配"分支）。
+    /// Construct in the "known peer" state (pre-write `<known_fp>.pin` so
+    /// subsequent verifies take the "known match" branch).
     ///
-    /// **预落盘是 best-effort**：失败时构造仍返回 Self，后续 verify 走 mismatch
-    /// 路径返回 `rustls::Error` —— 故意不静默吞 IO 错误，因为这通常意味着 fs
-    /// 权限 / 磁盘已满等运维问题。
-    #[allow(dead_code)] // 测试 only（生产 `dial()` 走 `.new()`）
+    /// **Pre-write is best-effort**: on failure the constructor still returns
+    /// `Self`, and subsequent verifies take the mismatch path returning a
+    /// `rustls::Error`. IO errors are intentionally not swallowed silently,
+    /// because they usually indicate operational problems such as filesystem
+    /// permissions or a full disk.
+    #[allow(dead_code)] // tests only (production `dial()` uses `.new()`)
     pub fn with_known(pins_dir: &Path, known_fp: &str) -> Self {
         let v = Self::new(pins_dir);
         let _ = fs::create_dir_all(&v.pins_dir);
@@ -201,14 +210,15 @@ impl TofuVerifier {
         v
     }
 
-    /// fingerprint → pin 文件路径。`:` 替换为 `_` 跨平台兼容。
+    /// fingerprint → pin file path. `:` replaced with `_` for cross-platform
+    /// compatibility.
     fn pin_path(&self, fp: &str) -> PathBuf {
         let safe = fp.replace(':', "_");
         self.pins_dir.join(format!("{safe}.pin"))
     }
 
-    /// `pins_dir` 下是否存在任意 `.pin` 文件（用于区分 First Connect vs
-    /// Known Mismatch）。
+    /// Whether any `.pin` file exists under `pins_dir` (used to distinguish
+    /// First Connect from Known Mismatch).
     fn has_any_pins(&self) -> bool {
         if !self.pins_dir.exists() {
             return false;
@@ -231,11 +241,12 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        // (1) 拿 server cert 算 SHA-256 fingerprint（与 `crypto::generate_fingerprint`
-        //     输出格式一致：hex 用 `:` 分隔，小写）
+        // (1) Compute the SHA-256 fingerprint of the server cert (matches the
+        //     format produced by `crypto::generate_fingerprint`: lowercase hex
+        //     separated by `:`).
         let fp = crypto::generate_fingerprint(end_entity.as_ref());
 
-        // (2) ensure pins_dir 存在（First Connect 时也需要）
+        // (2) Ensure pins_dir exists (also needed on First Connect).
         fs::create_dir_all(&self.pins_dir).map_err(|e| {
             rustls::Error::General(format!(
                 "TOFU: create_dir_all({:?}) failed: {e}",
@@ -243,20 +254,21 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
             ))
         })?;
 
-        // (3) 三态判定
+        // (3) Three-state decision.
         let pin = self.pin_path(&fp);
 
         if pin.exists() {
-            // Known Match —— pin 文件已存在，接受
+            // Known Match — pin file exists, accept.
             Ok(ServerCertVerified::assertion())
         } else if self.has_any_pins() {
-            // Known Mismatch —— 其他 fp 的 pin 存在但当前 fp 没有，拒绝
+            // Known Mismatch — some other fingerprint's pin exists but this
+            // one does not, reject.
             log::warn!("TOFU: rejected untrusted peer {fp}");
             Err(rustls::Error::General(format!(
                 "TOFU mismatch: peer fingerprint {fp} not in known peers"
             )))
         } else {
-            // First Connect —— 落盘占位 + 接受
+            // First Connect — write the placeholder pin and accept.
             fs::write(&pin, b"trusted\n").map_err(|e| {
                 rustls::Error::General(format!("TOFU: write pin {:?} failed: {e}", pin))
             })?;
@@ -300,28 +312,35 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
     }
 }
 
-/// **STEP-2.5 占位 verifier**：server 端 mTLS 强制要求 client 出示（`offer
-/// _client_auth() -> true` + `client_auth_mandatory() -> true`），但**任何**
-/// 通过 TLS 1.3 内置链校验的 client cert 都接受 —— 不做 fingerprint allowlist。
+/// Placeholder verifier: the server-side mTLS handshake requires the client
+/// to present a cert (`offer_client_auth() -> true` +
+/// `client_auth_mandatory() -> true`), but **any** cert that passes the TLS 1.3
+/// built-in chain check is accepted — no fingerprint allowlist.
 ///
-/// **用途**：让 mTLS 链路本身（server 端 `CertificateRequest` → client 出示
-/// cert → 握手完成）能在 STEP-2.5 端到端跑通，同时给 [`mtls_rejects_no_client_cert`]
-/// 等负面测试提供"server 强制要求 client cert 但放行任意"的可控 verifier。
+/// **Purpose**: lets the mTLS link itself (server `CertificateRequest` →
+/// client presents cert → handshake completes) work end-to-end, while
+/// providing a controllable verifier for negative tests such as
+/// [`mtls_rejects_no_client_cert`] (server forces client cert, accepts any).
 ///
-/// **STEP-2.7 替换**：[`AuthorizedKeysVerifier`] 走 `config.authorized_fingerprints()`
-/// 的 fingerprint allowlist —— 未授权 fingerprint 即拒握。`mtls_rejects_no_client_cert`
-/// 之外的所有 server 路径（`endpoint_with_verifier` 生产 caller）STEP-2.7 切换。
+/// **Supersession**: [`AuthorizedKeysVerifier`] uses the fingerprint allowlist
+/// from `config.authorized_fingerprints()` — an unauthorized fingerprint is
+/// rejected at handshake. All server paths other than
+/// `mtls_rejects_no_client_cert` (production callers of
+/// `endpoint_with_verifier`) use `AuthorizedKeysVerifier`.
 ///
-/// **`Send + Sync + 'static`**：rustls 0.23 trait 约束 —— `PermissiveClientCertVerifier`
-/// 不持有跨 await 的可变状态，单字段结构体 + `Arc<ServerNameProvider>` 衍生
-/// 自动满足（`Debug` 同样 derive 出）。
+/// **`Send + Sync + 'static`**: rustls 0.23 trait constraint —
+/// `PermissiveClientCertVerifier` holds no mutable state across awaits; the
+/// struct is auto-derived (and so is `Debug`).
 ///
-/// **`verify_client_cert`**：调用 `crypto::generate_fingerprint(cert)` 算 SHA-256
-/// → 写出日志（不与 allowlist 比对 —— 占位实现）→ 返回
-/// `Ok(ClientCertVerified::assertion())`。这是**唯一**路径 —— 因为服务端
-/// 已经 `with_client_cert_verifier(...)` 装上 verifier，且 `client_auth_mandatory()`
-/// 为 true，client **必须**出示 cert 才能到这一步；client 不出示 → TLS 1.3
-/// 内置流程直接 `rustls::Error::NoCertificatesPresented` 拒握（见测试）。
+/// **`verify_client_cert`**: calls `crypto::generate_fingerprint(cert)` to
+/// compute SHA-256, emits a log line (no allowlist check — placeholder
+/// implementation), and returns `Ok(ClientCertVerified::assertion())`. This
+/// is the **only** path — the server has already installed the verifier via
+/// `with_client_cert_verifier(...)` and `client_auth_mandatory()` is true, so
+/// the client **must** present a cert to reach this point; if the client
+/// presents none, the TLS 1.3 built-in flow returns
+/// `rustls::Error::NoCertificatesPresented` and aborts the handshake (see
+/// tests).
 #[derive(Debug)]
 pub struct PermissiveClientCertVerifier;
 
@@ -335,7 +354,7 @@ impl rustls::server::danger::ClientCertVerifier for PermissiveClientCertVerifier
     }
 
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
-        // 不提供 root hints —— 任意自签 cert 都接受
+        // No root hints — any self-signed cert is accepted.
         &[]
     }
 
@@ -346,7 +365,7 @@ impl rustls::server::danger::ClientCertVerifier for PermissiveClientCertVerifier
         _now: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         let fp = crate::crypto::generate_fingerprint(end_entity.as_ref());
-        log::debug!("[STEP-2.5 占位 verifier] accept client cert fp={fp}");
+        log::debug!("[placeholder verifier] accept client cert fp={fp}");
         Ok(rustls::server::danger::ClientCertVerified::assertion())
     }
 
@@ -356,9 +375,11 @@ impl rustls::server::danger::ClientCertVerifier for PermissiveClientCertVerifier
         _cert: &CertificateDer<'_>,
         _dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        // STEP-2.5 占位 verifier —— TLS 1.2 路径无签名需求（client cert
-        // 通过 TLS 1.3 内置链校验即可）。签名验签实现在 STEP-2.7
-        // `AuthorizedKeysVerifier` 中（持 provider + 转发到 ring provider）。
+        // Placeholder verifier — the TLS 1.2 path does not need signature
+        // validation (the client cert is validated by the TLS 1.3 built-in
+        // chain check). Signature verification is implemented in
+        // `AuthorizedKeysVerifier` (holds a provider and forwards to the
+        // ring provider).
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -368,91 +389,85 @@ impl rustls::server::danger::ClientCertVerifier for PermissiveClientCertVerifier
         _cert: &CertificateDer<'_>,
         _dss: &rustls::DigitallySignedStruct,
     ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        // 同上 —— TLS 1.3 路径下 STEP-2.5 占位 verifier 不做签名验签
+        // Same as above — the placeholder verifier does not perform
+        // signature verification on the TLS 1.3 path.
         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        // 占位 verifier 不校验签名 schema —— 返回空 vec 即可
+        // Placeholder verifier does not validate signature schemes —
+        // returning an empty vec is sufficient.
         Vec::new()
     }
 }
 
-/// **STEP-2.7 server 端授权指纹 allowlist verifier** —— mTLS 双层防御的核心
-/// 约束：client cert 即使通过了 TLS 1.3 内置链校验（自签根信任），还要看
-/// `allowlist` 里有没有这个 fingerprint 才放行。
+/// Server-side authorized-fingerprint allowlist verifier — the core
+/// invariant of the two-layer mTLS defense: even if a client cert passes the
+/// TLS 1.3 built-in chain check (self-signed root trust), it must also be
+/// present in the `allowlist` fingerprint map to be admitted.
 ///
-/// **#S-9（治理）**：allowlist 的 value 类型用 `String` 而**非**
-/// `lan_mouse_ipc::IncomingPeerConfig` —— `IncomingPeerConfig` 是 M2 范围
-/// （带 `clipboard_receive` / `description` 等字段）；当前 M1
-/// `config::authorized_fingerprints: HashMap<String, String>` 也是 String，
-/// 自然对齐。STEP-7 / M2 把 `IncomingPeerConfig` 引入 `lan-mouse-ipc` 后，
-/// 同步把本结构 + caller 一起改成 `HashMap<String, IncomingPeerConfig>`
-/// （与 bak `mousehop/src/quic_transport.rs:1577-1754 AuthorizedKeysVerifier`
-/// 形态完全对齐；值类型用 `IncomingPeerConfig::default()` 表示"已授权但
-/// 还没填配置"）。
+/// **`allowlist` semantics**: `String` is the fingerprint (lowercase hex +
+/// `:` separator, matching the format produced by
+/// `crypto::generate_fingerprint`). Runtime addition / removal of allowlist
+/// entries is shared through `Arc<RwLock<HashMap<...>>>` — the listen.rs
+/// supervisor or a later IPC push of `authorized_fingerprints` changes can
+/// write into the inner `RwLock` and have those changes visible
+/// (`RwLock::read()` does not block readers; `RwLock::write()` only blocks
+/// writers).
 ///
-/// **`allowlist` 跨平台语义**：`String` 是 fingerprint（小写 hex + `:` 分隔，
-/// 与 `crypto::generate_fingerprint` 输出格式一致）。运行时增 / 删 allowlist
-/// 条目通过 `Arc<RwLock<HashMap<...>>>` 共享所有权 —— listen.rs supervisor
-/// 或后续 IPC 推 `authorized_fingerprints` 变更时，可直接写本结构内的
-/// RwLock 看到变更（`RwLock::read()` 不阻塞 reader；`RwLock::write()` 仅
-/// 阻塞 writer）。M1 阶段 caller 仅有测试 + 未来 STEP-6.2 listen.rs
-/// supervisor；运行时增删 allowlist 路径 STEP-6.x 接入。
+/// **`Send + Sync + 'static`**: rustls 0.23 trait constraint —
+/// `allowlist: Arc<RwLock<HashMap<...>>>` is auto `Send + Sync`, and so is
+/// `provider: Arc<CryptoProvider>`.
 ///
-/// **`Send + Sync + 'static`**：rustls 0.23 trait 约束 —— `allowlist: Arc<
-/// RwLock<HashMap<...>>>` 自动 `Send + Sync`，`provider: Arc<CryptoProvider>`
-/// 也自动满足。
+/// **`provider` field**: forwarding `verify_tls12_signature` /
+/// `verify_tls13_signature` to `rustls::crypto::verify_*_signature` requires
+/// the `signature_verification_algorithms` list — a provider reference must
+/// be held (same pattern as `TofuVerifier`).
 ///
-/// **`provider` 字段**：`verify_tls12_signature` / `verify_tls13_signature`
-/// 转发到 `rustls::crypto::verify_*_signature` 需要
-/// `signature_verification_algorithms` —— 必须持有 provider 引用（与 STEP-2.6
-/// `TofuVerifier` 同模式）。
-///
-/// **`verify_client_cert` 二态判定**：
-/// - 命中（allowlist.contains_key(&fp)）→ `Ok(ClientCertVerified::assertion())` + `log::info!`
-/// - 未命中 → `Err(rustls::Error::General(format!("unauthorized peer {fp}")))`
-///   + `log::warn!`（PLAN §2.7 验收文本，与 STEP-2.6 "untrusted peer" 对齐）
-///
-/// **dead_code chain**：本结构被 [`super::endpoint::endpoint_with_verifier`] 的 verifier 参数
-/// 消费 → 由 `endpoint_with_verifier` 间接消费 → 单测直接调
-/// `verify_client_cert`。main-code 接入路径留 STEP-6.2 `listen.rs` supervisor
-/// 整段重写时一并消化（listen.rs 当前仍调 DTLS 路径，14 errors 不在本步范围）。
+/// **`verify_client_cert` two-state decision**:
+/// - Hit (`allowlist.contains_key(&fp)`) → `Ok(ClientCertVerified::assertion())`
+///   + `log::info!`
+/// - Miss → `Err(rustls::Error::General(format!("unauthorized peer {fp}")))`
+///   + `log::warn!`
 #[derive(Debug)]
 pub struct AuthorizedKeysVerifier {
-    /// 授权指纹表：键 = client cert SHA-256 fingerprint（`crypto::generate_fingerprint` 格式），
-    /// 值 = 占位 `String`（M2 接 `lan_mouse_ipc::IncomingPeerConfig::default()`）。
+    /// Authorized fingerprint map: key = client cert SHA-256 fingerprint
+    /// (`crypto::generate_fingerprint` format), value = placeholder `String`.
     allowlist: Arc<RwLock<HashMap<String, String>>>,
-    /// 签名验签需要的 provider（`verify_tls12_signature` / `verify_tls13_signature`
-    /// 转发到 `rustls::crypto::verify_*_signature` 时拿它的
-    /// `signature_verification_algorithms`）。
+    /// Crypto provider needed for signature verification; its
+    /// `signature_verification_algorithms` is forwarded by
+    /// `verify_tls12_signature` / `verify_tls13_signature`.
     provider: Arc<rustls::crypto::CryptoProvider>,
-    /// **STEP-8.2 修复**：被拒对端 fingerprint 反向通知 channel —— 把
-    /// rustls 拒握路径里拿到的 fingerprint 透回 listen task，转译为
-    /// `ListenEvent::Rejected` → emulation.rs 上报 `ConnectionAttempt`
-    /// → GUI 弹窗。
+    /// Reverse-notification channel for rejected peer fingerprints — lets
+    /// the listen task translate the fingerprint obtained during the rustls
+    /// rejection path into a `ListenEvent::Rejected` → emulation.rs
+    /// `ConnectionAttempt` → GUI popup.
     ///
-    /// **`Option` 而非必填**：单测 + 早期 caller（无 listen task 装配时）
-    /// 不接 channel 时为 `None`，`verify_client_cert` 走 no-op 分支。
+    /// **`Option` rather than required**: unit tests and early callers (no
+    /// listen task wired up) pass `None`, and `verify_client_cert` follows
+    /// a no-op branch.
     ///
-    /// **为什么用 `tokio::sync::mpsc::UnboundedSender` 而非 `local_channel`**：
-    /// `verify_client_cert` 由 rustls 在 QUIC 握手回调链里调用 —— quinn
-    /// 的 I/O task 可能跑在非 local 线程上（与 spawn_local 不属同一 task）。
-    /// `tokio::sync::mpsc::UnboundedSender` 是 `Send + Sync`，可跨线程持有；
-    /// listen task 的 forwarder 在 `spawn_local` 上 recv（同 §1 `wake_rx`
-    /// 模式）。
+    /// **Why `tokio::sync::mpsc::UnboundedSender` instead of `local_channel`**:
+    /// `verify_client_cert` is invoked by rustls on the QUIC handshake
+    /// callback chain — quinn's I/O task may run on a non-local thread (not
+    /// in the same task as `spawn_local`). `tokio::sync::mpsc::UnboundedSender`
+    /// is `Send + Sync` and can be held across threads; the listen task's
+    /// forwarder receives on `spawn_local`.
     rejection_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl AuthorizedKeysVerifier {
-    /// 构造：allowlist 由 caller 持有（生产 `Config::authorized_fingerprints()`，
-    /// 测试 `Arc::new(RwLock::new(HashMap::new()))`）。
+    /// Construct: the allowlist is owned by the caller (production
+    /// `Config::authorized_fingerprints()`, tests
+    /// `Arc::new(RwLock::new(HashMap::new()))`).
     ///
-    /// `allowlist` 必须 `Send + Sync + 'static`（rustls 要求 verifier
-    /// `Send + Sync + 'static`；`Arc<RwLock<HashMap<...>>>` 自动满足）。
+    /// `allowlist` must be `Send + Sync + 'static` (rustls requires the
+    /// verifier to be `Send + Sync + 'static`; `Arc<RwLock<HashMap<...>>>`
+    /// satisfies this automatically).
     ///
-    /// **无 rejection channel**：单测 / 早期 caller 用此构造；rustls 拒握
-    /// 时仅 `log::warn` 留审计线索，不通知 GUI。
+    /// **No rejection channel**: unit tests and early callers use this
+    /// constructor; when rustls rejects a handshake only a `log::warn`
+    /// audit line is emitted, with no GUI notification.
     #[allow(dead_code)]
     pub fn new(allowlist: Arc<RwLock<HashMap<String, String>>>) -> Self {
         Self {
@@ -462,27 +477,33 @@ impl AuthorizedKeysVerifier {
         }
     }
 
-    /// **STEP-8.2 修复**：注入 rejection 反向通知 channel —— builder 模式，
-    /// 不破坏既有 `new()` / `with_known()` 单测与 caller 的签名。
+    /// Inject the rejection reverse-notification channel — builder style,
+    /// does not break the signatures of existing `new()` / `with_known()`
+    /// tests and callers.
     ///
-    /// `verify_client_cert` 在 Err 路径上额外 `rejection_tx.send(fp.clone())`
-    /// （channel 满 / 关闭时静默 no-op —— reject 事件是 best-effort，不应
-    /// 干扰 rustls 原本返 Err 的语义）。
+    /// `verify_client_cert` additionally calls `rejection_tx.send(fp.clone())`
+    /// on the Err path (silent no-op if the channel is full or closed — the
+    /// reject event is best-effort and must not interfere with rustls's
+    /// intended `Err` semantics).
     #[allow(dead_code)]
     pub fn with_rejection_tx(mut self, tx: tokio::sync::mpsc::UnboundedSender<String>) -> Self {
         self.rejection_tx = Some(tx);
         self
     }
 
-    /// 构造：已知 peer 状态（预填 `allowlist` 让后续 verify 走 Authorized 分支）。
+    /// Construct in the "known peer" state (pre-fill `allowlist` so
+    /// subsequent verifies take the Authorized path).
     ///
-    /// **预填是 best-effort**：失败时构造仍返回 Self，后续 verify 走
-    /// Unauthorized 路径返回 `rustls::Error` —— 故意不静默吞
-    /// `RwLock::write()` 的 poison 错误，因为这通常意味着上游 panic。
+    /// **Pre-fill is best-effort**: on failure the constructor still returns
+    /// `Self`, and subsequent verifies take the Unauthorized path returning
+    /// a `rustls::Error`. `RwLock::write()` poison errors are intentionally
+    /// not swallowed, because they usually indicate an upstream panic.
     ///
-    /// 测试用：直接调 `verify_client_cert(cert)` → 应 `Ok`（不需要端到端
-    /// QUIC 握手）。生产路径不用（生产走 listen.rs supervisor / service.rs
-    /// 写 allowlist，verifier 通过 `new()` 拿到 Arc 引用）。
+    /// Test-only: callers invoke `verify_client_cert(cert)` directly and
+    /// expect `Ok` (no end-to-end QUIC handshake required). Not used in
+    /// production (production writes the allowlist via the listen.rs
+    /// supervisor / service.rs, and the verifier gets an `Arc` reference
+    /// through `new()`).
     #[allow(dead_code)]
     pub fn with_known(allowlist: Arc<RwLock<HashMap<String, String>>>, known_fp: &str) -> Self {
         let v = Self::new(allowlist);
@@ -493,7 +514,8 @@ impl AuthorizedKeysVerifier {
         v
     }
 
-    /// 暴露 `allowlist`（测试用：断言 allowlist 内容 + 模拟运行时增删）。
+    /// Expose `allowlist` (tests assert allowlist contents and simulate
+    /// runtime add/remove).
     #[allow(dead_code)]
     pub fn allowlist(&self) -> &Arc<RwLock<HashMap<String, String>>> {
         &self.allowlist
@@ -502,19 +524,21 @@ impl AuthorizedKeysVerifier {
 
 impl rustls::server::danger::ClientCertVerifier for AuthorizedKeysVerifier {
     fn offer_client_auth(&self) -> bool {
-        // server 端 mTLS 强制 client cert 出示（与 `PermissiveClientCertVerifier`
-        // 对称 —— 不出 cert 就走 TLS 1.3 `NoCertificatesPresented` 拒握）。
+        // Server-side mTLS forces client cert presentation (symmetric with
+        // `PermissiveClientCertVerifier` — no cert triggers TLS 1.3's
+        // `NoCertificatesPresented` rejection).
         true
     }
 
     fn client_auth_mandatory(&self) -> bool {
-        // 不出 cert → 直接拒（与 `offer_client_auth` 一致）
+        // No cert → reject directly (consistent with `offer_client_auth`).
         true
     }
 
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
-        // 不提供 root hints —— 任意自签 cert 都尝试接入（fingerprint 校验由
-        // `verify_client_cert` 自己做）
+        // No root hints — any self-signed cert is allowed to attempt the
+        // handshake; the fingerprint check is performed by
+        // `verify_client_cert` itself.
         &[]
     }
 
@@ -524,13 +548,15 @@ impl rustls::server::danger::ClientCertVerifier for AuthorizedKeysVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        // (1) 拿 client cert 算 SHA-256 fingerprint（与
-        //     `crypto::generate_fingerprint` 输出格式一致：hex 用 `:` 分隔，小写）
+        // (1) Compute the SHA-256 fingerprint of the client cert (matches the
+        //     format produced by `crypto::generate_fingerprint`: lowercase hex
+        //     separated by `:`).
         let fp = crypto::generate_fingerprint(end_entity.as_ref());
 
-        // (2) allowlist 查询（注意：与模块顶层 `Result<T>` 别名冲突 —— `verify_client_cert`
-        //     是 trait method，必须显式写 `std::result::Result<_, rustls::Error>` 才能
-        //     与 rustls 期望类型对齐；与 STEP-2.6 `TofuVerifier` 偏差 #1 同模式）
+        // (2) Allowlist lookup (note: this collides with the module-level
+        //     `Result<T>` alias — `verify_client_cert` is a trait method and
+        //     must spell out `std::result::Result<_, rustls::Error>` to
+        //     align with the rustls-expected type).
         let allowed = self
             .allowlist
             .read()
@@ -538,22 +564,27 @@ impl rustls::server::danger::ClientCertVerifier for AuthorizedKeysVerifier {
             .contains_key(&fp);
 
         if allowed {
-            // Authorized —— 命中 allowlist
+            // Authorized — fingerprint hit the allowlist.
             log::info!("AuthorizedKeysVerifier: authorized peer {fp}");
             Ok(rustls::server::danger::ClientCertVerified::assertion())
         } else {
-            // Unauthorized —— allowlist 不命中
+            // Unauthorized — fingerprint not in the allowlist.
             //
-            // **STEP-8.2 修复**：除了 `log::warn` 留审计线索 + 返回 rustls
-            // `Err` 触发握手拒绝，**同时**把 fingerprint 通过反向 channel
-            // 通知 listen task → 转译 `ListenEvent::Rejected` →
-            // `EmulationEvent::ConnectionAttempt` → GUI `request_authorization`
-            // 弹窗（emulation.rs:190 + service.rs:320 + 前端 `request_authorization`）。
+            // Besides the `log::warn` audit line and the rustls `Err` that
+            // triggers handshake rejection, also send the fingerprint
+            // through the reverse channel to the listen task → translated
+            // into `ListenEvent::Rejected` → `EmulationEvent::ConnectionAttempt`
+            // → GUI `request_authorization` popup (emulation.rs:190 +
+            // service.rs:320 + frontend `request_authorization`).
             //
-            // **send 失败静默吞**：`UnboundedSender::send` 仅在 receiver drop
-            // 时返 `Err`（channel 关闭），此时 listen task 已退出（terminate）
-            // —— 拒握已是终局，发不出"弹窗"信号合理 no-op，**不**应让这影响
-            // rustls 原本返 Err 的语义（rustls 仍按设计拒握，错误消息不变）。
+            // **Send failures are swallowed silently**:
+            // `UnboundedSender::send` only returns `Err` when the receiver
+            // is dropped (channel closed), at which point the listen task
+            // has already terminated — the rejection is already final, and
+            // failing to emit the popup signal is a reasonable no-op. It
+            // **must not** affect rustls's intended `Err` semantics (rustls
+            // still rejects the handshake as designed, and the error
+            // message is unchanged).
             log::warn!("AuthorizedKeysVerifier: rejected unauthorized peer {fp}");
             if let Some(tx) = &self.rejection_tx {
                 let _ = tx.send(fp.clone());
@@ -608,7 +639,8 @@ mod tests {
 
     use super::*;
 
-    /// PLAN §2.1 验收：用测试自签 cert 装配 `quinn::ClientConfig` 不 panic。
+    /// Verifies that assembling a `quinn::ClientConfig` with a test self-signed
+    /// cert does not panic.
     #[test]
     fn quinn_client_config_loads_rustls_provider() {
         super::super::endpoint::install_crypto_provider();
@@ -617,13 +649,13 @@ mod tests {
         let pins_dir = ephemeral_pins_dir();
         let _ = std::fs::remove_dir_all(&pins_dir);
         let cfg = build_quic_client_config(vec![cert_chain[0].clone()], key, &pins_dir)
-            .expect("ClientConfig 装配不应失败");
+            .expect("ClientConfig assembly should not fail");
         let _clone: quinn::ClientConfig = cfg.clone();
     }
 
-    /// PLAN §2.5 验收：server 端 [`PermissiveClientCertVerifier`] 强制 mTLS
-    /// dial → TLS 1.3 内置 `rustls::Error::NoCertificatesPresented` 应在
-    /// server 端拒握。
+    /// Verifies the server-side [`PermissiveClientCertVerifier`] forces
+    /// mTLS: a dial without a client cert must be rejected at the server
+    /// via TLS 1.3's built-in `rustls::Error::NoCertificatesPresented`.
     #[tokio::test]
     async fn mtls_rejects_no_client_cert() {
         use std::net::{Ipv4Addr, SocketAddrV4};
@@ -638,17 +670,17 @@ mod tests {
             server_key,
             verifier,
         )
-        .expect("server endpoint_with_verifier bind 不应失败");
+        .expect("server endpoint_with_verifier bind should not fail");
         let server_addr = server_ep
             .local_addr()
-            .expect("server endpoint 必须有 local_addr");
+            .expect("server endpoint must have local_addr");
 
         let server_task = tokio::spawn(async move {
-            let incoming = server_ep.accept().await.expect("server accept 不应失败");
+            let incoming = server_ep.accept().await.expect("server accept should not fail");
             let result = incoming.await;
             assert!(
                 result.is_err(),
-                "server 端 handshake 应失败（mTLS 强制 client cert，client 未出示），实际 Ok"
+                "server side handshake should fail (mTLS requires client cert, client did not present), actually Ok"
             );
         });
 
@@ -671,29 +703,29 @@ mod tests {
 
         let client_ep =
             super::super::endpoint::endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
-                .expect("client endpoint bind 不应失败");
+                .expect("client endpoint bind should not fail");
 
         let connecting_outcome = client_ep.connect_with(client_cfg, server_addr, "lan-mouse");
         let handshake_result = match connecting_outcome {
             Ok(connecting) => tokio::time::timeout(std::time::Duration::from_secs(5), connecting)
                 .await
-                .expect("dial 端到端超时"),
+                .expect("dial end-to-end timed out"),
             Err(_connect_err) => {
-                log::debug!("connect_with 同步部分失败（接受）");
+                log::debug!("connect_with synchronous part failed (accepted)");
                 return;
             }
         };
 
         assert!(
             handshake_result.is_err(),
-            "无 client cert 的 dial 应失败（server 端拒握），实际 Ok"
+            "dial without client cert should fail (server rejected handshake), actually Ok"
         );
 
         drop(client_ep);
         let _ = server_task.await;
     }
 
-    /// STEP-2.6 验收 (1/2)：新 fingerprint 被接受并写入 known_peers。
+    /// Verifies that a new fingerprint is accepted and written to known_peers.
     #[test]
     fn tofu_first_run_pins() {
         super::super::endpoint::install_crypto_provider();
@@ -731,8 +763,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&pins_dir);
     }
 
-    /// STEP-2.6 验收 (2/2)：不同 fingerprint 被拒绝
-    /// （`rustls::Error::General("TOFU mismatch: ...")`）。
+    /// Verifies that a different fingerprint is rejected
+    /// (`rustls::Error::General("TOFU mismatch: ...")`).
     #[test]
     fn tofu_disallows_swap() {
         super::super::endpoint::install_crypto_provider();
@@ -749,7 +781,7 @@ mod tests {
         let fp2 = crate::crypto::generate_fingerprint(cert2_der.as_ref());
         assert_ne!(
             fp1, fp2,
-            "两个 ephemeral_cert 必须有不同的指纹（rcgen 每次随机）"
+            "two ephemeral_certs must have different fingerprints (rcgen randomizes each time)"
         );
 
         let server_name = test_server_name();
@@ -760,7 +792,7 @@ mod tests {
             Err(rustls::Error::General(msg)) => {
                 assert!(
                     msg.contains("TOFU mismatch") || msg.contains("untrusted peer"),
-                    "错误消息应含 TOFU mismatch / untrusted peer，实际: {msg}"
+                    "error message should contain TOFU mismatch / untrusted peer, actually: {msg}"
                 );
             }
             other => panic!(
@@ -772,20 +804,20 @@ mod tests {
         let fp1_pin = pins_dir.join(format!("{}.pin", fp1.replace(':', "_")));
         assert!(
             fp1_pin.exists(),
-            "mismatch 不应删除已存在的 fp1 pin 文件（pin 应保留）"
+            "mismatch should not delete the existing fp1 pin file (pin should be retained)"
         );
 
         let fp2_pin = pins_dir.join(format!("{}.pin", fp2.replace(':', "_")));
         assert!(
             !fp2_pin.exists(),
-            "mismatch 不应自动 pin fp2（陌生 cert 必须保持陌生）"
+            "mismatch should not auto-pin fp2 (unfamiliar cert must remain unfamiliar)"
         );
 
         let _ = std::fs::remove_dir_all(&pins_dir);
     }
 
-    /// STEP-2.7 验收 (1/2)：allowlist 预填某 fingerprint → `verify_client_cert`
-    /// 用对应 cert → `Ok`。
+    /// Verifies that when the allowlist is pre-filled with a fingerprint,
+    /// `verify_client_cert` with the corresponding cert returns `Ok`.
     #[test]
     fn authorized_keys_accepts_known() {
         let allowlist = tmp_allowlist("accepts");
@@ -804,17 +836,18 @@ mod tests {
         );
         assert!(
             result.is_ok(),
-            "allowlist 预填的 fingerprint 应被接受，实际: {result:?}"
+            "pre-filled fingerprint in allowlist should be accepted, actually: {result:?}"
         );
 
         assert!(
             verifier.allowlist().read().unwrap().contains_key(&fp),
-            "allowlist 应包含预填 fp"
+            "allowlist should contain pre-filled fp"
         );
     }
 
-    /// STEP-2.7 验收 (2/2)：allowlist 不含某 fingerprint → `verify_client_cert`
-    /// 用对应 cert → `Err(rustls::Error::General("unauthorized peer {fp}"))`。
+    /// Verifies that when the allowlist does not contain a fingerprint,
+    /// `verify_client_cert` with the corresponding cert returns
+    /// `Err(rustls::Error::General("unauthorized peer {fp}"))`.
     #[test]
     fn authorized_keys_rejects_unknown() {
         let allowlist = tmp_allowlist("rejects");
@@ -832,28 +865,28 @@ mod tests {
         );
         assert!(
             result.is_err(),
-            "allowlist 不含的 fingerprint 应被拒绝，实际: {result:?}"
+            "fingerprint not in allowlist should be rejected, actually: {result:?}"
         );
 
         let err_msg = format!("{:?}", result.unwrap_err());
         assert!(
             err_msg.contains(&fp),
-            "Err 消息应包含 fingerprint `{fp}`，实际: {err_msg}"
+            "Err message should contain fingerprint `{fp}`, actually: {err_msg}"
         );
         assert!(
             err_msg.contains("unauthorized"),
-            "Err 消息应包含 'unauthorized' 关键字，实际: {err_msg}"
+            "Err message should contain 'unauthorized' keyword, actually: {err_msg}"
         );
 
         assert!(
             !verifier.allowlist().read().unwrap().contains_key(&fp),
-            "allowlist 应不含 cert_der 的 fp"
+            "allowlist should not contain cert_der's fp"
         );
     }
 
-    /// STEP-8.2 验收：rejection channel 接通 — 当 `verify_client_cert`
-    /// 在 allowlist 未命中返 Err 时，fingerprint 必须通过 `rejection_tx`
-    /// 同步送达 rx。
+    /// Verifies the rejection channel: when `verify_client_cert` returns Err
+    /// on an allowlist miss, the fingerprint must be delivered to rx
+    /// synchronously via `rejection_tx`.
     #[test]
     fn rejection_channel_forwards_rejected_fingerprint() {
         let allowlist = tmp_allowlist("rejection-tx");
@@ -874,10 +907,10 @@ mod tests {
             &[],
             rustls::pki_types::UnixTime::now(),
         );
-        assert!(r.is_ok(), "allowlist 命中应 Ok");
+        assert!(r.is_ok(), "allowlist hit should be Ok");
         assert!(
             rx.try_recv().is_err(),
-            "allowlist 命中路径不应 send rejection（防止误报）"
+            "allowlist hit path should not send rejection (preventing false positives)"
         );
 
         allowlist.write().expect("RwLock poisoned").remove(&fp);
@@ -887,16 +920,16 @@ mod tests {
             &[],
             rustls::pki_types::UnixTime::now(),
         );
-        assert!(r.is_err(), "allowlist 不命中应 Err");
+        assert!(r.is_err(), "allowlist miss should be Err");
 
-        let received = rx.try_recv().expect("rejection_tx 应在 Err 路径 send fp");
+        let received = rx.try_recv().expect("rejection_tx should send fp on Err path");
         assert_eq!(
             received, fp,
-            "rejection channel 收到的 fp 应与被拒 cert 的 fp 一致"
+            "fp received on rejection channel should match the fp of the rejected cert"
         );
         assert!(
             rx.try_recv().is_err(),
-            "第二次 try_recv 应为空（一次拒绝只 send 一次）"
+            "second try_recv should be empty (one rejection sends once)"
         );
     }
 }

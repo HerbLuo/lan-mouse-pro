@@ -92,7 +92,7 @@ local-ip-address = "0.6"
 
 [dev-dependencies]
 rcgen = "0.13"
-# rt-multi-thread: local_set_test! macro 走 multi_thread flavor 需要
+# rt-multi-thread: required by `local_set_test!` which runs under the multi_thread flavor
 tokio = { version = "1.32.0", features = ["rt-multi-thread", "time", "macros"] }
 
 [target.'cfg(unix)'.dependencies]

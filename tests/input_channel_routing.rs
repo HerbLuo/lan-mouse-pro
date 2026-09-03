@@ -1,4 +1,4 @@
-//! ChannelMode routing smoke test (PLAN-M1 §STEP-7.2 / §STEP-4.4 cross-cut)
+//! ChannelMode routing smoke test (PLAN-M1, control-plane + channel-routing cross-cut)
 //!
 //! **Goal**: assert that `route_input(cfg, event)` from `lan-mouse-ipc` +
 //! `route_input(...)` in `lan_mouse::quic_transport` agrees on channel
@@ -147,7 +147,7 @@ fn assert_event_routing(cfg: &InputChannelConfig, table: &str) {
     );
 
     // Key + Modifiers follow keyboard config (modifiers follow keyboard — see
-    // STEP-4.4 doc table in `quic_transport::route_input`).
+    // the dispatch table in `quic_transport::route_input`).
     assert_eq!(route_input(cfg, &key()), expected_key, "{table}: key");
     assert_eq!(
         route_input(cfg, &modifiers()),

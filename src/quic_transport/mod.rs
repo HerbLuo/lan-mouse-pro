@@ -1,19 +1,22 @@
-//! QUIC 传输抽象层 —— M1 入口。
+//! QUIC transport abstraction layer.
 //!
-//! 本模块把 UDP socket 包装成 [`quinn::Endpoint`]，并定义与对端的一路
-//! QUIC 会话 [`PeerSession`]。完整生命周期由 STEP-1.x ~ STEP-8.x 逐步
-//! 填实。
+//! This module wraps a UDP socket into a [`quinn::Endpoint`] and defines a
+//! QUIC session [`PeerSession`] with a remote peer.
 //!
-//! 本文件（`mod.rs`）只承担 **公共表面 + 跨模块错误类型**：
+//! This file (`mod.rs`) provides only the **public surface + cross-module
+//! error type**:
 //!
-//! - [`Error`] / [`Result`] —— 所有子模块共用的传输层错误类型
-//! - [`ALPN_LAN_MOUSE`] —— ALPN 协议名（`endpoint.rs` 和 `tls.rs` 都用）
-//! - `pub use` 重导出 —— 把 5 个子模块（`endpoint` / `tls` / `protocol` /
-//!   `streams` / `session`）的公共 API 拍平到 `quic_transport::xxx` 路径
-//!   下，保持外部 caller (`connect.rs` / `listen.rs` / `service.rs` /
-//!   `lib.rs` / `tests/quic_smoke.rs`) 完全不需要改
+//! - [`Error`] / [`Result`] — transport-layer error types shared by all
+//!   submodules.
+//! - [`ALPN_LAN_MOUSE`] — ALPN protocol name (used by both `endpoint.rs`
+//!   and `tls.rs`).
+//! - `pub use` re-exports — flatten the public API of the five submodules
+//!   (`endpoint` / `tls` / `protocol` / `streams` / `session`) under the
+//!   `quic_transport::xxx` path so external callers (`connect.rs` /
+//!   `listen.rs` / `service.rs` / `lib.rs` / `tests/quic_smoke.rs`) need
+//!   no changes.
 //!
-//! STEP 演进历史见各子模块的 docstring。
+//! See the docstrings in each submodule for additional documentation.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -33,8 +36,9 @@ pub mod session;
 pub mod streams;
 pub mod tls;
 
-// 重导出各子模块的公共 API —— 让外部 caller 写 `quic_transport::xxx` 即可，
-// 不需要直接访问子模块。外部 API 与拆分前完全一致。
+// Re-export the public API of each submodule so external callers can write
+// `quic_transport::xxx` without accessing the submodules directly.
+// The external API is identical to before the split.
 pub use crate::quic_transport::{
     endpoint::{
         accept, dial, dial_any, endpoint, endpoint_with_cert, endpoint_with_verifier,
@@ -51,25 +55,15 @@ pub use crate::quic_transport::{
     },
 };
 
-/// M1 传输层错误。
+/// Transport-layer error type.
 ///
-/// STEP-1.4 引入：占位变体 [`Error::NotImplemented`] 保留；新增
-/// [`Error::Io`] / [`Error::Bind`] / [`Error::EndpointSetup`] 给 `endpoint()`
-/// 路径用。
-/// STEP-3.2 新增 [`Error::HelloFailed`] / [`Error::HelloTimeout`] 给应用层
-/// Hello 握手用。
-/// STEP-5.1 新增 [`Error::Datagram`] / [`Error::DatagramFallback`]；
-/// STEP-5.2 新增 [`Error::StreamB`]（替换 [`Error::DatagramFallback`]，
-/// SUGGESTION #S-14 治理落地）+ [`Error::FrameTooLarge`] /
-/// [`Error::Truncated`]（codec 边界守护）。
-///
-/// **位置**：`mod.rs`（跨模块错误类型）—— 所有子模块都 `use super::Error`。
-/// `#[from]` 派生绑定的 `quinn::{ConnectError, ConnectionError,
-/// SendDatagramError}` 与 `crate::crypto::Error` 都通过 `super::Error` 透明
-/// 转换。
+/// Location: `mod.rs` (cross-module error type). Every submodule uses
+/// `use super::Error`. The `quinn::{ConnectError, ConnectionError,
+/// SendDatagramError}` and `crate::crypto::Error` types bound via
+/// `#[from]` are transparently converted through `super::Error`.
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("not implemented (STEP-1.3 占位)")]
+    #[error("not implemented (placeholder)")]
     NotImplemented,
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -83,97 +77,114 @@ pub enum Error {
     EndpointSetup(String),
     #[error("rustls / quic client config failed: {0}")]
     ClientConfig(String),
-    /// `Endpoint::connect_with(...)` 同步失败 —— endpoint 关闭 / 远端地址非法 /
-    /// 当前 endpoint 未配 client config（PLAN §2.2）。
+    /// `Endpoint::connect_with(...)` failed synchronously — the endpoint is
+    /// closed, the remote address is invalid, or the current endpoint has
+    /// no client config.
     #[error("connect_with failed: {0}")]
     Connect(#[from] quinn::ConnectError),
-    /// QUIC TLS 1.3 握手失败 —— 证书校验不通过 / ALPN 不匹配 / 中断等
-    /// （PLAN §2.2）。`ConnectionError` 含 LocallyClosed / RemoteClosed /
-    /// TransportError / ApplicationClosed 等子类；STEP-2.6 TofuVerifier 替
-    /// 换占位 verifier 后，`rustls::Error::General("untrusted peer ...")`
-    /// 会以 `ConnectionError::TransportError(...)` 形态冒到这里。
+    /// QUIC TLS 1.3 handshake failed — certificate validation did not pass,
+    /// the ALPN did not match, the connection was aborted, etc.
+    /// `ConnectionError` contains sub-variants such as `LocallyClosed`,
+    /// `RemoteClosed`, `TransportError`, and `ApplicationClosed`. After the
+    /// `TofuVerifier` replaced the placeholder verifier, errors such as
+    /// `rustls::Error::General("untrusted peer ...")` surface here as
+    /// `ConnectionError::TransportError(...)`.
     #[error("handshake failed: {0}")]
     Handshake(#[from] quinn::ConnectionError),
-    /// 应用层 Hello 握手失败：magic 不匹配 / 协议层错误 / 解码失败 /
-    /// 收到非 Hello 帧等。消息含具体原因（"wrong magic: ..." /
-    /// "non-Hello message: / " decode frame: ..."）。
-    /// STEP-3.2 引入。
+    /// Application-layer Hello handshake failed: magic mismatch, protocol
+    /// error, decode failure, or a non-Hello frame was received.
+    /// The message includes a specific reason ("wrong magic: ..." /
+    /// "non-Hello message: ..." / "decode frame: ...").
     #[error("hello handshake failed: {0}")]
     HelloFailed(String),
-    /// Hello 握手超时（对端在 [`HELLO_TIMEOUT`] 内未完成 stream A 上的
-    /// magic 交换）。STEP-3.2 引入。
+    /// Hello handshake timed out (the remote peer did not complete the
+    /// magic exchange on stream A within [`HELLO_TIMEOUT`]).
     #[error("hello handshake timed out after {0:?}")]
     HelloTimeout(Duration),
-    /// QUIC datagram 发送失败（STEP-5.1 引入）。
+    /// QUIC datagram send failed.
     ///
-    /// 包装 [`quinn::SendDatagramError`] —— 包含 `UnsupportedByPeer` /
-    /// `Disabled` / `TooLarge` / `ConnectionLost` 四种。**`ConnectionLost`
-    /// 是连接已死，降级到 stream 也救不回来**，调用方需要据此决策是否上报
-    /// `Error::Handshake`（TODO M2 接入 connect.rs 时细化）；其他三种
-    /// 是"这条路走不通"，由 `send_datagram_or_stream_b` 内部兜底到
-    /// stream B 路径，不冒到这里。
+    /// Wraps [`quinn::SendDatagramError`] — contains `UnsupportedByPeer`,
+    /// `Disabled`, `TooLarge`, and `ConnectionLost`. `ConnectionLost`
+    /// indicates the connection is already dead and falling back to a
+    /// stream cannot save it; callers must decide whether to report this
+    /// as `Error::Handshake` (TODO: refine when integrating into
+    /// `connect.rs` in the next stage). The other three variants
+    /// indicate that this path is unavailable; `send_datagram_or_stream_b`
+    /// falls back to the stream B path internally and does not surface
+    /// them here.
     #[error("datagram send failed: {0}")]
     Datagram(#[from] quinn::SendDatagramError),
-    /// 降级到 stream uni 时的 IO 错误（STEP-5.1 引入，**临时**）。
+    /// IO error when falling back to a stream uni. **Temporary.**
     ///
-    /// STEP-5.1 的降级路径是 inline `open_uni() + write_all() + finish()`，
-    /// 不复用 STEP-5.2 才定义的 stream B cache + 长度前缀帧。本变体仅
-    /// 承载降级 IO 错误（含 `open_uni` 的 `ConnectionError` /
-    /// `write_all` 的 `WriteError` / `finish` 的 `ClosedStream`），STEP-5.2
-    /// 落地后会被 [`Error::StreamB`] 替换（与 bak
-    /// `mousehop/src/quic_transport.rs:564 Error::StreamB(format!("open_bi: {e}"))`
-    /// 形态对齐）。
+    /// The fallback path opens a uni stream inline, writes the frame, and
+    /// finishes the stream — it does not reuse the stream B cache +
+    /// length-prefix framing. This variant carries only fallback IO
+    /// errors (including `ConnectionError` from `open_uni`,
+    /// `WriteError` from `write_all`, and `ClosedStream` from `finish`).
+    /// It will be replaced by [`Error::StreamB`] once the stream B cache
+    /// lands (aligned in shape with bak
+    /// `mousehop/src/quic_transport.rs:564
+    /// Error::StreamB(format!("open_bi: {e}"))`).
     #[error("datagram fallback stream io error: {0}")]
     DatagramFallback(String),
-    /// Stream B（input 流）建立或写入失败（STEP-5.2 引入，**替换**
-    /// [`Error::DatagramFallback`]，SUGGESTION #S-14 治理落地）。
+    /// Stream B (input stream) setup or write failed.
     ///
-    /// 消息前缀区分两个阶段（`"open_bi: ..."` / `"write frame length: ..."` /
-    /// `"write: ..."`）—— 底层类型不同（`ConnectionError` vs `WriteError`），
-    /// 收敛成 `String` 避免为一条降级路径加两个两个版本体；与 bak
-    /// `mousehop/src/quic_transport.rs:1035-1040 Error::StreamB` 完全对齐。
+    /// The message prefix distinguishes the two stages (`"open_bi: ..."` /
+    /// `"write frame length: ..."` / `"write: ..."`) — the underlying
+    /// types differ (`ConnectionError` vs `WriteError`), so they are
+    /// collapsed into a `String` to avoid adding two more variants for a
+    /// single fallback path; aligned in shape with bak
+    /// `mousehop/src/quic_transport.rs:1035-1040 Error::StreamB`.
     #[error("stream B: {0}")]
     StreamB(String),
-    /// 帧长度字段超过 [`MAX_EVENT_SIZE`] 上限（[`read_frame`] 专用，STEP-5.2
-    /// 引入）。
+    /// Frame length field exceeds [`MAX_EVENT_SIZE`] (used by [`read_frame`]).
     ///
-    /// 攻击者控制长度前缀字段时会诱使 `read_exact(&mut buf[..len])` 读
-    /// 非常多字节（DoS 攻击向量）；本变体让 `read_frame` 在读到超限长度
-    /// 时立即返回错误，避免 OOM / 慢速读。消息含超限的 `len` 值方便
-    /// 上层诊断。
+    /// An attacker who controls the length-prefix field can induce
+    /// `read_exact(&mut buf[..len])` to read a huge number of bytes (a
+    /// DoS vector). This variant lets `read_frame` return an error
+    /// immediately when an over-limit length is read, avoiding OOM or
+    /// slow reads. The message includes the offending `len` value to
+    /// aid diagnosis.
     ///
-    /// 与 bak `mousehop/src/quic_transport.rs:1063-1071 Error::FrameTooLarge`
-    /// 完全对齐（PLAN §5.2 验收清单要求）。
+    /// Aligned in shape with bak
+    /// `mousehop/src/quic_transport.rs:1063-1071 Error::FrameTooLarge`.
     #[error("frame too large: {0} bytes (max {MAX_EVENT_SIZE})")]
     FrameTooLarge(usize),
-    /// 帧 body 在 [`read_frame`] 内被截断（STEP-5.2 引入）。
+    /// Frame body was truncated inside [`read_frame`].
     ///
-    /// 当 `read_exact` 因为流提前关闭（quinn `UnexpectedEof` / `ClosedStream`）
-    /// 而读到 < `len` 字节时返回 —— 与解码失败（`Error::HelloFailed`）和
-    /// 长度字段超限（[`Error::FrameTooLarge`]）**语义区分**：本变体表示
-    /// "对端在帧内半途关流"（可能是恶意 / 也可能是 peer 崩溃），是
-    /// fatal —— read_loop 看到本错误应关 conn + 整体退出，不做
-    /// "skip frame" 续读（与 bak `frame_truncated_rejected` 测试一致）。
+    /// Returned when `read_exact` reads fewer than `len` bytes because
+    /// the stream was closed early (quinn `UnexpectedEof` /
+    /// `ClosedStream`). This is semantically distinct from a decode
+    /// failure (`Error::HelloFailed`) and an over-limit length field
+    /// ([`Error::FrameTooLarge`]): this variant indicates that the
+    /// remote peer closed the stream mid-frame (possibly malicious or
+    /// possibly a peer crash) and is fatal — `read_loop` should close
+    /// the connection and exit on this error, not skip the frame and
+    /// continue reading (consistent with the bak
+    /// `frame_truncated_rejected` test).
     #[error("frame body truncated")]
     Truncated,
-    /// crypto.rs 错误透传 —— 主要由 `crypto::rustls_server_config` /
-    /// `rustls_server_config_with_verifier` 失败冒上来（证书解析 / 链构
-    /// 建失败 / rcgen 自签 cert 失败等）。STEP-6.2 引入。
+    /// crypto.rs error pass-through — primarily surfaced by failures in
+    /// `crypto::rustls_server_config` or
+    /// `rustls_server_config_with_verifier` (certificate parsing, chain
+    /// construction, or `rcgen` self-signed cert failures, etc.).
     #[error("crypto: {0}")]
     Crypto(#[from] crate::crypto::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-// 抑制 `use` 中的 `Arc` / `ProtoEvent` 警告 —— 本文件顶层不再直接引用，但
-// 保留 import 占位方便后续修改。
+// Suppress `Arc` / `ProtoEvent` warnings in the `use` statement —
+// these are not used directly at the top of this file, but the
+// imports remain for convenience when future changes are made.
 #[allow(unused_imports)]
 use {Arc as _Arc, ProtoEvent as _ProtoEvent};
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
-    //! 跨子模块测试 helpers —— 5 个子模块的 `mod tests` 通过
-    //! `use crate::quic_transport::test_helpers::*;` 共享本模块的辅助函数与宏。
+    //! Cross-submodule test helpers. The `mod tests` blocks of the five
+    //! submodules share this module's helper functions and macros via
+    //! `use crate::quic_transport::test_helpers::*;`.
 
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -184,19 +195,25 @@ pub(crate) mod test_helpers {
 
     use crate::crypto;
 
-    /// `local_set_test!` 把测试体包在 `LocalSet::run_until` 里，让
-    /// `spawn_local` / `JoinSet::spawn_local` 在单元测试中也能用。
-    ///
-    /// **为什么 multi_thread flavor**：multi_thread runtime 让 Quinn I/O
-    /// driver / server task 等 `Send` future 在独立 worker thread 跑，LocalSet
-    /// 单独跑 main future + `spawn_local` 任务，避免 current_thread 下所有
-    /// `Send` 任务排在 main future 之后（server task 还没起来 client 就 dial
-    /// 完成 → handshake timeout）。需要 tokio `rt-multi-thread` feature。
     /// Run `$body` inside a fresh `LocalSet`, awaiting it inline.
     ///
+    /// `local_set_test!` wraps the test body in `LocalSet::run_until` so
+    /// that `spawn_local` / `JoinSet::spawn_local` work in unit tests.
+    ///
     /// The caller is expected to be inside a `#[tokio::test]` `async fn`.
-    /// The macro emits a single expression statement (no inner fn), so it
-    /// does not produce `unnameable_test_items` / `dead_code` warnings.
+    /// The macro emits a single expression statement (no inner fn), so
+    /// it does not produce `unnameable_test_items` / `dead_code`
+    /// warnings.
+    ///
+    /// **Why the multi-thread flavor**: a multi-thread runtime lets
+    /// `Send` futures such as the Quinn I/O driver and server task run
+    /// on independent worker threads. The `LocalSet` runs the main
+    /// future and `spawn_local` tasks separately, preventing the
+    /// situation in the `current_thread` flavor where all `Send` tasks
+    /// are queued behind the main future (the client dials and
+    /// completes before the server task starts up, leading to a
+    /// handshake timeout). Requires the tokio `rt-multi-thread`
+    /// feature.
     macro_rules! local_set_test {
         ($name:ident, $body:block) => {
             tokio::task::LocalSet::new()
@@ -205,11 +222,13 @@ pub(crate) mod test_helpers {
         };
     }
 
-    /// 测试用临时自签 cert —— 落盘到 `/tmp` 下 ephemeral 子目录（PID + nanos
-    /// + 全局 counter 三重隔离），避免污染用户 cert 路径（`crypto::cert_path()`
-    ///   / `key_path()`），并让并行跑的多个 test 互不踩同一目录。
-    ///   返回 `(cert_chain, key)`，DER 字节直接喂给 `endpoint_with_cert` /
-    ///   `build_quic_client_config`。
+    /// Temporary self-signed cert for tests — written to an ephemeral
+    /// subdirectory under `/tmp` (triple-isolated by PID + nanos + a
+    /// global counter) to avoid polluting the user cert path
+    /// (`crypto::cert_path()` / `key_path()`) and to keep multiple
+    /// parallel tests from sharing a directory.
+    /// Returns `(cert_chain, key)`; the DER bytes are fed directly into
+    /// `endpoint_with_cert` / `build_quic_client_config`.
     pub(crate) fn ephemeral_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -224,11 +243,11 @@ pub(crate) mod test_helpers {
         ));
         let cp = dir.join("cert.pem");
         let kp = dir.join("key.pem");
-        crypto::generate_self_signed("lan-mouse-test", &cp, &kp).expect("test cert 自签")
+        crypto::generate_self_signed("lan-mouse-test", &cp, &kp).expect("self-sign test cert")
     }
 
-    /// 测试用临时 TOFU pins 目录 —— 与 `ephemeral_cert()` 同三重隔离（PID +
-    /// nanos + counter）。
+    /// Temporary TOFU pins directory for tests — triple-isolated (PID +
+    /// nanos + counter), same as `ephemeral_cert()`.
     pub(crate) fn ephemeral_pins_dir() -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -243,8 +262,9 @@ pub(crate) mod test_helpers {
         ))
     }
 
-    /// 测试用 server endpoint 装配 —— 直接调公共 `endpoint_with_cert`
-    /// （STEP-2.4 起不再内联；测试 helper 与生产路径共用一条代码路径）。
+    /// Test server endpoint assembly — directly calls the public
+    /// `endpoint_with_cert`. The test helper shares the production code
+    /// path.
     pub(crate) fn endpoint_with_test_cert(
         addr: SocketAddr,
         cert_chain: Vec<CertificateDer<'static>>,
@@ -253,13 +273,15 @@ pub(crate) mod test_helpers {
         crate::quic_transport::endpoint_with_cert(addr, cert_chain, key)
     }
 
-    /// 构造 ServerName 用于 verifier 测试。localhost 在所有平台都是合法 DNS name。
+    /// Build a `ServerName` for verifier tests. `localhost` is a valid DNS
+    /// name on all platforms.
     pub(crate) fn test_server_name() -> ServerName<'static> {
         ServerName::try_from("localhost").expect("localhost is a valid DNS name")
     }
 
-    /// 临时 pins_dir helper（与 `ephemeral_cert()` 风格对称）。返回
-    /// `(dir, owned_path)` —— `dir` 在 test 期间自动清理。
+    /// Temporary `pins_dir` helper (symmetric in style with
+    /// `ephemeral_cert()`). Returns `(dir, owned_path)` — `dir` is
+    /// automatically cleaned up during the test.
     pub(crate) fn tmp_pins_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "lan-mouse-tofu-{}-{}-{}",
@@ -275,7 +297,7 @@ pub(crate) mod test_helpers {
         dir
     }
 
-    /// 临时 allowlist helper（与 `tmp_pins_dir` 风格对称）。
+    /// Temporary allowlist helper (symmetric in style with `tmp_pins_dir`).
     pub(crate) fn tmp_allowlist(
         tag: &str,
     ) -> std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>> {
@@ -293,7 +315,7 @@ pub(crate) mod test_helpers {
         std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()))
     }
 
-    /// 测试用 Motion 事件（STEP-5.1 引入）。
+    /// Test motion event.
     pub(crate) fn motion_event() -> lan_mouse_proto::ProtoEvent {
         lan_mouse_proto::ProtoEvent::Input(input_event::Event::Pointer(
             input_event::PointerEvent::Motion {
@@ -304,7 +326,7 @@ pub(crate) mod test_helpers {
         ))
     }
 
-    /// 测试用 server endpoint 装配 helper（STEP-5.1 引入）。
+    /// Test server endpoint assembly helper.
     pub(crate) fn motion_test_server(
         cert: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
@@ -319,7 +341,7 @@ pub(crate) mod test_helpers {
         (ep, addr)
     }
 
-    /// 测试用键盘按键事件（STEP-5.3 引入）。
+    /// Test keyboard key event.
     pub(crate) fn key_event() -> lan_mouse_proto::ProtoEvent {
         lan_mouse_proto::ProtoEvent::Input(input_event::Event::Keyboard(
             input_event::KeyboardEvent::Key {
@@ -332,7 +354,8 @@ pub(crate) mod test_helpers {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    // 把宏重导出到 crate 范围，让子模块 `use crate::quic_transport::test_helpers::local_set_test;`
-    // 后能调 `local_set_test!(name, { body })`。
+    // Re-export the macro at the crate scope so that submodule tests can
+    // invoke `local_set_test!(name, { body })` after
+    // `use crate::quic_transport::test_helpers::local_set_test;`.
     pub(crate) use local_set_test;
 }

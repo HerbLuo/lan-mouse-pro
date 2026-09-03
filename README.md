@@ -472,13 +472,13 @@ transported over the QUIC connection:
 
 The two modes trade reliability for latency:
 
-- **Stream 模式不丢操作** (`"stream"`) — events are sent over a reliable,
+- **Stream mode (no event loss)** (`"stream"`) — events are sent over a reliable,
   ordered QUIC stream. The receiver is guaranteed to see every event in the
   order it was sent, but the stream's in-order delivery can stall and add
   ~200ms+ of latency when packets are reordered or retransmitted on the
   network. Use this when correctness matters more than freshness — e.g. when
   one missed key press would leave a sticky modifier on the receiver.
-- **Datagram 模式丢操作** (`"datagram"`) — events are sent as individual
+- **Datagram mode (events may drop)** (`"datagram"`) — events are sent as individual
   QUIC datagrams. They reach the receiver with the lowest possible latency
   but, like UDP, individual packets can be dropped silently when the path
   is congested. Use this when freshness matters more than completeness —

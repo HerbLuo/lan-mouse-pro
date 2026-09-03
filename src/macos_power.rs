@@ -1,21 +1,22 @@
 //! macOS power integration for wake observation.
 //!
-//! **STEP-6.3 引入**：macOS 系统唤醒后强制关闭所有 QUIC peer conn。
+//! Force-closes all QUIC peer connections after the macOS system wakes up.
 //!
-//! QUIC `max_idle_timeout = 30s`（PLAN §5 D4）。若 sleep/wake 后 30s 内
-//! peer 没主动 ping，conn 会被 QUIC idle timeout 关掉 —— 但 GUI 用户期望
-//! 是「wake 后立刻 reconnect」。`PowerObserver` 在
-//! `kIOMessageSystemHasPoweredOn` 时向 `wake_tx` 发 `()`，
-//! `listen.rs::spawn_wake_task` 收到后遍历 `quic_conns` 表，对每条 conn
-//! 调 `peer.connection().close(0u32.into(), b"wake")` 强制关闭，触发
-//! supervisor 的 read_loop EOF → 发 `ListenEvent::Disconnected` →
-//! ListenTask 同步清理 proxy + 上报 service → client 端 next `send()` 触发
-//! `dial_any` 重连（STEP-6.4 接入）。
+//! QUIC uses `max_idle_timeout = 30s`. If no peer pings within 30s of a
+//! sleep/wake cycle, the connection is torn down by the QUIC idle timeout —
+//! but GUI users expect an immediate reconnect after wake. On
+//! `kIOMessageSystemHasPoweredOn`, `PowerObserver` sends `()` on `wake_tx`;
+//! `listen.rs::spawn_wake_task` then walks the `quic_conns` table and calls
+//! `peer.connection().close(0u32.into(), b"wake")` on every connection to
+//! force it closed. That triggers EOF in the supervisor's read_loop →
+//! emits `ListenEvent::Disconnected` → ListenTask synchronously cleans up the
+//! proxy and reports to the service → the client's next `send()` triggers a
+//! `dial_any` reconnect.
 //!
-//! **M1 简化**：与 bak `mousehop/src/macos_power.rs:1-364` 对齐但**删除**
-//! capture-only 的 `UserActivity` / `keep_awake_mouse_event` / `core_graphics`
-//! 段（捕获路径属 M2 后范畴，main-code 现在不消费）；仅保留
-//! IOKit `PowerObserver` + IOKit / CoreFoundation extern "C" 块。
+//! This module keeps only the IOKit `PowerObserver` plus the IOKit /
+//! CoreFoundation `extern "C"` blocks. The capture-only `UserActivity` /
+//! `keep_awake_mouse_event` / `core_graphics` sections are intentionally
+//! omitted, since the capture path is not consumed by the main code here.
 //!
 //! Mirrors the IOKit registration pattern in `input-capture/src/macos.rs:810`,
 //! but spawned by the daemon — capture lives elsewhere (and may not even

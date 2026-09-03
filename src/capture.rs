@@ -5,60 +5,75 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// **Pending-capture 握手超时**：主线程发了 `ProtoEvent::Enter` 后等对
-/// 端 `Ack` 的最大时长。LAN 内 Ack 通常 <50ms；500ms 给 10× 缓冲，超时
-/// 后取消 pending（鼠标留在主机）。
+/// Maximum wait for the peer's `Ack` after the local side sent `ProtoEvent::Enter`.
+/// On a LAN an Ack typically arrives in <50ms; 500ms provides a 10x margin.
+/// On timeout the pending capture is cancelled and the host cursor stays visible.
 ///
-/// **为什么不阻塞等更长**：用户感受优先 —— 移过边沿 0.5s 还不见鼠标切
-/// 走就已经觉得"卡了"，再长直接归类为故障。可作为后续可配置项（M2）。
+/// Why not block longer: user experience takes priority — if the mouse
+/// hasn't switched 0.5s after crossing the edge it already feels "stuck",
+/// and going longer just looks like a fault. Can be made configurable later.
 const PENDING_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Pending 超时检测 tick 周期。100ms 给超时判定最多 100ms 抖动（worst
-/// case：500ms 整边界 → 实际 500–600ms 才触发取消）。
+/// Pending timeout check tick period. 100ms gives the timeout check up to
+/// 100ms of jitter (worst case: hitting the 500ms boundary exactly results in
+/// actual cancellation at 500–600ms).
 const PENDING_TICK_INTERVAL: Duration = Duration::from_millis(100);
 
-// === FIX 4 — Watchdog 自愈 ====================================================
+// === Watchdog self-healing ====================================================
 //
-// **背景**：1+2 修复覆盖了"`release_capture` 后 State::Sending 残留"和"迟
-// 到 Ack 切错状态"两类 bug；剩余失败场景（网络抖动后 `active_client` 与
-// backend 状态错位、用户反复跨边但都走重试 gate、连续 `send_input` 失败
-// 但 release 路径竞态未触发）需要主动检测 + 自愈。本节加 watchdog。
+// Background: previous fixes covered "`State::Sending` residue after
+// `release_capture`" and "wrong state from a late Ack". Remaining failure
+// scenarios (network jitter leaves `active_client` and the backend out of
+// sync, the user keeps crossing the edge but always hits the retry gate,
+// consecutive `send_input` failures whose release-path race never fires)
+// need active detection + self-healing. This section adds the watchdog.
 //
-// **设计原则**：
-// - **不改协议**：纯本地状态自检，不新增 ProtoEvent。
-// - **分层检测**：light (200ms) 跑无 IO 的 ghost-active 检测，heavy (3s)
-//   跑带状态聚合的 storm / failures / no-progress 检测，分摊开销。
-// - **可关闭**：环境变量 `LAN_MOUSE_WATCHDOG=off` 一键关，方便调试。
-// - **可观测**：命中后 WARN 一条；触发恢复后 INFO 记一条结果。
+// Design principles:
+// - No protocol changes: pure local state inspection, no new ProtoEvents.
+// - Layered detection: light (200ms) runs the IO-free ghost-active check,
+//   heavy (3s) runs the stateful storm / failures / no-progress checks,
+//   spreading the cost.
+// - Disableable: environment variable `LAN_MOUSE_WATCHDOG=off` turns it off
+//   for debugging.
+// - Observable: one WARN log when it triggers; one INFO log on recovery.
 //
-// **不做**的事：
-// - 不修协议层（无新增 ProtoEvent 字段）。
-// - 不强依赖具体后端（OS-agnostic，只调 `InputCapture::release`）。
-// - 不替代 release-bind —— 用户主动按键永远是最高优先级。
+// Out of scope:
+// - Does not fix the protocol layer (no new ProtoEvent fields).
+// - Does not depend on a specific backend (OS-agnostic; only calls
+//   `InputCapture::release`).
+// - Does not replace the release-bind — an explicit user key press is
+//   always the highest priority.
 
-/// Watchdog light 检测周期。无 IO 状态自检。
+/// Watchdog light check period. IO-free local state self-check.
 const WATCHDOG_LIGHT_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Watchdog heavy 检测周期。带状态聚合（crossings 计数、send_failures 累
-/// 计、no-progress 时间窗），允许大窗口。
+/// Watchdog heavy check period. Performs stateful aggregation (crossing
+/// count, send-failure accumulation, no-progress time window), so a larger
+/// window is acceptable.
 const WATCHDOG_HEAVY_INTERVAL: Duration = Duration::from_secs(3);
 
-/// 连续 `conn.send` 失败次数阈值；`State::Sending` 期间累计到该值 → 强制
-/// release。选 3 是因为 LAN 内连续 3 次失败已经能区分"瞬时网络抖动"与"对
-/// 端真挂"，前者 1~2 次就恢复，后者需 3+ 次后才好真正判定。
+/// Consecutive `conn.send` failure count threshold; while in `State::Sending`,
+/// once the accumulated count reaches this value a forced release is
+/// triggered. The value 3 is chosen because three consecutive failures on a
+/// LAN already distinguish "transient network jitter" (which recovers after
+/// 1–2 attempts) from "the peer is really down" (which needs 3+ before the
+/// verdict is reliable).
 const WATCHDOG_SEND_FAILURES_THRESHOLD: u32 = 3;
 
-/// "跨边风暴"窗口大小。窗口内跨边次数 ≥ 阈值即触发。
+/// "Crossing storm" window size. If the number of crossings within the
+/// window reaches the threshold, recovery fires.
 const WATCHDOG_CROSSING_WINDOW: Duration = Duration::from_secs(5);
 
-/// 窗口内允许的最大"未成功推进"的跨边次数。5s 内 5 次意味着用户每次跨过去
-/// 都在反复 retry 都失败 —— 大概率是状态机冻住了。轻量场景（用户正常来回
-/// 切）下不会触达：5s 内最多 1~2 次有效跨边。
+/// Maximum number of "unsuccessful" crossings permitted in the window.
+/// 5 crossings within 5s means every attempt failed — the state machine is
+/// most likely frozen. Under normal use (the user switching back and forth)
+/// this is not reached: at most 1–2 successful crossings happen in 5s.
 const WATCHDOG_CROSSING_STORM_THRESHOLD: usize = 5;
 
-/// "无进度"超时：从最近一次成功状态推进（Pending→Sending、send_input ok
-/// 等）算起，超此时长仍停留在非 Idle 状态 → 强制 release。8s 远大于正常
-/// LAN jitter（<10ms），也不会让用户卡超过这个时间。
+/// "No progress" timeout: counted from the last successful state advance
+/// (Pending→Sending, send_input ok, etc.), if a non-Idle state persists
+/// beyond this duration a forced release fires. 8s is far above normal LAN
+/// jitter (<10ms) and ensures the user is never stuck for longer than this.
 const WATCHDOG_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(8);
 
 use futures::StreamExt;
@@ -119,10 +134,11 @@ enum CaptureRequest {
     Reenable,
     /// set release bind
     SetReleaseBind(Vec<scancode::Linux>),
-    /// **STEP-8.2 修复 — `connect_on_activate`**：主动触发拨号但不发送
-    /// 任何事件。`service.rs::activate_client` 在 client 激活后立即 fire-
-    /// and-forget 发这条请求 → `CaptureTask` 调用 `conn.dial(handle)` →
-    /// `connect_to_handle` 后台 spawn。详见 connect.rs::dial docstring。
+    /// `connect_on_activate`: actively trigger a dial without sending any
+    /// events. `service.rs::activate_client` fires-and-forgets this request
+    /// as soon as a client is activated → `CaptureTask` calls
+    /// `conn.dial(handle)` → `connect_to_handle` is spawned in the
+    /// background. See the docstring on `connect.rs::dial` for details.
     Dial(ClientHandle),
 }
 
@@ -146,7 +162,6 @@ impl Capture {
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
             release_bind_prev: false,
-            // FIX 4：watchdog 自愈状态初始化。
             watchdog: WatchdogState::new(),
         };
         let task = spawn_local(capture_task.run());
@@ -204,22 +219,25 @@ impl Capture {
         let _ = self.request_tx.send(CaptureRequest::SetReleaseBind(bind));
     }
 
-    /// **STEP-8.2 修复 — `connect_on_activate`**：主动触发对端的拨号，但不
-    /// 发送任何事件。
+    /// `connect_on_activate`: actively trigger a dial to the peer without
+    /// sending any events.
     ///
-    /// **为什么需要这条路径**：`service.rs::activate_client` 在 client 激活
-    /// 时调它 —— 即便没人移鼠标到屏边，也能立即 spawn 一次拨号尝试。解决
-    /// "两侧 daemon 启动 + 指纹已授权 + 没人移鼠标 → 永远不建连"的鸡生蛋
-    /// 问题。
+    /// Why this path is needed: `service.rs::activate_client` calls it when
+    /// a client is activated — even if no one moves the mouse to the screen
+    /// edge, it spawns an immediate dial attempt. Solves the chicken-and-egg
+    /// problem where "both daemons are running + fingerprints are authorised
+    /// + nobody moves the mouse → no connection ever gets established".
     ///
-    /// **fire-and-forget**：本方法 send `CaptureRequest::Dial` 后立即返回。
-    /// `CaptureTask` 在两个 `select!` 臂（`run()` 重启循环 + `do_capture_
-    /// session()` 主循环）的任一臂收到 `Dial(handle)` 时调
-    /// `self.conn.dial(handle)`（fire-and-forget spawn `connect_to_handle`）。
+    /// Fire-and-forget: this method sends `CaptureRequest::Dial` and returns
+    /// immediately. `CaptureTask` handles `Dial(handle)` in either of its
+    /// two `select!` arms (the `run()` restart loop and the
+    /// `do_capture_session()` main loop) by calling `self.conn.dial(handle)`
+    /// (fire-and-forget spawning of `connect_to_handle`).
     ///
-    /// **失败模式**：send `request_tx` 失败仅在 task 已退出时发生（terminate
-    /// 已触发），**不**是用户可见的失败 —— 此后 activate_client 也不再有
-    /// 意义。静默 no-op。
+    /// Failure mode: a failed `request_tx.send` only happens after the task
+    /// has already exited (terminate was triggered) and is not a user-visible
+    /// failure — `activate_client` is also meaningless from that point on.
+    /// Silent no-op.
     pub(crate) fn dial(&self, handle: ClientHandle) {
         let _ = self.request_tx.send(CaptureRequest::Dial(handle));
     }
@@ -252,47 +270,53 @@ struct CaptureTask {
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
-    /// 上一次 `keys_pressed(release_bind)` 检测结果 —— 用于在 false→true
-    /// 跳变时记一条 INFO(mouse 卡住 bug 复现时只关心按下那一瞬间,持续
-    /// 按下时不刷屏)。
+    /// Previous `keys_pressed(release_bind)` result — used to log a single
+    /// INFO line on the false→true transition (when reproducing the
+    /// "mouse stuck" bug we only care about the instant the bind is
+    /// pressed; we don't want to spam the log while it is held).
     release_bind_prev: bool,
-    /// **FIX 4 — Watchdog 自愈状态**：见下方 `WatchdogState` docstring。
+    /// Watchdog self-healing state: see the `WatchdogState` docstring below.
     watchdog: WatchdogState,
 }
 
-/// **FIX 4 — Watchdog 自愈状态**：
+/// Watchdog self-healing state:
 ///
-/// 用于在 `do_capture_session` 主循环被动 select 不到异常时主动检测一
-/// 类无法被现有事件流捕获的"状态机冻住"场景。具体三类 detection 需要
-/// 不同的状态：
+/// Used by `do_capture_session` to actively detect "state machine frozen"
+/// scenarios that the passive main loop select cannot catch, since the
+/// event stream doesn't surface them. Four different detections need
+/// different state:
 ///
-/// 1. **Ghost-active**：`state == State::Sending` 但 `active_client ==
-///    None`（修复 1 没覆盖的镜像 bug —— `active_client.take()` 之后忘了
-///    重置 state）。light tick 检测。
-/// 2. **Send-failure storm**：连续 `conn.send` 失败次数累计。input 事
-///    件发送失败时累加，发送成功或离开 Sending 时清零。heavy tick 检测。
-/// 3. **Crossing storm**：滑动窗口 [`WATCHDOG_CROSSING_WINDOW`] 内的
-///    `BeginPending` 时间戳。`do_capture_session` 进入 `BeginPending`
-///    handler 时 push。heavy tick 清理过期条目 + 检测风暴。
-/// 4. **No-progress**：`last_progress_at` 上次"状态成功推进"时间戳。包
-///    含 Pending→Sending 提升、`send_input` ok、`release_capture` 完
-///    成。heavy tick 检测距此时长超 [`WATCHDOG_NO_PROGRESS_TIMEOUT`]
-///    且 state 非 Idle → 强 release。
+/// 1. **Ghost-active**: `state == State::Sending` but `active_client ==
+///    None` (the mirror bug to "state left as Sending after release").
+///    Detected by the light tick.
+/// 2. **Send-failure storm**: accumulated consecutive `conn.send` failure
+///    count. Incremented when an input send fails; cleared on a successful
+///    send or on leaving Sending. Detected by the heavy tick.
+/// 3. **Crossing storm**: timestamps of `BeginPending` events within the
+///    sliding [`WATCHDOG_CROSSING_WINDOW`]. Pushed when `do_capture_session`
+///    enters the `BeginPending` handler. The heavy tick expires old entries
+///    and detects the storm.
+/// 4. **No-progress**: `last_progress_at` is the timestamp of the last
+///    successful state advance (Pending→Sending promotion, `send_input`
+///    ok, `release_capture` completion). The heavy tick checks that the
+///    elapsed time is within [`WATCHDOG_NO_PROGRESS_TIMEOUT`] and the state
+///    is non-Idle, otherwise it forces a release.
 ///
-/// **reset 触发点**：
-/// - `release_capture` 末尾：清零 `consecutive_send_failures`、刷新
-///   `last_progress_at = now`、清 `recent_crossings`。
-/// - `handle_capture_event::Input(e)` State::Sending Ok 时：清零 + 刷新。
-/// - `Begin` 命中 pending→active 分支时：刷新 `last_progress_at`。
+/// Reset points:
+/// - End of `release_capture`: zero `consecutive_send_failures`, refresh
+///   `last_progress_at = now`, clear `recent_crossings`.
+/// - `handle_capture_event::Input(e)` on State::Sending Ok: clear + refresh.
+/// - `Begin` hitting the pending→active branch: refresh `last_progress_at`.
 struct WatchdogState {
-    /// `State::Sending` 期间连续 `conn.send` 失败次数。
+    /// Number of consecutive `conn.send` failures during `State::Sending`.
     consecutive_send_failures: u32,
-    /// 滑动窗口 `BeginPending` 时间戳。push 在 `handle_capture_event` 入
-    /// `BeginPending` 分支处；heavy tick 清理 [`WATCHDOG_CROSSING_WINDOW`]
-    /// 之前的旧条目。
+    /// Timestamps of `BeginPending` events inside the sliding window. Pushed
+    /// when `handle_capture_event` enters the `BeginPending` branch; the heavy
+    /// tick discards entries older than [`WATCHDOG_CROSSING_WINDOW`].
     recent_crossings: VecDeque<Instant>,
-    /// 上次"状态推进成功"时间戳。`release_capture` 完成 / Pending→Sending
-    /// 提升 / `send_input` ok 三处刷新。
+    /// Timestamp of the last successful state advance. Refreshed in three
+    /// places: `release_capture` completion, Pending→Sending promotion,
+    /// and `send_input` ok.
     last_progress_at: Instant,
 }
 
@@ -301,8 +325,8 @@ impl WatchdogState {
         Self {
             consecutive_send_failures: 0,
             recent_crossings: VecDeque::new(),
-            // 初值 = `do_capture_session` 启动时间；后续三处刷新点保持
-            // 最新。
+            // Initial value is the time `do_capture_session` starts;
+            // subsequently kept current at the three refresh points.
             last_progress_at: Instant::now(),
         }
     }
@@ -354,10 +378,12 @@ impl CaptureTask {
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
-                        // STEP-8.2 修复：do_capture 退出循环期间（重启期
-                        // 间）来的 dial 请求也要立即转发 —— 等下次 capture
-                        // 起来再处理就太晚了（peer daemon 可能已退出
-                        // retry 退避窗口）。fire-and-forget 调 conn.dial。
+                        // Forward Dial requests received while do_capture is
+                        // out of its loop (during the restart gap) immediately
+                        // — waiting for the next capture to start handling them
+                        // is too late (the peer daemon may have already exited
+                        // the retry back-off window). Fire-and-forget call to
+                        // conn.dial.
                         CaptureRequest::Dial(handle) => {
                             let _ = self.conn.dial(handle).await;
                         }
@@ -411,31 +437,33 @@ impl CaptureTask {
         &mut self,
         capture: &mut InputCapture,
     ) -> Result<(), InputCaptureError> {
-        // **Pending 超时 tick**：100ms 周期检查 `State::Pending` 的
-        // `started.elapsed()`，超过 500ms 主动 cancel_pending。
-        // `MissedTickBehavior::Skip` 防止累积延迟（back-pressure）。
+        // Pending timeout tick: at a 100ms period, check `started.elapsed()`
+        // for the current `State::Pending`; once it exceeds 500ms, actively
+        // cancel. `MissedTickBehavior::Skip` prevents accumulated latency
+        // (back-pressure).
         let mut pending_tick = tokio::time::interval(PENDING_TICK_INTERVAL);
         pending_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // 跳过初始立即触发的 tick —— session 启动时还没 pending 可查。
+        // Skip the initial immediate tick — at session start there is no
+        // pending state to check yet.
         pending_tick.tick().await;
 
-        // **FIX 4 — Watchdog ticks**：
+        // Watchdog ticks:
+        // - `watchdog_light_tick` (200ms) — IO-free ghost-active detection.
+        //   High frequency but cheap; force-reset immediately on hit.
+        // - `watchdog_heavy_tick` (3s) — crossing-window cleanup + send-failure
+        //   accumulation + no-progress timeout. Lower frequency, needs state.
         //
-        // - `watchdog_light_tick` (200ms) —— 无 IO 的 ghost-active 检测。
-        //   频次高但成本低，命中后立即 force-reset。
-        // - `watchdog_heavy_tick` (3s) —— 跨边窗口清理 + send-failures
-        //   累计 + no-progress 超时，频次低但需要状态聚合。
-        //
-        // **环境变量关停**：`LAN_MOUSE_WATCHDOG=off` 时两个 tick 都不
-        // 创建，loop 永远不命中这两个分支 —— 等价于禁用。开发调试时用。
+        // Disable via env: when `LAN_MOUSE_WATCHDOG=off` neither tick is
+        // created and the loop can never hit those branches — equivalent to
+        // disabled. For development and debugging.
         let watchdog_enabled = std::env::var("LAN_MOUSE_WATCHDOG")
             .map(|v| !v.eq_ignore_ascii_case("off"))
             .unwrap_or(true);
         let (mut watchdog_light_tick, mut watchdog_heavy_tick) = if watchdog_enabled {
             let mut light = tokio::time::interval(WATCHDOG_LIGHT_INTERVAL);
             light.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // 跳过初始立即 tick，避免启动瞬时 false-positive
-            // （CaptureTask 内字段刚初始化）。
+            // Skip the initial immediate tick to avoid a transient false-positive
+            // at startup (the CaptureTask fields were just initialised).
             light.tick().await;
             let mut heavy = tokio::time::interval(WATCHDOG_HEAVY_INTERVAL);
             heavy.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -462,13 +490,16 @@ impl CaptureTask {
                     }
 
                     match event {
-                        // **Pending-capture 握手 Ack**：
-                        // - 当前是 Pending 且 handle 匹配 → 让后端提升
-                        //   pending → active，然后等后端 emit Begin →
-                        //   在 handle_capture_event 里切到 Sending。
-                        // - 当前是 Idle（libei 异步路径或 Begin 已先到）
-                        //   → 走老逻辑，直接转 Sending。
-                        // - handle 不匹配 → ignore（Ack 跟我们无关）。
+                        // Pending-capture handshake Ack:
+                        // - Currently Pending and the handle matches → ask the
+                        //   backend to promote pending → active, then wait for
+                        //   the backend to emit Begin → switch to Sending in
+                        //   handle_capture_event.
+                        // - Currently Idle (libei async path, or Begin arrived
+                        //   first) → fall back to the old logic and switch
+                        //   straight to Sending.
+                        // - Handle does not match → ignore (the Ack is not
+                        //   ours).
                         ProtoEvent::Ack(_) => {
                             match self.state {
                                 State::Pending { handle: pending_h, started } => {
@@ -477,12 +508,15 @@ impl CaptureTask {
                                             "client {handle} acknowledged Enter after {:?}",
                                             started.elapsed()
                                         );
-                                        // 让 Windows / macOS 后端把 pending
-                                        // 提升为 active；后端会在自己的消息
-                                        // 循环里 emit Begin，主线程收到 Begin
-                                        // 时切 Sending（见 handle_capture_event）。
-                                        // 注：start_capture 是 idempotent，如
-                                        // 果期间被 cancel（用户回退）则 no-op。
+                                        // Ask the Windows / macOS backend to
+                                        // promote pending to active; the backend
+                                        // will emit Begin from its own message
+                                        // loop, and the main thread switches to
+                                        // Sending on receiving Begin (see
+                                        // handle_capture_event). Note:
+                                        // start_capture is idempotent; if a
+                                        // cancel happens in between (user backs
+                                        // off) it's a no-op.
                                         if let Err(e) =
                                             capture.start_capture(self.get_pos(handle))
                                         {
@@ -494,7 +528,8 @@ impl CaptureTask {
                                                 capture.cancel_pending(self.get_pos(handle));
                                             self.state = State::Idle;
                                         }
-                                        // 保持 Pending，等后端 Begin 切 Sending。
+                                        // Stay Pending and wait for the backend's
+                                        // Begin to switch us to Sending.
                                     } else {
                                         log::trace!(
                                             "Ack for handle {handle} ignored: pending handle is {pending_h:?}"
@@ -502,20 +537,24 @@ impl CaptureTask {
                                     }
                                 }
                                 _ => {
-                                    // **补丁（修复 2）**：迟到的 Ack 不再盲目切 Sending。
+                                    // Patch: late Acks no longer blindly switch
+                                    // to Sending.
                                     //
-                                    // **bug**：Master 端 500ms Pending 超时
-                                    // 取消后（state 已 Idle），Slave 这边才
-                                    // 把 Ack 发到。命中 `_` 分支 → 直接把
-                                    // State::Sending 设回去。后端 OS 层
-                                    // 没激活、`active_client` 是空，结果是
-                                    // State 跟 backend 状态错位 —— 用户感
-                                    // 受为"鼠标抖一下又卡住"。
+                                    // Bug: after the Master side's 500ms Pending
+                                    // timeout cancels (state is already Idle),
+                                    // the Slave only then sends the Ack. Hitting
+                                    // the `_` branch used to set State::Sending
+                                    // straight back. The OS backend was never
+                                    // activated and `active_client` was empty —
+                                    // leaving State and the backend out of sync.
+                                    // The user experienced "the mouse jitters
+                                    // and then sticks".
                                     //
-                                    // **修法**：只有当本地仍有 `active_client`
-                                    // 时才接受 Ack 进 Sending；否则日志告警
-                                    // + 保持 Idle，让下一轮 BeginPending 自
-                                    // 然覆盖。
+                                    // Fix: only accept the Ack into Sending when
+                                    // we still have a local `active_client`;
+                                    // otherwise log a warning and stay Idle,
+                                    // letting the next BeginPending naturally
+                                    // take over.
                                     if self.active_client.is_some() {
                                         log::info!("client {handle} acknowledged the connection!");
                                         self.state = State::Sending;
@@ -550,15 +589,17 @@ impl CaptureTask {
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
-                    // STEP-8.2 修复：service.rs::activate_client 触发的主
-                    // 动拨号。fire-and-forget 调 conn.dial —— RetryState
-                    // gate + connecting set 去重由 connect.rs 内部保证。
+                    // Active dial triggered by service.rs::activate_client.
+                    // Fire-and-forget call to conn.dial — dedup via the
+                    // RetryState gate and connecting set is handled internally
+                    // by connect.rs.
                     CaptureRequest::Dial(handle) => {
                         let _ = self.conn.dial(handle).await;
                     }
                 },
-                // **Pending 超时 tick**：Pending 状态下超过 500ms 没收到
-                // Ack → 主动取消 pending，鼠标留在主机。
+                // Pending timeout tick: in the Pending state, if no Ack arrives
+                // within 500ms → actively cancel pending and the mouse stays
+                // on the host.
                 _ = pending_tick.tick() => {
                     if let State::Pending { handle, started } = self.state {
                         let elapsed = started.elapsed();
@@ -573,38 +614,42 @@ impl CaptureTask {
                                 log::warn!("cancel_pending on timeout: {e}");
                             }
                             self.state = State::Idle;
-                            // 注意：timeout 分支不需要走 capture.release()。
-                            // pending 状态下后端没真正激活，ACTIVE_CLIENT
-                            // 本来就没设；cancel_pending 已经把后端 PENDING
-                            // 清掉。release_bind / Leave 等路径才需要 release。
+                            // Note: the timeout branch does not need to call
+                            // capture.release(). In the pending state the
+                            // backend was never actually activated and
+                            // ACTIVE_CLIENT was never set; cancel_pending
+                            // already clears PENDING on the backend. Only the
+                            // release_bind / Leave paths need to call release.
                         }
                     }
                 },
-                // **FIX 4 — Watchdog light tick**：ghost-active 检测。
+                // Watchdog light tick: ghost-active detection.
                 //
-                // **触发条件**：`state == State::Sending` 且
-                // `active_client.is_none()` —— 状态机说"我们在 active"但
-                // 实际上没有任何 active client。这是修复 1 没覆盖的镜像
-                // bug（`active_client.take()` 之后忘了 `state = Idle`）。
+                // Trigger condition: `state == State::Sending` and
+                // `active_client.is_none()` — the state machine says
+                // "we are active" but in reality there is no active client.
+                // This is the mirror bug where `active_client.take()` was
+                // followed but `state` was not reset to Idle.
                 //
-                // **修复**：把 state 强制回 Idle、调 `capture.release()`。
-                // 即使本分支命中频繁，因为命中后立即 reset state，下次
-                // tick 不会再次触发。
+                // Fix: force state back to Idle and call `capture.release()`.
+                // Even if this branch fires frequently, state is reset
+                // immediately on hit, so the next tick will not re-trigger.
                 //
-                // **不做**：不重建 peer、不主动 dial —— 仅本地状态对齐，
-                // 让下一轮 `BeginPending` 自然从 Idle 开始。
+                // Out of scope: do not rebuild the peer, do not dial
+                // proactively — only realign local state, letting the next
+                // `BeginPending` naturally start from Idle.
                 _ = async {
                     if let Some(t) = watchdog_light_tick.as_mut() {
                         t.tick().await;
                     } else {
-                        // 永不 resolve（旁路分支）
+                        // Never resolves (bypass branch).
                         std::future::pending::<()>().await
                     }
                 } => {
                     self.run_watchdog_light(capture).await;
                 }
-                // **FIX 4 — Watchdog heavy tick**：跨边窗口清理 +
-                // send-failures 累计 + no-progress 超时。
+                // Watchdog heavy tick: crossing-window cleanup + send-failure
+                // accumulation + no-progress timeout.
                 _ = async {
                     if let Some(t) = watchdog_heavy_tick.as_mut() {
                         t.tick().await;
@@ -620,69 +665,76 @@ impl CaptureTask {
         Ok(())
     }
 
-    // === FIX 4 — Watchdog 检测函数 ============================================
+    // === Watchdog detection functions ============================================
 
-    /// **Watchdog light check**：无 IO 检测，仅 ghost-active 一种条件。
+    /// Watchdog light check: IO-free; only checks the ghost-active condition.
     ///
-    /// 调频 [`WATCHDOG_LIGHT_INTERVAL`] = 200ms。设计原则是"便宜到随时
-    /// 可跑"——只看 `self.state` 和 `self.active_client` 两个字段，不触
-    /// 任何 peer / send / select。
+    /// Fires every [`WATCHDOG_LIGHT_INTERVAL`] = 200ms. Design principle is
+    /// "cheap enough to run anytime" — only reads `self.state` and
+    /// `self.active_client`; no peer / send / select touched.
     ///
-    /// **ghost-active**：原逻辑 `release_capture` 的 Pending 分支显式置
-    /// `state = Idle`，但 Sending 分支只 `active_client.take()` 即发送
-    /// Leave + 调 `capture.release()`，**没有同步置 state**（这是修复
-    /// 1 的内容；但当前 fix 4 单独 ship 时此路径仍残留）。watchdog 在
-    /// 此处兜底。
+    /// Ghost-active: the original `release_capture` Pending branch explicitly
+    /// sets `state = Idle`, but the Sending branch only `active_client.take()`
+    /// before sending Leave + calling `capture.release()` — state is **not**
+    /// synced (this is the previously-reported bug; this path may still
+    /// remain after the standalone watchdog fix ships). The watchdog catches
+    /// it here as a safety net.
     ///
-    /// **命中后**：state 强制回 Idle，`capture.release()` 兜底（清 OS
-    /// 层 ACTIVE_CLIENT），刷新 `last_progress_at = now` 让 heavy tick
-    /// 不再视为 no-progress。
+    /// On hit: state is forced back to Idle, `capture.release()` is called
+    /// as a safety net (clears OS-level ACTIVE_CLIENT), and `last_progress_at`
+    /// is refreshed to `now` so the heavy tick does not flag it as no-progress.
     async fn run_watchdog_light(&mut self, capture: &mut InputCapture) {
-        // 仅在 state == Sending 且 active_client == None 时命中。
-        // 不打 Sending 但 active_client 还有 / Idle 状态：前者是正常
-        // active 状态，后者本来就该 idle。
+        // Only hits when state == Sending and active_client == None.
+        // Doesn't hit when state is Sending with an active_client (normal
+        // active state), or when state is Idle (already idle).
         if matches!(self.state, State::Sending) && self.active_client.is_none() {
             log::warn!(
                 "watchdog[light]: ghost-active detected (State::Sending + active_client=None) \
                  -- force-resetting to Idle"
             );
             self.state = State::Idle;
-            // best-effort: 这一步让 OS 层真释放 ACTIVE_CLIENT，避免
-            // hook 还在吞事件但 state 已经说 idle。
+            // Best-effort: this makes the OS layer actually release
+            // ACTIVE_CLIENT, preventing the hook from still swallowing events
+            // while state already says idle.
             if let Err(e) = capture.release().await {
                 log::warn!("watchdog[light]: capture.release() failed: {e}");
             }
-            // 重置 watchdog 状态：刚刚"恢复"一次，从 now 起算。
+            // Reset watchdog state: we just "recovered" once; restart counting
+            // from now.
             self.watchdog.consecutive_send_failures = 0;
             self.watchdog.last_progress_at = Instant::now();
         }
     }
 
-    /// **Watchdog heavy check**：跨边窗口清理 + send-failures 累计 +
-    /// no-progress 超时三种检测。调频 [`WATCHDOG_HEAVY_INTERVAL`] = 3s。
+    /// Watchdog heavy check: three independent detections — crossing-window
+    /// cleanup + send-failure accumulation + no-progress timeout.
+    /// Fires every [`WATCHDOG_HEAVY_INTERVAL`] = 3s.
     ///
-    /// **三类检测独立判断**：
-    /// 1. **Crossing storm**：清理 [`WATCHDOG_CROSSING_WINDOW`] 之前的旧
-    ///    条目，再看 `recent_crossings.len()` 是否 ≥
-    ///    [`WATCHDOG_CROSSING_STORM_THRESHOLD`] 且当前 Idle + 无 active。
-    ///    → 用户反复跨过去但都失败，状态机卡住。强制 release 让下一轮
-    ///    Begin 从 Idle 自然开始。
-    /// 2. **Send-failure storm**：`State::Sending` 期间累计连续 send 失
-    ///    败达 [`WATCHDOG_SEND_FAILURES_THRESHOLD`] → 强制 release。
-    ///    与 `release_capture` 的"send 失败 → release"路径互补，处理
-    ///    `conn.send` 在 retry gate 内返 NotConnected 但 release 路径竞
-    ///    态未触发的场景。
-    /// 3. **No-progress**：距 `last_progress_at` 超
-    ///    [`WATCHDOG_NO_PROGRESS_TIMEOUT`] 且 state 非 Idle → 状态机
-    ///    "冻住"，强制 release。
+    /// The three checks run independently:
+    /// 1. **Crossing storm**: drop entries older than
+    ///    [`WATCHDOG_CROSSING_WINDOW`], then check whether
+    ///    `recent_crossings.len()` is ≥ [`WATCHDOG_CROSSING_STORM_THRESHOLD`]
+    ///    while the current state is Idle and there is no active_client. The
+    ///    user keeps crossing but every attempt fails — the state machine is
+    ///    stuck. Force a release so the next Begin naturally starts from Idle.
+    /// 2. **Send-failure storm**: while in `State::Sending`, accumulated
+    ///    consecutive send failures reach [`WATCHDOG_SEND_FAILURES_THRESHOLD`]
+    ///    → force a release. Complements the `release_capture`
+    ///    "send failure → release" path by covering the race where `conn.send`
+    ///    returns NotConnected inside the retry gate but the release path is
+    ///    never triggered.
+    /// 3. **No-progress**: time since `last_progress_at` exceeds
+    ///    [`WATCHDOG_NO_PROGRESS_TIMEOUT`] and state is non-Idle → state
+    ///    machine "frozen", force a release.
     ///
-    /// **顺序**：先做 (1)，再做 (2)，最后 (3)。每一项独立判断、独立记日志。
-    /// 一次 tick 命中多个时全部触发（各自 `release_capture` 是幂等的）。
+    /// Order: (1) first, then (2), then (3). Each check is independent and
+    /// logs independently. If a single tick triggers multiple, they all fire
+    /// (each `release_capture` is idempotent).
     async fn run_watchdog_heavy(&mut self, capture: &mut InputCapture) {
         let now = Instant::now();
 
         // ── (1) Crossing storm ────────────────────────────────────────────
-        // 清理过期 entries（早于窗口的）。
+        // Drop expired entries (older than the window).
         while let Some(&front) = self.watchdog.recent_crossings.front() {
             if now - front > WATCHDOG_CROSSING_WINDOW {
                 self.watchdog.recent_crossings.pop_front();
@@ -705,7 +757,8 @@ impl CaptureTask {
             }
             self.watchdog.recent_crossings.clear();
             self.watchdog.last_progress_at = now;
-            // 跳过后续两个检测：本轮已释放，状态已 reset。
+            // Skip the next two checks: this round has already released and
+            // reset.
             return;
         }
 
@@ -729,7 +782,7 @@ impl CaptureTask {
         }
 
         // ── (3) No-progress ────────────────────────────────────────────────
-        // 仅在非 Idle 状态检查（Idle 本来就没"进展"可言）。
+        // Only check in non-Idle states (Idle has no concept of "progress").
         if !matches!(self.state, State::Idle)
             && now - self.watchdog.last_progress_at > WATCHDOG_NO_PROGRESS_TIMEOUT
         {
@@ -755,8 +808,9 @@ impl CaptureTask {
         log::trace!("({handle}): {event:?}");
 
         let pressed = capture.keys_pressed(&self.release_bind.borrow());
-        // 持续按住 release-bind 时不刷屏,只在按下那一瞬间记一条 INFO,
-        // 便于诊断 "鼠标卡住但 release-bind 已按下" 这类状态错乱 bug。
+        // When the release-bind is held, do not spam the log; only log INFO
+        // on the press edge — useful for diagnosing state-mismatch bugs like
+        // "mouse stuck while release-bind is pressed".
         if pressed && !self.release_bind_prev {
             log::info!("release_bind detected as PRESSED (rising edge)");
         }
@@ -769,23 +823,29 @@ impl CaptureTask {
 
         // enter only capture (for incoming connections)
         //
-        // **Pending-capture 兼容（bc5507f 修复 #2）**：commit `bc5507f` 让
-        // Windows / macOS 后端对所有 client 统一走 pending-capture 握手，
-        // 边沿跨越一律发 `BeginPending` + 设 `PENDING_CLIENT`，由主线程
-        // 等对端 Ack 后调 `start_capture` 提升到 active 才发 `Begin`。
+        // Pending-capture compatibility: a previous commit unified Windows /
+        // macOS backends so every client uses the pending-capture handshake —
+        // edge crossings always emit `BeginPending` + set `PENDING_CLIENT`,
+        // and the main thread waits for the peer's Ack, calls `start_capture`
+        // to promote to active, and only then emits `Begin`.
         //
-        // **问题**：EnterOnly 是单向 trigger（不发 Enter，只让 service 给
-        // 对端发 Leave），根本不会进入 `State::Pending` 也不会等 Ack，所以
-        // 后端对它也只发 `BeginPending`、永远不会发 `Begin`。原"event==
-        // Begin 才发 CaptureBegin"的逻辑对 EnterOnly 永远漏报 → service
-        // 收不到 trigger 信号 → emulation.send_leave_event 不被调 → 对端
-        // 收不到 `ProtoEvent::Leave(0)` → 主控端 capture 永远不释放 →
-        // 鼠标卡在被控端回不到主机（即用户报的 BUG）。
+        // Problem: EnterOnly is a one-way trigger (it does not send Enter;
+        // it only tells the service to send Leave to the peer). It never
+        // enters `State::Pending` and never waits for an Ack, so the backend
+        // emits `BeginPending` for it and never emits `Begin`. The previous
+        // logic of "only emit CaptureBegin on Begin" missed EnterOnly
+        // forever → the service never receives the trigger signal →
+        // emulation.send_leave_event is not called → the peer never receives
+        // `ProtoEvent::Leave(0)` → the controller-side capture is never
+        // released → the mouse stays on the controlled machine and never
+        // returns to the host.
         //
-        // **修复**：对 EnterOnly capture，Begin 和 BeginPending 都当 trigger
-        // 处理，都向上层发 `CaptureBegin`（service 用来调 send_leave_event）。
-        // 不改变 EnterOnly 的语义（不真正捕获光标、不发 Enter、不进入
-        // State::Pending），只让 trigger 信号正确到达 service 层。
+        // Fix: for EnterOnly captures, treat both Begin and BeginPending as
+        // triggers and forward both upward as `CaptureBegin` (which the
+        // service uses to call send_leave_event). Does not change the
+        // semantics of EnterOnly (no real cursor capture, no Enter sent,
+        // no entry into State::Pending) — only makes the trigger signal
+        // reach the service layer.
         if self.get_type(handle) == CaptureType::EnterOnly {
             if event == CaptureEvent::Begin || event == CaptureEvent::BeginPending {
                 log::info!(
@@ -806,20 +866,22 @@ impl CaptureTask {
             return Ok(());
         }
 
-        // 通知 service 层有 hook 事件。CaptureBegin 对 Begin 发（libei /
-        // 其他异步后端的"立即进入捕获"路径），对 BeginPending 不发（pending
-        // 路径在 `match` 分支里走自己的握手，不在这里 trigger）。
+        // Notify the service layer about the hook event. CaptureBegin is
+        // sent for Begin (the "immediate capture" path used by libei / other
+        // async backends) but NOT for BeginPending (the pending path runs its
+        // own handshake inside the `match` arm; it does not trigger here).
         if event == CaptureEvent::Begin {
             self.event_tx
                 .send(ICaptureEvent::CaptureBegin(handle))
                 .expect("channel closed");
         }
 
-        // ── 按 event 变体分支 ──────────────────────────────────────────────
+        // ── Dispatch by event variant ──────────────────────────────────────
         match event {
-            // **Pending-capture 握手入口**：Windows / macOS 后端检测到鼠
-            // 标跨过边沿 → 设 pending（光标仍可见）→ 发 BeginPending。
-            // 我们发 Enter 给对端，等 Ack。Send 失败直接取消 pending。
+            // Pending-capture handshake entry point: Windows / macOS backend
+            // detects the mouse crossing the edge → sets pending (cursor
+            // still visible) → emits BeginPending. We send Enter to the peer
+            // and wait for the Ack. On send failure, cancel pending directly.
             CaptureEvent::BeginPending => {
                 self.state = State::Pending {
                     handle,
@@ -828,10 +890,11 @@ impl CaptureTask {
                 log::info!(
                     "capture: BeginPending (handle={handle:?}) - awaiting Ack within {PENDING_ACK_TIMEOUT:?}"
                 );
-                // **FIX 4**：watchdog 跨边风暴检测 —— 每次 BeginPending
-                // 都记一次。heavy tick 在 5s 窗口内看到 ≥ 5 次且 state
-                // 仍 Idle → 判定状态机卡住，强制 release 后让下一轮自
-                // 然从头来。
+                // Watchdog crossing-storm detection: record one entry per
+                // BeginPending. The heavy tick seeing ≥ 5 entries within a
+                // 5s window while state is still Idle → state machine is
+                // stuck; force a release and let the next round start
+                // naturally from scratch.
                 self.watchdog.recent_crossings.push_back(Instant::now());
                 let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
                 if let Err(e) = self
@@ -843,33 +906,40 @@ impl CaptureTask {
                         "releasing capture: BeginPending send failed: {e} \
                          (cancelling pending, host cursor stays visible)"
                     );
-                    // send 失败 → 取消 pending。注意：主线程发的 cancel
-                    // 是异步消息到 Windows thread；即便 cancel_pending
-                    // 失败，500ms tick 也会兜底清掉 PENDING_CLIENT。
+                    // send failed → cancel pending. Note: the main thread's
+                    // cancel is an async message to the Windows thread; even
+                    // if cancel_pending fails, the 500ms tick catches it and
+                    // clears PENDING_CLIENT.
                     if let Err(e) = capture.cancel_pending(self.get_pos(handle)) {
                         log::warn!("cancel_pending after send failure: {e}");
                     }
                     self.state = State::Idle;
-                    // **FIX 4**：BeginPending 内的 send 失败也计入
-                    // consecutive failures，让 watchdog heavy 把
-                    // "反复 Begin→send 失败"识别为跨边风暴前的征兆。
+                    // Watchdog: send failures inside BeginPending also count
+                    // toward consecutive failures, so the heavy tick can
+                    // recognise a pattern of "repeated Begin → send failure"
+                    // as a precursor to a crossing storm.
                     self.watchdog.consecutive_send_failures =
                         self.watchdog.consecutive_send_failures.saturating_add(1);
-                    // 不要走 capture.release()：pending 状态后端本来就没
-                    // 激活，无 Leave 要发。
+                    // Do not call capture.release(): in the pending state the
+                    // backend was never activated, so there is no Leave to
+                    // send.
                     return Ok(());
                 }
-                // send 成功 → 重置失败计数 + 记录推进（Pending 已建
-                // 立，下一步等 Ack 是预期路径不视作 no-progress）。
+                // Send succeeded → reset the failure count and record progress
+                // (Pending is established; waiting for Ack is the expected
+                // next step and does not count as no-progress).
                 self.watchdog.consecutive_send_failures = 0;
                 self.watchdog.last_progress_at = Instant::now();
                 Ok(())
             }
 
-            // **Pending-capture 取消**：用户把鼠标移回屏幕内、Windows
-            // 后端自动取消，或 cancel_pending 失败后的兜底。我们已不在
-            // 等 Ack；只把状态归 Idle。如果当前不是 Pending（已切换或
-            // 还在 Idle）也不报错 —— CancelPending 可能重复到达。
+            // Pending-capture cancelled: user moves the mouse back inside
+            // the screen, the Windows backend cancels automatically, or this
+            // is the safety net after cancel_pending failed. We are no longer
+            // waiting for Ack; just return the state to Idle. If the state
+            // is not currently Pending (already transitioned or still Idle)
+            // we do not report an error — CancelPending may arrive multiple
+            // times.
             CaptureEvent::CancelPending => {
                 log::info!("capture: CancelPending (handle={handle:?})");
                 if let Err(e) = capture.cancel_pending(self.get_pos(handle)) {
@@ -883,28 +953,34 @@ impl CaptureTask {
                 Ok(())
             }
 
-            // **普通 Begin**：libei 等异步后端的路径（compositor 已经捕
-            // 获了 cursor，我们只是被通知）。行为与旧版几乎一致：
-            // 设 Sending 状态 + 发 Enter。
+            // Plain Begin: the libei and other async backends' path (the
+            // compositor has already captured the cursor; we are just being
+            // notified). Behaviour is almost identical to before: set Sending
+            // state + send Enter.
             //
-            // **为什么有 BeginPending 还要保留 Begin 路径**：libei 模
-            // 型是 compositor 端先捕获，主线程从 `Activated` 信号才知
-            // 道。Begin 直接对应"已经在捕获中"。Windows / macOS 的
-            // BeginPending 后 Ack 到达 → capture.start_capture → 后端
-            // 主动 emit Begin（见 event_thread.rs::update_clients 的
-            // StartCapture 分支）。
+            // Why we keep the Begin path even though BeginPending exists: the
+            // libei model captures on the compositor side first; the main
+            // thread only learns about it from the `Activated` signal. Begin
+            // corresponds directly to "already capturing". On Windows /
+            // macOS after the BeginPending → Ack → capture.start_capture
+            // flow the backend actively emits Begin (see the StartCapture
+            // branch in event_thread.rs::update_clients).
             CaptureEvent::Begin => {
-                // Begin 的两种来源：
-                // 1. **Pending → Active 提升**（Windows / macOS 路径）：
-                //    BeginPending → Enter → Ack → capture.start_capture → 后端
-                //    主动 emit Begin。这种情况下 Enter **已经为 BeginPending
-                //    发过**，这里**不**能再发（重复 Enter 会让对端重复
-                //    ReleaseNotify + add_incoming，状态错乱）。
-                // 2. **libei 异步路径**：compositor 已捕获，backend 第一次
-                //    emit Begin，没有前置 Enter，需要现在发。
+                // Begin has two sources:
+                // 1. Pending → Active promotion (Windows / macOS path):
+                //    BeginPending → Enter → Ack → capture.start_capture →
+                //    backend actively emits Begin. In this case Enter has
+                //    **already been sent for BeginPending** and **must not**
+                //    be sent again here (a duplicate Enter causes the peer
+                //    to issue duplicate ReleaseNotify + add_incoming,
+                //    corrupting state).
+                // 2. libei async path: the compositor has captured; the
+                //    backend emits Begin for the first time with no preceding
+                //    Enter; we must send now.
                 //
-                // 区分依据：`State::Pending { handle, .. }` 且 handle 匹配
-                // → 路径 1；其他（Idle / Sending）→ 路径 2。
+                // Distinguishing rule: `State::Pending { handle, .. }` with
+                // a matching handle → path 1; otherwise (Idle / Sending) →
+                // path 2.
                 match self.state {
                     State::Pending {
                         handle: pending_h, ..
@@ -919,11 +995,11 @@ impl CaptureTask {
                                 .send(ICaptureEvent::ClientEntered(handle))
                                 .expect("channel closed");
                         }
-                        // **不**发 Enter —— 见上方路径 1 说明。
+                        // Do **not** send Enter — see path 1 explanation above.
                         self.state = State::Sending;
-                        // **FIX 4**：Pending → Sending 是 happy path 主
-                        // 推进点之一；刷新 last_progress_at 让 heavy
-                        // tick 不把它当 no-progress。
+                        // Pending → Sending is one of the happy-path main
+                        // progress points; refresh last_progress_at so the
+                        // heavy tick does not treat this as no-progress.
                         self.watchdog.last_progress_at = Instant::now();
                         self.watchdog.consecutive_send_failures = 0;
                         Ok(())
@@ -950,8 +1026,9 @@ impl CaptureTask {
                                 self.watchdog.consecutive_send_failures.saturating_add(1);
                             capture.release().await?;
                         } else {
-                            // **FIX 4**：Begin 路径（同进程内第 2 次
-                            // Enter）发送成功也算一次进度推进。
+                            // Begin path: a successful Enter (the second one
+                            // within this process) also counts as a progress
+                            // advance.
                             self.watchdog.consecutive_send_failures = 0;
                             self.watchdog.last_progress_at = Instant::now();
                         }
@@ -960,25 +1037,27 @@ impl CaptureTask {
                 }
             }
 
-            // **普通输入事件**：仅在 Sending 状态转发。Pending / Idle 时
-            // 是"鼠标还没真切走"，不应当出现在这里（如果出现，说明后端
-            // 在不该吞事件时吞了 —— 记 warning 便于诊断，正常 drop）。
+            // Plain input event: forwarded only in the Sending state. While
+            // in Pending / Idle the mouse has not really been "handed off"
+            // yet, so it should not appear here. If it does, the backend has
+            // swallowed events when it should not — log a warning for
+            // diagnosis and drop normally.
             CaptureEvent::Input(e) => match self.state {
                 State::Sending => {
                     if let Err(err) = self.conn.send(ProtoEvent::Input(e), handle).await {
                         const DUR: Duration = Duration::from_millis(500);
                         debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {err}"));
                         log::warn!("releasing capture: send failed: {err}");
-                        // **FIX 4**：连续 send 失败累加；heavy tick
-                        // 在 ≥ 3 次时强制 release（即使本路径 release
-                        // 已调），做兜底。
+                        // Watchdog: accumulate consecutive send failures; the
+                        // heavy tick force-releases on ≥ 3 even if this
+                        // path's release has already fired (as a safety net).
                         self.watchdog.consecutive_send_failures =
                             self.watchdog.consecutive_send_failures.saturating_add(1);
                         capture.release().await?;
                     } else {
-                        // **FIX 4**：成功 send 视为"还在干活"——清零失
-                        // 败计数、刷新 last_progress_at 让 no-progress
-                        // 不会误触发。
+                        // Watchdog: a successful send means "still working" —
+                        // clear the failure count and refresh last_progress_at
+                        // so no-progress won't false-trigger.
                         self.watchdog.consecutive_send_failures = 0;
                         self.watchdog.last_progress_at = Instant::now();
                     }
@@ -1002,15 +1081,16 @@ impl CaptureTask {
             self.active_client,
         );
 
-        // **Pending-capture 特殊路径**：如果当前还在等 Ack，宿主端还没
-        // 真正捕获过鼠标（active_client = None，pressed_keys 仍可能为
-        // 空），不需要发 Leave / key-ups / modifiers=0 —— 因为从没发过
-        // 被 Ack 的 Enter。仅通知后端清 PENDING_CLIENT。
+        // Pending-capture special path: if we are still waiting for the Ack,
+        // the host has not actually captured the mouse yet (active_client is
+        // None and pressed_keys may still be empty), so we do not need to
+        // send Leave / key-ups / modifiers=0 — we never sent an Enter that
+        // was acknowledged. Just tell the backend to clear PENDING_CLIENT.
         //
-        // **触发场景**：
-        // 1. release-bind 在 pending 状态被按下
-        // 2. service.rs 主动 release（用户操作）
-        // 3. capture::Capture 的 Drop / destroy
+        // Triggered by:
+        // 1. release-bind pressed while in the pending state
+        // 2. service.rs actively releasing (user action)
+        // 3. capture::Capture Drop / destroy
         if let State::Pending { handle, .. } = self.state {
             log::info!(
                 "release_capture: was in Pending for handle {handle} - \
@@ -1020,15 +1100,19 @@ impl CaptureTask {
                 log::warn!("cancel_pending in release_capture: {e}");
             }
             self.state = State::Idle;
-            // 后端 Windows 消息循环顺带清 PENDING（`RequestType::Release`
-            // 分支 belt-and-suspenders 已加），无需再调 capture.release()。
-            // 但为 macOS 兜底，这里也调一次 —— 后端 `release()` 在
-            // pending 状态下是 no-op（macOS pending_pos 不依赖 ACTIVE
-            // 状态，已被 StartCapture/CancelPending 异步处理过）。
+            // The backend Windows message loop also clears PENDING (a
+            // belt-and-suspenders was added in the `RequestType::Release`
+            // branch), so capture.release() is not strictly required. But as
+            // a safety net for macOS we also call it here — the backend
+            // `release()` is a no-op in the pending state (macOS's
+            // pending_pos does not depend on the ACTIVE state and has
+            // already been handled asynchronously by
+            // StartCapture/CancelPending).
             let res = capture.release().await;
-            // **FIX 4**：Pending 早返回路径也要清 watchdog（避免
-            // 用户在 pending 期间按 release-bind → 立刻又跨过去 →
-            // recent_crossings 含旧条目被误判为风暴）。
+            // Watchdog: the Pending early-return path also clears the
+            // watchdog (to avoid the user pressing release-bind during
+            // pending → immediately crossing again → old recent_crossings
+            // entries being misjudged as a storm).
             self.watchdog.consecutive_send_failures = 0;
             self.watchdog.recent_crossings.clear();
             self.watchdog.last_progress_at = Instant::now();
@@ -1085,17 +1169,20 @@ impl CaptureTask {
         } else {
             log::info!("release_capture: no active_client, skipping Leave send");
         }
-        // **补丁（修复 1）**：`release_capture` 末尾强制 `state = State::Idle`。
+        // Patch: `release_capture` forces `state = State::Idle` at the end.
         //
-        // **bug**：原逻辑 Pending 分支显式置 Idle（行 670），Sending 分支
-        // 只 `active_client.take()` + 发 Leave + 调 `capture.release()`
-        // —— State 字段整次调用下来都不归位。下一次发过来的 motion 落到
-        // `State::Sending` 分支但 `active_client` 已是 None → `conn.send`
-        // 返 NotConnected → 反复 release_capture 但 State 仍未变，UI
-        // 体感"鼠标抖一下又不动了"。
+        // Bug: in the original logic the Pending branch explicitly sets Idle,
+        // but the Sending branch only does `active_client.take()` + send
+        // Leave + call `capture.release()` — the State field is never reset
+        // for the entire call. The next motion event arrives at the
+        // `State::Sending` branch but `active_client` is already None →
+        // `conn.send` returns NotConnected → release_capture is called again
+        // but State still doesn't change. The UI experiences "the mouse
+        // jitters and then stops moving".
         //
-        // **修法**：与 Pending 分支对齐 —— 在调 `capture.release()` 之前
-        // 置 Idle，状态机和后端 OS 状态保持一致。
+        // Fix: align with the Pending branch — set Idle before calling
+        // `capture.release()`, so the state machine and the OS backend state
+        // stay consistent.
         log::info!("release_capture: setting state = Idle (force-reset)");
         self.state = State::Idle;
 
@@ -1106,16 +1193,18 @@ impl CaptureTask {
             res.is_ok()
         );
 
-        // **FIX 4**：release_capture 完成 → 重置 watchdog 状态。
+        // Watchdog: release_capture completion → reset the watchdog state.
         //
-        // - 清零 `consecutive_send_failures`：下次 BeginPending / Input
-        //   重新计数。
-        // - 清空 `recent_crossings`：跨边风暴的滑动窗口从 now 起重新计。
-        // - 刷新 `last_progress_at`：刚释放完成视作一次进度（no-progress
-        //   超时从 now 重新算）。
+        // - Zero `consecutive_send_failures`: the next BeginPending / Input
+        //   starts counting from scratch.
+        // - Clear `recent_crossings`: the sliding window for crossing storms
+        //   restarts from now.
+        // - Refresh `last_progress_at`: a successful release counts as
+        //   progress (no-progress timeout restarts from now).
         //
-        // 任何分支（Pending 早返回 / Sending 路径 / leave/send-failure）
-        // 走完 release 都重置 —— watchdog 的"已恢复"哨兵。
+        // Every branch (Pending early-return / Sending path / leave/send-
+        // failure) resets when release completes — the watchdog's
+        // "recovered" sentinel.
         self.watchdog.consecutive_send_failures = 0;
         self.watchdog.recent_crossings.clear();
         self.watchdog.last_progress_at = Instant::now();

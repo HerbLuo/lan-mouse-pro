@@ -191,8 +191,9 @@ impl InputCapture {
     /// distinguish pending from active (libei, layer-shell, x11, dummy)
     /// are no-ops.
     ///
-    /// **同步**：Windows 直接 `PostThreadMessage`；macOS `spawn_local` 发
-    /// notify_tx。主线程调完无需 await。
+    /// **Synchronous**: Windows directly calls `PostThreadMessage`; macOS
+    /// fires `notify_tx` via `spawn_local`. The caller does not need to
+    /// await after the call.
     pub fn start_capture(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.capture.start_capture(pos)
     }
