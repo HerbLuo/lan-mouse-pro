@@ -250,11 +250,7 @@ impl ClientManager {
     /// when the value changed. Sender-side preference; the receiver
     /// has no parallel concept. Mirrors the `set_enter_hook` flow:
     /// return-bool-on-change → broadcast → save_config.
-    pub(crate) fn set_input_channels(
-        &self,
-        handle: ClientHandle,
-        cfg: InputChannelConfig,
-    ) -> bool {
+    pub(crate) fn set_input_channels(&self, handle: ClientHandle, cfg: InputChannelConfig) -> bool {
         match self.clients.borrow_mut().get_mut(handle as usize) {
             Some((c, _)) if c.input_channels != cfg => {
                 c.input_channels = cfg;
@@ -304,12 +300,6 @@ impl ClientManager {
         }
     }
 
-    pub(crate) fn set_alive(&self, handle: ClientHandle, alive: bool) {
-        if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
-            s.alive = alive;
-        }
-    }
-
     pub(crate) fn set_peer_commit(&self, handle: ClientHandle, commit: Option<[u8; 8]>) {
         if let Some((_, s)) = self.clients.borrow_mut().get_mut(handle as usize) {
             s.peer_commit = commit;
@@ -321,14 +311,6 @@ impl ClientManager {
             .borrow()
             .get(handle as usize)
             .and_then(|(_, s)| s.active_addr)
-    }
-
-    pub(crate) fn alive(&self, handle: ClientHandle) -> bool {
-        self.clients
-            .borrow()
-            .get(handle as usize)
-            .map(|(_, s)| s.alive)
-            .unwrap_or(false)
     }
 
     pub(crate) fn get_port(&self, handle: ClientHandle) -> Option<u16> {
@@ -355,10 +337,7 @@ impl ClientManager {
     /// `route_input` 分派的 key。`None` 在 caller 处走
     /// `unwrap_or_default()` 兜底（与 STEP-4.1 `InputChannelConfig::default()`
     /// 一致）。
-    pub(crate) fn input_channels(
-        &self,
-        handle: ClientHandle,
-    ) -> Option<InputChannelConfig> {
+    pub(crate) fn input_channels(&self, handle: ClientHandle) -> Option<InputChannelConfig> {
         self.clients
             .borrow()
             .get(handle as usize)

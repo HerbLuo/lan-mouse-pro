@@ -18,22 +18,26 @@
 //! 与 [`super::streams`] 的关系：`run()` spawn [`super::streams::datagram_reader_task`]
 //! 与 [`super::streams::read_loop`]；后者 take 走 `stream_bunch`。
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use quinn::{Connection as QuinnConnection, SendStream};
 
-use tokio::sync::{mpsc as tokio_mpsc, Mutex};
+/// Outgoing event payload routed from `peer.run` to the local capture
+/// task: `(peer socket, ProtoEvent)`. The capture task maps the socket
+/// back to a `ClientHandle` via `client_manager.get_client(addr)`.
+type OutgoingEvent = (std::net::SocketAddr, ProtoEvent);
+type OutgoingEventSender = tokio_mpsc::UnboundedSender<OutgoingEvent>;
+
+use tokio::sync::{Mutex, mpsc as tokio_mpsc};
 use tokio::task::spawn_local;
 
 use lan_mouse_ipc::InputChannelConfig;
 use lan_mouse_proto::ProtoEvent;
 
-use super::protocol::{
-    client_hello, hello_watchdog, read_frame, server_hello, write_frame as _write_frame,
-};
 use super::protocol::StreamPair;
-use super::streams::{datagram_reader_task, read_loop, Bidi, ReadStreams, StreamBunch, StreamEvent};
+use super::protocol::{client_hello, hello_watchdog, read_frame, server_hello};
+use super::streams::{Bidi, StreamBunch, StreamEvent, datagram_reader_task, read_loop};
 
 use lan_mouse_proto::MAX_EVENT_SIZE;
 
@@ -123,7 +127,7 @@ pub struct PeerSession {
     /// **为何 server 端不用设**：server 端 `listen.rs::handle_quic_
     /// peer_supervisor` 不调 peer.run，自己 accept_bi + read_frame
     /// + 推 listen_tx，forwarding 路径已存在。
-    pub(crate) outgoing_events: Arc<Mutex<Option<tokio_mpsc::UnboundedSender<(std::net::SocketAddr, ProtoEvent)>>>>,
+    pub(crate) outgoing_events: Arc<Mutex<Option<OutgoingEventSender>>>,
     /// 3 条 bidi stream 集合缓存（STEP-5.2 引入）。
     ///
     /// STEP-5.3 / 5.4 `read_loop` 装配时填充 —— 装配路径：server 端
@@ -352,10 +356,7 @@ impl PeerSession {
     /// Ack / Pong / Leave 时能 forward 出去（详见字段 docstring）。
     /// `Some(_)` 覆盖旧值；`None` 关闭 forwarding（兜底用，理论上
     /// 不需要 —— client 路径应保持设上）。
-    pub async fn set_outgoing_events(
-        &self,
-        tx: Option<tokio_mpsc::UnboundedSender<(std::net::SocketAddr, ProtoEvent)>>,
-    ) {
+    pub async fn set_outgoing_events(&self, tx: Option<OutgoingEventSender>) {
         *self.outgoing_events.lock().await = tx;
     }
 
@@ -368,9 +369,7 @@ impl PeerSession {
     async fn send_outgoing_event(&self, event: ProtoEvent, addr: std::net::SocketAddr) {
         if let Some(tx) = self.outgoing_events.lock().await.as_ref() {
             if let Err(e) = tx.send((addr, event)) {
-                log::debug!(
-                    "send_outgoing_event: outgoing_events 已退（forwarder 不在）: {e}"
-                );
+                log::debug!("send_outgoing_event: outgoing_events 已退（forwarder 不在）: {e}");
             }
         }
     }
@@ -398,7 +397,7 @@ impl PeerSession {
         // 定长 codec 编码到 `[u8; MAX_EVENT_SIZE]`（21 字节）—— 与 stream B
         // 读端的 `read_frame` 走同一个定长 `MAX_EVENT_SIZE` 解码路径（datagram
         // 自带长度，但解码入口统一在 `ProtoEvent::try_from`）。
-        let (buf, _len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
+        let (buf, _len): ([u8; MAX_EVENT_SIZE], usize) = (*event).into();
         self.send_datagram_or_stream_b(&buf).await
     }
 
@@ -566,24 +565,22 @@ impl PeerSession {
         event: &ProtoEvent,
         cfg: &InputChannelConfig,
     ) -> super::Result<()> {
-        use super::protocol::{route_input, Channel};
+        use super::protocol::{Channel, route_input};
         let routed = route_input(cfg, event);
         // **INFO on Ack/Leave** —— 被控端发 Ack 卡住的 bug 排查用。
         // `delivered` 出现 = send_input 真的返回 Ok;
         // 没出现但本条 log 出现 = 卡在 send_stream_a 等对端消费。
         if matches!(event, ProtoEvent::Ack(_) | ProtoEvent::Leave(_)) {
-            log::info!(
-                "send_input: routing {event:?} via {routed:?} (entry; awaiting send)"
-            );
+            log::info!("send_input: routing {event:?} via {routed:?} (entry; awaiting send)");
         }
         let result = match routed {
             Channel::Datagram => self.send_motion(event).await,
             Channel::StreamA => {
-                let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
+                let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = (*event).into();
                 self.send_stream_a(&buf[..len]).await
             }
             Channel::StreamB => {
-                let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
+                let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = (*event).into();
                 self.send_stream_b(&buf[..len]).await
             }
             Channel::StreamC => Err(super::Error::HelloFailed(
@@ -616,8 +613,8 @@ impl PeerSession {
     /// **后续优化空间**（STEP-6.x 之外）：
     /// - 与 bak `mousehop/src/quic_transport.rs::send_stream_a` 对齐（缓存
     ///   + in-place write）—— 本步已**部分实现**：send 路径走
-    ///   `cached_send_a` 复用 hello 同 bidi（详见 `cached_send_a`
-    ///   docstring），但仍持锁 await（无锁优化空间）
+    ///     `cached_send_a` 复用 hello 同 bidi（详见 `cached_send_a`
+    ///     docstring），但仍持锁 await（无锁优化空间）
     /// - M1 阶段不做进一步优化（保持单步范围可控）
     ///
     /// **错误归一**：与 [`Self::send_stream_b`] 对称 —— IO 错误归到
@@ -646,16 +643,12 @@ impl PeerSession {
         let mut g = self.cached_send_a.lock().await;
         if let Some(send) = g.as_mut() {
             use tokio::io::AsyncWriteExt;
-            send.write_u32(bytes.len() as u32)
-                .await
-                .map_err(|e| {
-                    super::Error::HelloFailed(format!("send_stream_a cached length: {e}"))
-                })?;
-            send.write_all(bytes)
-                .await
-                .map_err(|e| {
-                    super::Error::HelloFailed(format!("send_stream_a cached body: {e}"))
-                })?;
+            send.write_u32(bytes.len() as u32).await.map_err(|e| {
+                super::Error::HelloFailed(format!("send_stream_a cached length: {e}"))
+            })?;
+            send.write_all(bytes).await.map_err(|e| {
+                super::Error::HelloFailed(format!("send_stream_a cached body: {e}"))
+            })?;
             log::trace!(
                 "send_stream_a cached: wrote {} bytes on hello bidi",
                 bytes.len()
@@ -778,7 +771,8 @@ impl PeerSession {
 
         // (2) 启 datagram_reader_task —— 产生 StreamEvent::Datagram
         //     本步新增：详见下面 datagram_reader_task 函数
-        let (tx_d, mut rx_d) = tokio_mpsc::channel::<StreamEvent>(super::streams::READ_STREAM_BUFFER_CAP);
+        let (tx_d, mut rx_d) =
+            tokio_mpsc::channel::<StreamEvent>(super::streams::READ_STREAM_BUFFER_CAP);
         spawn_local(datagram_reader_task(self.clone(), tx_d));
 
         // (3) Hello 握手 —— role 决定走 client_hello / server_hello
@@ -906,7 +900,7 @@ impl PeerSession {
                             log::debug!("run: stream A read event: {event:?}");
                             if let Some(tx) = self.outgoing_events.lock().await.as_ref() {
                                 let remote = self.conn.remote_address();
-                                if let Err(e) = tx.send((remote, event.clone())) {
+                                if let Err(e) = tx.send((remote, event)) {
                                     log::debug!(
                                         "run: outgoing_events send failed (forwarder 已退): {e}"
                                     );
@@ -930,7 +924,7 @@ impl PeerSession {
                             // 同时推一个 Leave 到 outgoing_events → forwarder
                             // → capture.rs 立即 release_capture（不等下次
                             // mouse event 触发 send）。
-                            let _ = self.conn.close(0u32.into(), b"peer closed stream");
+                            self.conn.close(0u32.into(), b"peer closed stream");
                             let remote = self.conn.remote_address();
                             self.send_outgoing_event(ProtoEvent::Leave(0), remote).await;
                             break;
@@ -953,7 +947,7 @@ impl PeerSession {
                             // `Err(e) => return Err(e)` —— 任何 IO 错误立刻
                             // 退出，与本 fix 语义一致。
                             log::info!("run: stream A read IO error (Bug #10 path): {msg}");
-                            let _ = self.conn.close(0u32.into(), b"peer read IO error");
+                            self.conn.close(0u32.into(), b"peer read IO error");
                             let remote = self.conn.remote_address();
                             self.send_outgoing_event(ProtoEvent::Leave(0), remote).await;
                             break;
@@ -1074,13 +1068,13 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     use lan_mouse_ipc::InputChannelConfig;
-    use lan_mouse_proto::{ProtoEvent, MAX_EVENT_SIZE};
+    use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
 
     use crate::quic_transport::endpoint::{accept, dial, endpoint};
     use crate::quic_transport::protocol::{client_hello, read_frame, server_hello};
     use crate::quic_transport::session::PeerRole;
     use crate::quic_transport::test_helpers::{
-        ephemeral_cert, ephemeral_pins_dir, endpoint_with_test_cert, key_event, local_set_test,
+        endpoint_with_test_cert, ephemeral_cert, ephemeral_pins_dir, key_event, local_set_test,
         motion_event, motion_test_server,
     };
 
@@ -1201,13 +1195,11 @@ mod tests {
             let server_addr = server_ep.local_addr().expect("server addr");
 
             let server_task = tokio::task::spawn_local(async move {
-                let conn = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    accept(&server_ep),
-                )
-                .await
-                .expect("server accept timeout")
-                .expect("server accept");
+                let conn =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
+                        .await
+                        .expect("server accept timeout")
+                        .expect("server accept");
                 let session = std::sync::Arc::new(PeerSession::from_connection(conn));
                 tokio::time::timeout(
                     std::time::Duration::from_secs(5),
@@ -1222,9 +1214,9 @@ mod tests {
                 "lan-mouse-step-5-4-pins-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
             ));
             let _ = std::fs::remove_dir_all(&pins_dir);
             let (client_cert, client_key) = ephemeral_cert();
@@ -1241,13 +1233,10 @@ mod tests {
             .expect("dial");
             let client_arc = std::sync::Arc::new(PeerSession::from_connection(conn));
 
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client_hello(&client_arc),
-            )
-            .await
-            .expect("client_hello timeout")
-            .expect("client_hello");
+            tokio::time::timeout(std::time::Duration::from_secs(5), client_hello(&client_arc))
+                .await
+                .expect("client_hello timeout")
+                .expect("client_hello");
 
             tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -1293,22 +1282,17 @@ mod tests {
             let server_addr = server_ep.local_addr().expect("server addr");
 
             let server_task = tokio::task::spawn_local(async move {
-                let conn = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    accept(&server_ep),
-                )
-                .await
-                .expect("server accept timeout")
-                .expect("server accept");
+                let conn =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
+                        .await
+                        .expect("server accept timeout")
+                        .expect("server accept");
                 let session = PeerSession::from_connection(conn);
 
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    server_hello(&session),
-                )
-                .await
-                .expect("server hello timeout")
-                .expect("server hello should succeed");
+                tokio::time::timeout(std::time::Duration::from_secs(5), server_hello(&session))
+                    .await
+                    .expect("server hello timeout")
+                    .expect("server hello should succeed");
 
                 let mut recv_a = session
                     .take_stream_a_recv()
@@ -1339,19 +1323,15 @@ mod tests {
             .expect("dial");
             let client_arc = std::sync::Arc::new(PeerSession::from_connection(conn));
 
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client_hello(&client_arc),
-            )
-            .await
-            .expect("client_hello timeout")
-            .expect("client_hello");
+            tokio::time::timeout(std::time::Duration::from_secs(5), client_hello(&client_arc))
+                .await
+                .expect("client_hello timeout")
+                .expect("client_hello");
             assert!(client_arc.hello_ok(), "client_hello 后 hello_ok 应已置位");
 
             let client_for_run = std::sync::Arc::clone(&client_arc);
-            let run_task = tokio::task::spawn_local(async move {
-                client_for_run.run(PeerRole::Client).await
-            });
+            let run_task =
+                tokio::task::spawn_local(async move { client_for_run.run(PeerRole::Client).await });
 
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
@@ -1359,13 +1339,10 @@ mod tests {
                 .connection()
                 .close(quinn::VarInt::from(0u32), b"test done");
 
-            let run_result = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                run_task,
-            )
-            .await
-            .expect("peer.run 未在 2s 内退出")
-            .expect("peer.run task 未 panic");
+            let run_result = tokio::time::timeout(std::time::Duration::from_secs(2), run_task)
+                .await
+                .expect("peer.run 未在 2s 内退出")
+                .expect("peer.run task 未 panic");
 
             match run_result {
                 Err(crate::quic_transport::Error::HelloTimeout(_)) => {
@@ -1410,22 +1387,17 @@ mod tests {
             let server_addr = server_ep.local_addr().expect("server addr");
 
             let server_task = tokio::task::spawn_local(async move {
-                let conn = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    accept(&server_ep),
-                )
-                .await
-                .expect("server accept timeout")
-                .expect("server accept");
+                let conn =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
+                        .await
+                        .expect("server accept timeout")
+                        .expect("server accept");
                 let session = PeerSession::from_connection(conn);
 
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    server_hello(&session),
-                )
-                .await
-                .expect("server hello timeout")
-                .expect("server hello should succeed");
+                tokio::time::timeout(std::time::Duration::from_secs(5), server_hello(&session))
+                    .await
+                    .expect("server hello timeout")
+                    .expect("server hello should succeed");
 
                 let mut recv_a = session
                     .take_stream_a_recv()
@@ -1464,21 +1436,15 @@ mod tests {
             .expect("dial");
             let client_arc = std::sync::Arc::new(PeerSession::from_connection(conn));
 
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client_hello(&client_arc),
-            )
-            .await
-            .expect("client_hello timeout")
-            .expect("client_hello");
+            tokio::time::timeout(std::time::Duration::from_secs(5), client_hello(&client_arc))
+                .await
+                .expect("client_hello timeout")
+                .expect("client_hello");
             assert!(client_arc.hello_ok());
 
             tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                client_arc.send_input(
-                    &ProtoEvent::Ping,
-                    &InputChannelConfig::default(),
-                ),
+                client_arc.send_input(&ProtoEvent::Ping, &InputChannelConfig::default()),
             )
             .await
             .expect("client send_input(Ping) 超时")

@@ -17,9 +17,7 @@ use thiserror::Error;
 use tokio::{sync::Mutex, task::spawn_local};
 
 use crate::client::ClientManager;
-use crate::quic_transport::{
-    self, should_retry_after_close, Endpoint, PeerSession, PeerRole,
-};
+use crate::quic_transport::{self, Endpoint, PeerRole, PeerSession, should_retry_after_close};
 
 /// mTLS 出示给对端的 client cert + key（STEP-6.1 引入，与 bak
 /// `mousehop/src/connect.rs::QuicDialerCreds` 完全对齐）。
@@ -35,7 +33,8 @@ pub(crate) struct QuicDialerCreds {
     pub key: PrivateKeyDer<'static>,
 }
 
-#[allow(dead_code)] // STEP-8.2: Timeout / TargetEmulationDisabled 暂无人构造；TargetEmulationDisabled 留 M2 接 Pong 路径后重新启用
+#[allow(dead_code)]
+// STEP-8.2: Timeout / TargetEmulationDisabled 暂无人构造；TargetEmulationDisabled 留 M2 接 Pong 路径后重新启用
 #[derive(Debug, Error)]
 pub(crate) enum LanMouseConnectionError {
     #[error(transparent)]
@@ -368,7 +367,7 @@ const PING_INTERVAL: Duration = Duration::from_millis(500);
 
 /// 记录一次拨号失败（dial_any / client_hello / etc.）—— 把 backoff 翻倍
 /// + 累加 `failure_count`，到 `MAX_RETRY_FAILURES_BEFORE_OFFLINE` 打
-/// `log::error`。
+///   `log::error`。
 ///
 /// **Caller 责任**：调本函数前确认 `connecting` 已 insert —— 否则 `send()`
 /// 路径会重复 spawn_local dial。本函数只更 retry_state，**不**碰
@@ -525,8 +524,10 @@ async fn connect_to_handle(
     //    `recv_tx` (本 LanMouseConnection 的 recv_tx 字段 —— 至此
     //    **不是死字段了**)
     // 3. peer.set_outgoing_events(Some(tx))
-    let (out_tx, mut out_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(std::net::SocketAddr, lan_mouse_proto::ProtoEvent)>();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        std::net::SocketAddr,
+        lan_mouse_proto::ProtoEvent,
+    )>();
     {
         let client_manager_for_forwarder = client_manager.clone();
         let recv_tx = recv_tx.clone();
@@ -608,9 +609,7 @@ async fn spawn_peer_supervisor(
     addr: SocketAddr,
     peer: Arc<PeerSession>,
 ) {
-    log::info!(
-        "spawn_peer_supervisor: starting for handle {handle} addr {addr}"
-    );
+    log::info!("spawn_peer_supervisor: starting for handle {handle} addr {addr}");
 
     // **应用层心跳任务** —— 与 supervisor 并行：每 [`PING_INTERVAL`] 主动
     // 发 `ProtoEvent::Ping` 到被控端，被控端 `emulation.rs::ListenTask`
@@ -628,9 +627,7 @@ async fn spawn_peer_supervisor(
     let ping_task = spawn_local(ping_heartbeat_task(peer.clone(), addr));
 
     let close_result = peer.run(PeerRole::Client).await;
-    log::info!(
-        "spawn_peer_supervisor: peer.run() returned for handle {handle} addr {addr}"
-    );
+    log::info!("spawn_peer_supervisor: peer.run() returned for handle {handle} addr {addr}");
 
     // peer 已死 → 停心跳。`send_input` 早已失败自退，但 abort 让日志与
     // supervisor 退出同步，避免停手后还有 tick 触发 send_input 报 warn。
@@ -706,9 +703,7 @@ async fn spawn_peer_supervisor(
             }
         }
         Err(other) => {
-            log::error!(
-                "client ({handle}) peer.run() 返了非预期 Err: {other} — 不触发 RetryState"
-            );
+            log::error!("client ({handle}) peer.run() 返了非预期 Err: {other} — 不触发 RetryState");
         }
         Ok(()) => {
             // `conn.closed()` future 在 quinn 协议层定义就只返回 Err；
@@ -759,9 +754,7 @@ async fn ping_heartbeat_task(peer: Arc<PeerSession>, addr: SocketAddr) {
                 // 这里是 send_input 先失败时的提前退出路径。warn 而非
                 // error：peer 死亡本身会被 supervisor 报出来，这里只
                 // 是心跳线程先察觉到。
-                log::warn!(
-                    "ping_heartbeat: send Ping to {addr} failed (peer dead): {e}"
-                );
+                log::warn!("ping_heartbeat: send Ping to {addr} failed (peer dead): {e}");
                 return;
             }
         }
@@ -797,47 +790,85 @@ mod tests {
 
         // 1st fail: backoff = 2 × INITIAL = 2s; count = 1
         record_retry_failure(&retry_state, handle);
-        let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
-        assert_eq!(entry.backoff, INITIAL_RETRY_BACKOFF * 2, "1st fail: backoff = 2x INITIAL = 2s");
+        let entry = retry_state
+            .borrow()
+            .get(&handle)
+            .cloned()
+            .expect("entry exists");
+        assert_eq!(
+            entry.backoff,
+            INITIAL_RETRY_BACKOFF * 2,
+            "1st fail: backoff = 2x INITIAL = 2s"
+        );
         assert_eq!(entry.failure_count, 1);
 
         // 2nd fail: backoff = 4 × INITIAL = 4s; count = 2
         record_retry_failure(&retry_state, handle);
-        let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
-        assert_eq!(entry.backoff, INITIAL_RETRY_BACKOFF * 4, "2nd fail: backoff = 4x INITIAL = 4s");
+        let entry = retry_state
+            .borrow()
+            .get(&handle)
+            .cloned()
+            .expect("entry exists");
+        assert_eq!(
+            entry.backoff,
+            INITIAL_RETRY_BACKOFF * 4,
+            "2nd fail: backoff = 4x INITIAL = 4s"
+        );
         assert_eq!(entry.failure_count, 2);
 
         // 3rd fail: backoff = 8 × INITIAL = 8s = MAX，撞 cap；count = 3
         record_retry_failure(&retry_state, handle);
-        let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
+        let entry = retry_state
+            .borrow()
+            .get(&handle)
+            .cloned()
+            .expect("entry exists");
         assert_eq!(
-            entry.backoff,
-            MAX_RETRY_BACKOFF,
+            entry.backoff, MAX_RETRY_BACKOFF,
             "3rd fail: backoff = 8x INITIAL = 8s = MAX, hit cap"
         );
         assert_eq!(entry.failure_count, 3);
 
         // 4th fail: backoff 已被 cap 在 MAX, 不再翻倍；count = 4
         record_retry_failure(&retry_state, handle);
-        let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
-        assert_eq!(entry.backoff, MAX_RETRY_BACKOFF, "4th fail: cap stays at MAX");
+        let entry = retry_state
+            .borrow()
+            .get(&handle)
+            .cloned()
+            .expect("entry exists");
+        assert_eq!(
+            entry.backoff, MAX_RETRY_BACKOFF,
+            "4th fail: cap stays at MAX"
+        );
         assert_eq!(entry.failure_count, 4);
 
         // 5th fail: count = 5 触发熔断 log（仅 log 不 panic），backoff 不变
         record_retry_failure(&retry_state, handle);
-        let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
+        let entry = retry_state
+            .borrow()
+            .get(&handle)
+            .cloned()
+            .expect("entry exists");
         assert_eq!(entry.backoff, MAX_RETRY_BACKOFF);
         assert_eq!(entry.failure_count, 5, "5th fail: 触发熔断阈值");
 
         // 6th fail: backoff 仍 cap, count = 6
         record_retry_failure(&retry_state, handle);
-        let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
+        let entry = retry_state
+            .borrow()
+            .get(&handle)
+            .cloned()
+            .expect("entry exists");
         assert_eq!(entry.backoff, MAX_RETRY_BACKOFF);
         assert_eq!(entry.failure_count, 6);
 
         // 7th fail: cap 不变, count = 7
         record_retry_failure(&retry_state, handle);
-        let entry = retry_state.borrow().get(&handle).cloned().expect("entry exists");
+        let entry = retry_state
+            .borrow()
+            .get(&handle)
+            .cloned()
+            .expect("entry exists");
         assert_eq!(entry.backoff, MAX_RETRY_BACKOFF);
         assert_eq!(entry.failure_count, 7);
     }
@@ -865,7 +896,10 @@ mod tests {
 
         // (1) 模拟拨号失败（peer 死 / 网络断）
         record_retry_failure(&retry_state, handle);
-        assert!(retry_state.borrow().contains_key(&handle), "拨号失败后 entry 应存在");
+        assert!(
+            retry_state.borrow().contains_key(&handle),
+            "拨号失败后 entry 应存在"
+        );
         let entry = retry_state.borrow().get(&handle).cloned().unwrap();
         assert_eq!(entry.failure_count, 1);
 
@@ -891,7 +925,10 @@ mod tests {
         record_retry_failure(&retry_state, handle);
         record_retry_failure(&retry_state, handle);
         let entry = retry_state.borrow().get(&handle).cloned().unwrap();
-        assert_eq!(entry.failure_count, 2, "拨号成功清空后再次失败 → count 从 1 重新累加到 2");
+        assert_eq!(
+            entry.failure_count, 2,
+            "拨号成功清空后再次失败 → count 从 1 重新累加到 2"
+        );
         retry_state.borrow_mut().remove(&handle);
         assert!(!retry_state.borrow().contains_key(&handle));
     }

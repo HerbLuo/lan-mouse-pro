@@ -29,7 +29,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
 use crate::crypto;
 
-use super::{Error, Result, ALPN_LAN_MOUSE};
+use super::{ALPN_LAN_MOUSE, Error, Result};
 
 /// server / client 共享的 `TransportConfig`：
 ///
@@ -469,10 +469,7 @@ impl AuthorizedKeysVerifier {
     /// （channel 满 / 关闭时静默 no-op —— reject 事件是 best-effort，不应
     /// 干扰 rustls 原本返 Err 的语义）。
     #[allow(dead_code)]
-    pub fn with_rejection_tx(
-        mut self,
-        tx: tokio::sync::mpsc::UnboundedSender<String>,
-    ) -> Self {
+    pub fn with_rejection_tx(mut self, tx: tokio::sync::mpsc::UnboundedSender<String>) -> Self {
         self.rejection_tx = Some(tx);
         self
     }
@@ -642,7 +639,9 @@ mod tests {
             verifier,
         )
         .expect("server endpoint_with_verifier bind 不应失败");
-        let server_addr = server_ep.local_addr().expect("server endpoint 必须有 local_addr");
+        let server_addr = server_ep
+            .local_addr()
+            .expect("server endpoint 必须有 local_addr");
 
         let server_task = tokio::spawn(async move {
             let incoming = server_ep.accept().await.expect("server accept 不应失败");
@@ -670,19 +669,15 @@ mod tests {
         let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_client));
         client_cfg.transport_config(super::default_transport_config());
 
-        let client_ep = super::super::endpoint::endpoint(
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
-        )
-        .expect("client endpoint bind 不应失败");
+        let client_ep =
+            super::super::endpoint::endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+                .expect("client endpoint bind 不应失败");
 
         let connecting_outcome = client_ep.connect_with(client_cfg, server_addr, "lan-mouse");
         let handshake_result = match connecting_outcome {
-            Ok(connecting) => tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                connecting,
-            )
-            .await
-            .expect("dial 端到端超时"),
+            Ok(connecting) => tokio::time::timeout(std::time::Duration::from_secs(5), connecting)
+                .await
+                .expect("dial 端到端超时"),
             Err(_connect_err) => {
                 log::debug!("connect_with 同步部分失败（接受）");
                 return;
@@ -714,7 +709,11 @@ mod tests {
         let now = UnixTime::now();
         let result = verifier.verify_server_cert(&cert_der, &[], &server_name, &[], now);
 
-        assert!(result.is_ok(), "first connect should be accepted (Ok), got {:?}", result);
+        assert!(
+            result.is_ok(),
+            "first connect should be accepted (Ok), got {:?}",
+            result
+        );
 
         let expected_pin = pins_dir.join(format!("{}.pin", fp.replace(':', "_")));
         assert!(
@@ -891,7 +890,10 @@ mod tests {
         assert!(r.is_err(), "allowlist 不命中应 Err");
 
         let received = rx.try_recv().expect("rejection_tx 应在 Err 路径 send fp");
-        assert_eq!(received, fp, "rejection channel 收到的 fp 应与被拒 cert 的 fp 一致");
+        assert_eq!(
+            received, fp,
+            "rejection channel 收到的 fp 应与被拒 cert 的 fp 一致"
+        );
         assert!(
             rx.try_recv().is_err(),
             "第二次 try_recv 应为空（一次拒绝只 send 一次）"

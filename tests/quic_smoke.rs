@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lan_mouse::quic_transport::{
-    accept, dial, endpoint, endpoint_with_cert,
-    install_crypto_provider, read_frame, PeerSession, StreamBunch,
+    PeerSession, StreamBunch, accept, dial, endpoint, endpoint_with_cert, install_crypto_provider,
+    read_frame,
 };
 use lan_mouse_proto::ProtoEvent;
 
@@ -47,15 +47,21 @@ fn ephemeral_cert(tag: &str) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'st
         .self_signed(&key_pair)
         .expect("self-signed cert");
     let cert_der = CertificateDer::from(cert.der().to_vec());
-    let key_der =
-        PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+    let key_der = PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        key_pair.serialize_der(),
+    ));
     (vec![cert_der], key_der)
 }
 
 /// Convenience: build an `endpoint_with_cert` server bound to localhost:0.
 fn server_endpoint(
     tag: &str,
-) -> (quinn::Endpoint, std::net::SocketAddr, Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+) -> (
+    quinn::Endpoint,
+    std::net::SocketAddr,
+    Vec<CertificateDer<'static>>,
+    PrivateKeyDer<'static>,
+) {
     let (cert_chain, key) = ephemeral_cert(tag);
     let addr: std::net::SocketAddr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into();
     let ep = endpoint_with_cert(addr, cert_chain.clone(), key.clone_key()).expect("server ep");
@@ -113,18 +119,22 @@ async fn five_motion_and_five_keyboard_events_round_trip() {
             .expect("server accept");
         let session = Arc::new(PeerSession::from_connection(conn));
 
-        tokio::time::timeout(Duration::from_secs(5), lan_mouse::quic_transport::server_hello(&session))
-            .await
-            .expect("server_hello timeout")
-            .expect("server_hello");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            lan_mouse::quic_transport::server_hello(&session),
+        )
+        .await
+        .expect("server_hello timeout")
+        .expect("server_hello");
 
         // (a) Read 5 motion datagrams.
         let mut motion_got: Vec<ProtoEvent> = Vec::with_capacity(5);
         while motion_got.len() < 5 {
-            let bytes = tokio::time::timeout(Duration::from_secs(5), session.connection().read_datagram())
-                .await
-                .expect("read_datagram timeout")
-                .expect("read_datagram");
+            let bytes =
+                tokio::time::timeout(Duration::from_secs(5), session.connection().read_datagram())
+                    .await
+                    .expect("read_datagram timeout")
+                    .expect("read_datagram");
             assert_eq!(
                 bytes.len(),
                 lan_mouse_proto::MAX_EVENT_SIZE,
@@ -143,13 +153,11 @@ async fn five_motion_and_five_keyboard_events_round_trip() {
         //     with the client sends (the bidi is opened by the *first*
         //     `send_stream_b` call, so the server's `accept_bi` is racing
         //     with that first send).
-        let (_ts, mut rs) = tokio::time::timeout(
-            Duration::from_secs(10),
-            session.connection().accept_bi(),
-        )
-        .await
-        .expect("accept_bi stream B timeout")
-        .expect("accept_bi stream B");
+        let (_ts, mut rs) =
+            tokio::time::timeout(Duration::from_secs(10), session.connection().accept_bi())
+                .await
+                .expect("accept_bi stream B timeout")
+                .expect("accept_bi stream B");
         drop(_ts);
 
         let mut key_got: Vec<ProtoEvent> = Vec::with_capacity(5);
@@ -190,27 +198,37 @@ async fn five_motion_and_five_keyboard_events_round_trip() {
 
     // (5) Send 5 Motion (datagram) + 5 KeyboardKey (stream B).
     for i in 0..5 {
-        client_session.send_motion(&motion_event(i)).await.expect("send_motion");
+        client_session
+            .send_motion(&motion_event(i))
+            .await
+            .expect("send_motion");
     }
     for i in 0..5 {
         let ev = key_event(i);
         let (buf, _len): ([u8; lan_mouse_proto::MAX_EVENT_SIZE], usize) = ev.into();
-        client_session.send_stream_b(&buf).await.expect("send_stream_b");
+        client_session
+            .send_stream_b(&buf)
+            .await
+            .expect("send_stream_b");
     }
 
     // (6) Wait for server to receive all 10 events, then drop client too.
-    let (motion_got, key_got) =
-        tokio::time::timeout(Duration::from_secs(15), server_task)
-            .await
-            .expect("server task timeout")
-            .expect("server task join");
+    let (motion_got, key_got) = tokio::time::timeout(Duration::from_secs(15), server_task)
+        .await
+        .expect("server task timeout")
+        .expect("server task join");
 
-    assert_eq!(motion_got.len(), 5, "server should have received 5 motion events");
+    assert_eq!(
+        motion_got.len(),
+        5,
+        "server should have received 5 motion events"
+    );
     assert_eq!(key_got.len(), 5, "server should have received 5 key events");
 
     // Field check on the payloads (don't trust identity :: only structure).
     for (i, e) in motion_got.iter().enumerate() {
-        let ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion { time, dx, dy })) = e else {
+        let ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion { time, dx, dy })) = e
+        else {
             panic!("motion[{i}] not a Pointer Motion event: {e:?}");
         };
         assert_eq!(*time, i as u32);
@@ -280,14 +298,23 @@ async fn connection_survives_ten_seconds_of_silence() {
     });
 
     let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into()).expect("client ep");
-    let conn = dial(&client_ep, server_addr, client_cert_chain[0].clone(), client_key.clone_key(), &pins_dir)
-        .await
-        .expect("dial");
+    let conn = dial(
+        &client_ep,
+        server_addr,
+        client_cert_chain[0].clone(),
+        client_key.clone_key(),
+        &pins_dir,
+    )
+    .await
+    .expect("dial");
     let client_session = Arc::new(PeerSession::from_connection(conn));
-    tokio::time::timeout(Duration::from_secs(5), lan_mouse::quic_transport::client_hello(&client_session))
-        .await
-        .expect("client hello timeout")
-        .expect("client hello");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        lan_mouse::quic_transport::client_hello(&client_session),
+    )
+    .await
+    .expect("client hello timeout")
+    .expect("client hello");
 
     let (server_alive, elapsed) = tokio::time::timeout(Duration::from_secs(20), server_task)
         .await
@@ -308,8 +335,14 @@ async fn connection_survives_ten_seconds_of_silence() {
         elapsed >= Duration::from_secs(10),
         "server wait should have actually been ≥ 10s (real elapsed: {elapsed:?})"
     );
-    assert!(server_alive, "server-side connection must remain alive after 10s silence");
-    assert!(client_alive, "client-side connection must remain alive after 10s silence");
+    assert!(
+        server_alive,
+        "server-side connection must remain alive after 10s silence"
+    );
+    assert!(
+        client_alive,
+        "client-side connection must remain alive after 10s silence"
+    );
     assert!(
         client_peer_id_present,
         "client-side peer_identity must remain present (server cert is what the client pins)"

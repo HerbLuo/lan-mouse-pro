@@ -222,17 +222,14 @@ impl LanMouseListener {
         // §1 `wake_tx` 同模式 —— verifier 在 rustls 握手回调里 send，
         // 可能在非 local 线程上，需 Send/Sync sender；forwarder 在
         // spawn_local 上 recv）。
-        let (rejection_tx, rejection_rx) =
-            tokio::sync::mpsc::unbounded_channel::<String>();
-        let rejection_forwarder_task = spawn_rejection_forwarder_task(rejection_rx, listen_tx.clone());
+        let (rejection_tx, rejection_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let rejection_forwarder_task =
+            spawn_rejection_forwarder_task(rejection_rx, listen_tx.clone());
 
         let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
             Arc::new(AuthorizedKeysVerifier::new(authorized_keys).with_rejection_tx(rejection_tx));
 
-        let addr = SocketAddr::new(
-            "0.0.0.0".parse().expect("invalid ip"),
-            port,
-        );
+        let addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
         let endpoint = quic_transport::endpoint_with_verifier(addr, cert_chain, key, verifier)?;
 
         let accept_task = spawn_quic_accept_task(endpoint, listen_tx.clone(), quic_conns.clone());
@@ -290,7 +287,10 @@ impl LanMouseListener {
         match peer {
             Some(peer) => {
                 use lan_mouse_ipc::InputChannelConfig;
-                match peer.send_input(&event, &InputChannelConfig::default()).await {
+                match peer
+                    .send_input(&event, &InputChannelConfig::default())
+                    .await
+                {
                     Ok(()) => {
                         if matches!(event, ProtoEvent::Ack(_) | ProtoEvent::Leave(_)) {
                             log::info!("reply: {event} to {addr} delivered");
@@ -299,9 +299,7 @@ impl LanMouseListener {
                     Err(e) => log::warn!("reply QUIC send to {addr} failed: {e}"),
                 }
             }
-            None => log::warn!(
-                "reply: peer {addr} not in quic_conns; dropping {event}"
-            ),
+            None => log::warn!("reply: peer {addr} not in quic_conns; dropping {event}"),
         }
     }
 
@@ -316,10 +314,7 @@ impl LanMouseListener {
     /// 现有 API 调用站桩，**M1 阶段不真正用**（与 bak 对齐：bak 也保留这
     /// 个 no-op stub）。
     #[allow(dead_code)]
-    pub(crate) async fn get_certificate_fingerprint(
-        &self,
-        addr: SocketAddr,
-    ) -> Option<String> {
+    pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
         // M1 占位：直接返 None。ListenTask 当前路径是从 Accept event 拿
         // fingerprint；本函数仅是 emulation.rs:152 调用站桩。
         let _ = addr;
@@ -521,7 +516,9 @@ fn spawn_rejection_forwarder_task(
 ) -> JoinHandle<()> {
     spawn_local(async move {
         while let Some(fp) = rejection_rx.recv().await {
-            log::debug!("rejection forwarder: peer {fp} rejected by mTLS — sending ListenEvent::Rejected");
+            log::debug!(
+                "rejection forwarder: peer {fp} rejected by mTLS — sending ListenEvent::Rejected"
+            );
             if listen_tx
                 .send(ListenEvent::Rejected { fingerprint: fp })
                 .is_err()
@@ -579,9 +576,7 @@ async fn handle_quic_peer_supervisor(
     let fingerprint = certs
         .and_then(|c| c.first())
         .map(|cert| crypto::generate_fingerprint(cert.as_ref()))
-        .ok_or_else(|| {
-            quic_transport::Error::HelloFailed("no client cert presented".into())
-        })?;
+        .ok_or_else(|| quic_transport::Error::HelloFailed("no client cert presented".into()))?;
 
     // (3) 发 Accept 事件
     log::info!("QUIC peer {addr} authorized (fingerprint {fingerprint})");
@@ -590,9 +585,7 @@ async fn handle_quic_peer_supervisor(
             addr,
             fingerprint: fingerprint.clone(),
         })
-        .map_err(|_| {
-            quic_transport::Error::HelloFailed("listen_tx closed (terminated)".into())
-        })?;
+        .map_err(|_| quic_transport::Error::HelloFailed("listen_tx closed (terminated)".into()))?;
 
     // (4) 注册到 QUIC peer 表（让 `reply()` 能查到）+ 装 QuicConnGuard
     //     让任何退出路径（Ok / Err / panic / wake close）都自动反注册
@@ -614,12 +607,9 @@ async fn handle_quic_peer_supervisor(
     log::debug!("QUIC peer {addr} registered in quic_conns (guard active)");
 
     // (5) take stream A recv 半边（控制帧 reader 用）
-    let mut recv_a = peer
-        .take_stream_a_recv()
-        .await
-        .ok_or_else(|| {
-            quic_transport::Error::HelloFailed("stream A not cached after server_hello".into())
-        })?;
+    let mut recv_a = peer.take_stream_a_recv().await.ok_or_else(|| {
+        quic_transport::Error::HelloFailed("stream A not cached after server_hello".into())
+    })?;
 
     // **STEP-8.2 修复 — Bug #8**：spawn datagram reader task。
     //
@@ -701,10 +691,7 @@ async fn handle_quic_peer_supervisor(
                 // 上线前调回 DEBUG —— 配合 RUST_LOG=lan_mouse::listen=debug
                 // 仍能精确诊断"控制事件有没有从 client 到 server"。
                 log::debug!("stream A recv from {addr}: {event}");
-                if listen_tx
-                    .send(ListenEvent::Msg { event, addr })
-                    .is_err()
-                {
+                if listen_tx.send(ListenEvent::Msg { event, addr }).is_err() {
                     log::debug!(
                         "QUIC supervisor: listen_tx send failed (channel closed, terminating)"
                     );
@@ -715,9 +702,7 @@ async fn handle_quic_peer_supervisor(
                 log::error!("stream A: FrameTooLarge({len}) — fatal, closing task");
                 return Err(quic_transport::Error::FrameTooLarge(len));
             }
-            Err(quic_transport::Error::HelloFailed(msg))
-                if msg.starts_with("decode frame") =>
-            {
+            Err(quic_transport::Error::HelloFailed(msg)) if msg.starts_with("decode frame") => {
                 log::warn!("stream A: skip frame (decode error): {msg}");
                 continue;
             }
@@ -816,7 +801,9 @@ async fn server_accept_bi_task(
                 // → client 端 stream_bunch.b.recv 立即 EOF → peer.run
                 // break → conn.close。两边都 park，让 client 端 recv 永远
                 // 停在"等数据"状态。
-                log::debug!("server accept_bi: 接到的 stream 立即 EOF（bunch bidi），park send+recv: {e}");
+                log::debug!(
+                    "server accept_bi: 接到的 stream 立即 EOF（bunch bidi），park send+recv: {e}"
+                );
                 parked_streams.borrow_mut().push((send, recv));
                 continue;
             }
@@ -852,10 +839,7 @@ async fn server_accept_bi_task(
             }
         };
         log::debug!("server accept_bi: 真实 stream B 首帧 from {addr}: {event}");
-        if listen_tx
-            .send(ListenEvent::Msg { event, addr })
-            .is_err()
-        {
+        if listen_tx.send(ListenEvent::Msg { event, addr }).is_err() {
             log::debug!("server accept_bi: listen_tx closed, exiting");
             return;
         }
@@ -922,43 +906,31 @@ async fn server_datagram_reader_task(
         match peer.connection().read_datagram().await {
             Ok(bytes) => {
                 // 定长 ProtoEvent codec：bytes.len() 必须 == MAX_EVENT_SIZE
-                let buf: [u8; lan_mouse_proto::MAX_EVENT_SIZE] =
-                    match bytes.as_ref().try_into() {
-                        Ok(b) => b,
-                        Err(_) => {
-                            log::warn!(
-                                "server datagram_reader: datagram 长度非 MAX_EVENT_SIZE({})，skip frame",
-                                lan_mouse_proto::MAX_EVENT_SIZE
-                            );
-                            continue;
-                        }
-                    };
-                let event = match lan_mouse_proto::ProtoEvent::try_from(buf) {
-                    Ok(e) => e,
-                    Err(e) => {
+                let buf: [u8; lan_mouse_proto::MAX_EVENT_SIZE] = match bytes.as_ref().try_into() {
+                    Ok(b) => b,
+                    Err(_) => {
                         log::warn!(
-                            "server datagram_reader: ProtoEvent 解码失败，skip frame: {e}"
+                            "server datagram_reader: datagram 长度非 MAX_EVENT_SIZE({})，skip frame",
+                            lan_mouse_proto::MAX_EVENT_SIZE
                         );
                         continue;
                     }
                 };
-                log::trace!(
-                    "server datagram_reader: from {addr}: {event}"
-                );
-                if listen_tx
-                    .send(ListenEvent::Msg { event, addr })
-                    .is_err()
-                {
-                    log::debug!(
-                        "server datagram_reader: listen_tx closed, exiting"
-                    );
+                let event = match lan_mouse_proto::ProtoEvent::try_from(buf) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        log::warn!("server datagram_reader: ProtoEvent 解码失败，skip frame: {e}");
+                        continue;
+                    }
+                };
+                log::trace!("server datagram_reader: from {addr}: {event}");
+                if listen_tx.send(ListenEvent::Msg { event, addr }).is_err() {
+                    log::debug!("server datagram_reader: listen_tx closed, exiting");
                     return;
                 }
             }
             Err(e) => {
-                log::info!(
-                    "server datagram_reader: read_datagram error, exiting: {e}"
-                );
+                log::info!("server datagram_reader: read_datagram error, exiting: {e}");
                 return;
             }
         }

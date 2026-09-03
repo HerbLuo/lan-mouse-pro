@@ -429,7 +429,7 @@ impl CaptureTask {
         // **环境变量关停**：`LAN_MOUSE_WATCHDOG=off` 时两个 tick 都不
         // 创建，loop 永远不命中这两个分支 —— 等价于禁用。开发调试时用。
         let watchdog_enabled = std::env::var("LAN_MOUSE_WATCHDOG")
-            .map(|v| v.to_ascii_lowercase() != "off")
+            .map(|v| !v.eq_ignore_ascii_case("off"))
             .unwrap_or(true);
         let (mut watchdog_light_tick, mut watchdog_heavy_tick) = if watchdog_enabled {
             let mut light = tokio::time::interval(WATCHDOG_LIGHT_INTERVAL);
@@ -637,10 +637,7 @@ impl CaptureTask {
     /// **命中后**：state 强制回 Idle，`capture.release()` 兜底（清 OS
     /// 层 ACTIVE_CLIENT），刷新 `last_progress_at = now` 让 heavy tick
     /// 不再视为 no-progress。
-    async fn run_watchdog_light(
-        &mut self,
-        capture: &mut InputCapture,
-    ) {
+    async fn run_watchdog_light(&mut self, capture: &mut InputCapture) {
         // 仅在 state == Sending 且 active_client == None 时命中。
         // 不打 Sending 但 active_client 还有 / Idle 状态：前者是正常
         // active 状态，后者本来就该 idle。
@@ -681,10 +678,7 @@ impl CaptureTask {
     ///
     /// **顺序**：先做 (1)，再做 (2)，最后 (3)。每一项独立判断、独立记日志。
     /// 一次 tick 命中多个时全部触发（各自 `release_capture` 是幂等的）。
-    async fn run_watchdog_heavy(
-        &mut self,
-        capture: &mut InputCapture,
-    ) {
+    async fn run_watchdog_heavy(&mut self, capture: &mut InputCapture) {
         let now = Instant::now();
 
         // ── (1) Crossing storm ────────────────────────────────────────────
@@ -726,7 +720,9 @@ impl CaptureTask {
             );
             self.watchdog.consecutive_send_failures = 0;
             if let Err(e) = self.release_capture(capture).await {
-                log::warn!("watchdog[heavy]: release_capture during send-failure clear failed: {e}");
+                log::warn!(
+                    "watchdog[heavy]: release_capture during send-failure clear failed: {e}"
+                );
             }
             self.watchdog.last_progress_at = now;
             return;
@@ -838,7 +834,11 @@ impl CaptureTask {
                 // 然从头来。
                 self.watchdog.recent_crossings.push_back(Instant::now());
                 let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
-                if let Err(e) = self.conn.send(ProtoEvent::Enter(opposite_pos), handle).await {
+                if let Err(e) = self
+                    .conn
+                    .send(ProtoEvent::Enter(opposite_pos), handle)
+                    .await
+                {
                     log::warn!(
                         "releasing capture: BeginPending send failed: {e} \
                          (cancelling pending, host cursor stays visible)"
@@ -853,10 +853,8 @@ impl CaptureTask {
                     // **FIX 4**：BeginPending 内的 send 失败也计入
                     // consecutive failures，让 watchdog heavy 把
                     // "反复 Begin→send 失败"识别为跨边风暴前的征兆。
-                    self.watchdog.consecutive_send_failures = self
-                        .watchdog
-                        .consecutive_send_failures
-                        .saturating_add(1);
+                    self.watchdog.consecutive_send_failures =
+                        self.watchdog.consecutive_send_failures.saturating_add(1);
                     // 不要走 capture.release()：pending 状态后端本来就没
                     // 激活，无 Leave 要发。
                     return Ok(());
@@ -908,7 +906,9 @@ impl CaptureTask {
                 // 区分依据：`State::Pending { handle, .. }` 且 handle 匹配
                 // → 路径 1；其他（Idle / Sending）→ 路径 2。
                 match self.state {
-                    State::Pending { handle: pending_h, .. } if pending_h == handle => {
+                    State::Pending {
+                        handle: pending_h, ..
+                    } if pending_h == handle => {
                         log::info!(
                             "capture: pending -> active promotion (handle={handle:?}, \
                              Begin already Entered for BeginPending)"
@@ -938,14 +938,16 @@ impl CaptureTask {
                         }
                         self.state = State::Sending;
                         let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
-                        if let Err(e) = self.conn.send(ProtoEvent::Enter(opposite_pos), handle).await {
+                        if let Err(e) = self
+                            .conn
+                            .send(ProtoEvent::Enter(opposite_pos), handle)
+                            .await
+                        {
                             const DUR: Duration = Duration::from_millis(500);
                             debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
                             log::warn!("releasing capture: send failed: {e}");
-                            self.watchdog.consecutive_send_failures = self
-                                .watchdog
-                                .consecutive_send_failures
-                                .saturating_add(1);
+                            self.watchdog.consecutive_send_failures =
+                                self.watchdog.consecutive_send_failures.saturating_add(1);
                             capture.release().await?;
                         } else {
                             // **FIX 4**：Begin 路径（同进程内第 2 次
@@ -970,10 +972,8 @@ impl CaptureTask {
                         // **FIX 4**：连续 send 失败累加；heavy tick
                         // 在 ≥ 3 次时强制 release（即使本路径 release
                         // 已调），做兜底。
-                        self.watchdog.consecutive_send_failures = self
-                            .watchdog
-                            .consecutive_send_failures
-                            .saturating_add(1);
+                        self.watchdog.consecutive_send_failures =
+                            self.watchdog.consecutive_send_failures.saturating_add(1);
                         capture.release().await?;
                     } else {
                         // **FIX 4**：成功 send 视为"还在干活"——清零失
@@ -1101,7 +1101,10 @@ impl CaptureTask {
 
         log::info!("release_capture: calling capture.release() (OS-level release)");
         let res = capture.release().await;
-        log::info!("release_capture: capture.release() returned (ok={})", res.is_ok());
+        log::info!(
+            "release_capture: capture.release() returned (ok={})",
+            res.is_ok()
+        );
 
         // **FIX 4**：release_capture 完成 → 重置 watchdog 状态。
         //

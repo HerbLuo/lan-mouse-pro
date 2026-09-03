@@ -23,9 +23,9 @@ use tokio::task::{JoinHandle, spawn_local};
 
 use lan_mouse_proto::ProtoEvent;
 
-use super::protocol::{read_frame, write_frame};
+use super::Error;
+use super::protocol::read_frame;
 use super::session::PeerSession;
-use super::{Error, Result};
 
 /// Stream B reader task 用的 mpsc 通道容量（STEP-5.3 引入）。
 ///
@@ -339,10 +339,7 @@ pub async fn read_loop(
          stream C dropped (M1 §9 守门)"
     );
 
-    Ok(ReadStreams {
-        b: rx_b,
-        join_b,
-    })
+    Ok(ReadStreams { b: rx_b, join_b })
 }
 
 /// Datagram 类事件读 task（STEP-5.4 引入，SUGGESTION #S-16 治理落地）。
@@ -436,11 +433,9 @@ mod tests {
     use lan_mouse_proto::ProtoEvent;
 
     use crate::quic_transport::endpoint::{accept, dial, endpoint};
-    use crate::quic_transport::protocol::write_frame;
     use crate::quic_transport::session::PeerSession;
     use crate::quic_transport::test_helpers::{
-        ephemeral_cert, ephemeral_pins_dir, endpoint_with_test_cert, key_event, local_set_test,
-        motion_event, motion_test_server,
+        ephemeral_cert, key_event, local_set_test, motion_event, motion_test_server,
     };
 
     use super::*;
@@ -492,10 +487,7 @@ mod tests {
         let (mut write_half, mut read_half) = tokio::io::duplex(4096);
 
         let writer = tokio::spawn(async move {
-            write_half
-                .write_u32(17)
-                .await
-                .expect("write length prefix");
+            write_half.write_u32(17).await.expect("write length prefix");
             write_half
                 .write_all(&[0u8; 8])
                 .await
@@ -604,13 +596,11 @@ mod tests {
             let (server_ep, server_addr) = motion_test_server(server_cert, server_key);
 
             let server_session_fut = tokio::task::spawn_local(async move {
-                let conn = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    accept(&server_ep),
-                )
-                .await
-                .expect("server accept timeout")
-                .expect("server accept");
+                let conn =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
+                        .await
+                        .expect("server accept timeout")
+                        .expect("server accept");
                 let session = std::sync::Arc::new(PeerSession::from_connection(conn));
 
                 tokio::time::timeout(std::time::Duration::from_secs(5), server_hello(&session))
@@ -636,9 +626,9 @@ mod tests {
                 "lan-mouse-stream-c-pins-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
             ));
             let _ = std::fs::remove_dir_all(&pins_dir);
             let (client_cert, client_key) = ephemeral_cert();

@@ -113,14 +113,13 @@ impl Service {
         .await?;
         // connection 走新 QUIC 路径 —— 复用同一份 rustls 落盘 cert/key + 一个
         // client endpoint（v4 任意本地端口）+ pins_dir（client TOFU 缓存位置）。
-        let client_endpoint = crate::quic_transport::endpoint(
-            std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
-        )
-        .map_err(|e| {
-            ServiceError::Io(io::Error::other(format!(
-                "client endpoint bind failed: {e}"
-            )))
-        })?;
+        let client_endpoint =
+            crate::quic_transport::endpoint(std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
+                .map_err(|e| {
+                    ServiceError::Io(io::Error::other(format!(
+                        "client endpoint bind failed: {e}"
+                    )))
+                })?;
         let pins_dir = crypto::cert_pins_dir();
         let conn = LanMouseConnection::new(
             client_endpoint,

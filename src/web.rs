@@ -143,14 +143,14 @@ fn event_bus() -> &'static broadcast::Sender<FrontendEvent> {
 /// Returns the request sender (clone it per WebSocket client) and a
 /// join handle for the event-pump task — pass both to
 /// [`WebServer::bind`].
-pub async fn spawn_ipc_bridge() -> Result<(mpsc::Sender<FrontendRequest>, JoinHandle<()>), WebError> {
+pub async fn spawn_ipc_bridge() -> Result<(mpsc::Sender<FrontendRequest>, JoinHandle<()>), WebError>
+{
     // The daemon creates this socket in `AsyncFrontendListener::new`.
     // Connecting to it from the same process is supported — the kernel
     // happily round-trips a same-process connect(2) — and lets us
     // reuse 100% of the existing IPC framing code instead of
     // refactoring the service to expose events over a channel.
-    let (mut event_rx, mut request_tx) =
-        connect_async(Some(Duration::from_millis(500))).await?;
+    let (mut event_rx, mut request_tx) = connect_async(Some(Duration::from_millis(500))).await?;
 
     let event_tx = event_bus().clone();
     let event_pump: JoinHandle<()> = tokio::spawn(async move {
@@ -216,10 +216,12 @@ impl WebServer {
 
     /// Serve forever. Returns only on fatal bind / accept failure.
     pub async fn run(self) -> Result<(), WebError> {
-        let listener = TokioTcpListener::bind(self.addr).await.map_err(|e| WebError::Bind {
-            addr: self.addr,
-            source: e,
-        })?;
+        let listener = TokioTcpListener::bind(self.addr)
+            .await
+            .map_err(|e| WebError::Bind {
+                addr: self.addr,
+                source: e,
+            })?;
         log::info!("lan-mouse web UI listening on http://{}", self.addr);
 
         let router = Router::new()
@@ -245,10 +247,7 @@ async fn info_handler(State(state): State<WebState>) -> Json<InitialInfo> {
     })
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<WebState>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<WebState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -269,11 +268,7 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                             continue;
                         }
                     };
-                    if sink
-                        .send(Message::Text(json.into()))
-                        .await
-                        .is_err()
-                    {
+                    if sink.send(Message::Text(json)).await.is_err() {
                         break;
                     }
                 }

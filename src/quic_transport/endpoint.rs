@@ -31,7 +31,7 @@ use tokio::task::JoinSet;
 use crate::crypto;
 
 use super::tls;
-use super::{Error, Result, ALPN_LAN_MOUSE, Connection, Endpoint};
+use super::{ALPN_LAN_MOUSE, Connection, Endpoint, Error, Result};
 
 /// 占位实现：把 `addr` 绑成 `quinn::Endpoint`。
 ///
@@ -183,7 +183,7 @@ pub fn endpoint_with_verifier(
 ///
 /// 抽出来是为了让两条路径共享 `Arc::try_unwrap` + ALPN + QuicServerConfig
 /// + transport_config + bind + Endpoint::new 的固定装配流程，新增 verifier
-/// 入口时不用复制这段（#S-7 / STEP-2.5 配套抽象）。
+///   入口时不用复制这段（#S-7 / STEP-2.5 配套抽象）。
 ///
 /// `Arc::try_unwrap` 必然成功：刚拿到的 `Arc<ServerConfig>` 强引用数 = 1
 /// （`crypto::rustls_server_config[_with_verifier]` 返回后未持有其它副本）；
@@ -285,9 +285,9 @@ pub fn install_crypto_provider() {
 ///   / 中断）→ [`Error::Handshake`]（`#[from] quinn::ConnectionError`）；
 ///   TofuVerifier mismatch 会以 `ConnectionError::TransportError(rustls::
 ///   Error::General("TOFU mismatch: ..."))` 形态冒到这里（§2.6 误差：PLAN
-/// 文字写 "untrusted peer {fp}"，实际 bak 字符串是 "TOFU mismatch: peer
-/// fingerprint {fp} not in known peers"，本步采用 bak 字符串以便与已落地
-/// 的 SUGGESTION 治理纪律对齐）。
+///   文字写 "untrusted peer {fp}"，实际 bak 字符串是 "TOFU mismatch: peer
+///   fingerprint {fp} not in known peers"，本步采用 bak 字符串以便与已落地
+///   的 SUGGESTION 治理纪律对齐）。
 ///
 /// **不**主动 `install_crypto_provider`：与 `build_quic_client_config` 对称，
 /// 由 `main.rs` / 测试首句显式守护。
@@ -346,8 +346,9 @@ pub async fn dial(
 ///
 /// **`JoinSet` vs `Vec<SpawnLocal>`**：JoinSet 提供 `join_next().await`
 /// + `abort_all()` 一站式 API，与 STEP-0.1 全仓 `spawn_local` 惯例一致。
+///
 /// quinn `Connection` 实现 `Drop` 自动 close（QUIC 相对 DTLS 的简化），
-/// 输家被 abort 时 RAII 自动关连，**不**需要显式 `conn.close(...)`。
+///   输家被 abort 时 RAII 自动关连，**不**需要显式 `conn.close(...)`。
 ///
 /// **`#[allow(dead_code)]`**：STEP-6.4 仅被 `connect.rs::connect_to_handle`
 /// 接入；dead_code 自动消失。
@@ -513,7 +514,7 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
     use crate::quic_transport::test_helpers::{
-        ephemeral_cert, ephemeral_pins_dir, endpoint_with_test_cert,
+        endpoint_with_test_cert, ephemeral_cert, ephemeral_pins_dir,
     };
 
     use super::*;
@@ -524,7 +525,8 @@ mod tests {
         install_crypto_provider();
         let (cert_chain, key) = ephemeral_cert();
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into();
-        let ep = endpoint_with_cert(addr, cert_chain, key).expect("endpoint_with_cert bind 不应失败");
+        let ep =
+            endpoint_with_cert(addr, cert_chain, key).expect("endpoint_with_cert bind 不应失败");
         let local = ep.local_addr().expect("endpoint 必须有 local_addr");
         assert_ne!(local.port(), 0, "ephly 端口应非零");
         drop(ep);
@@ -602,7 +604,9 @@ mod tests {
             server_key,
         )
         .expect("server endpoint bind 不应失败");
-        let server_addr = server_ep.local_addr().expect("server endpoint 必须有 local_addr");
+        let server_addr = server_ep
+            .local_addr()
+            .expect("server endpoint 必须有 local_addr");
 
         let server_task = tokio::spawn(async move {
             let incoming = server_ep.accept().await.expect("server accept 不应失败");
@@ -655,13 +659,11 @@ mod tests {
             let server_addr = server_ep.local_addr().expect("server addr");
 
             let server_task = tokio::spawn(async move {
-                let _conn = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    accept(&server_ep),
-                )
-                .await
-                .expect("server accept timeout")
-                .expect("server accept");
+                let _conn =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
+                        .await
+                        .expect("server accept timeout")
+                        .expect("server accept");
             });
 
             let pins_dir = ephemeral_pins_dir();
@@ -670,10 +672,8 @@ mod tests {
             let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
                 .expect("client endpoint bind");
 
-            let unreachable = SocketAddr::new(
-                std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-                65535,
-            );
+            let unreachable =
+                SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 65535);
             let all = vec![server_addr, unreachable];
 
             let conn = tokio::time::timeout(
@@ -718,14 +718,9 @@ mod tests {
             let _ = std::fs::remove_dir_all(&pins_dir);
             let (client_cert, client_key) = ephemeral_cert();
 
-            let primary = SocketAddr::new(
-                std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-                65535,
-            );
-            let secondary = SocketAddr::new(
-                std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
-                65535,
-            );
+            let primary = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 65535);
+            let secondary =
+                SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 65535);
             let all = vec![primary, secondary];
 
             let result = tokio::time::timeout(

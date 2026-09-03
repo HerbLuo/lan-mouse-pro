@@ -111,8 +111,8 @@ fn _unused_silencer() {
 /// events (Enter/Leave/Ack/Ping/Pong/Hello) are always StreamA regardless
 /// of config — they're the control plane, not user input.
 fn assert_event_routing(cfg: &InputChannelConfig, table: &str) {
-    use lan_mouse::quic_transport::route_input;
     use lan_mouse::quic_transport::Channel;
+    use lan_mouse::quic_transport::route_input;
 
     let expected_motion = Channel::Datagram;
     let expected_axis = Channel::Datagram;
@@ -127,7 +127,11 @@ fn assert_event_routing(cfg: &InputChannelConfig, table: &str) {
     };
 
     // Pointer motion family — always Datagram
-    assert_eq!(route_input(cfg, &motion()), expected_motion, "{table}: motion");
+    assert_eq!(
+        route_input(cfg, &motion()),
+        expected_motion,
+        "{table}: motion"
+    );
     assert_eq!(route_input(cfg, &axis()), expected_axis, "{table}: axis");
     assert_eq!(
         route_input(cfg, &axis_discrete()),
@@ -136,7 +140,11 @@ fn assert_event_routing(cfg: &InputChannelConfig, table: &str) {
     );
 
     // Button follows mouse config
-    assert_eq!(route_input(cfg, &button()), expected_button, "{table}: button");
+    assert_eq!(
+        route_input(cfg, &button()),
+        expected_button,
+        "{table}: button"
+    );
 
     // Key + Modifiers follow keyboard config (modifiers follow keyboard — see
     // STEP-4.4 doc table in `quic_transport::route_input`).
@@ -246,7 +254,10 @@ fn input_channels_accept_all_combos_exhaustively() {
     // Combinatorial check: every (mouse_button, keyboard) pair routes OK.
     for mouse in [ChannelMode::Datagram, ChannelMode::Stream] {
         for keyboard in [ChannelMode::Datagram, ChannelMode::Stream] {
-            let cfg = InputChannelConfig { mouse_button: mouse, keyboard };
+            let cfg = InputChannelConfig {
+                mouse_button: mouse,
+                keyboard,
+            };
             assert_event_routing(&cfg, &format!("combo m={mouse:?} k={keyboard:?}"));
         }
     }

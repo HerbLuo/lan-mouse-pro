@@ -78,11 +78,7 @@ pub(crate) fn entered_barrier(
 /// Conceptually the inverse of [`entered_barrier`]: `entered_barrier`
 /// fires on the transition from "inside" to "outside", and `cursor_within`
 /// answers "is it currently inside".
-pub(crate) fn cursor_within(
-    point: (i32, i32),
-    displays: &[RECT],
-    pos: Position,
-) -> bool {
+pub(crate) fn cursor_within(point: (i32, i32), displays: &[RECT], pos: Position) -> bool {
     in_display_region(point, displays) && in_bounds(point, displays, pos)
 }
 

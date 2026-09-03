@@ -27,7 +27,6 @@ export interface ClientConfig {
 export interface ClientState {
   active: boolean
   active_addr: string | null
-  alive: boolean
   dns_ips: string[]
   ips: string[]
   has_pressed_keys: boolean

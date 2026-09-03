@@ -21,13 +21,13 @@ use std::time::Duration;
 
 use quinn::{RecvStream, SendStream, VarInt};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use lan_mouse_ipc::{ChannelMode, InputChannelConfig};
-use lan_mouse_proto::{ProtoEvent, MAX_EVENT_SIZE};
+use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
 
+use super::Error;
 use super::session::PeerSession;
-use super::{Error, Result, ALPN_LAN_MOUSE};
 
 /// 应用层 Hello 握手超时（STEP-3.2 引入）。
 ///
@@ -140,11 +140,12 @@ pub fn route_input(cfg: &InputChannelConfig, event: &ProtoEvent) -> Channel {
         )) => Channel::Datagram,
 
         // (2) 鼠标按键 → 按 cfg.mouse_button 分派
-        ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Button { .. })) => match cfg.mouse_button
-        {
-            ChannelMode::Datagram => Channel::Datagram,
-            ChannelMode::Stream => Channel::StreamB,
-        },
+        ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Button { .. })) => {
+            match cfg.mouse_button {
+                ChannelMode::Datagram => Channel::Datagram,
+                ChannelMode::Stream => Channel::StreamB,
+            }
+        }
 
         // (3) 键盘按键 / Modifiers → 按 cfg.keyboard 分派（同一通道，避免
         //     modifier / key 时序错位）
@@ -343,8 +344,11 @@ pub async fn server_hello(peer: &PeerSession) -> std::result::Result<(), Error> 
 /// **失败传播**：写 IO 错误透传为 `Error::HelloFailed("write Hello frame:
 /// ...")`。`ProtoEvent::try_from` / `.into()` 不可能失败（定长 codec +
 /// Hello 只有 17 字节），无解码错误路径。
-async fn write_hello_frame(send: &mut SendStream, event: &ProtoEvent) -> std::result::Result<(), Error> {
-    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
+async fn write_hello_frame(
+    send: &mut SendStream,
+    event: &ProtoEvent,
+) -> std::result::Result<(), Error> {
+    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = (*event).into();
     send.write_u32(len as u32)
         .await
         .map_err(|e| Error::HelloFailed(format!("write Hello frame length: {e}")))?;
@@ -367,7 +371,9 @@ async fn write_hello_frame(send: &mut SendStream, event: &ProtoEvent) -> std::re
 ///
 /// **可见性 `pub(crate)`**：单测 `send_stream_a_round_trip_control_event`（session.rs）
 /// 走 server 端 recv_a 读一帧 Ping 时调它。
-pub(crate) async fn read_hello_frame(recv: &mut RecvStream) -> std::result::Result<ProtoEvent, Error> {
+pub(crate) async fn read_hello_frame(
+    recv: &mut RecvStream,
+) -> std::result::Result<ProtoEvent, Error> {
     let len = recv
         .read_u32()
         .await
@@ -416,11 +422,14 @@ pub(crate) async fn read_hello_frame(recv: &mut RecvStream) -> std::result::Resu
 /// **可见性 `pub(crate)`**：[`super::session::PeerSession::send_stream_a`]
 /// 等内部方法调它；外部 test (`frame_round_trip`) 走 `use super::*`。
 #[allow(dead_code)]
-pub(crate) async fn write_frame<W>(send: &mut W, event: &ProtoEvent) -> std::result::Result<(), Error>
+pub(crate) async fn write_frame<W>(
+    send: &mut W,
+    event: &ProtoEvent,
+) -> std::result::Result<(), Error>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
+    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = (*event).into();
     send.write_u32(len as u32)
         .await
         .map_err(|e| Error::HelloFailed(format!("write frame length: {e}")))?;
@@ -539,9 +548,7 @@ pub(crate) fn hello_watchdog(peer: std::sync::Arc<PeerSession>) {
     tokio::spawn(async move {
         tokio::time::sleep(HELLO_TIMEOUT).await;
         if !peer.hello_ok.load(Ordering::Acquire) {
-            log::warn!(
-                "hello watchdog: hello_ok 未在 {HELLO_TIMEOUT:?} 内置位，主动关闭连接"
-            );
+            log::warn!("hello watchdog: hello_ok 未在 {HELLO_TIMEOUT:?} 内置位，主动关闭连接");
             peer.conn
                 .close(VarInt::from(0u32), b"hello timeout (watchdog)");
         }
@@ -553,14 +560,14 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     use lan_mouse_ipc::{ChannelMode, InputChannelConfig};
-    use lan_mouse_proto::{ProtoEvent, MAX_EVENT_SIZE};
+    use lan_mouse_proto::ProtoEvent;
 
     use crate::quic_transport::endpoint::accept;
     use crate::quic_transport::endpoint::dial;
     use crate::quic_transport::endpoint::endpoint;
     use crate::quic_transport::session::PeerSession;
     use crate::quic_transport::test_helpers::{
-        ephemeral_cert, ephemeral_pins_dir, endpoint_with_test_cert, local_set_test,
+        endpoint_with_test_cert, ephemeral_cert, ephemeral_pins_dir, local_set_test,
     };
 
     use super::*;
@@ -582,13 +589,10 @@ mod tests {
         let server_addr = server_ep.local_addr().expect("server addr");
 
         let server_task = tokio::spawn(async move {
-            let conn = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                accept(&server_ep),
-            )
-            .await
-            .expect("server accept timeout")
-            .expect("server accept");
+            let conn = tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
+                .await
+                .expect("server accept timeout")
+                .expect("server accept");
             let session = PeerSession::from_connection(conn);
 
             tokio::time::timeout(std::time::Duration::from_secs(5), server_hello(&session))
@@ -664,21 +668,17 @@ mod tests {
             let server_addr = server_ep.local_addr().expect("server addr");
 
             let server_task = tokio::task::spawn_local(async move {
-                let conn = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    accept(&server_ep),
-                )
-                .await
-                .expect("server accept timeout")
-                .expect("server accept");
+                let conn =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
+                        .await
+                        .expect("server accept timeout")
+                        .expect("server accept");
 
-                let (mut send, _recv) = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    conn.accept_bi(),
-                )
-                .await
-                .expect("accept_bi timeout")
-                .expect("accept_bi");
+                let (mut send, _recv) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), conn.accept_bi())
+                        .await
+                        .expect("accept_bi timeout")
+                        .expect("accept_bi");
 
                 let wrong = ProtoEvent::Hello {
                     magic: *b"LAN-MOUS",
@@ -753,13 +753,10 @@ mod tests {
         let server_addr = server_ep.local_addr().expect("server addr");
 
         let server_task = tokio::spawn(async move {
-            let conn = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                accept(&server_ep),
-            )
-            .await
-            .expect("server accept timeout")
-            .expect("server accept");
+            let conn = tokio::time::timeout(std::time::Duration::from_secs(10), accept(&server_ep))
+                .await
+                .expect("server accept timeout")
+                .expect("server accept");
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             drop(conn);
         });
@@ -807,9 +804,7 @@ mod tests {
 
     mod route_input_fixtures {
         use super::*;
-        use input_event::{
-            Event as InputEvent, KeyboardEvent, PointerEvent,
-        };
+        use input_event::{Event as InputEvent, KeyboardEvent, PointerEvent};
         use lan_mouse_proto::Position;
 
         pub(super) fn motion() -> ProtoEvent {

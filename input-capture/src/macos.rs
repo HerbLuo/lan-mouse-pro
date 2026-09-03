@@ -607,9 +607,7 @@ fn create_event_tap<'a>(
                     }
                     Some(other_pos) if other_pos != pending_pos => {
                         // 换边：先取消旧 pending，再开新 pending。
-                        log::debug!(
-                            "switch pending: {pending_pos:?} -> {other_pos:?}"
-                        );
+                        log::debug!("switch pending: {pending_pos:?} -> {other_pos:?}");
                         // 立即发 CancelPending（带旧位置）—— 同上，单独发。
                         let _ = event_tx.blocking_send((pending_pos, CaptureEvent::CancelPending));
                         state.pending_pos = Some(other_pos);

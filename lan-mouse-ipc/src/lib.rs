@@ -296,8 +296,6 @@ pub struct ClientState {
     /// This should generally be the socket address where data
     /// was last received from.
     pub active_addr: Option<SocketAddr>,
-    /// tracks whether or not the client is available for emulation
-    pub alive: bool,
     /// ips from dns
     pub dns_ips: Vec<IpAddr>,
     /// all ip addresses associated with a particular client

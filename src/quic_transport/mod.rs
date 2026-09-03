@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use lan_mouse_proto::{ProtoEvent, MAX_EVENT_SIZE};
+use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
 
 pub use quinn::{Connection, Endpoint};
 
@@ -36,11 +36,19 @@ pub mod tls;
 // 重导出各子模块的公共 API —— 让外部 caller 写 `quic_transport::xxx` 即可，
 // 不需要直接访问子模块。外部 API 与拆分前完全一致。
 pub use crate::quic_transport::{
-    endpoint::{accept, dial, dial_any, endpoint, endpoint_with_cert, endpoint_with_verifier, install_crypto_provider},
-    protocol::{client_hello, read_any_frame, read_frame, route_input, server_hello, Channel, HELLO_TIMEOUT},
-    session::{should_retry_after_close, PeerRole, PeerSession},
+    endpoint::{
+        accept, dial, dial_any, endpoint, endpoint_with_cert, endpoint_with_verifier,
+        install_crypto_provider,
+    },
+    protocol::{
+        Channel, HELLO_TIMEOUT, client_hello, read_any_frame, read_frame, route_input, server_hello,
+    },
+    session::{PeerRole, PeerSession, should_retry_after_close},
     streams::StreamBunch,
-    tls::{build_quic_client_config, AuthorizedKeysVerifier, PermissiveClientCertVerifier, TofuVerifier},
+    tls::{
+        AuthorizedKeysVerifier, PermissiveClientCertVerifier, TofuVerifier,
+        build_quic_client_config,
+    },
 };
 
 /// M1 传输层错误。
@@ -170,7 +178,7 @@ pub(crate) mod test_helpers {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use quinn::Endpoint;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
     use std::net::SocketAddr;
     use std::path::PathBuf;
 
@@ -184,20 +192,24 @@ pub(crate) mod test_helpers {
     /// 单独跑 main future + `spawn_local` 任务，避免 current_thread 下所有
     /// `Send` 任务排在 main future 之后（server task 还没起来 client 就 dial
     /// 完成 → handshake timeout）。需要 tokio `rt-multi-thread` feature。
+    /// Run `$body` inside a fresh `LocalSet`, awaiting it inline.
+    ///
+    /// The caller is expected to be inside a `#[tokio::test]` `async fn`.
+    /// The macro emits a single expression statement (no inner fn), so it
+    /// does not produce `unnameable_test_items` / `dead_code` warnings.
     macro_rules! local_set_test {
         ($name:ident, $body:block) => {
-            #[tokio::test(flavor = "multi_thread")]
-            async fn $name() {
-                tokio::task::LocalSet::new().run_until(async move $body).await;
-            }
+            tokio::task::LocalSet::new()
+                .run_until(async move $body)
+                .await
         };
     }
 
     /// 测试用临时自签 cert —— 落盘到 `/tmp` 下 ephemeral 子目录（PID + nanos
     /// + 全局 counter 三重隔离），避免污染用户 cert 路径（`crypto::cert_path()`
-    /// / `key_path()`），并让并行跑的多个 test 互不踩同一目录。
-    /// 返回 `(cert_chain, key)`，DER 字节直接喂给 `endpoint_with_cert` /
-    /// `build_quic_client_config`。
+    ///   / `key_path()`），并让并行跑的多个 test 互不踩同一目录。
+    ///   返回 `(cert_chain, key)`，DER 字节直接喂给 `endpoint_with_cert` /
+    ///   `build_quic_client_config`。
     pub(crate) fn ephemeral_cert() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -264,7 +276,9 @@ pub(crate) mod test_helpers {
     }
 
     /// 临时 allowlist helper（与 `tmp_pins_dir` 风格对称）。
-    pub(crate) fn tmp_allowlist(tag: &str) -> std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>> {
+    pub(crate) fn tmp_allowlist(
+        tag: &str,
+    ) -> std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, String>>> {
         let dir = std::env::temp_dir().join(format!(
             "lan-mouse-allowlist-{}-{}-{}",
             tag,
@@ -310,7 +324,7 @@ pub(crate) mod test_helpers {
         lan_mouse_proto::ProtoEvent::Input(input_event::Event::Keyboard(
             input_event::KeyboardEvent::Key {
                 time: 0,
-                key: 30, // 'a'
+                key: 30,  // 'a'
                 state: 1, // press
             },
         ))
