@@ -70,6 +70,7 @@ enum ProducerEvent {
     Create(Position),
     Destroy(Position),
     /// macOS 旧版无 pending 时直接用 Grab。保留兼容性；新代码不再 emit。
+    #[allow(dead_code)]
     Grab(Position),
     /// **Pending → Active 提升**：主线程在对端 Ack 后调 `start_capture`
     /// 转发到这里。提升后 warp cursor + hide cursor + emit Begin。
@@ -130,6 +131,12 @@ impl InputCaptureState {
     }
 
     /// start the input capture by
+    ///
+    /// **当前未调用**：pending-capture 改造后 promotion 由 tap thread 通过
+    /// [`ProducerEvent::StartCapture`] 统一处理（见下文 `handle_producer_event`
+    /// 与 [`InputCaptureState::compute_edge_point`] 注释）。保留本方法作为
+    /// 直观的"激活 capture 时该做什么"参考实现，避免后续回归。
+    #[allow(dead_code)]
     fn start_capture(&mut self, event: &CGEvent, position: Position) -> Result<(), CaptureError> {
         let mut location = event.location();
         let edge_offset = 1.0;
@@ -258,7 +265,7 @@ impl InputCaptureState {
                 if self.pending_pos.is_some() {
                     self.pending_pos = None;
                 }
-                return Err(CaptureError::EventTapDisabled);
+                Err(CaptureError::EventTapDisabled)
             }
             ProducerEvent::DisplayReconfigured => {
                 // The macOS display configuration changed — a monitor

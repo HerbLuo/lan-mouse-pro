@@ -179,6 +179,7 @@ pub(crate) struct LanMouseListener {
     /// dismissal. QUIC keepalive has taken over idle detection —
     /// see STEP-7.1.
     #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
     power_observer: crate::macos_power::PowerObserver,
 }
 
