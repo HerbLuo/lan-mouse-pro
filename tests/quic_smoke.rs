@@ -136,27 +136,29 @@ async fn five_motion_and_five_keyboard_events_round_trip() {
             motion_got.push(event);
         }
 
-        // (b) Accept the client's stream-B bidis as they arrive. `send_stream_b`
-        //     currently opens a fresh `open_bi()` per call (no stream-B cache
-        //     until STEP-5.3 bulk-up), so the server must `accept_bi` once
-        //     per frame. We collect all 5 frames regardless of stream identity.
+        // (b) Accept the client's stream-B bidi. `send_stream_b` now caches
+        //     one long-lived stream B and writes all 5 frames on it (see
+        //     `session.rs::cached_send_b`), so the server `accept_bi`s once
+        //     and reads all 5 frames off that one stream. Reads must overlap
+        //     with the client sends (the bidi is opened by the *first*
+        //     `send_stream_b` call, so the server's `accept_bi` is racing
+        //     with that first send).
+        let (_ts, mut rs) = tokio::time::timeout(
+            Duration::from_secs(10),
+            session.connection().accept_bi(),
+        )
+        .await
+        .expect("accept_bi stream B timeout")
+        .expect("accept_bi stream B");
+        drop(_ts);
+
         let mut key_got: Vec<ProtoEvent> = Vec::with_capacity(5);
         while key_got.len() < 5 {
-            let (_ts, mut rs) = tokio::time::timeout(
-                Duration::from_secs(5),
-                session.connection().accept_bi(),
-            )
-            .await
-            .expect("accept_bi stream B timeout")
-            .expect("accept_bi stream B");
-
             let event = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut rs))
                 .await
                 .expect("read_frame stream B timeout")
                 .expect("read_frame");
             key_got.push(event);
-            drop(rs);
-            drop(_ts);
         }
         drop(session);
         drop(server_ep_for_task);

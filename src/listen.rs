@@ -647,6 +647,25 @@ async fn handle_quic_peer_supervisor(
         addr,
     ));
 
+    // **键盘不通修复**：spawn accept_bi 循环，接收 client 端 stream B 的帧。
+    //
+    // **背景**：默认 `InputChannelConfig { keyboard: Stream }` 把所有按键
+    // 事件路由到 `Channel::StreamB` → `PeerSession::send_stream_b`，走的是
+    // 一条**独立于 hello stream A 之外**的 bidi。但修前本 supervisor 只读
+    // 缓存的 recv_a + datagram —— 从不 `accept_bi()`，那条 stream B 永远
+    // 堆在 quinn 的 accept 队列里没人消费，按键静默丢光。这就是"鼠标能动
+    // （走 datagram，有 Bug #8 的 reader）但键盘完全不通"的直接原因。
+    //
+    // **为什么是 accept 循环而不是只 accept 一次**：发送端虽然已改成缓存
+    // 单条 stream B（见 `session.rs::cached_send_b`），但写失败时会弃掉旧
+    // 流重开一条；`send_stream_a` 的 fallback 分支也可能开新 bidi。循环
+    // accept + per-stream reader task 对两种情形都兼容。
+    spawn_local(server_accept_bi_task(
+        peer.clone(),
+        listen_tx.clone(),
+        addr,
+    ));
+
     // (6) 循环 read_frame(recv_a) → ListenEvent::Msg
     //
     // 错误分流（与 bak `read_stream_a_loop` 对齐）：
@@ -729,6 +748,74 @@ impl Drop for QuicConnGuard {
         }
         // removed == None：peer 从未被注册（Accept event 之前早退），
         // 或已被 wake 路径覆盖（不可能，单线程）；静默 no-op。
+    }
+}
+
+/// **键盘不通修复**：server 侧 `accept_bi()` 循环 —— 接收 client 端在
+/// stream A / datagram 之外新开的 bidi（当前唯一来源是 stream B 的按键
+/// 事件流），每条流交给一个独立的 frame reader task。
+///
+/// 与 [`server_datagram_reader_task`] 对称：解出的 `ProtoEvent` 同样包成
+/// `ListenEvent::Msg { event, addr }` 推 `listen_tx`，由 emulation.rs 的
+/// ListenTask 分派到本地 emulation。**不**走 `route_input` 反向分派 ——
+/// receiver 端不感知发送端 cfg（PLAN §3.1.4），物理通道到事件的转译就够了。
+///
+/// **生命周期**：`accept_bi()` 在 conn 关闭时返 Err → 本 task 退出；已
+/// spawn 的子 reader task 各自在流 EOF / conn 关闭时退出。
+async fn server_accept_bi_task(
+    peer: Rc<PeerSession>,
+    listen_tx: Sender<ListenEvent>,
+    addr: SocketAddr,
+) {
+    loop {
+        match peer.connection().accept_bi().await {
+            Ok((send, recv)) => {
+                // send 半边不用（stream B 是单向数据流：client 写、server 读）
+                drop(send);
+                log::debug!("server accept_bi: 接到来自 {addr} 的新 stream，启动 reader");
+                spawn_local(server_stream_reader_task(recv, listen_tx.clone(), addr));
+            }
+            Err(e) => {
+                log::info!("server accept_bi: 退出（conn 关闭）: {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// 单条 accepted stream 的帧读循环（[`server_accept_bi_task`] 的子 task）。
+///
+/// 错误分流与 `handle_quic_peer_supervisor` 的 stream A 循环一致：
+/// `FrameTooLarge` / decode 错误 → skip frame 续读（单帧损坏不致命，
+/// 丢一个按键好过整条流断掉）；`Truncated` / IO 错误 → 流结束，退出。
+///
+/// **为何 FrameTooLarge 这里不 fatal**：stream A 上它意味着控制面协议
+/// 失同步（必须关连）；stream B 上只是一帧输入事件坏了，下一帧仍可能
+/// 正常 —— 但长度前缀已读错会导致后续帧边界全乱，所以仍然退出该流，
+/// 由发送端的写失败重开新流恢复（见 `session.rs::send_stream_b`）。
+async fn server_stream_reader_task(
+    mut recv: quinn::RecvStream,
+    listen_tx: Sender<ListenEvent>,
+    addr: SocketAddr,
+) {
+    loop {
+        match quic_transport::read_frame(&mut recv).await {
+            Ok(event) => {
+                log::debug!("server stream reader: from {addr}: {event}");
+                if listen_tx.send(ListenEvent::Msg { event, addr }).is_err() {
+                    log::debug!("server stream reader: listen_tx closed, exiting");
+                    return;
+                }
+            }
+            Err(quic_transport::Error::HelloFailed(msg)) if msg.starts_with("decode frame") => {
+                log::warn!("server stream reader: skip frame (decode error): {msg}");
+                continue;
+            }
+            Err(e) => {
+                log::info!("server stream reader: 流结束（{addr}）: {e}");
+                return;
+            }
+        }
     }
 }
 

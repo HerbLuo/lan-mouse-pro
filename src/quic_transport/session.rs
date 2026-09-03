@@ -86,6 +86,27 @@ pub struct PeerSession {
     /// 的同一 `StreamPair`）—— client 写 send_a ↔ server 读 recv_a 是
     /// **同一条 bidi**。
     pub(crate) cached_send_a: Mutex<Option<SendStream>>,
+    /// **键盘不通修复**：stream B（input 流）的 send 半边缓存 —— 与
+    /// [`Self::cached_send_a`] 同模式。
+    ///
+    /// **背景**：修前 [`Self::send_stream_b`] **每帧 `open_bi()` 开一条新
+    /// bidi**，而 server 端 `listen.rs::handle_quic_peer_supervisor` 只读
+    /// hello 缓存的 stream A recv + datagram，**没有 `accept_bi()` 循环**
+    /// —— 每条新开的 stream B 都堆在 quinn 的 accept 队列里没人消费。
+    /// 默认 `InputChannelConfig { keyboard: Stream }` 让所有按键走这条
+    /// 路，于是"鼠标通、键盘不通"：Motion/Button/Axis 走 datagram 有
+    /// reader，按键走 stream B 全丢。发送端 `send_stream_b` 还返 `Ok(())`
+    /// （quinn 缓冲小写入），日志里看不出错。
+    ///
+    /// **修法（发送端半边）**：首次调用 `open_bi()` 拿一条 bidi，send 半
+    /// 边存本字段长期复用，后续每次只 `write_frame` 不 `finish` ——
+    /// 整个 peer 生命周期只有**一条** stream B。接收端只需一次
+    /// `accept_bi()` 就能拿到它并持续读（见 `listen.rs::
+    /// server_stream_reader_task`）。
+    ///
+    /// **写失败即失效**：任何 write 错误都把本字段置回 `None`，下次调用
+    /// 重开一条（对端仍会通过 accept_bi 循环接到新流）。
+    pub(crate) cached_send_b: Mutex<Option<SendStream>>,
     /// **STEP-8.2 修复 — Bug #7**：可选的 stream A 事件出向 channel。
     ///
     /// **背景**：peer.run 主循环从 stream A 读 control 事件（Ack /
@@ -239,6 +260,9 @@ impl PeerSession {
             // release capture、不 inject input，用户看到"连上了但键
             // 鼠不通"。
             cached_send_a: Mutex::new(None),
+            // 键盘不通修复：stream B send 半边缓存，首次 send_stream_b
+            // 时惰性 open_bi 填充（详见字段 docstring）。
+            cached_send_b: Mutex::new(None),
             // STEP-8.2 修复 — Bug #7：stream A 事件出向 channel
             // 初始 None；client 端 connect_to_handle 在 spawn peer.run
             // 之前调 `set_outgoing_events` 设上。详见字段 docstring。
@@ -465,53 +489,46 @@ impl PeerSession {
     /// STEP-6.1 升级为 `pub`：供 [`Self::send_input`] 在 `Channel::StreamB`
     /// 分派时直接消费（不经过 datagram 试探）。
     pub async fn send_stream_b(&self, bytes: &[u8]) -> super::Result<()> {
-        // NOTE：STEP-5.2 临时借用 `stream_a_cache` 字段作为 stream B 的
-        // 缓存位置（两半边 take 模式一致）。STEP-5.3 read_loop 接入时整
-        // 体重构：`stream_b` / `stream_c` 各自独立缓存，最终合并到
-        // `PeerSession.stream_bunch: Arc<Mutex<Option<StreamBunch>>>`。
-        // —— 本步范围严格守住 PLAN §5.2 文字"Bidi / StreamBunch 类型 +
-        // write_frame / read_frame codec + 单测"。
-        let guard = self.stream_a_cache.lock().await;
-        // 当前 STEP-5.2 仅用作降级路径 —— cache 实际存的是 stream B 的
-        // send 半边（HELLO 完成后 stream A 已被 server_hello / client_hello
-        // 缓存，**会**与本缓存冲突 —— 见下方临时方案说明）。
+        // **键盘不通修复**：复用缓存的 stream B send 半边，**不**再每帧
+        // `open_bi()` 开新流。详见 [`Self::cached_send_b`] 字段 docstring
+        // —— 修前每个按键都开一条新 bidi，而 server 端 supervisor 没有
+        // `accept_bi()` 循环，这些流全部堆在 accept 队列里没人读。
         //
-        // **临时方案**（STEP-5.2）：本步**不**引入独立 `stream_b_cache`
-        // 字段（避免 PeerSession 字段碎片化），而是用一个**单独的**
-        // `Mutex<Option<StreamPair>>` 路径 —— 直接调 `conn.open_bi()`
-        // 拿新 stream，**不缓存**（每次都新建一条）；STEP-5.3 才引入
-        // 真正 `stream_b: Mutex<Option<StreamPair>>` 字段做 cache。
-        // 这与 bak的"cache 命中复用 / 未命中 open_bi"语义略不同
-        // （bak Step 1.9a 就已经有 cache），但 M1 范围不影响功能
-        // —— datagram 失败后多次降级写，每条 stream 都独立；接收端
-        // `read_frame` 每次都解一帧，**不**要求 stream 复用。
-        //
-        // 实际实现：直接 open_bi + write 长度前缀帧，不存 cache（透传
-        // 完成即释放 SendStream 半边；RecvStream 半边随 drop 关闭——本步
-        // 接收端 STEP-5.3 才接管 stream B reader，本步测试不需要 reader）。
-        drop(guard);
-
+        // **持锁 await 设计**：与 [`Self::send_stream_a`] 一致 ——
+        // `send_stream_b` 是 stream B 的唯一写路径，持锁期间并发 caller
+        // 排队串行，避免两帧字节交错破坏帧边界。
         use tokio::io::AsyncWriteExt;
-        let pair = self
-            .conn
-            .open_bi()
-            .await
-            .map_err(|e| super::Error::StreamB(format!("open_bi: {e}")))?;
-        let mut send = pair.0;
-        // recv 半边 drop 即可（释放反向读能力，对端 STEP-5.3 不会读这
-        // 条临时 stream —— 每条 stream 只写一帧）
-        drop(pair.1);
 
-        // 长度前缀帧：写 u32 BE len + body
-        send.write_u32(bytes.len() as u32)
-            .await
-            .map_err(|e| super::Error::StreamB(format!("write frame length: {e}")))?;
-        send.write_all(bytes)
-            .await
-            .map_err(|e| super::Error::StreamB(format!("write frame body: {e}")))?;
-        send.finish()
-            .map_err(|e| super::Error::StreamB(format!("finish: {e}")))?;
-        Ok(())
+        let mut g = self.cached_send_b.lock().await;
+        if g.is_none() {
+            let (send, recv) = self
+                .conn
+                .open_bi()
+                .await
+                .map_err(|e| super::Error::StreamB(format!("open_bi: {e}")))?;
+            // recv 半边 drop —— stream B 是单向数据流（本端写、对端读），
+            // 反向读能力不需要。
+            drop(recv);
+            *g = Some(send);
+            log::debug!("send_stream_b: 新建并缓存 stream B（后续帧复用同一条）");
+        }
+
+        // 写失败时把 cache 置回 None，下次调用重开一条（对端 accept_bi
+        // 循环会接到新流）—— 避免一次瞬时错误让 stream B 永久失效。
+        let result = {
+            let send = g.as_mut().expect("cached_send_b 刚填充");
+            match send.write_u32(bytes.len() as u32).await {
+                Err(e) => Err(super::Error::StreamB(format!("write frame length: {e}"))),
+                Ok(()) => send
+                    .write_all(bytes)
+                    .await
+                    .map_err(|e| super::Error::StreamB(format!("write frame body: {e}"))),
+            }
+        };
+        if result.is_err() {
+            *g = None;
+        }
+        result
     }
 
     /// 通道分发入口（STEP-6.1 引入）—— 按 per-handle [`InputChannelConfig`]
