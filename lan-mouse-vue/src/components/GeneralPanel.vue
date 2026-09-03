@@ -188,8 +188,8 @@ async function copy(text: string, label = 'copied') {
     <div style="margin-top: 14px">
       <div>
         <div class="muted card-title">Certificate fingerprint (sha256)</div>
-        <div style="display: flex; align-items: center; margin: 0 12px">
-          <div class="mono em1" style="word-break: break-all; color: var(--fg-default)">
+        <div style="display: flex; align-items: center; margin: 0 12px; gap: 8px">
+          <div class="mono em1" style="word-break: break-all; color: var(--fg-default);">
             {{ daemonStore.fingerprint || '—' }}
           </div>
           <button

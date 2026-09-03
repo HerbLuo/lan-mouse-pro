@@ -1,4 +1,5 @@
 import './styles/main.css'
+import './styles/tooltip.css'
 
 import { createApp } from 'vue'
 import App from './App.vue'

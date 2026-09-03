@@ -6,7 +6,7 @@ import ConnectionRow from '@/components/ConnectionRow.vue'
 
 <template>
   <div class="card">
-    <div class="section-header-row">
+    <div>
       <button class="primary" @click="addClient">
         <IconPlus />
         Add

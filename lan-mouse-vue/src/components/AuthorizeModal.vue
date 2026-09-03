@@ -77,25 +77,25 @@ function cancelPending() {
       </p>
 
       <label style="display: block; margin-bottom: 12px">
-        <span style="font-size: 12px; color: var(--fg-muted)">description</span>
+        <span style="font-size: 12px; color: var(--fg-muted)">Description</span>
         <input
           v-if="pendingFp"
           v-model="pendingDesc"
           type="text"
-          placeholder="my desktop, dad's laptop, …"
+          placeholder="My desktop, dad's laptop, …"
           style="margin-top: 4px"
         />
         <input
           v-else
           v-model="newAuthDesc"
           type="text"
-          placeholder="my desktop, dad's laptop, …"
+          placeholder="My desktop, dad's laptop, …"
           style="margin-top: 4px"
         />
       </label>
 
       <label style="display: block; margin-bottom: 16px">
-        <span style="font-size: 12px; color: var(--fg-muted)">sha256 fingerprint</span>
+        <span style="font-size: 12px; color: var(--fg-muted)">Sha256 fingerprint</span>
         <input
           v-if="pendingFp"
           v-model="pendingFp"
@@ -151,5 +151,11 @@ function cancelPending() {
   padding: 20px 24px;
   width: min(420px, 92vw);
   box-shadow: var(--shadow);
+}
+label {
+  display: flex;
+}
+label input {
+  width: 100%;
 }
 </style>

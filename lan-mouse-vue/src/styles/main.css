@@ -4,8 +4,6 @@
   --border: 1px solid #aaa;
   --error: #ff6b6b;
   --shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-  --radius: 4px;
-  --radius-sm: 2px;
   font-family:
     -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, 'Helvetica Neue',
     sans-serif;
@@ -86,9 +84,7 @@ select:focus {
 button {
   appearance: none;
   border: 1px solid #4a4a55;
-  background: #414141;
-  color: var(--fg-default);
-  border-radius: var(--radius);
+  border-radius: 2px;
   padding: 8px 14px;
   font-size: 14px;
   font-family: inherit;
@@ -97,26 +93,19 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  background: #515151;
+  color: #cecece;
+  border-color: #ababab;
+  font-weight: 600;
 }
 
 button:hover {
-  background: #3a3a44;
-  border-color: var(--fg-muted);
+  background: #636363;
 }
 
 button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
-}
-
-button.primary {
-  background: #636363;
-  color: #cecece;
-  border-color: #ababab;
-  font-weight: 600;
-}
-w button.primary:hover {
-  background: #ffb56b;
 }
 
 button.ghost {

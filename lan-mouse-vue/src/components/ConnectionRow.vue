@@ -26,10 +26,10 @@ function setChannel(key: 'mouse_button' | 'keyboard', ev: Event) {
 </script>
 
 <template>
-  <div style="margin-top: 16px" :class="{ 'is-active': connection.state.active }">
-    <div style="display: flex; justify-content: space-between">
+  <div class="row">
+    <div :class="{ summary: true, expand: connection.expanded }">
       <div style="display: flex; justify-content: flex-start">
-        <label class="connection-toggle" style="margin-right: 12px;">
+        <label class="connection-toggle" style="margin-right: 12px">
           <input
             type="checkbox"
             :checked="connection.state.active"
@@ -63,7 +63,7 @@ function setChannel(key: 'mouse_button' | 'keyboard', ev: Event) {
         </div>
       </div>
 
-      <div>
+      <div style="display: flex; align-items: center">
         <button class="icon ghost" @click="resolveDns(connection.handle)" :title="'re-resolve DNS'">
           <IconRefresh />
         </button>
@@ -87,83 +87,136 @@ function setChannel(key: 'mouse_button' | 'keyboard', ev: Event) {
     </div>
 
     <div v-if="connection.expanded" class="connection-body">
-      <label>
-        <span class="lbl">hostname</span>
-        <input
-          type="text"
-          :value="connection.config.hostname ?? ''"
-          @change="
-            setField({
-              hostname: ($event.target as HTMLInputElement).value,
-            })
-          "
-          placeholder="192.168.1.x or my-laptop"
-        />
-      </label>
-      <label>
-        <span class="lbl">port</span>
-        <input
-          type="number"
-          :value="connection.config.port"
-          @change="
-            setField({
-              port: Number(($event.target as HTMLInputElement).value),
-            })
-          "
-          placeholder="4242"
-        />
-      </label>
-      <label>
-        <span class="lbl">position</span>
-        <select
-          :value="connection.config.pos"
-          @change="
-            setField({
-              pos: ($event.target as HTMLSelectElement).value as Position,
-            })
-          "
-        >
-          <option value="left">Left</option>
-          <option value="right">Right</option>
-          <option value="top">Top</option>
-          <option value="bottom">Bottom</option>
-        </select>
-      </label>
-      <label class="full">
-        <span class="lbl">mouse button channel</span>
-        <select
-          :value="connection.config.input_channels.mouse_button"
-          @change="setChannel('mouse_button', $event)"
-        >
-          <option value="datagram">Datagram (real-time)</option>
-          <option value="stream">Stream (reliable)</option>
-        </select>
-        <span class="desc"
-          >Datagram is lowest-latency and may drop clicks on a flaky link; Stream is reliable but
-          may add head-of-line delay.</span
-        >
-      </label>
-      <label class="full">
-        <span class="lbl">keyboard channel</span>
-        <select
-          :value="connection.config.input_channels.keyboard"
-          @change="setChannel('keyboard', $event)"
-        >
-          <option value="stream">Stream (reliable)</option>
-          <option value="datagram">Datagram (real-time)</option>
-        </select>
-        <span class="desc"
-          >Stream is reliable (no dropped keys); Datagram is the game-friendly low-latency choice if
-          you tolerate occasional lost keystrokes.</span
-        >
-      </label>
+      <div>
+        <label>
+          <span class="lbl">Hostname</span>
+          <input
+            type="text"
+            :value="connection.config.hostname ?? ''"
+            @change="
+              setField({
+                hostname: ($event.target as HTMLInputElement).value,
+              })
+            "
+            placeholder="192.168.1.x or my-laptop"
+          />
+        </label>
+        <label>
+          <span class="lbl">Port</span>
+          <input
+            type="number"
+            :value="connection.config.port"
+            @change="
+              setField({
+                port: Number(($event.target as HTMLInputElement).value),
+              })
+            "
+            placeholder="4242"
+          />
+        </label>
+        <label>
+          <span class="lbl">Position</span>
+          <select
+            :value="connection.config.pos"
+            @change="
+              setField({
+                pos: ($event.target as HTMLSelectElement).value as Position,
+              })
+            "
+          >
+            <option value="left">Left</option>
+            <option value="right">Right</option>
+            <option value="top">Top</option>
+            <option value="bottom">Bottom</option>
+          </select>
+        </label>
+        <label class="full">
+          <span class="lbl">Mouse button channel</span>
+          <select
+            :value="connection.config.input_channels.mouse_button"
+            @change="setChannel('mouse_button', $event)"
+          >
+            <option value="datagram">Datagram (real-time)</option>
+            <option value="stream">Stream (reliable)</option>
+          </select>
+          <span
+            class="desc"
+            tooltip="Datagram is lowest-latency and may drop clicks on a flaky link; Stream is reliable but may add head-of-line delay."
+            >?</span
+          >
+        </label>
+        <label class="full">
+          <span class="lbl">Keyboard channel</span>
+          <select
+            :value="connection.config.input_channels.keyboard"
+            @change="setChannel('keyboard', $event)"
+          >
+            <option value="stream">Stream (reliable)</option>
+            <option value="datagram">Datagram (real-time)</option>
+          </select>
+          <span
+            class="desc"
+            tooltip="Stream is reliable (no dropped keys); Datagram is the game-friendly low-latency choice if you tolerate occasional lost keystrokes."
+            >?</span
+          >
+        </label>
+      </div>
       <div class="row-actions">
         <button class="danger" @click="deleteClient(connection.handle)">
           <IconTrash />
-          delete this client
+          Delete
         </button>
       </div>
     </div>
   </div>
 </template>
-<style scoped></style>
+<style scoped>
+.row {
+  margin-top: 16px;
+  border: var(--border);
+  border-radius: 2px;
+  padding: 12px;
+}
+.summary {
+  display: flex;
+  justify-content: space-between;
+}
+.expand {
+  border-bottom: var(--border);
+  padding-bottom: 12px;
+}
+.connection-body {
+  display: flex;
+  padding: 12px;
+}
+.connection-body-left {
+  display: flex;
+  flex-direction: column;
+}
+.connection-body label {
+  margin-bottom: 6px;
+}
+.connection-body label .lbl {
+  display: inline-block;
+  margin-right: 6px;
+  width: 200px;
+}
+.row-actions {
+  display: flex;
+  align-items: center;
+}
+.row-actions button {
+  height: 66px;
+}
+.desc {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  font-size: 12px;
+  width: 14px;
+  height: 14px;
+  margin-left: 6px;
+  border-radius: 50%;
+  border: 1px solid var(--fg-default);
+}
+</style>
