@@ -319,62 +319,42 @@ fn get_events(
             })));
         }
         CGEventType::FlagsChanged => {
-            let cg_flags = ev.get_flags();
-            let prev = *modifier_state;
-            let mut new = XMods::empty();
+            let mut depressed = XMods::empty();
             let mut mods_locked = XMods::empty();
+            let cg_flags = ev.get_flags();
 
             if cg_flags.contains(CGEventFlags::CGEventFlagShift) {
-                new |= XMods::ShiftMask;
+                depressed |= XMods::ShiftMask;
             }
             if cg_flags.contains(CGEventFlags::CGEventFlagControl) {
-                new |= XMods::ControlMask;
+                depressed |= XMods::ControlMask;
             }
             if cg_flags.contains(CGEventFlags::CGEventFlagAlternate) {
-                new |= XMods::Mod1Mask;
+                depressed |= XMods::Mod1Mask;
             }
             if cg_flags.contains(CGEventFlags::CGEventFlagCommand) {
-                new |= XMods::Mod4Mask;
+                depressed |= XMods::Mod4Mask;
             }
             if cg_flags.contains(CGEventFlags::CGEventFlagAlphaShift) {
-                new |= XMods::LockMask;
+                depressed |= XMods::LockMask;
                 mods_locked |= XMods::LockMask;
             }
 
-            // **直接基于 CGEventFlags 推每个 modifier 的按键事件**，
-            // 绕过 map_key：keycode crate 在某些 macOS 版本 / 键盘布局下
-            // 可能映射失败（KVM、第三方键盘、或干脆没映射），导致
-            // release_bind 检测不到。CGEventFlags 由 Quartz 直接给出，
-            // 永远可靠。
-            //
-            // 旧逻辑（仅靠 map_key 推一次按键事件）的隐患：
-            // 1. `map_key` 失败 → 按键事件不推 → pressed_keys 缺这个
-            //    modifier → release_bind 永远不触发
-            // 2. `state = if depressed > *modifier_state { 1 } else { 0 }`
-            //    在 depressed == modifier_state 时错误地发"释放"事件，
-            //    把已经按下的 modifier 从 pressed_keys 移除
-            const MODIFIER_KEYS: &[(XMods, scancode::Linux)] = &[
-                (XMods::ShiftMask, scancode::Linux::KeyLeftShift),
-                (XMods::ControlMask, scancode::Linux::KeyLeftCtrl),
-                (XMods::Mod1Mask, scancode::Linux::KeyLeftAlt),
-                (XMods::Mod4Mask, scancode::Linux::KeyLeftMeta),
-            ];
-            for (mask, sc) in MODIFIER_KEYS {
-                let was_pressed = prev.contains(*mask);
-                let now_pressed = new.contains(*mask);
-                if was_pressed != now_pressed {
-                    result.push(CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
-                        time: 0,
-                        key: *sc as u32,
-                        state: if now_pressed { 1 } else { 0 },
-                    })));
-                }
+            // check if pressed or released
+            let state = if depressed > *modifier_state { 1 } else { 0 };
+            *modifier_state = depressed;
+
+            if let Ok(key) = map_key(ev) {
+                let key_event = CaptureEvent::Input(Event::Keyboard(KeyboardEvent::Key {
+                    time: 0,
+                    key,
+                    state,
+                }));
+                result.push(key_event);
             }
 
-            *modifier_state = new;
-
             let modifier_event = KeyboardEvent::Modifiers {
-                depressed: new.bits(),
+                depressed: depressed.bits(),
                 latched: 0,
                 locked: mods_locked.bits(),
                 group: 0,

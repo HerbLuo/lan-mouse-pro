@@ -462,16 +462,35 @@ impl CaptureTask {
             return self.release_capture(capture).await;
         }
 
-        // 通知 service 层有 hook 事件。CaptureBegin 对 Begin 也发（旧逻辑），
-        // 对 BeginPending 不发（还没真捕获）。
-        if event == CaptureEvent::Begin {
-            self.event_tx
-                .send(ICaptureEvent::CaptureBegin(handle))
-                .expect("channel closed");
-        }
-
         // enter only capture (for incoming connections)
+        //
+        // **Pending-capture 兼容（bc5507f 修复 #2）**：commit `bc5507f` 让
+        // Windows / macOS 后端对所有 client 统一走 pending-capture 握手，
+        // 边沿跨越一律发 `BeginPending` + 设 `PENDING_CLIENT`，由主线程
+        // 等对端 Ack 后调 `start_capture` 提升到 active 才发 `Begin`。
+        //
+        // **问题**：EnterOnly 是单向 trigger（不发 Enter，只让 service 给
+        // 对端发 Leave），根本不会进入 `State::Pending` 也不会等 Ack，所以
+        // 后端对它也只发 `BeginPending`、永远不会发 `Begin`。原"event==
+        // Begin 才发 CaptureBegin"的逻辑对 EnterOnly 永远漏报 → service
+        // 收不到 trigger 信号 → emulation.send_leave_event 不被调 → 对端
+        // 收不到 `ProtoEvent::Leave(0)` → 主控端 capture 永远不释放 →
+        // 鼠标卡在被控端回不到主机（即用户报的 BUG）。
+        //
+        // **修复**：对 EnterOnly capture，Begin 和 BeginPending 都当 trigger
+        // 处理，都向上层发 `CaptureBegin`（service 用来调 send_leave_event）。
+        // 不改变 EnterOnly 的语义（不真正捕获光标、不发 Enter、不进入
+        // State::Pending），只让 trigger 信号正确到达 service 层。
         if self.get_type(handle) == CaptureType::EnterOnly {
+            if event == CaptureEvent::Begin || event == CaptureEvent::BeginPending {
+                log::info!(
+                    "capture: EnterOnly trigger on {handle:?} (event={event:?}) \
+                     — forwarding to service as CaptureBegin"
+                );
+                self.event_tx
+                    .send(ICaptureEvent::CaptureBegin(handle))
+                    .expect("channel closed");
+            }
             // if there is no active outgoing connection at the current capture,
             // we release the capture
             if !self.is_default_capture_at(self.get_pos(handle)) {
@@ -480,6 +499,15 @@ impl CaptureTask {
             }
             // we dont care about events from incoming handles except for releasing the capture
             return Ok(());
+        }
+
+        // 通知 service 层有 hook 事件。CaptureBegin 对 Begin 发（libei /
+        // 其他异步后端的"立即进入捕获"路径），对 BeginPending 不发（pending
+        // 路径在 `match` 分支里走自己的握手，不在这里 trigger）。
+        if event == CaptureEvent::Begin {
+            self.event_tx
+                .send(ICaptureEvent::CaptureBegin(handle))
+                .expect("channel closed");
         }
 
         // ── 按 event 变体分支 ──────────────────────────────────────────────
