@@ -63,3 +63,6 @@ Run from repo root—no `cd` in scripts.
 2. Implement minimal change; flag follow-up work.
 3. Add proportional tests; run `cargo test` on affected crates.
 4. Run `cargo fmt` and `cargo clippy --workspace --all-targets --all-features`.
+
+## Notes
+Please use English for project annotations.

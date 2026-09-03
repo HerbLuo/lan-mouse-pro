@@ -1,4 +1,4 @@
-### 14.3 首次连接应自动弹窗接受指纹（功能缺失）
+### 首次连接应自动弹窗接受指纹（功能缺失）
 
 **现状**：首次连接对端时，需要用户**手动**在 `~/.config/lan-mouse/config.toml`
 的 `[authorized_fingerprints]` 段加对方 cert fingerprint，否则 mTLS 拒握 +

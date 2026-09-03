@@ -1,29 +1,19 @@
-# Mousehop QUIC 迁移与扩展路线图（v4 定稿）
+# Mousehop QUIC 迁移与扩展路线图
 
-> 范围：把现有基于 `webrtc-dtls + UDP` 的传输替换为 QUIC，并在此之上引入剪贴板图片、大文本与"复制文件"的跨设备同步
-> 状态：**定稿**（v4 终稿，含 Phase0 / Phase 1 / Phase 2 全部步骤 + §11 项目控制纪律；）
-
-### 修订记录
-
-按 §11.3「PLAN-v4 只在决议级变化时更新」，每次改动在此登记。
-
-| 日期       | 决议级变更                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | 触发                           |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
-| 2026-08-29 | ① Phase 0 增补 **Step 0.1 实测结论 A–E**，并回写到 Step 1.1 / 1.4a / 1.7 / 1.8b / 2.1 / 2.5a / §5：crypto provider 改用 `ring`、`h3` 精确锁 `=0.0.8`、沿用 `spawn_local` 不换并发模型、h3 生命周期约束、`max_datagram_size()` 不可缓存<br>② **1.15c 与 1.15d 合并**——原 1.15c 的"预期结果"是编译失败，违反 §11.1 闸 1<br>③ 删除**重复的旧 Step 2.13** 与 2.8b / 2.9b 之后两段**无标题的孤儿正文**（原 2.9 / 2.10 残留），其中独有内容已并入 2.13a / 2.9a<br>④ 修复**依赖编号断链**：1.5c→1.5a（原指向不存在的 1.5b）、1.10a / 1.11 / 1.14→1.10b/c（原指向已拆掉的 1.10）、1.9b 标注实施顺序先于文档顺序 | Step 0.1 执行 + 执行前通读评审 |
+> 范围：把现有基于 `webrtc-dtls + UDP` 的传输替换为 QUIC，并在此之上引入文本、大文本、剪贴板图片、与"复制文件"的跨设备同步
+> 状态：**定稿**
 
 ---
 
 ## 1. 背景与动机
 
-当前实现（参考 `mousehop/src/connect.rs` 与 `listen.rs`）存在以下局限：
+当前实现（参考 `src/connect.rs` 与 `listen.rs`）存在以下局限：
 
-| 问题                  | 触发场景                   | 后果                                                   |
-| --------------------- | -------------------------- | ------------------------------------------------------ |
-| 应用层无 ACK/重传     | 任何 UDP 丢包              | 按键、Enter/Leave、剪贴板丢失（`capture.rs:834` 自承） |
-| 8 秒 idle 即断        | 对端静默（暂停、GC、休眠） | 鼠标卡顿数秒                                           |
-| Wi-Fi 切换掉线        | 物理接口变更               | DTLS 4-tuple 失效，需重拨                              |
-| 剪贴板硬上限 4 KiB    | 想复制截图 / 大段文本      | 编码层直接拒绝                                         |
-| 没有剪贴板图片 / 文件 | 跨设备粘图、复制文件       | 完全没有协议机制                                       |
+| 问题                  | 触发场景           | 后果                       |
+| --------------------- | ------------------ | -------------------------- |
+| 应用层无 ACK / 重传   | UDP 丢包           | 按键、Enter/Leave 丢失     |
+| 2 s idle 即断         | 对端暂停、GC、休眠 | 鼠标卡顿数秒               |
+| 大文件 / 图片没有通道 | -                  | 传大文件会导致鼠标卡顿数秒 |
 
 QUIC 对应能力：
 
@@ -78,9 +68,9 @@ QUIC 对应能力：
 > | ---------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
 > | **A — control**        | bidi | `Hello` / `Enter` / `Leave` / `Ack` / `Ping` / `Pong` / `Bounds` / `CursorPos` / `MotionAbsolute` / `ReceiverSensitivity` | 低频，与字节流解耦                  |
 > | **B — input**          | bidi | `KeyboardKey` / `KeyboardModifiers` / `Button`（当对应配置选 Stream 模式时）                                              | 可靠、有序，可能因流控/重传产生延迟 |
-> | **C — clipboard meta** | bidi | `Clipboard { content ≤ 4 KiB }` / `ClipboardText` / `ClipboardImage` / `ClipboardFiles`                                   | 元数据，不背字节                    |
+> | **C — clipboard meta** | bidi | `Clipboard { content ≤ 1 KiB }` / `ClipboardText` / `ClipboardImage` / `ClipboardFiles`                                   | 元数据，不背字节                    |
 >
-> 字节（图片 / 大文本 / 文件）**永远**走 HTTP/3 GET。`MousehopConnection::send()` 按本表分派；A/B/C 在连接建立时各开 1 条，长生命周期复用。
+> 字节（图片 / 大文本 / 文件）**永远**走 HTTP/3 GET。`LanMouseConnection::send()` 按本表分派；A/B/C 在连接建立时各开 1 条，长生命周期复用。
 
 | ProtoEvent                                                  | 通道（默认）               | 通道（per-handle 可配）                     | 理由                                                   |
 | ----------------------------------------------------------- | -------------------------- | ------------------------------------------- | ------------------------------------------------------ |
@@ -95,18 +85,18 @@ QUIC 对应能力：
 | `Ping` / `Pong`                                             | Stream A（control）        | （恒定）                                    | 低频必到                                               |
 | `Bounds` / `CursorPos` / `MotionAbsolute`                   | Stream A（control）        | （恒定）                                    | 建立期                                                 |
 | `ReceiverSensitivity`                                       | Stream A（control）        | （恒定）                                    | 建立期                                                 |
-| `Clipboard { fingerprint, content }`                        | Stream C（clipboard meta） | （恒定）                                    | **小文本 ≤ 4 KiB** 内联                                |
-| **新** `ClipboardText { fingerprint, sha256, size }`        | Stream C（clipboard meta） | （恒定）                                    | **大文本 > 4 KiB** 只发元数据；字节走 HTTP/3           |
+| `Clipboard { fingerprint, content }`                        | Stream C（clipboard meta） | （恒定）                                    | **小文本 ≤ 1 KiB** 内联                                |
+| **新** `ClipboardText { fingerprint, sha256, size }`        | Stream C（clipboard meta） | （恒定）                                    | **大文本 > 1 KiB** 只发元数据；字节走 HTTP/3           |
 | **新** `ClipboardImage { fingerprint, mime, sha256, size }` | Stream C（clipboard meta） | （恒定）                                    | 只发元数据                                             |
 | **新** `ClipboardFiles { fingerprint, entries }`            | Stream C（clipboard meta） | （恒定）                                    | 只发元数据                                             |
 | HTTP/3 `GET /clipboard/{text,image,file}/{sha256}`          | QUIC stream（请求 / 响应） | （恒定）                                    | 字节永远按需拉取                                       |
 
-> **阈值**：`MAX_CLIPBOARD_SIZE = 4 KiB`，从硬上限改为内联阈值（可配置）。
+> **阈值**：`MAX_CLIPBOARD_SIZE = 1 KiB`，从硬上限改为内联阈值（可配置）。
 > **设计原则**：
 >
 > - 事件体尽量小（几十字节）；字节永远 HTTP/3 GET 拉取
 > - 三个 stream 各自有序，**Stream B 与 Stream C 解耦**：剪贴板大文本 / 文件元数据阻塞 C，**不会**阻塞键鼠
-> - datagram 优先级最高，token bucket 见 Step 1.13
+> - datagram 优先级最高，token bucket
 > - 字段类型：`size` / `Content-Length` 一律 `u64`，不上 `u32`（单文件 > 4 GiB 是现实场景）
 > - 术语：本端抓键鼠的为 **Source**（QUIC client / dial），对端接收并模拟的为 **Target**（QUIC server / accept）
 
