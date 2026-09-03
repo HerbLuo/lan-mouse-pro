@@ -660,22 +660,31 @@ async fn handle_quic_peer_supervisor(
     // 完成后会 `open_bi()` × 3 装配 StreamBunch（见 `session.rs:832-865`），
     // 这 3 条 bidi server 端没有对应的 reader 消费（server 端不跑 peer.run）。
     // 它们的特点是 **被 open 但从未 write** —— 任何 read 都立即 EOF。
-    // 我们的策略：accept → 读第一帧 → EOF 则把这条的 recv **park**（塞进
-    // supervisor 持有的 Vec，不 drop），这样不会向 client 发 STOP_SENDING，
-    // 不会影响 client 端 peer.run 持有的 stream_bunch。当 conn 关闭时
-    // park Vec 随之 drop，所有 parked recvs 一并清理（此时已 conn-closed，
-    // STOP_SENDING 无害）。
+    //
+    // **关键陷阱**：QUIC bidi 是双向的 —— acceptor 的 send 对应 initiator
+    // 的 recv。如果 server 简单地 `drop(send)` bunch bidi，quinn 发 FIN，
+    // client 端 `bunch.b.recv` 立刻看到 EOF → 它的 `read_stream_b_loop`
+    // 退出 → peer.run 主循环 break → `conn.close()` → 连接死。v1/v2
+    // 都踩了这个坑。
+    //
+    // **正确策略**：bunch bidi 的 send 和 recv **都不能 drop**，两者都
+    // park 进 supervisor 持有的 Vec。client 端 `bunch.b.recv` 永远停在
+    // "等数据"状态（不是 EOF），`read_stream_b_loop` 一直 block 直到 conn
+    // 关闭时 quinn 统一清理。真实 stream B 才走正常读路径（drop send
+    // 因为 client 端 `send_stream_b` 已经 drop 了它自己的 recv，server
+    // 的 send 对端没人读，drop 无副作用）。
     //
     // **真实 stream B 怎么识别**：client `send_stream_b` 第一次被调时
     // `open_bi()` + `write_u32(len)` + `write_all(body)` 同步完成才返回
     // —— server accept 时数据已在 quinn buffer 里，read_u32 立即返回
     // 合法长度。这就是"有数据 vs 无数据"的可靠区分信号。
-    let parked_recvs: Rc<RefCell<Vec<quinn::RecvStream>>> = Rc::new(RefCell::new(Vec::new()));
+    let parked_streams: Rc<RefCell<Vec<(quinn::SendStream, quinn::RecvStream)>>> =
+        Rc::new(RefCell::new(Vec::new()));
     spawn_local(server_accept_bi_task(
         peer.clone(),
         listen_tx.clone(),
         addr,
-        parked_recvs.clone(),
+        parked_streams.clone(),
     ));
 
     // (6) 循环 read_frame(recv_a) → ListenEvent::Msg
@@ -773,18 +782,20 @@ impl Drop for QuicConnGuard {
 /// `read_u32(len)` —— bunch bidi 从未被 write，立即 EOF；真实 stream B
 /// 已被 `send_stream_b` 同步写入首帧，read_u32 立即返回合法长度。
 ///
-/// EOF 时把这条 recv **park** 进 `parked_recvs`（不 drop）—— 避免向
-/// client 发 STOP_SENDING 进而影响 client 端 peer.run 持有的
-/// stream_bunch。parked recvs 在 supervisor 退出时随 `parked_recvs`
-/// 一起 drop（conn 已关，STOP_SENDING 无害）。
+/// **bunch 路径必须 park send+recv 两边**：QUIC bidi 是双向的 —— acceptor
+/// 的 send 对应 initiator 的 recv。如果只 park recv、drop send，quinn
+/// 发 FIN，client 端 `bunch.b.recv` 立即 EOF → `read_stream_b_loop` 退出
+/// → peer.run break → conn.close。两边都 park 才能让 client 端 recv
+/// 一直停在"等数据"状态，直到 conn 关闭统一清理。
 ///
-/// **真实 stream B**：read_u32 拿到合法长度 → `read_exact(body)` → 解码
-/// → 推 `listen_tx` → spawn reader task 继续读后续帧（用 `read_frame`）。
+/// **真实 stream B 路径**：drop send（client 端 `send_stream_b` 已经
+/// drop 了它自己的 recv，server send 的对端没人读，drop 无副作用），
+/// 读 recv。
 async fn server_accept_bi_task(
     peer: Rc<PeerSession>,
     listen_tx: Sender<ListenEvent>,
     addr: SocketAddr,
-    parked_recvs: Rc<RefCell<Vec<quinn::RecvStream>>>,
+    parked_streams: Rc<RefCell<Vec<(quinn::SendStream, quinn::RecvStream)>>>,
 ) {
     loop {
         let (send, mut recv) = match peer.connection().accept_bi().await {
@@ -794,46 +805,50 @@ async fn server_accept_bi_task(
                 return;
             }
         };
-        // send 半边不用（stream B 单向数据流：client 写、server 读）
-        drop(send);
 
         // 试读首帧长度 —— 区分 bunch bidi（EOF）与真实 stream B（合法 u32）
         use tokio::io::AsyncReadExt;
         let len: u32 = match recv.read_u32().await {
             Ok(n) => n,
             Err(e) => {
-                // EOF / IO 错误 = bunch bidi 或 peer 关连。park 让 recv 持
-                // 有直到 supervisor 退出，不向 client 发 STOP_SENDING。
-                log::debug!("server accept_bi: 接到的 stream 立即 EOF/IO 错误，按 bunch 忽略并 park: {e}");
-                parked_recvs.borrow_mut().push(recv);
+                // EOF = bunch bidi（client 从未 write）。**关键**：send
+                // 和 recv **都不能 drop**，否则向 client 发 FIN/STOP_SENDING
+                // → client 端 stream_bunch.b.recv 立即 EOF → peer.run
+                // break → conn.close。两边都 park，让 client 端 recv 永远
+                // 停在"等数据"状态。
+                log::debug!("server accept_bi: 接到的 stream 立即 EOF（bunch bidi），park send+recv: {e}");
+                parked_streams.borrow_mut().push((send, recv));
                 continue;
             }
         };
 
-        // 真实 stream B —— 读 body、解码、首帧推 listen_tx
+        // 真实 stream B —— drop send（对端 client 已 drop 自己的 recv，
+        // server send 无对端读者，drop 无副作用），读 body、解码、首帧
+        // 推 listen_tx
+        drop(send);
         let mut body = vec![0u8; len as usize];
         if let Err(e) = recv.read_exact(&mut body).await {
-            // 长度读到了但 body 读失败 —— 仍按 bunch 行为 park（不破坏 client）
+            // 长度读到了但 body 读失败 —— 也按 bunch 行为 park（不破坏 client）
             log::debug!("server accept_bi: 首帧 body 读失败，按 bunch park: {e}");
-            parked_recvs.borrow_mut().push(recv);
-            continue;
+            // send 已被 drop，这里只 push recv 也要避免 client 端 EOF →
+            // 已经 drop 了 send 就无法挽回，这种情况是协议 bug，让 peer.run
+            // 走原错误路径
+            return;
         }
         let mut buf = [0u8; lan_mouse_proto::MAX_EVENT_SIZE];
         if len as usize > buf.len() {
             log::warn!(
-                "server accept_bi: 首帧长度 {len} 超过 MAX_EVENT_SIZE={}，按 bunch park",
+                "server accept_bi: 首帧长度 {len} 超过 MAX_EVENT_SIZE={}",
                 lan_mouse_proto::MAX_EVENT_SIZE
             );
-            parked_recvs.borrow_mut().push(recv);
-            continue;
+            return;
         }
         buf[..len as usize].copy_from_slice(&body);
         let event = match lan_mouse_proto::ProtoEvent::try_from(buf) {
             Ok(e) => e,
             Err(e) => {
-                log::warn!("server accept_bi: 首帧解码失败，按 bunch park: {e}");
-                parked_recvs.borrow_mut().push(recv);
-                continue;
+                log::warn!("server accept_bi: 首帧解码失败: {e}");
+                return;
             }
         };
         log::debug!("server accept_bi: 真实 stream B 首帧 from {addr}: {event}");
