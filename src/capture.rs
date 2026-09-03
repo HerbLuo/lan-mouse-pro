@@ -543,22 +543,52 @@ impl CaptureTask {
             // 主动 emit Begin（见 event_thread.rs::update_clients 的
             // StartCapture 分支）。
             CaptureEvent::Begin => {
-                if Some(handle) != self.active_client {
-                    log::info!("capture: new client entered (handle={handle:?})");
-                    self.active_client.replace(handle);
-                    self.event_tx
-                        .send(ICaptureEvent::ClientEntered(handle))
-                        .expect("channel closed");
+                // Begin 的两种来源：
+                // 1. **Pending → Active 提升**（Windows / macOS 路径）：
+                //    BeginPending → Enter → Ack → capture.start_capture → 后端
+                //    主动 emit Begin。这种情况下 Enter **已经为 BeginPending
+                //    发过**，这里**不**能再发（重复 Enter 会让对端重复
+                //    ReleaseNotify + add_incoming，状态错乱）。
+                // 2. **libei 异步路径**：compositor 已捕获，backend 第一次
+                //    emit Begin，没有前置 Enter，需要现在发。
+                //
+                // 区分依据：`State::Pending { handle, .. }` 且 handle 匹配
+                // → 路径 1；其他（Idle / Sending）→ 路径 2。
+                match self.state {
+                    State::Pending { handle: pending_h, .. } if pending_h == handle => {
+                        log::info!(
+                            "capture: pending -> active promotion (handle={handle:?}, \
+                             Begin already Entered for BeginPending)"
+                        );
+                        if Some(handle) != self.active_client {
+                            self.active_client.replace(handle);
+                            self.event_tx
+                                .send(ICaptureEvent::ClientEntered(handle))
+                                .expect("channel closed");
+                        }
+                        // **不**发 Enter —— 见上方路径 1 说明。
+                        self.state = State::Sending;
+                        Ok(())
+                    }
+                    _ => {
+                        if Some(handle) != self.active_client {
+                            log::info!("capture: new client entered (handle={handle:?})");
+                            self.active_client.replace(handle);
+                            self.event_tx
+                                .send(ICaptureEvent::ClientEntered(handle))
+                                .expect("channel closed");
+                        }
+                        self.state = State::Sending;
+                        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+                        if let Err(e) = self.conn.send(ProtoEvent::Enter(opposite_pos), handle).await {
+                            const DUR: Duration = Duration::from_millis(500);
+                            debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
+                            log::warn!("releasing capture: send failed: {e}");
+                            capture.release().await?;
+                        }
+                        Ok(())
+                    }
                 }
-                self.state = State::Sending;
-                let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
-                if let Err(e) = self.conn.send(ProtoEvent::Enter(opposite_pos), handle).await {
-                    const DUR: Duration = Duration::from_millis(500);
-                    debounce!(PREV_LOG, DUR, log::warn!("releasing capture: {e}"));
-                    log::warn!("releasing capture: send failed: {e}");
-                    capture.release().await?;
-                }
-                Ok(())
             }
 
             // **普通输入事件**：仅在 Sending 状态转发。Pending / Idle 时
