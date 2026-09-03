@@ -378,8 +378,29 @@ impl CaptureTask {
                                     }
                                 }
                                 _ => {
-                                    log::info!("client {handle} acknowledged the connection!");
-                                    self.state = State::Sending;
+                                    // **补丁（修复 2）**：迟到的 Ack 不再盲目切 Sending。
+                                    //
+                                    // **bug**：Master 端 500ms Pending 超时
+                                    // 取消后（state 已 Idle），Slave 这边才
+                                    // 把 Ack 发到。命中 `_` 分支 → 直接把
+                                    // State::Sending 设回去。后端 OS 层
+                                    // 没激活、`active_client` 是空，结果是
+                                    // State 跟 backend 状态错位 —— 用户感
+                                    // 受为"鼠标抖一下又卡住"。
+                                    //
+                                    // **修法**：只有当本地仍有 `active_client`
+                                    // 时才接受 Ack 进 Sending；否则日志告警
+                                    // + 保持 Idle，让下一轮 BeginPending 自
+                                    // 然覆盖。
+                                    if self.active_client.is_some() {
+                                        log::info!("client {handle} acknowledged the connection!");
+                                        self.state = State::Sending;
+                                    } else {
+                                        log::warn!(
+                                            "client {handle} acknowledged -- but no active_client \
+                                             (stale Ack after timeout, ignoring)"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -726,6 +747,20 @@ impl CaptureTask {
         } else {
             log::info!("release_capture: no active_client, skipping Leave send");
         }
+        // **补丁（修复 1）**：`release_capture` 末尾强制 `state = State::Idle`。
+        //
+        // **bug**：原逻辑 Pending 分支显式置 Idle（行 670），Sending 分支
+        // 只 `active_client.take()` + 发 Leave + 调 `capture.release()`
+        // —— State 字段整次调用下来都不归位。下一次发过来的 motion 落到
+        // `State::Sending` 分支但 `active_client` 已是 None → `conn.send`
+        // 返 NotConnected → 反复 release_capture 但 State 仍未变，UI
+        // 体感"鼠标抖一下又不动了"。
+        //
+        // **修法**：与 Pending 分支对齐 —— 在调 `capture.release()` 之前
+        // 置 Idle，状态机和后端 OS 状态保持一致。
+        log::info!("release_capture: setting state = Idle (force-reset)");
+        self.state = State::Idle;
+
         log::info!("release_capture: calling capture.release() (OS-level release)");
         let res = capture.release().await;
         log::info!("release_capture: capture.release() returned (ok={})", res.is_ok());
