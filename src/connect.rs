@@ -454,6 +454,13 @@ async fn connect_to_handle(
         addrs.len()
     );
 
+    // TOFU pin identity. Stable across restarts and independent of which
+    // candidate address wins the happy-eyeballs race — see
+    // `ClientStore::peer_key`.
+    let peer_key = client_manager
+        .peer_key(handle)
+        .unwrap_or_else(|| format!("client-{handle}"));
+
     let conn = match quic_transport::dial_any(
         &client_endpoint,
         primary,
@@ -461,6 +468,7 @@ async fn connect_to_handle(
         quic_creds.cert_chain[0].clone(),
         quic_creds.key.clone_key(),
         &pins_dir,
+        &peer_key,
     )
     .await
     {

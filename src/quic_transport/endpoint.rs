@@ -279,8 +279,14 @@ pub async fn dial(
     install_crypto_provider();
 
     // `build_quic_client_config` takes `pins_dir` (TofuVerifier replaces
-    // WebPkiServerVerifier; construction is fully owned by `TofuVerifier::new(pins_dir)`).
-    let cfg = tls::build_quic_client_config(vec![cert], key, pins_dir)?;
+    // WebPkiServerVerifier; construction is fully owned by
+    // `TofuVerifier::new(pins_dir, peer_key)`).
+    //
+    // Peer key: a single-address dial *is* addressed by that address, so the
+    // dialed IP is the peer identity here. `dial_any` cannot do this — its
+    // candidate list comes from an unordered set — so it takes an explicit
+    // key from the caller.
+    let cfg = tls::build_quic_client_config(vec![cert], key, pins_dir, &addr.ip().to_string())?;
     let conn = ep.connect_with(cfg, addr, "lan-mouse")?.await?;
     Ok(conn)
 }
@@ -323,11 +329,18 @@ pub async fn dial_any(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
     pins_dir: &Path,
+    peer_key: &str,
 ) -> Result<Connection> {
     install_crypto_provider();
 
     // (1) Construct ClientConfig once, reuse for every dial.
-    let cfg = tls::build_quic_client_config(vec![cert], key, pins_dir)?;
+    //
+    // `peer_key` — not `primary` — identifies the peer for TOFU pinning:
+    // every candidate in `all` is the *same* logical peer, and `primary`
+    // comes from an unordered `HashSet` in `connect.rs`, so it is not stable
+    // across restarts. Pinning against it would re-pair (and write a new pin
+    // file) whenever the set happened to iterate differently.
+    let cfg = tls::build_quic_client_config(vec![cert], key, pins_dir, peer_key)?;
 
     // (2) JoinSet collects (SocketAddr, Result<Connection, Error>).
     let mut joinset: JoinSet<(SocketAddr, Result<Connection>)> = JoinSet::new();
@@ -352,6 +365,12 @@ pub async fn dial_any(
 
     // (4) Primary head-start race: win within 200ms → return immediately;
     //     lose → log warn + wait for timer.
+    //
+    // `last_err` is hoisted to this scope so a head-start failure can be
+    // carried into (6) even when `all` is exactly `[primary]` (no other
+    // candidates are spawned in (5), so (6) would otherwise see an empty
+    // JoinSet and have no error to return).
+    let mut last_err: Option<Error> = None;
     {
         let head_start = tokio::time::sleep(HEAD_START);
         tokio::pin!(head_start);
@@ -371,6 +390,7 @@ pub async fn dial_any(
                         }
                         Err(e) => {
                             log::warn!("dial_any: dial {_addr} failed (during head-start): {e}");
+                            last_err = Some(e);
                         }
                     }
                 }
@@ -399,7 +419,6 @@ pub async fn dial_any(
     }
 
     // (6) wait for any to win
-    let mut last_err: Option<Error> = None;
     while let Some(joined) = joinset.join_next().await {
         let Ok((_addr, res)) = joined else {
             log::warn!("dial_any: JoinSet task panic");
@@ -417,7 +436,14 @@ pub async fn dial_any(
         }
     }
 
-    Err(last_err.expect("JoinSet should join at least one task"))
+    Err(last_err.unwrap_or_else(|| {
+        Error::EndpointSetup(format!(
+            "dial_any: no dial result for primary {primary} ({} candidate(s), {} spawned) — \
+             all tasks panicked or were aborted",
+            all.len(),
+            spawned.len()
+        ))
+    }))
 }
 
 /// The 200ms head-start reserved for the primary in happy-eyeballs
@@ -485,8 +511,8 @@ mod tests {
         install_crypto_provider();
         let (cert_chain, key) = ephemeral_cert();
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into();
-        let ep =
-            endpoint_with_cert(addr, cert_chain, key).expect("endpoint_with_cert bind should not fail");
+        let ep = endpoint_with_cert(addr, cert_chain, key)
+            .expect("endpoint_with_cert bind should not fail");
         let local = ep.local_addr().expect("endpoint must have local_addr");
         assert_ne!(local.port(), 0, "ephly port should be non-zero");
         drop(ep);
@@ -504,10 +530,15 @@ mod tests {
             key,
         )
         .expect("server endpoint bind should not fail");
-        let server_addr = server_ep.local_addr().expect("server ep must have local_addr");
+        let server_addr = server_ep
+            .local_addr()
+            .expect("server ep must have local_addr");
 
         let server_task = tokio::spawn(async move {
-            let incoming = server_ep.accept().await.expect("server accept should not fail");
+            let incoming = server_ep
+                .accept()
+                .await
+                .expect("server accept should not fail");
             let conn = incoming.await.expect("server handshake should not fail");
             drop(conn);
         });
@@ -569,7 +600,10 @@ mod tests {
             .expect("server endpoint must have local_addr");
 
         let server_task = tokio::spawn(async move {
-            let incoming = server_ep.accept().await.expect("server accept should not fail");
+            let incoming = server_ep
+                .accept()
+                .await
+                .expect("server accept should not fail");
             let conn = incoming.await.expect("server handshake should not fail");
             drop(conn);
         });
@@ -645,6 +679,7 @@ mod tests {
                     client_cert[0].clone(),
                     client_key,
                     &pins_dir,
+                    "peer-primary-wins",
                 ),
             )
             .await
@@ -692,6 +727,7 @@ mod tests {
                     client_cert[0].clone(),
                     client_key,
                     &pins_dir,
+                    "peer-all-unreachable",
                 ),
             )
             .await
@@ -703,6 +739,118 @@ mod tests {
             );
 
             drop(client_ep);
+            let _ = std::fs::remove_dir_all(&pins_dir);
+        };
+        tokio::task::LocalSet::new().run_until(fut).await;
+    }
+
+    /// Regression: a single-address `dial_any` whose only candidate fails
+    /// inside the 200ms head-start must return `Err`, **not** panic.
+    ///
+    /// The original bug: when `all == [primary]` and the head-start task
+    /// fails, step (4) only logged the error, step (5) skipped every
+    /// candidate (all were already in `spawned`), step (6) saw an empty
+    /// `JoinSet`, and `last_err.expect(...)` panicked. This crashed the
+    /// `LocalSet` runtime because `spawn_local(connect_to_handle(...))` is
+    /// fire-and-forget — `record_retry_failure` was bypassed and the
+    /// process died instead of backing off.
+    ///
+    /// Shape: bind a real server endpoint, then pre-populate the client's
+    /// `pins_dir` with a **fake** pin (not the server's fingerprint). When
+    /// the client dials, `TofuVerifier::verify_server_cert` returns
+    /// `Err("TOFU mismatch: ...")`, the QUIC handshake fails inside the
+    /// 200ms head-start, and `dial_any` must propagate that error to the
+    /// caller rather than panic. Pass `all = vec![primary]` so (5) spawns
+    /// nothing — the exact trigger condition. Assert the error is **not**
+    /// the defensive `EndpointSetup("dial_any: no dial result ...")`
+    /// fallback.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dial_any_single_addr_head_start_failure_returns_err() {
+        let fut = async {
+            install_crypto_provider();
+
+            let (server_cert_chain, server_key) = ephemeral_cert();
+            let (client_cert_chain, client_key) = ephemeral_cert();
+            let server_ep = endpoint_with_test_cert(
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+                server_cert_chain,
+                server_key,
+            )
+            .expect("server endpoint bind");
+            let server_addr = server_ep.local_addr().expect("server addr");
+
+            // Drive the server-side accept loop on a separate task so the
+            // handshake actually reaches `TofuVerifier::verify_server_cert`
+            // on the client side.
+            let server_task = tokio::spawn(async move {
+                while let Ok(Some(incoming)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        server_ep.accept().await
+                    })
+                    .await
+                {
+                    let _ = incoming.await;
+                }
+            });
+
+            let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+                .expect("client endpoint bind");
+            let pins_dir = ephemeral_pins_dir();
+            let _ = std::fs::remove_dir_all(&pins_dir);
+
+            // Pin *this peer* to a fingerprint the server cannot present, so
+            // the next dial hits the "Known Mismatch" branch in
+            // `TofuVerifier` and is rejected at handshake, fast —
+            // comfortably inside the 200ms head-start. This mirrors the
+            // reported `TOFU mismatch ...` scenario.
+            //
+            // The pin must be named after the peer key passed to `dial_any`
+            // below: pins are per-peer, so a pin filed under any other name
+            // is (correctly) ignored and the dial would succeed as a first
+            // connect.
+            std::fs::create_dir_all(&pins_dir).expect("create pins_dir");
+            let fake_fp = "00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff";
+            std::fs::write(
+                pins_dir.join("peer-head-start-failure.pin"),
+                format!("{fake_fp}\n"),
+            )
+            .expect("write fake pin");
+
+            // Trigger condition: single candidate, equal to primary.
+            let all = vec![server_addr];
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                dial_any(
+                    &client_ep,
+                    server_addr,
+                    &all,
+                    client_cert_chain[0].clone(),
+                    client_key,
+                    &pins_dir,
+                    "peer-head-start-failure",
+                ),
+            )
+            .await
+            .expect("dial_any total timeout — head-start failure should return within ms, not 5s");
+
+            assert!(
+                result.is_err(),
+                "single-address dial_any with a head-start failure must return Err, got: {result:?}"
+            );
+            match &result {
+                Err(Error::EndpointSetup(msg)) if msg.starts_with("dial_any: no dial result") => {
+                    panic!(
+                        "dial_any fell through to the defensive EndpointSetup fallback \
+                         instead of propagating the real handshake error: {result:?}"
+                    );
+                }
+                Err(_) => {}
+                Ok(_) => unreachable!("assert above"),
+            }
+
+            drop(client_ep);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
             let _ = std::fs::remove_dir_all(&pins_dir);
         };
         tokio::task::LocalSet::new().run_until(fut).await;
