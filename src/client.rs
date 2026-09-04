@@ -322,6 +322,33 @@ impl ClientManager {
             .map(|(_, s)| s.ips.clone())
     }
 
+    /// Stable identity of a peer, used to name its TOFU pin file
+    /// (`known_peers/<key>.pin`, see
+    /// [`crate::quic_transport::TofuVerifier`]).
+    ///
+    /// Derived from the peer's **configured** identity — hostname first,
+    /// then the lowest configured fix ip. Deliberately *not* derived from
+    /// [`ClientState::ips`]: that is a `HashSet` whose iteration order
+    /// varies per process, so a key taken from it would move between
+    /// restarts, silently re-pair the peer, and litter `known_peers/` with a
+    /// pin per ordering. `min()` (rather than `first()`) keeps the key
+    /// stable even if the user reorders the configured ip list.
+    ///
+    /// The `client-<handle>` fallback only applies to a client configured
+    /// with neither a hostname nor a fix ip — which cannot be dialed anyway,
+    /// so it is a well-formedness guard rather than a real identity.
+    pub(crate) fn peer_key(&self, handle: ClientHandle) -> Option<String> {
+        self.clients.borrow().get(handle as usize).map(|(c, _)| {
+            c.hostname
+                .as_deref()
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .map(str::to_owned)
+                .or_else(|| c.fix_ips.iter().min().map(IpAddr::to_string))
+                .unwrap_or_else(|| format!("client-{handle}"))
+        })
+    }
+
     /// Per-handle input-channel configuration (datagram vs. stream for
     /// mouse-button and keyboard). `None` is only returned for an
     /// out-of-range (invalid) handle; a valid handle always returns

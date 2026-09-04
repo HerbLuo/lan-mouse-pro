@@ -93,6 +93,11 @@ pub(super) fn default_transport_config() -> Arc<TransportConfig> {
 /// the sole responsibility of `TofuVerifier` — this function only constructs
 /// the verifier and injects it into the rustls builder.
 ///
+/// **`peer_key` injection**: the stable identity of the peer being dialed
+/// (see [`TofuVerifier`]). One pin is kept per peer, so this must be the
+/// same string across restarts for a given peer — a hostname or a configured
+/// IP, never a value derived from `HashSet` iteration order.
+///
 /// **Does not** install the crypto provider itself: this function is guarded
 /// by the caller of [`super::endpoint::install_crypto_provider`] (main.rs);
 /// `#[test]` unit tests call `install` once on the first line.
@@ -104,6 +109,7 @@ pub fn build_quic_client_config(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     pins_dir: &Path,
+    peer_key: &str,
 ) -> Result<QuinnClientConfig> {
     use rustls::ClientConfig as RustlsClientConfig;
 
@@ -116,7 +122,7 @@ pub fn build_quic_client_config(
     // verifier is fully responsible for server cert validation — no root
     // store is installed.
     let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
-        Arc::new(TofuVerifier::new(pins_dir));
+        Arc::new(TofuVerifier::new(pins_dir, peer_key));
 
     // mTLS client cert chain presentation — `with_client_auth_cert` is a
     // terminal builder (returns `Result<ClientConfig, Error>`, unlike
@@ -144,30 +150,44 @@ pub fn build_quic_client_config(
 
 /// Client-side TOFU (Trust On First Use) fingerprint pinning verifier.
 ///
-/// Compares the server cert SHA-256 fingerprint against the
-/// `$pins_dir/<sanitized_fp>.pin` on-disk cache:
+/// One pin per **peer**: `$pins_dir/<sanitized peer_key>.pin` holds the
+/// fingerprint that peer presented the first time we talked to it.
 ///
 /// | Decision | Trigger | Behavior |
 /// |---|---|---|
-/// | **Known Match** | pin file exists | `Ok(ServerCertVerified::assertion())` |
-/// | **Known Mismatch** | some `.pin` exists in `pins_dir` but the current fingerprint's pin does not | `Err(rustls::Error::General("TOFU mismatch: ..."))` |
-/// | **First Connect** | `pins_dir` does not exist / contains no `.pin` | write placeholder `b"trusted\n"` + `log::info!("paired with {fp}")` + `Ok(ServerCertVerified::assertion())` |
+/// | **Known Match** | this peer's pin holds the presented fingerprint | `Ok(ServerCertVerified::assertion())` |
+/// | **Known Mismatch** | this peer's pin holds a *different* fingerprint | `Err(rustls::Error::General("TOFU mismatch: ..."))` |
+/// | **First Connect** | this peer has no pin | write the fingerprint + `log::info!("paired peer ...")` + `Ok(ServerCertVerified::assertion())` |
 ///
-/// **Three-state semantics**: distinguishes "first sight" from "known peer
-/// rotated its cert". The former is a legitimate TOFU path (first connection
-/// to a new peer on the LAN), the latter is an attack signal (someone is
-/// impersonating the peer). When `pins_dir` is empty, the verifier follows
-/// First Connect (any peer is accepted); when `pins_dir` is non-empty but the
-/// current fingerprint is not pinned, it rejects — this is the core LAN
-/// attack-protection invariant.
+/// **Why the pin is keyed by peer, not by fingerprint**: the decision that
+/// matters is "did *this* peer swap its certificate", which is only
+/// answerable if the pin is addressable by a stable peer identity. The
+/// earlier shape named the file after the fingerprint (`<fp>.pin`) and took
+/// the mismatch branch whenever `pins_dir` held *any* `.pin` at all — a
+/// directory-wide check with two fatal consequences: pairing a second peer
+/// was impossible (the first peer's pin rejected every newcomer), and a peer
+/// that legitimately regenerated its cert was locked out permanently with no
+/// UI to clear the stale pin. Keying by peer restores the intended
+/// three-state semantics: other peers' pins no longer participate in the
+/// decision at all.
 ///
-/// **`pins_dir` cross-platform compatibility**: replace `aa:bb:cc:...` with
-/// `aa_bb_cc_...` (`:` is not a legal filename character on Windows) and
-/// append `<sanitized_fp>.pin`.
+/// **Legacy `<fp>.pin` files are inert** — they are neither read nor
+/// deleted; every peer simply re-pairs once on first connect after the
+/// upgrade. They can be removed by hand.
+///
+/// **`peer_key`**: must be stable across restarts. `connect.rs` derives it
+/// from the client's configured hostname, falling back to the lowest
+/// configured IP — never from `HashSet` iteration order, which varies per
+/// process and would silently re-pair (and litter `pins_dir`) on every
+/// restart.
+///
+/// **Filename sanitization**: [`sanitize_peer_key`] reduces the key to
+/// `[A-Za-z0-9._-]` so that IPv6 colons, path separators and `..` cannot
+/// escape `pins_dir`.
 ///
 /// **`Send + Sync + 'static`**: rustls 0.23 trait constraint —
-/// `TofuVerifier` holds `PathBuf` + `Arc<CryptoProvider>`, which satisfies
-/// the bound automatically.
+/// `TofuVerifier` holds `PathBuf` + `String` + `Arc<CryptoProvider>`, which
+/// satisfies the bound automatically.
 ///
 /// **`provider` field**: forwarding `verify_tls12_signature` /
 /// `verify_tls13_signature` to `rustls::crypto::verify_*_signature` requires
@@ -176,59 +196,74 @@ pub fn build_quic_client_config(
 #[derive(Debug)]
 pub struct TofuVerifier {
     pins_dir: PathBuf,
+    /// Stable identity of the peer this verifier was built for; names the
+    /// pin file. See the struct docs on why this may not be derived from an
+    /// unordered address set.
+    peer_key: String,
     /// Crypto provider needed for signature verification; its
     /// `signature_verification_algorithms` is forwarded by
     /// `verify_tls12_signature` / `verify_tls13_signature`.
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
+/// Reduce a peer key to a safe filename component.
+///
+/// Keeps `[A-Za-z0-9._-]` (enough for hostnames and IPv4 literals) and
+/// replaces everything else with `_` — IPv6 colons included. Keys that are
+/// empty or consist only of dots (`.` / `..`, which are directory entries,
+/// not files) collapse to a fixed placeholder, so no key can escape
+/// `pins_dir` or name a directory.
+fn sanitize_peer_key(peer_key: &str) -> String {
+    let safe: String = peer_key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if safe.is_empty() || safe.chars().all(|c| c == '.') {
+        "unnamed-peer".to_owned()
+    } else {
+        safe
+    }
+}
+
 impl TofuVerifier {
-    /// Construct in the "first connection" state.
+    /// Construct a verifier for `peer_key`.
     ///
     /// `pins_dir` may not exist — `verify_server_cert` runs `create_dir_all`
     /// then `fs::write` in the First Connect branch.
-    pub fn new(pins_dir: &Path) -> Self {
+    pub fn new(pins_dir: &Path, peer_key: &str) -> Self {
         Self {
             pins_dir: pins_dir.to_path_buf(),
+            peer_key: peer_key.to_owned(),
             provider: Arc::new(rustls::crypto::ring::default_provider()),
         }
     }
 
-    /// Construct in the "known peer" state (pre-write `<known_fp>.pin` so
-    /// subsequent verifies take the "known match" branch).
+    /// Construct in the "known peer" state (pre-write the pin so subsequent
+    /// verifies take the Known Match / Known Mismatch branch).
     ///
     /// **Pre-write is best-effort**: on failure the constructor still returns
-    /// `Self`, and subsequent verifies take the mismatch path returning a
-    /// `rustls::Error`. IO errors are intentionally not swallowed silently,
-    /// because they usually indicate operational problems such as filesystem
-    /// permissions or a full disk.
+    /// `Self`, and subsequent verifies take the First Connect path instead.
+    /// IO errors are intentionally not swallowed silently, because they
+    /// usually indicate operational problems such as filesystem permissions
+    /// or a full disk.
     #[allow(dead_code)] // tests only (production `dial()` uses `.new()`)
-    pub fn with_known(pins_dir: &Path, known_fp: &str) -> Self {
-        let v = Self::new(pins_dir);
+    pub fn with_known(pins_dir: &Path, peer_key: &str, known_fp: &str) -> Self {
+        let v = Self::new(pins_dir, peer_key);
         let _ = fs::create_dir_all(&v.pins_dir);
-        let _ = fs::write(v.pin_path(known_fp), b"trusted\n");
+        let _ = fs::write(v.pin_path(), format!("{known_fp}\n"));
         v
     }
 
-    /// fingerprint → pin file path. `:` replaced with `_` for cross-platform
-    /// compatibility.
-    fn pin_path(&self, fp: &str) -> PathBuf {
-        let safe = fp.replace(':', "_");
-        self.pins_dir.join(format!("{safe}.pin"))
-    }
-
-    /// Whether any `.pin` file exists under `pins_dir` (used to distinguish
-    /// First Connect from Known Mismatch).
-    fn has_any_pins(&self) -> bool {
-        if !self.pins_dir.exists() {
-            return false;
-        }
-        fs::read_dir(&self.pins_dir)
-            .map(|d| {
-                d.filter_map(std::io::Result::ok)
-                    .any(|e| e.path().extension().is_some_and(|ext| ext == "pin"))
-            })
-            .unwrap_or(false)
+    /// Path of this peer's pin file.
+    fn pin_path(&self) -> PathBuf {
+        self.pins_dir
+            .join(format!("{}.pin", sanitize_peer_key(&self.peer_key)))
     }
 }
 
@@ -254,26 +289,46 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
             ))
         })?;
 
-        // (3) Three-state decision.
-        let pin = self.pin_path(&fp);
+        // (3) Three-state decision, scoped to this peer alone.
+        let pin = self.pin_path();
 
-        if pin.exists() {
-            // Known Match — pin file exists, accept.
-            Ok(ServerCertVerified::assertion())
-        } else if self.has_any_pins() {
-            // Known Mismatch — some other fingerprint's pin exists but this
-            // one does not, reject.
-            log::warn!("TOFU: rejected untrusted peer {fp}");
-            Err(rustls::Error::General(format!(
-                "TOFU mismatch: peer fingerprint {fp} not in known peers"
-            )))
-        } else {
-            // First Connect — write the placeholder pin and accept.
-            fs::write(&pin, b"trusted\n").map_err(|e| {
-                rustls::Error::General(format!("TOFU: write pin {:?} failed: {e}", pin))
-            })?;
-            log::info!("TOFU: paired with {fp}");
-            Ok(ServerCertVerified::assertion())
+        match fs::read_to_string(&pin) {
+            Ok(pinned) => {
+                let pinned = pinned.trim();
+                if pinned == fp {
+                    // Known Match.
+                    Ok(ServerCertVerified::assertion())
+                } else {
+                    // Known Mismatch — this peer previously presented a
+                    // different certificate. Either it legitimately rotated
+                    // its key, or someone is impersonating it; TOFU cannot
+                    // tell the two apart, so it refuses and names the file
+                    // to delete for a deliberate re-pair.
+                    log::warn!(
+                        "TOFU: peer {} presented {fp} but {pinned} is pinned — rejecting",
+                        self.peer_key
+                    );
+                    Err(rustls::Error::General(format!(
+                        "TOFU mismatch for peer {}: presented fingerprint {fp}, pinned {pinned} \
+                         (delete {} to re-pair)",
+                        self.peer_key,
+                        pin.display()
+                    )))
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // First Connect — this peer has never been seen. Other
+                // peers' pins are deliberately not consulted.
+                fs::write(&pin, format!("{fp}\n")).map_err(|e| {
+                    rustls::Error::General(format!("TOFU: write pin {:?} failed: {e}", pin))
+                })?;
+                log::info!("TOFU: paired peer {} with {fp}", self.peer_key);
+                Ok(ServerCertVerified::assertion())
+            }
+            Err(e) => Err(rustls::Error::General(format!(
+                "TOFU: read pin {:?} failed: {e}",
+                pin
+            ))),
         }
     }
 
@@ -648,7 +703,7 @@ mod tests {
         let (cert_chain, key) = ephemeral_cert();
         let pins_dir = ephemeral_pins_dir();
         let _ = std::fs::remove_dir_all(&pins_dir);
-        let cfg = build_quic_client_config(vec![cert_chain[0].clone()], key, &pins_dir)
+        let cfg = build_quic_client_config(vec![cert_chain[0].clone()], key, &pins_dir, "peer-a")
             .expect("ClientConfig assembly should not fail");
         let _clone: quinn::ClientConfig = cfg.clone();
     }
@@ -676,7 +731,10 @@ mod tests {
             .expect("server endpoint must have local_addr");
 
         let server_task = tokio::spawn(async move {
-            let incoming = server_ep.accept().await.expect("server accept should not fail");
+            let incoming = server_ep
+                .accept()
+                .await
+                .expect("server accept should not fail");
             let result = incoming.await;
             assert!(
                 result.is_err(),
@@ -725,13 +783,14 @@ mod tests {
         let _ = server_task.await;
     }
 
-    /// Verifies that a new fingerprint is accepted and written to known_peers.
+    /// Verifies that a peer's first fingerprint is accepted and pinned under
+    /// that peer's key.
     #[test]
     fn tofu_first_run_pins() {
         super::super::endpoint::install_crypto_provider();
 
         let pins_dir = tmp_pins_dir("first");
-        let verifier = TofuVerifier::new(&pins_dir);
+        let verifier = TofuVerifier::new(&pins_dir, "peer-a");
 
         let (cert_chain, _key) = ephemeral_cert();
         let cert_der = cert_chain[0].clone();
@@ -747,23 +806,101 @@ mod tests {
             result
         );
 
-        let expected_pin = pins_dir.join(format!("{}.pin", fp.replace(':', "_")));
+        // The pin is named after the peer, not the fingerprint, and holds
+        // the fingerprint as its content.
+        let expected_pin = pins_dir.join("peer-a.pin");
         assert!(
             expected_pin.exists(),
             "pin file should exist at {:?}",
             expected_pin
         );
 
-        let content = std::fs::read(&expected_pin).expect("read pin");
+        let content = std::fs::read_to_string(&expected_pin).expect("read pin");
         assert_eq!(
-            content, b"trusted\n",
-            "pin file content should be 'trusted\\n'"
+            content.trim(),
+            fp,
+            "pin file should hold the peer's fingerprint"
+        );
+
+        // A second verify for the same peer takes the Known Match branch.
+        let again = TofuVerifier::new(&pins_dir, "peer-a").verify_server_cert(
+            &cert_der,
+            &[],
+            &server_name,
+            &[],
+            now,
+        );
+        assert!(
+            again.is_ok(),
+            "an unchanged fingerprint must stay accepted, got {:?}",
+            again
         );
 
         let _ = std::fs::remove_dir_all(&pins_dir);
     }
 
-    /// Verifies that a different fingerprint is rejected
+    /// Regression: one peer's pin must not affect the verdict for a
+    /// *different* peer.
+    ///
+    /// The pin used to be named after the fingerprint, and the mismatch
+    /// branch fired whenever `pins_dir` held any `.pin` at all. That made the
+    /// first paired peer poison the directory: every subsequent peer — a
+    /// second machine, or the same machine after a legitimate cert
+    /// regeneration — was rejected as "not in known peers" with no way to
+    /// clear the pin from the UI.
+    #[test]
+    fn tofu_pins_are_per_peer() {
+        super::super::endpoint::install_crypto_provider();
+
+        let pins_dir = tmp_pins_dir("per-peer");
+        let server_name = test_server_name();
+        let now = UnixTime::now();
+
+        // peer-a pairs first, leaving a pin behind.
+        let (cert_a_chain, _key_a) = ephemeral_cert();
+        let cert_a = cert_a_chain[0].clone();
+        assert!(
+            TofuVerifier::new(&pins_dir, "peer-a")
+                .verify_server_cert(&cert_a, &[], &server_name, &[], now)
+                .is_ok(),
+            "peer-a first connect should be accepted"
+        );
+
+        // peer-b is a different peer with a different cert: still a first
+        // connect, and peer-a's pin must not be consulted.
+        let (cert_b_chain, _key_b) = ephemeral_cert();
+        let cert_b = cert_b_chain[0].clone();
+        let fp_b = crate::crypto::generate_fingerprint(cert_b.as_ref());
+        let result = TofuVerifier::new(&pins_dir, "peer-b").verify_server_cert(
+            &cert_b,
+            &[],
+            &server_name,
+            &[],
+            now,
+        );
+        assert!(
+            result.is_ok(),
+            "a second peer must pair even though another peer is already pinned, got {:?}",
+            result
+        );
+
+        let pin_b = pins_dir.join("peer-b.pin");
+        assert_eq!(
+            std::fs::read_to_string(&pin_b)
+                .expect("read peer-b pin")
+                .trim(),
+            fp_b,
+            "peer-b should be pinned to its own fingerprint"
+        );
+        assert!(
+            pins_dir.join("peer-a.pin").exists(),
+            "pairing peer-b must leave peer-a's pin untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&pins_dir);
+    }
+
+    /// Verifies that a *known* peer swapping its fingerprint is rejected
     /// (`rustls::Error::General("TOFU mismatch: ...")`).
     #[test]
     fn tofu_disallows_swap() {
@@ -774,7 +911,7 @@ mod tests {
         let (cert1_chain, _key1) = ephemeral_cert();
         let cert1_der = cert1_chain[0].clone();
         let fp1 = crate::crypto::generate_fingerprint(cert1_der.as_ref());
-        let verifier = TofuVerifier::with_known(&pins_dir, &fp1);
+        let verifier = TofuVerifier::with_known(&pins_dir, "peer-a", &fp1);
 
         let (cert2_chain, _key2) = ephemeral_cert();
         let cert2_der = cert2_chain[0].clone();
@@ -791,8 +928,8 @@ mod tests {
         match result {
             Err(rustls::Error::General(msg)) => {
                 assert!(
-                    msg.contains("TOFU mismatch") || msg.contains("untrusted peer"),
-                    "error message should contain TOFU mismatch / untrusted peer, actually: {msg}"
+                    msg.contains("TOFU mismatch"),
+                    "error message should contain TOFU mismatch, actually: {msg}"
                 );
             }
             other => panic!(
@@ -801,16 +938,11 @@ mod tests {
             ),
         }
 
-        let fp1_pin = pins_dir.join(format!("{}.pin", fp1.replace(':', "_")));
-        assert!(
-            fp1_pin.exists(),
-            "mismatch should not delete the existing fp1 pin file (pin should be retained)"
-        );
-
-        let fp2_pin = pins_dir.join(format!("{}.pin", fp2.replace(':', "_")));
-        assert!(
-            !fp2_pin.exists(),
-            "mismatch should not auto-pin fp2 (unfamiliar cert must remain unfamiliar)"
+        let pin = pins_dir.join("peer-a.pin");
+        assert_eq!(
+            std::fs::read_to_string(&pin).expect("read pin").trim(),
+            fp1,
+            "mismatch must not overwrite the pinned fingerprint"
         );
 
         let _ = std::fs::remove_dir_all(&pins_dir);
@@ -922,7 +1054,9 @@ mod tests {
         );
         assert!(r.is_err(), "allowlist miss should be Err");
 
-        let received = rx.try_recv().expect("rejection_tx should send fp on Err path");
+        let received = rx
+            .try_recv()
+            .expect("rejection_tx should send fp on Err path");
         assert_eq!(
             received, fp,
             "fp received on rejection channel should match the fp of the rejected cert"

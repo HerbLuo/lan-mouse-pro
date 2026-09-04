@@ -108,10 +108,14 @@ pub fn key_path() -> PathBuf {
 /// This function only returns the path.
 ///
 /// **Why this lives separately from `cert_path` / `key_path`:**
-/// - The TOFU cache is per-peer persistence (one `<fp>.pin` file per peer)
-///   and has its own lifetime, independent of the server's own cert/key.
+/// - The TOFU cache is per-peer persistence (one `<peer>.pin` file per
+///   peer, named after the peer's stable identity and holding the
+///   fingerprint that peer presented on first contact — see
+///   [`crate::quic_transport::TofuVerifier`]) and has its own lifetime,
+///   independent of the server's own cert/key.
 /// - Clearing `known_peers/` only resets peer trust — the next connection
-///   drops a fresh pin — without touching the server's own cert.
+///   drops a fresh pin — without touching the server's own cert. Deleting a
+///   single `<peer>.pin` re-pairs just that peer.
 pub fn cert_pins_dir() -> PathBuf {
     lan_mouse_data_dir().join("known_peers")
 }

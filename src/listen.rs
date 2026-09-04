@@ -10,8 +10,11 @@
 //!    `endpoint_with_verifier(port, cert_chain, key, AuthorizedKeysVerifier)`
 //!    to obtain an `Endpoint` (mTLS + fingerprint allowlist are enforced
 //!    during the handshake).
-//! 2. A per-listener accept task loops on `quic_transport::accept()`, spawning
-//!    one `handle_quic_peer_supervisor` task per `Connection`.
+//! 2. A per-listener accept task loops on `quinn::Endpoint::accept()`,
+//!    awaiting each handshake in its own task and spawning one
+//!    `handle_quic_peer_supervisor` task per established `Connection`. Only
+//!    endpoint closure ends the loop — a rejected handshake is per-connection
+//!    (see `spawn_quic_accept_task`).
 //! 3. The supervisor: `server_hello` → compute fingerprint (defense-in-depth)
 //!    → push `ListenEvent::Accept` → `take_stream_a_recv` to obtain the recv
 //!    half of stream A → loop on `read_frame(&mut recv_a)` and translate each
@@ -386,9 +389,33 @@ impl Stream for LanMouseListener {
 /// Helper called by `LanMouseListener::new()`: spawns the QUIC accept task
 /// for a single endpoint plus a per-peer supervisor task for each connection.
 ///
+/// **Only endpoint closure ends this loop.** `quinn::Endpoint::accept()`
+/// returning `None` means the endpoint itself is gone (`terminate()` aborts
+/// this task, or the runtime is shutting down) — that is the sole fatal
+/// condition. A failed *handshake* is per-connection and must never reach the
+/// loop: a peer whose fingerprint is not yet in `authorized_keys` is rejected
+/// by [`AuthorizedKeysVerifier`], and that rejection is completely routine —
+/// it is exactly the first-contact path that raises the "authorize this peer?"
+/// dialog.
+///
+/// The earlier shape drove the loop with `quic_transport::accept(&ep)`, which
+/// collapses both cases into a single `Err`, and `break`ing on it dropped the
+/// last `quinn::Endpoint` handle. With no connection alive, quinn's endpoint
+/// driver then saw `ref_count == 0 && connections.is_empty()`, shut down, and
+/// closed the UDP socket — so the daemon kept running while the port silently
+/// vanished from the listen table, and no code path ever rebinds it
+/// (`request_port_change` is a no-op). One unauthorized dial, one ALPN
+/// mismatch, one aborted `dial_any` happy-eyeballs loser, or one peer whose
+/// TOFU verifier rejected our cert killed the listener for the lifetime of
+/// the process — including, fatally, the very rejection that the pairing
+/// dialog is supposed to resolve.
+///
 /// Supervisor shape:
-/// 1. Loop on `quic_transport::accept(&ep)` to obtain `Connection`s.
-/// 2. On each new conn, spawn a supervisor that:
+/// 1. Loop on `ep.accept()` for `Incoming`s; `None` (and only `None`) breaks.
+/// 2. Await the TLS 1.3 handshake in a per-connection task — never inline on
+///    the accept loop, where a peer stalling mid-handshake would block every
+///    other peer from being accepted.
+/// 3. On each established conn, spawn a supervisor that:
 ///    - Exchanges `PROTOCOL_MAGIC` via `server_hello` (a `HelloFailed` error
 ///      exits the supervisor).
 ///    - Computes the client cert fingerprint from `peer_identity` and
@@ -412,33 +439,43 @@ fn spawn_quic_accept_task(
     spawn_local(async move {
         log::info!("QUIC listener listening on {ep:?}");
         loop {
-            match quic_transport::accept(&ep).await {
-                Ok(conn) => {
-                    let peer = Rc::new(PeerSession::from_connection(conn));
-                    let remote = peer.connection().remote_address();
-                    log::info!("QUIC peer connected: {remote}");
-                    let peer_clone = peer.clone();
-                    let tx_clone = listen_tx.clone();
-                    let quic_conns_for_supervisor = quic_conns.clone();
-                    spawn_local(async move {
-                        if let Err(e) = handle_quic_peer_supervisor(
-                            peer_clone,
-                            tx_clone,
-                            quic_conns_for_supervisor,
-                        )
-                        .await
-                        {
-                            log::warn!("QUIC peer supervisor exited with err: {e}");
-                        }
-                    });
+            // `None` — the endpoint is closed — is the *only* fatal condition.
+            // Everything else is per-connection and must leave the listener
+            // bound.
+            let Some(incoming) = ep.accept().await else {
+                log::info!("QUIC endpoint closed (accept returned None) — accept loop exiting");
+                break;
+            };
+
+            let remote = incoming.remote_address();
+            let tx_clone = listen_tx.clone();
+            let quic_conns_for_supervisor = quic_conns.clone();
+            spawn_local(async move {
+                // The TLS 1.3 handshake runs here, off the accept loop, so a
+                // peer that stalls mid-handshake cannot stop other peers from
+                // being accepted.
+                let conn = match incoming.await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        // Routine and non-fatal: unauthorized fingerprint
+                        // (the pairing-dialog path — `AuthorizedKeysVerifier`
+                        // has already pushed `ListenEvent::Rejected` through
+                        // the rejection forwarder), ALPN mismatch, the peer's
+                        // TOFU verifier rejecting our cert, or a `dial_any`
+                        // happy-eyeballs loser being aborted. The endpoint
+                        // stays bound and keeps accepting.
+                        log::warn!("QUIC handshake from {remote} failed: {e}");
+                        return;
+                    }
+                };
+                let peer = Rc::new(PeerSession::from_connection(conn));
+                log::info!("QUIC peer connected: {remote}");
+                if let Err(e) =
+                    handle_quic_peer_supervisor(peer, tx_clone, quic_conns_for_supervisor).await
+                {
+                    log::warn!("QUIC peer supervisor exited with err: {e}");
                 }
-                Err(e) => {
-                    // QUIC accept failures usually mean the endpoint was
-                    // closed (terminate path).
-                    log::debug!("QUIC accept returned: {e}");
-                    break;
-                }
-            }
+            });
         }
     })
 }
@@ -963,5 +1000,129 @@ async fn server_datagram_reader_task(
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    use crate::quic_transport::test_helpers::{ephemeral_cert, ephemeral_pins_dir, local_set_test};
+
+    use super::*;
+
+    /// Regression: a rejected handshake must not tear down the listener.
+    ///
+    /// The accept loop used to `break` on any `Err` from
+    /// `quic_transport::accept()`, which dropped the last `quinn::Endpoint`
+    /// handle and let quinn's endpoint driver close the UDP socket — the
+    /// daemon stayed alive while the port disappeared from the listen table.
+    /// An unauthorized fingerprint is the *normal* first-contact path (it is
+    /// what raises the pairing dialog), so the listener died the first time a
+    /// peer tried to pair with it and never came back.
+    ///
+    /// Shape: allowlist one client, dial with an unlisted cert (must be
+    /// rejected), then dial with the listed one and assert the listener is
+    /// still bound, still accepting, and still emitting `ListenEvent::Accept`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejected_handshake_keeps_listener_accepting() {
+        quic_transport::install_crypto_provider();
+
+        let (server_cert_chain, server_key) = ephemeral_cert();
+        let (good_cert_chain, good_key) = ephemeral_cert();
+        let (bad_cert_chain, bad_key) = ephemeral_cert();
+
+        // Only the "good" client is authorized; the "bad" one stands in for a
+        // peer that has not been paired yet.
+        let good_fingerprint = crypto::generate_fingerprint(good_cert_chain[0].as_ref());
+        let allowlist: Arc<RwLock<HashMap<String, String>>> = Arc::new(RwLock::new(HashMap::new()));
+        allowlist
+            .write()
+            .expect("allowlist write")
+            .insert(good_fingerprint.clone(), "good".to_owned());
+
+        local_set_test!(rejected_handshake_keeps_listener_accepting, {
+            let verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
+                Arc::new(AuthorizedKeysVerifier::new(allowlist));
+            let server_ep = quic_transport::endpoint_with_verifier(
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+                server_cert_chain,
+                server_key,
+                verifier,
+            )
+            .expect("server endpoint bind");
+            let server_addr = server_ep.local_addr().expect("server addr");
+
+            let (listen_tx, mut listen_rx) = channel();
+            let quic_conns = Rc::new(RefCell::new(HashMap::new()));
+            // Moved by value, exactly as `LanMouseListener::new` does it — if
+            // the loop exits, the endpoint is dropped and the socket closes.
+            let _accept_task = spawn_quic_accept_task(server_ep, listen_tx, quic_conns);
+
+            // (1) Unauthorized peer → rejected at the mTLS stage.
+            let bad_ep = quic_transport::endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+                .expect("bad client endpoint bind");
+            let rejected = quic_transport::dial(
+                &bad_ep,
+                server_addr,
+                bad_cert_chain[0].clone(),
+                bad_key,
+                &ephemeral_pins_dir(),
+            )
+            .await;
+            if let Ok(conn) = rejected {
+                // In TLS 1.3 the client reaches 1-RTT before the server has
+                // finished validating the client cert, so `dial` can return
+                // Ok and the rejection lands afterwards as a connection
+                // close. Wait for that close: it is the proof that the server
+                // took its rejection path *before* step (2) dials.
+                tokio::time::timeout(std::time::Duration::from_secs(5), conn.closed())
+                    .await
+                    .expect("server must close a connection with an unlisted fingerprint");
+            }
+
+            // (2) The listener must still be bound and accepting.
+            let good_ep =
+                quic_transport::endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+                    .expect("good client endpoint bind");
+            let conn = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                quic_transport::dial(
+                    &good_ep,
+                    server_addr,
+                    good_cert_chain[0].clone(),
+                    good_key,
+                    &ephemeral_pins_dir(),
+                ),
+            )
+            .await
+            .expect("dial timed out after a rejected handshake — listener is gone")
+            .expect("authorized peer must connect after a rejected handshake");
+
+            let peer = PeerSession::from_connection(conn);
+            quic_transport::client_hello(&peer)
+                .await
+                .expect("client hello");
+
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), listen_rx.recv())
+                .await
+                .expect("no ListenEvent after a rejected handshake — accept loop is dead")
+                .expect("listen channel closed");
+            match event {
+                ListenEvent::Accept { fingerprint, .. } => assert_eq!(
+                    fingerprint, good_fingerprint,
+                    "only the allowlisted peer may be accepted"
+                ),
+                other => panic!(
+                    "expected ListenEvent::Accept for the authorized peer, got {}",
+                    match other {
+                        ListenEvent::Msg { event, .. } => format!("Msg({event})"),
+                        ListenEvent::Disconnected { addr } => format!("Disconnected({addr})"),
+                        ListenEvent::Rejected { fingerprint } => format!("Rejected({fingerprint})"),
+                        ListenEvent::Accept { .. } => unreachable!(),
+                    }
+                ),
+            }
+        });
     }
 }

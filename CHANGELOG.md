@@ -29,12 +29,19 @@ and this project aims to adhere to [Semantic Versioning](https://semver.org/).
   the client now present a self-signed certificate. The server enforces
   mTLS via an explicit `authorized_keys` allowlist of certificate
   fingerprints (`authorized_fingerprints` in `config.toml`); the client
-  pins the first server fingerprint it sees to
-  `$XDG_DATA_HOME/lan-mouse/known_peers/<fp>.pin` (TOFU) and refuses any
-  future swap. The `generate_fingerprint` algorithm (SHA-256 of the DER,
-  lower-case hex joined by `:`) is unchanged from v3, so existing
+  pins each peer's first server fingerprint to
+  `$XDG_DATA_HOME/lan-mouse/known_peers/<peer>.pin` (TOFU) — one file per
+  peer, named after the peer's configured hostname (or its lowest
+  configured IP) and holding that peer's fingerprint — and refuses a
+  future swap **by that peer**. Other peers' pins never participate in the
+  decision, so adding a second peer and re-pairing after a peer
+  legitimately regenerates its certificate both work; to re-pair, delete
+  that peer's `.pin`. The `generate_fingerprint` algorithm (SHA-256 of the
+  DER, lower-case hex joined by `:`) is unchanged from v3, so existing
   `authorized_fingerprints` entries continue to be accepted after
-  upgrading.
+  upgrading. Pins written by earlier builds were named after the
+  fingerprint (`<fp>.pin`); those files are inert and can be deleted —
+  each peer re-pairs once on its next connection.
 
 ### Removed (M1: DTLS gone)
 

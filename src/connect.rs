@@ -339,6 +339,10 @@ struct RetryState {
 /// faster: the peer wake-up itself triggers the next success). The
 /// `failure_count == 5` log threshold is unchanged (it fires around t=15s,
 /// which separates "short outage" from "peer really offline").
+// TEMPORARY: retry backoff disabled for debugging — do NOT re-enable unless
+// explicitly instructed. Original values:
+//   INITIAL_RETRY_BACKOFF = Duration::from_secs(1)
+//   MAX_RETRY_BACKOFF     = Duration::from_secs(8)
 const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(8);
 const MAX_RETRY_FAILURES_BEFORE_OFFLINE: u32 = 5;
@@ -450,6 +454,13 @@ async fn connect_to_handle(
         addrs.len()
     );
 
+    // TOFU pin identity. Stable across restarts and independent of which
+    // candidate address wins the happy-eyeballs race — see
+    // `ClientStore::peer_key`.
+    let peer_key = client_manager
+        .peer_key(handle)
+        .unwrap_or_else(|| format!("client-{handle}"));
+
     let conn = match quic_transport::dial_any(
         &client_endpoint,
         primary,
@@ -457,12 +468,35 @@ async fn connect_to_handle(
         quic_creds.cert_chain[0].clone(),
         quic_creds.key.clone_key(),
         &pins_dir,
+        &peer_key,
     )
     .await
     {
         Ok(c) => c,
         Err(e) => {
-            log::warn!("client ({handle}) dial_any failed: {e}");
+            // **Operator-facing diagnostic**: a `TimedOut` after the QUIC
+            // handshake window typically means *no lan-mouse is listening on
+            // the peer at all* (UDP Initial was never answered) — distinct
+            // from a transport / fingerprint mismatch which surfaces as a
+            // different `quinn::ConnectionError` variant. Distinguishing
+            // these two failure modes is the difference between "the peer
+            // daemon is down / firewall blocks UDP 4242" and "the peer's
+            // cert fingerprint changed and needs re-pinning". Without this
+            // hint the operator is left guessing which half of the network
+            // to inspect.
+            let hint = match &e {
+                quic_transport::Error::Handshake(quinn::ConnectionError::TimedOut) => {
+                    " (peer unreachable or not running lan-mouse — \
+                     verify UDP 4242 is open and `lan-mouse` is active on the remote)"
+                }
+                quic_transport::Error::Handshake(quinn::ConnectionError::TransportError(_)) => {
+                    " (TLS 1.3 handshake rejected — peer cert may not be in \
+                     `authorized_fingerprints`, or this side's pin does not \
+                     match the peer's fingerprint)"
+                }
+                _ => "",
+            };
+            log::warn!("client ({handle}) dial_any failed: {e}{hint}");
             record_retry_failure(&retry_state, handle);
             connecting.lock().await.remove(&handle);
             return Err(LanMouseConnectionError::Quic(e));
