@@ -591,6 +591,59 @@ impl CaptureTask {
                         }
                     }
 
+                    // **BUG FIX: "静止鼠标触发按键回流"** — refresh
+                    // `last_progress_at` (and zero `consecutive_send_failures`)
+                    // on *any* inbound control-plane message from the peer.
+                    //
+                    // Rationale: `last_progress_at` was previously only
+                    // refreshed by `CaptureEvent::Input` (mouse motion / key
+                    // presses flowing master → slave). When the user moves
+                    // the cursor onto the peer and stops, no Input events
+                    // arrive at `do_capture_session`, so `last_progress_at`
+                    // stops being refreshed; after
+                    // [`WATCHDOG_NO_PROGRESS_TIMEOUT`] = 8s the heavy
+                    // watchdog misclassified "user is idle" as "peer is
+                    // unresponsive", synthesises a Leave back to the peer,
+                    // and the peer releases its `emulation_proxy` — the
+                    // user observed this as "the keyboard stops working on
+                    // the peer and returns to the master".
+                    //
+                    // The first attempt at this fix only refreshed
+                    // `last_progress_at` on `ProtoEvent::Pong` (the
+                    // application-layer heartbeat reply, 500ms cadence on
+                    // each side). But Pong reaching `do_capture_session` has
+                    // two failure modes:
+                    // 1. The forwarder in `connect.rs` resolves `(addr, event)`
+                    //    to `(handle, event)` via
+                    //    `client_manager.get_client(addr)`. That lookup uses
+                    //    `s.ips.contains(&addr.ip())` and requires
+                    //    `s.active == true`. If the peer IP is missing from
+                    //    `s.ips` (DNS not yet resolved, multi-homed peer,
+                    //    etc.) the lookup returns None and Pong is dropped
+                    //    with a warn log — leaving `last_progress_at` to
+                    //    expire.
+                    // 2. The `active_client` early-continue above silently
+                    //    drops Pong when the handle doesn't match the
+                    //    currently-active client.
+                    //
+                    // Both failure modes leave the master watchdog blind to
+                    // the still-healthy heartbeat.
+                    //
+                    // **The fix here**: refresh the watchdog on *any* inbound
+                    // control-plane event (Ack / Pong / Hello / etc.) — if
+                    // the peer is sending us anything over stream A, the
+                    // QUIC connection is alive and the user just happens to
+                    // be idle. This is symmetric with the success path of
+                    // [`CaptureEvent::Input`] at line 1218-1219 (which clears
+                    // `consecutive_send_failures` and refreshes
+                    // `last_progress_at` when `conn.send` succeeds).
+                    //
+                    // Leave is exempt: it explicitly means "release capture",
+                    // and `last_progress_at` is refreshed inside
+                    // `release_capture` itself.
+                    self.watchdog.consecutive_send_failures = 0;
+                    self.watchdog.last_progress_at = Instant::now();
+
                     match event {
                         // Pending-capture handshake Ack:
                         // - Currently Pending and the handle matches → ask the
@@ -676,28 +729,9 @@ impl CaptureTask {
                         },
                         // Pong: peer's reply to the application-layer Ping
                         // heartbeat ([`crate::connect::ping_heartbeat_task`],
-                        // 500ms cadence). Treat it as a liveness signal —
-                        // refresh `last_progress_at` and clear the
-                        // send-failure counter, mirroring the success path
-                        // of [`CaptureEvent::Input`].
-                        //
-                        // **Why this is needed (BUG: "静止鼠标触发按键回流")**:
-                        // without an explicit Pong branch, `last_progress_at`
-                        // is only refreshed when the user is actively
-                        // producing input events (mouse motion, key press).
-                        // When the user moves the cursor onto the peer and
-                        // then stops, no Input events arrive at
-                        // `do_capture_session`, so `last_progress_at` stops
-                        // being refreshed; after
-                        // [`WATCHDOG_NO_PROGRESS_TIMEOUT`] = 8s the heavy
-                        // watchdog misclassifies "user is idle" as "peer is
-                        // unresponsive" and force-releases capture, sending
-                        // the keyboard back to the host. Pong refreshes
-                        // `last_progress_at` ~2 Hz (matched to the heartbeat
-                        // cadence), which is well below the 8s threshold and
-                        // mirrors how the peer's `ListenTask` refreshes its
-                        // own `last_response` on the corresponding Ping
-                        // frames ([`crate::emulation::ListenTask`]).
+                        // 500ms cadence). Watchdog refresh has already
+                        // happened at the top of the recv arm — only the
+                        // `alive=false` signal needs surface logging here.
                         //
                         // **Pong(alive=false)** is logged at info but does
                         // not change state — the alive check has been removed
@@ -710,8 +744,6 @@ impl CaptureTask {
                                      emulation disabled (no-op, optimistic-send still in effect)"
                                 );
                             }
-                            self.watchdog.consecutive_send_failures = 0;
-                            self.watchdog.last_progress_at = Instant::now();
                         }
                         _ => {}
                     }
