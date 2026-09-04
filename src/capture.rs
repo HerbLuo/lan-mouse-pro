@@ -71,9 +71,14 @@ const WATCHDOG_CROSSING_WINDOW: Duration = Duration::from_secs(5);
 const WATCHDOG_CROSSING_STORM_THRESHOLD: usize = 5;
 
 /// "No progress" timeout: counted from the last successful state advance
-/// (Pending→Sending, send_input ok, etc.), if a non-Idle state persists
+/// (Pending→Sending, send_input ok, *or any inbound control-plane event
+/// from the peer — see commit `f5f5a30`*), if a non-Idle state persists
 /// beyond this duration a forced release fires. 8s is far above normal LAN
-/// jitter (<10ms) and ensures the user is never stuck for longer than this.
+/// jitter (<10ms) and the peer's Ping/Pong cadence (500ms / 2Hz), and
+/// ensures the user is never stuck for longer than this. Note that with
+/// the recv-arm refresh in place this is strictly a "peer has gone
+/// completely silent" detector — the prior "user idle on the peer side"
+/// false positive is no longer reachable.
 const WATCHDOG_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(8);
 
 // === FIX 4 — Watchdog 配置 ===================================================
@@ -389,7 +394,8 @@ struct CaptureTask {
 ///    and detects the storm.
 /// 4. **No-progress**: `last_progress_at` is the timestamp of the last
 ///    successful state advance (Pending→Sending promotion, `send_input`
-///    ok, `release_capture` completion). The heavy tick checks that the
+///    ok, `release_capture` completion, **or any inbound control-plane
+///    event from the peer** — see below). The heavy tick checks that the
 ///    elapsed time is within [`WATCHDOG_NO_PROGRESS_TIMEOUT`] and the state
 ///    is non-Idle, otherwise it forces a release.
 ///
@@ -398,16 +404,35 @@ struct CaptureTask {
 ///   `last_progress_at = now`, clear `recent_crossings`.
 /// - `handle_capture_event::Input(e)` on State::Sending Ok: clear + refresh.
 /// - `Begin` hitting the pending→active branch: refresh `last_progress_at`.
+/// - **`** ANY** inbound control-plane event from the active peer in
+///   `do_capture_session` recv arm (Ack / Pong / Hello / etc.)** — added by
+///   commit `f5f5a30` ("静止鼠标触发按键回流"). Without this, a user who
+///   moved the cursor onto the peer and stopped produced no input events,
+///   `last_progress_at` went stale, and after
+///   [`WATCHDOG_NO_PROGRESS_TIMEOUT`] = 8s the watchdog misclassified
+///   "user is idle" as "peer is unresponsive" and force-released capture
+///   (returning the keyboard to the host). Ping/Pong from a healthy peer
+///   is a strong enough liveness signal; refreshing the timer on any
+///   inbound event keeps no-progress strictly a "peer is silent" signal.
 struct WatchdogState {
     /// Number of consecutive `conn.send` failures during `State::Sending`.
+    /// **Reset semantics** (post-commit `f5f5a30`): cleared not only on a
+    /// successful `Input Ok` send but also on *any* inbound control-plane
+    /// event (Ack / Pong / Hello). This is a heuristic — if the peer is
+    /// alive enough to push a Pong every 500ms the next outbound send will
+    /// almost certainly succeed. Net effect: in practice
+    /// `send_failures_check` only fires when the local send queue is
+    /// broken *and* the peer has gone silent at the same time.
     consecutive_send_failures: u32,
     /// Timestamps of `BeginPending` events inside the sliding window. Pushed
     /// when `handle_capture_event` enters the `BeginPending` branch; the heavy
     /// tick discards entries older than [`WATCHDOG_CROSSING_WINDOW`].
     recent_crossings: VecDeque<Instant>,
-    /// Timestamp of the last successful state advance. Refreshed in three
+    /// Timestamp of the last successful state advance. Refreshed in four
     /// places: `release_capture` completion, Pending→Sending promotion,
-    /// and `send_input` ok.
+    /// `send_input` ok, and *any* inbound control-plane event from the
+    /// active peer (commit `f5f5a30` — see docstring above for the
+    /// "静止鼠标触发按键回流" rationale).
     last_progress_at: Instant,
 }
 
@@ -902,9 +927,19 @@ impl CaptureTask {
     ///    "send failure → release" path by covering the race where `conn.send`
     ///    returns NotConnected inside the retry gate but the release path is
     ///    never triggered.
+    ///    **Reset semantics** (post-commit `f5f5a30`): `consecutive_send_failures`
+    ///    is cleared on *any* inbound control-plane event (Ack / Pong / Hello),
+    ///    not only on successful `Input Ok`. Because Ping/Pong arrives every
+    ///    500ms on a healthy connection, in practice this check only fires
+    ///    when the local send queue is broken *and* the peer has gone silent
+    ///    simultaneously — a narrow but real failure mode worth catching.
     /// 3. **No-progress**: time since `last_progress_at` exceeds
     ///    [`WATCHDOG_NO_PROGRESS_TIMEOUT`] and state is non-Idle → state
-    ///    machine "frozen", force a release.
+    ///    machine "frozen", force a release. With the recv-arm refresh
+    ///    (commit `f5f5a30`), `last_progress_at` is kept fresh by *any*
+    ///    inbound control-plane event, so this check is now strictly a
+    ///    "peer has gone completely silent" signal — no longer false-triggers
+    ///    on user idle.
     ///
     /// Order: (1) first, then (2), then (3). Each check is independent and
     /// logs independently. If a single tick triggers multiple, they all fire
