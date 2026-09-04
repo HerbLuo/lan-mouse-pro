@@ -235,6 +235,7 @@ impl Capture {
         conn: LanMouseConnection,
         release_bind: Vec<scancode::Linux>,
         watchdog_config: WatchdogConfig,
+        peer_lost_rx: Receiver<ClientHandle>,
     ) -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
@@ -255,6 +256,11 @@ impl Capture {
             // `watchdog_config()` 完成（service.rs 调用方），此处不再读
             // 环境变量。
             watchdog_config,
+            // Receiver is reusable across `do_capture_session` calls —
+            // a `recv()` on a `local_channel::mpsc::Receiver` returns
+            // `Option<T>` and leaves the receiver alive for the next
+            // call. No swap is needed between sessions.
+            peer_lost_rx,
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -373,6 +379,12 @@ struct CaptureTask {
     /// by `Capture::new`. `do_capture_session` consults this to decide
     /// which checks run and at what intervals.
     watchdog_config: WatchdogConfig,
+    /// Pong-health → capture-release receiver. Sender lives on
+    /// [`crate::connect::LanMouseConnection`] (cloned into every
+    /// supervisor's watchdog). Reusable across `do_capture_session`
+    /// calls — `local_channel::mpsc::Receiver::recv()` leaves the
+    /// receiver alive on `None` returns.
+    peer_lost_rx: Receiver<ClientHandle>,
 }
 
 /// Watchdog self-healing state:
@@ -856,6 +868,54 @@ impl CaptureTask {
                     }
                 } => {
                     self.run_watchdog_heavy(capture).await;
+                }
+                // **Pong health watchdog** — `connect.rs::pong_health_watchdog`
+                // decided the peer stopped answering Pings for > 1.5s and
+                // force-closed the conn. The supervisor's redial path will
+                // re-dial shortly; until then release capture so the master
+                // doesn't sit on a stale `State::Sending` with a dead peer.
+                //
+                // **Handle match**: if we have an `active_client` AND it
+                // matches the watchdog's handle, release. A mismatch
+                // (e.g. a stale watchdog from a re-dial that landed during
+                // the gap) is silently ignored — the peer it was watching
+                // is already gone.
+                //
+                // **Why not just `capture.release()`**: the Sending/Idle
+                // bookkeeping + leave-event synthesis in
+                // `release_capture` matters here. We synthesise key-up
+                // events and a `Leave(0)` to the (just-closed) peer, which
+                // is the same flow the user's release-bind would trigger.
+                // `release_capture` swallows the resulting send failures
+                // gracefully (peer is gone) — verified by the existing
+                // `release_capture` log paths.
+                handle = self.peer_lost_rx.recv() => {
+                    let Some(handle) = handle else {
+                        // Sender side dropped (LanMouseConnection
+                        // dropped its sender). Treat as "peer dead" on
+                        // any currently active client so capture
+                        // doesn't sit on `State::Sending`.
+                        log::warn!("capture: peer_lost_rx closed unexpectedly — releasing active capture if any");
+                        if self.active_client.is_some() {
+                            self.release_capture(capture).await?;
+                        }
+                        continue;
+                    };
+                    log::info!(
+                        "capture: PeerLost(handle={handle}) from pong health watchdog — releasing capture"
+                    );
+                    let matches = match self.active_client {
+                        Some(active) => active == handle,
+                        None => false,
+                    };
+                    if matches {
+                        self.release_capture(capture).await?;
+                    } else {
+                        log::debug!(
+                            "capture: PeerLost(handle={handle}) ignored (active_client={:?} mismatch)",
+                            self.active_client
+                        );
+                    }
                 }
                 _ = self.cancellation_token.cancelled() => break,
             }

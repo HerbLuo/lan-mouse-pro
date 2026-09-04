@@ -124,6 +124,14 @@ impl Service {
                     )))
                 })?;
         let pins_dir = crypto::cert_pins_dir();
+
+        // Pong-health → capture-release channel. Created once at service
+        // startup; sender is cloned into every supervisor spawned by
+        // `connect_to_handle`, receiver lives on `Capture` (consumed by
+        // `do_capture_session`'s `select!` loop). See
+        // `connect.rs::pong_health_watchdog` for the producer side.
+        let (peer_lost_tx, peer_lost_rx) = local_channel::mpsc::channel();
+
         let conn = LanMouseConnection::new(
             client_endpoint,
             cert_der.0.clone(),
@@ -131,13 +139,20 @@ impl Service {
             pins_dir,
             client_manager.clone(),
             quic_idle_timeout,
+            peer_lost_tx,
         );
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
         // FIX 4：从 config.toml + env 构造 watchdog 配置，传给 Capture。
         let watchdog_config = config.watchdog_config();
-        let capture = Capture::new(capture_backend, conn, config.release_bind(), watchdog_config);
+        let capture = Capture::new(
+            capture_backend,
+            conn,
+            config.release_bind(),
+            watchdog_config,
+            peer_lost_rx,
+        );
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(emulation_backend, listener);
 

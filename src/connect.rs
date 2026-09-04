@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT, InputChannelConfig};
@@ -68,6 +68,10 @@ pub(crate) enum LanMouseConnectionError {
 ///   prevents repeated `connect_to_handle` from racing.
 /// - `recv_tx: Sender<(ClientHandle, ProtoEvent)>` — sender half of the receive
 ///   channel consumed by `recv()`.
+/// - `peer_lost_tx: Sender<ClientHandle>` — supervisor → capture signal:
+///   "the Pong health watchdog decided this peer is dead; release capture
+///   immediately". Receiver half lives on `Capture`, not here, so capture's
+///   `select!` loop can use it without conflicting with `self.conn.recv()`.
 pub(crate) struct LanMouseConnection {
     quic_creds: Rc<QuicDialerCreds>,
     client_endpoint: Endpoint,
@@ -88,6 +92,12 @@ pub(crate) struct LanMouseConnection {
     /// transport config for the lifetime of the process" rule that
     /// applies to the server-side listener.
     idle_timeout: std::time::Duration,
+    /// Sender for the supervisor → capture "peer dead" signal. Cloned
+    /// into every supervisor's pong health watchdog. The receiver
+    /// lives on [`crate::capture::Capture`] (not here) so it can be
+    /// polled from `do_capture_session`'s `select!` without colliding
+    /// with `self.conn.recv()`.
+    peer_lost_tx: Sender<ClientHandle>,
 }
 
 impl LanMouseConnection {
@@ -98,6 +108,7 @@ impl LanMouseConnection {
         pins_dir: PathBuf,
         client_manager: ClientManager,
         idle_timeout: std::time::Duration,
+        peer_lost_tx: Sender<ClientHandle>,
     ) -> Self {
         let (recv_tx, recv_rx) = channel();
         let quic_creds = Rc::new(QuicDialerCreds { cert_chain, key });
@@ -112,6 +123,7 @@ impl LanMouseConnection {
             recv_tx,
             retry_state: Default::default(),
             idle_timeout,
+            peer_lost_tx,
         }
     }
 
@@ -175,6 +187,7 @@ impl LanMouseConnection {
                 self.recv_tx.clone(),
                 handle,
                 self.idle_timeout,
+                self.peer_lost_tx.clone(),
             ));
         }
         Ok(())
@@ -302,6 +315,7 @@ impl LanMouseConnection {
                 self.recv_tx.clone(),
                 handle,
                 self.idle_timeout,
+                self.peer_lost_tx.clone(),
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
@@ -380,6 +394,39 @@ const MAX_RETRY_FAILURES_BEFORE_OFFLINE: u32 = 5;
 /// plenty of margin; 2 frames/s × bidirectional stream A traffic (Pong replies)
 /// is negligible control-plane load.
 const PING_INTERVAL: Duration = Duration::from_millis(500);
+
+// === Pong health watchdog (master-side death detection) =====================
+//
+// **Why a separate watchdog**: the QUIC keepalive (5s) + idle_timeout (5s)
+// stack takes ~5s on a healthy link and up to 10s on edge cases. That's the
+// window during which the master keeps `State::Sending` and the user's mouse
+// is "stuck on the controlled machine" while actually being captured by the
+// master and dropped into a black-hole QUIC send buffer. The peer is also
+// application-layer-aware — every Pong reply is a hard "alive" signal that's
+// independent of the UDP-layer keepalive. Watching Pong arrivals lets us
+// detect death in well under 2s.
+//
+// **Threshold 1.5s**: the heartbeat sends a Ping every 500ms. On a healthy
+// LAN the Pong comes back in < 50ms; 1.5s is ~5× the worst realistic RTT
+// (busy CPU + transient packet loss) and 3× the Ping cadence. Any value
+// above `~3 × PING_INTERVAL` covers 99% of healthy networks while still
+// firing within ~1s of the network actually going down. Lowering below
+// `2 × PING_INTERVAL` (1s) risks false positives on a slow CPU; raising
+// above `5 × PING_INTERVAL` (2.5s) loses the speed advantage over the QUIC
+// idle_timeout.
+//
+// **Tick period 500ms**: matches the Ping cadence so the threshold check is
+// never older than the previous Ping. Cheaper ticks (e.g. 100ms) wouldn't
+// catch the peer any faster — the next Pong can only arrive after the next
+// Ping, which is at most 500ms away.
+
+/// How long [`pong_health_watchdog`] waits after the last Pong before
+/// declaring the peer dead and force-closing the QUIC conn.
+const PONG_HEALTH_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// How often the watchdog wakes up to check `last_pong_at`. Matches
+/// [`PING_INTERVAL`] so the check is never older than the previous Ping.
+const PONG_HEALTH_TICK: Duration = Duration::from_millis(500);
 
 /// Records a dial failure (`dial_any` / `client_hello` / etc.) — doubles the
 /// backoff and increments `failure_count`. Emits `log::error` once
@@ -462,6 +509,11 @@ async fn connect_to_handle(
     // "endpoint owns its transport config for the lifetime of the
     // process" rule that applies to the server-side listener.
     quic_idle_timeout: std::time::Duration,
+    // Cloned sender for the Pong health watchdog's "peer dead" signal.
+    // Multiple supervisors (one per dial) all share the same channel;
+    // the receiver lives on `LanMouseConnection` and is consumed by
+    // `capture.rs::do_capture_session` via [`LanMouseConnection::peer_lost`].
+    peer_lost_tx: Sender<ClientHandle>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     let Some(ips_set) = client_manager.get_ips(handle) else {
@@ -590,11 +642,28 @@ async fn connect_to_handle(
         std::net::SocketAddr,
         lan_mouse_proto::ProtoEvent,
     )>();
+    // Pong health watchdog shared state. Initialised to "now" so the
+    // watchdog doesn't fire in the first 1.5s after a fresh connect
+    // — the peer needs at least one round-trip (Ping → Pong) before
+    // the threshold check makes sense. The forwarder updates it on
+    // every Pong arrival; the watchdog reads it from
+    // `pong_health_watchdog` below.
+    let last_pong_at: Rc<RefCell<Instant>> = Rc::new(RefCell::new(Instant::now()));
     {
         let client_manager_for_forwarder = client_manager.clone();
         let recv_tx = recv_tx.clone();
+        let last_pong_at = last_pong_at.clone();
         spawn_local(async move {
             while let Some((addr, event)) = out_rx.recv().await {
+                // Pong health: refresh on every Pong arrival. The
+                // Pong-frame `alive` flag is currently unused (the
+                // server always responds with the current emulation
+                // state), so we don't differentiate Pong(true) /
+                // Pong(false) here — both are equally valid liveness
+                // signals.
+                if matches!(event, lan_mouse_proto::ProtoEvent::Pong(_)) {
+                    *last_pong_at.borrow_mut() = Instant::now();
+                }
                 if let Some(handle) = client_manager_for_forwarder.get_client(addr) {
                     // Production log level is DEBUG: this is a high-frequency
                     // path (Ack / Pong / Leave all traverse it; motion does
@@ -638,6 +707,8 @@ async fn connect_to_handle(
         remote,
         peer,
         quic_idle_timeout,
+        peer_lost_tx,
+        last_pong_at,
     ));
     Ok(())
 }
@@ -674,6 +745,15 @@ async fn spawn_peer_supervisor(
     // spawn (`connect_to_handle`). Same frozen-at-startup value as
     // on the dial side.
     idle_timeout: std::time::Duration,
+    // Cloned sender for "peer dead" → capture-release. Sent by the
+    // Pong health watchdog when the peer stops responding for
+    // [`PONG_HEALTH_TIMEOUT`]. Forwarded to `capture.rs` via the
+    // receiver half on `LanMouseConnection`.
+    peer_lost_tx: Sender<ClientHandle>,
+    // Shared `last_pong_at` written by the stream-A forwarder in
+    // `connect_to_handle`. Read every [`PONG_HEALTH_TICK`] by the
+    // watchdog below.
+    last_pong_at: Rc<RefCell<Instant>>,
 ) {
     log::info!("spawn_peer_supervisor: starting for handle {handle} addr {addr}");
 
@@ -695,6 +775,22 @@ async fn spawn_peer_supervisor(
     // to `peer.run()` inside the supervisor gives the cleanest lifecycle match.
     let ping_task = spawn_local(ping_heartbeat_task(peer.clone(), addr));
 
+    // Pong health watchdog (master-side death detection). Spawned alongside
+    // the heartbeat so we close the gap where `peer.run()` hasn't yet
+    // noticed the peer is dead but the application-layer Pings already
+    // stopped being answered. The watchdog exits naturally on a hit
+    // (returns after sending the PeerLost signal) or via the `abort()`
+    // below when `peer.run()` returns first. Shared `last_pong_at` is
+    // updated by the forwarder in `connect_to_handle`.
+    let pong_health_task = spawn_local(pong_health_watchdog(
+        peer.clone(),
+        addr,
+        handle,
+        last_pong_at,
+        PONG_HEALTH_TIMEOUT,
+        peer_lost_tx,
+    ));
+
     let close_result = peer.run(PeerRole::Client).await;
     log::info!("spawn_peer_supervisor: peer.run() returned for handle {handle} addr {addr}");
 
@@ -703,6 +799,10 @@ async fn spawn_peer_supervisor(
     // and supervisor exit synchronized and prevents stragglers from triggering
     // a spurious `send_input` warning.
     ping_task.abort();
+    // Same reasoning for the pong-health watchdog. If it already fired
+    // (returned early) the abort is a no-op; if it's still waiting for the
+    // next tick the abort prevents it from racing the supervisor's redial.
+    pong_health_task.abort();
 
     // (1) Remove the peer — regardless of whether the close is graceful or
     // abnormal, let `send()` follow the redial path immediately.
@@ -761,6 +861,13 @@ async fn spawn_peer_supervisor(
                     local_channel::mpsc::channel::<(ClientHandle, lan_mouse_proto::ProtoEvent)>().0,
                     handle,
                     idle_timeout,
+                    // Same throwaway pattern for `peer_lost_tx`: the
+                    // supervisor-spawned redial's watchdog has no
+                    // observation window worth signalling — the new
+                    // `do_capture_session` hasn't started yet, so
+                    // capture.rs can't be in `State::Sending` for
+                    // this handle. Drops on return.
+                    local_channel::mpsc::channel::<ClientHandle>().0,
                 ));
             } else {
                 log::info!(
@@ -829,6 +936,98 @@ async fn ping_heartbeat_task(peer: Arc<PeerSession>, addr: SocketAddr) {
                 log::warn!("ping_heartbeat: send Ping to {addr} failed (peer dead): {e}");
                 return;
             }
+        }
+    }
+}
+
+/// Pong health watchdog. Runs alongside [`ping_heartbeat_task`] inside
+/// [`spawn_peer_supervisor`] and decides — purely on application-layer
+/// liveness — whether the peer is dead. Fires once the gap since the
+/// last Pong exceeds [`PONG_HEALTH_TIMEOUT`].
+///
+/// **Why this lives in the supervisor, not capture.rs**: closing the
+/// QUIC conn requires a handle on the peer (`peer.connection().close(...)`),
+/// which only the supervisor has. Capture only needs to know "release
+/// now", which is exactly the [`ClientHandle`] the watchdog sends through
+/// `peer_lost_tx`.
+///
+/// **Why this fires before QUIC idle_timeout**: the QUIC stack's idle
+/// detection depends on transport-layer keepalive (5s) + idle_timeout
+/// (5s), giving up to ~10s on a silent peer. That's the window during
+/// which the master keeps the mouse captured and the user sees the
+/// pointer "disappear". Pong detection collapses that window to
+/// `PONG_HEALTH_TIMEOUT = 1.5s` — the master releases capture long
+/// before the QUIC stack notices anything.
+///
+/// **Coexistence with the QUIC stack**: when the watchdog force-closes
+/// the conn, `peer.run()` returns with `ConnectionError::ApplicationClosed(WAKE_CLOSE_CODE)`
+/// — exactly the same reason the existing macOS wake path and the
+/// server-side `last_response` timeout use. The supervisor's redial
+/// branch (the `should_retry_after_close` match) already handles this
+/// reason and schedules a fresh dial via RetryState, so no new logic
+/// is needed on the close side.
+///
+/// **False positives**: 1.5s is `3 × PING_INTERVAL`, so any single
+/// missed Pong triggers the watchdog. On a busy CPU this is the right
+/// trade-off — the user would rather see "mouse briefly returned" than
+/// "mouse stuck for 10s". False positives are bounded by the next
+/// redial (≤ 500ms retry backoff + dial time, see
+/// [`INITIAL_RETRY_BACKOFF`]).
+///
+/// **Exit paths** (first to fire wins):
+/// 1. Threshold exceeded → close conn + send PeerLost + `return`.
+/// 2. `pong_health_task.abort()` from the supervisor tail — the
+///    peer has died from another reason (Leave, QUIC handshake
+///    failure, etc.). This task drops mid-`interval.tick().await`.
+/// 3. `peer.connection().close()` from the same watchdog firing in
+///    duplicate — close is idempotent so a second attempt is a
+///    no-op; the supervisor's abort on `peer.run() return` covers
+///    cleanup.
+///
+/// **No tick on first iteration**: skipped via `interval.tick().await`
+/// before the loop, mirroring the heartbeat task. The shared
+/// `last_pong_at` is initialised to "now" in
+/// [`connect_to_handle`]'s forwarder block so even if the first tick
+/// fires immediately, the threshold check correctly reports
+/// `elapsed() ≈ 0` rather than firing spuriously.
+async fn pong_health_watchdog(
+    peer: Arc<PeerSession>,
+    addr: SocketAddr,
+    handle: ClientHandle,
+    last_pong_at: Rc<RefCell<Instant>>,
+    threshold: Duration,
+    peer_lost_tx: Sender<ClientHandle>,
+) {
+    let mut interval = tokio::time::interval(PONG_HEALTH_TICK);
+    // Skip the first tick — see the docstring above.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let elapsed = last_pong_at.borrow().elapsed();
+        if elapsed > threshold {
+            log::warn!(
+                "Pong health watchdog: peer {addr} hasn't responded in {elapsed:?} \
+                 (> {threshold:?}) — force-closing with WAKE_CLOSE_CODE + notifying capture"
+            );
+            // Force-close with the wake code so the supervisor's
+            // existing `should_retry_after_close` branch triggers the
+            // RetryState redial — no new code path needed.
+            peer.connection().close(
+                quic_transport::session::WAKE_CLOSE_CODE.into(),
+                b"pong_health_timeout",
+            );
+            // Notify capture so the master releases `State::Sending`
+            // immediately rather than waiting for the user's next
+            // Input event.
+            if let Err(e) = peer_lost_tx.send(handle) {
+                // The recv side is gone — likely the capture task has
+                // exited (shutdown / panic). The peer is already
+                // being closed above; just log and move on.
+                log::warn!(
+                    "Pong health watchdog: peer_lost_tx.send failed (capture task exited): {e}"
+                );
+            }
+            return;
         }
     }
 }
@@ -1012,5 +1211,31 @@ mod tests {
         );
         retry_state.borrow_mut().remove(&handle);
         assert!(!retry_state.borrow().contains_key(&handle));
+    }
+
+    /// **Pong health threshold** — keeps the 1.5s default under
+    /// guardrail. If a future change lowers this below `2 × PING_INTERVAL`
+    /// a single missed Pong will trip the watchdog, surfacing as
+    /// "mouse briefly returned during a brief pause". Going above
+    /// `5 × PING_INTERVAL` loses the speed advantage over QUIC
+    /// idle_timeout (5s).
+    #[test]
+    fn pong_health_threshold_in_safe_range() {
+        const PING_INTERVAL_NS: u128 = 500_000_000; // 500ms
+        const TIMEOUT_NS: u128 = 1_500_000_000; // 1.5s
+        const LOWER_BOUND_NS: u128 = PING_INTERVAL_NS * 2;
+        const UPPER_BOUND_NS: u128 = PING_INTERVAL_NS * 5;
+        assert!(
+            TIMEOUT_NS >= LOWER_BOUND_NS,
+            "PONG_HEALTH_TIMEOUT ({}) should be >= 2 × PING_INTERVAL ({})",
+            TIMEOUT_NS,
+            LOWER_BOUND_NS
+        );
+        assert!(
+            TIMEOUT_NS <= UPPER_BOUND_NS,
+            "PONG_HEALTH_TIMEOUT ({}) should be <= 5 × PING_INTERVAL ({}) to beat QUIC idle_timeout",
+            TIMEOUT_NS,
+            UPPER_BOUND_NS
+        );
     }
 }
