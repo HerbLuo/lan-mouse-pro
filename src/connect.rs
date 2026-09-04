@@ -466,7 +466,29 @@ async fn connect_to_handle(
     {
         Ok(c) => c,
         Err(e) => {
-            log::warn!("client ({handle}) dial_any failed: {e}");
+            // **Operator-facing diagnostic**: a `TimedOut` after the QUIC
+            // handshake window typically means *no lan-mouse is listening on
+            // the peer at all* (UDP Initial was never answered) — distinct
+            // from a transport / fingerprint mismatch which surfaces as a
+            // different `quinn::ConnectionError` variant. Distinguishing
+            // these two failure modes is the difference between "the peer
+            // daemon is down / firewall blocks UDP 4242" and "the peer's
+            // cert fingerprint changed and needs re-pinning". Without this
+            // hint the operator is left guessing which half of the network
+            // to inspect.
+            let hint = match &e {
+                quic_transport::Error::Handshake(quinn::ConnectionError::TimedOut) => {
+                    " (peer unreachable or not running lan-mouse — \
+                     verify UDP 4242 is open and `lan-mouse` is active on the remote)"
+                }
+                quic_transport::Error::Handshake(quinn::ConnectionError::TransportError(_)) => {
+                    " (TLS 1.3 handshake rejected — peer cert may not be in \
+                     `authorized_fingerprints`, or this side's pin does not \
+                     match the peer's fingerprint)"
+                }
+                _ => "",
+            };
+            log::warn!("client ({handle}) dial_any failed: {e}{hint}");
             record_retry_failure(&retry_state, handle);
             connecting.lock().await.remove(&handle);
             return Err(LanMouseConnectionError::Quic(e));
