@@ -699,6 +699,7 @@ async fn connect_to_handle(
     spawn_local(spawn_peer_supervisor(
         client_manager,
         peers.clone(),
+        connecting.clone(),
         retry_state,
         client_endpoint,
         quic_creds,
@@ -708,6 +709,7 @@ async fn connect_to_handle(
         peer,
         quic_idle_timeout,
         peer_lost_tx,
+        recv_tx.clone(),
         last_pong_at,
     ));
     Ok(())
@@ -734,6 +736,18 @@ async fn connect_to_handle(
 async fn spawn_peer_supervisor(
     client_manager: ClientManager,
     peers: Rc<Mutex<HashMap<SocketAddr, Arc<PeerSession>>>>,
+    // Shared dial de-duplication set. **Must be the same `Rc` cloned from
+    // `LanMouseConnection`** — see `connect_to_handle`'s spawn site. The
+    // supervisor passes it to its own redial `connect_to_handle` call so
+    // concurrent dials (send()/dial() retry path + supervisor-redial) are
+    // collapsed by `connecting.insert(handle)` / `connecting.remove(&handle)`
+    // the same way the initial dial is. Without this, the redial would
+    // create a fresh empty mutex and a second `connect_to_handle` could
+    // race the first — producing duplicate `PeerSession` registrations,
+    // duplicate supervisors, and on the slave side a duplicate Enter that
+    // drives the EnterOnly trigger → spurious Leave(0) → "mouse stuck on
+    // slave after reconnect".
+    connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     retry_state: Rc<RefCell<HashMap<ClientHandle, RetryState>>>,
     client_endpoint: Endpoint,
     quic_creds: Rc<QuicDialerCreds>,
@@ -750,6 +764,14 @@ async fn spawn_peer_supervisor(
     // [`PONG_HEALTH_TIMEOUT`]. Forwarded to `capture.rs` via the
     // receiver half on `LanMouseConnection`.
     peer_lost_tx: Sender<ClientHandle>,
+    // Stream-A forwarder channel. The redial `connect_to_handle` MUST
+    // reuse the same Sender the initial dial used, otherwise its
+    // forwarder would push Ack / Pong / Leave events into a throwaway
+    // channel whose receiver drops on return — capture.rs would never
+    // observe them and the state machine would drift (the first
+    // forwarder's exit logs `recv_tx.send failed (capture task exited)`
+    // with a misleading comment).
+    recv_tx: Sender<(ClientHandle, lan_mouse_proto::ProtoEvent)>,
     // Shared `last_pong_at` written by the stream-A forwarder in
     // `connect_to_handle`. Read every [`PONG_HEALTH_TICK`] by the
     // watchdog below.
@@ -788,7 +810,7 @@ async fn spawn_peer_supervisor(
         handle,
         last_pong_at,
         PONG_HEALTH_TIMEOUT,
-        peer_lost_tx,
+        peer_lost_tx.clone(),
     ));
 
     let close_result = peer.run(PeerRole::Client).await;
@@ -841,33 +863,29 @@ async fn spawn_peer_supervisor(
                     );
                 }
                 // Trigger a new dial round (spawn_local fire-and-forget).
-                // Do **not** reuse the caller's `connecting` set — the caller
-                // (`connect_to_handle`) has already done `remove(&handle)`,
-                // so the supervisor's view is empty (`Mutex<HashSet::new>`).
+                // Reuse the shared `connecting` set (`LanMouseConnection`'s
+                // self-connecting), the shared `recv_tx` (so the redial's
+                // forwarder still publishes Ack / Pong / Leave back to
+                // capture.rs), and the supervisor's own `peer_lost_tx` (so
+                // the redial's watchdog can still signal capture release if
+                // the new peer dies). Without sharing these, the redial
+                // races the `send()`/`dial()` retry path (concurrent
+                // `connect_to_handle` invocations for the same handle),
+                // producing duplicate `PeerSession` registrations and
+                // duplicate Enter events on the slave side — see the
+                // historical "mouse stuck on slave after reconnect" bug.
                 spawn_local(connect_to_handle(
                     client_manager,
                     client_endpoint,
                     quic_creds,
                     peers,
-                    Rc::new(Mutex::new(HashSet::new())),
+                    connecting.clone(),
                     pins_dir,
                     retry_state,
-                    // The supervisor can't easily reach the original
-                    // `LanMouseConnection::recv_tx`; a fresh throwaway sender
-                    // is fine here because the redial path doesn't need
-                    // forwarder events for the brief window before capture is
-                    // re-established (and capture has already been released
-                    // since `active_addr` was cleared above).
-                    local_channel::mpsc::channel::<(ClientHandle, lan_mouse_proto::ProtoEvent)>().0,
+                    recv_tx.clone(),
                     handle,
                     idle_timeout,
-                    // Same throwaway pattern for `peer_lost_tx`: the
-                    // supervisor-spawned redial's watchdog has no
-                    // observation window worth signalling — the new
-                    // `do_capture_session` hasn't started yet, so
-                    // capture.rs can't be in `State::Sending` for
-                    // this handle. Drops on return.
-                    local_channel::mpsc::channel::<ClientHandle>().0,
+                    peer_lost_tx.clone(),
                 ));
             } else {
                 log::info!(

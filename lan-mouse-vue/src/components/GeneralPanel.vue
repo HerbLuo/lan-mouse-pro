@@ -224,37 +224,28 @@ async function copy(text: string, label = 'copied') {
           >
             <IconCopy />
           </button>
-          <!-- QUIC idle_timeout, seconds. Sits next to the port input
-               so both "endpoint-level" controls are visible together.
-               The label and helper text below explain the restart
-               requirement — without it users would expect the change
-               to take effect immediately. -->
-          <div class="quic-idle-row">
-            <span class="quic-idle-label mono">QUIC idle</span>
-            <input
-              type="number"
-              min="5"
-              step="1"
-              v-model="quicIdleDraft"
-              @change="commitQuicIdle"
-              placeholder="5"
-              class="mono"
-              style="width: 56px"
-              title="QUIC max_idle_timeout in seconds (restart required to apply)"
-            />
-            <span class="quic-idle-unit mono">s</span>
-          </div>
         </div>
         <span
           v-if="daemonStore.portError"
           style="color: var(--error); margin-top: 6px; display: block"
           >{{ daemonStore.portError }}</span
         >
-        <!-- Helper text — required because the value doesn't apply
-             live. Repeats the constraint next to the input itself so
-             users don't have to hover the input to find the title. -->
-        <div class="muted quic-idle-hint">QUIC idle timeout — applies on next daemon restart</div>
       </div>
+    </div>
+
+    <div>
+      <div class="muted card-title">QUIC idle</div>
+      <input
+        type="number"
+        min="5"
+        step="1"
+        v-model="quicIdleDraft"
+        @change="commitQuicIdle"
+        placeholder="5"
+        class="mono"
+        style="width: 28px; margin-left: 12px"
+      />
+      <span class="mono em1">s</span>
     </div>
 
     <div style="margin-top: 14px">
