@@ -450,10 +450,16 @@ const HEAD_START: Duration = Duration::from_millis(200);
 ///   no new variants added)
 /// - handshake failure → [`Error::Handshake`] (`#[from] quinn::ConnectionError`)
 ///
+/// **Do not drive a long-lived accept loop with this function.** It collapses
+/// "the endpoint is gone" and "this one handshake failed" into a single `Err`,
+/// so a loop that `break`s on `Err` tears the listener down on the first
+/// unauthorized / mismatched / aborted dial. `listen.rs::spawn_quic_accept_task`
+/// therefore calls `ep.accept()` directly and only treats `None` as fatal.
+/// This helper is for one-shot accepts (tests, single-connection flows).
+///
 /// **Does not** proactively call `install_crypto_provider`: symmetric with
 /// [`dial`]; the caller is responsible for guarding it during main startup.
-#[allow(dead_code)]
-pub async fn accept(ep: &Endpoint) -> Result<Connection> {
+#[allow(dead_code)](ep: &Endpoint) -> Result<Connection> {
     let incoming = ep
         .accept()
         .await

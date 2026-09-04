@@ -10,8 +10,11 @@
 //!    `endpoint_with_verifier(port, cert_chain, key, AuthorizedKeysVerifier)`
 //!    to obtain an `Endpoint` (mTLS + fingerprint allowlist are enforced
 //!    during the handshake).
-//! 2. A per-listener accept task loops on `quic_transport::accept()`, spawning
-//!    one `handle_quic_peer_supervisor` task per `Connection`.
+//! 2. A per-listener accept task loops on `quinn::Endpoint::accept()`,
+//!    awaiting each handshake in its own task and spawning one
+//!    `handle_quic_peer_supervisor` task per established `Connection`. Only
+//!    endpoint closure ends the loop — a rejected handshake is per-connection
+//!    (see `spawn_quic_accept_task`).
 //! 3. The supervisor: `server_hello` → compute fingerprint (defense-in-depth)
 //!    → push `ListenEvent::Accept` → `take_stream_a_recv` to obtain the recv
 //!    half of stream A → loop on `read_frame(&mut recv_a)` and translate each
@@ -386,9 +389,33 @@ impl Stream for LanMouseListener {
 /// Helper called by `LanMouseListener::new()`: spawns the QUIC accept task
 /// for a single endpoint plus a per-peer supervisor task for each connection.
 ///
+/// **Only endpoint closure ends this loop.** `quinn::Endpoint::accept()`
+/// returning `None` means the endpoint itself is gone (`terminate()` aborts
+/// this task, or the runtime is shutting down) — that is the sole fatal
+/// condition. A failed *handshake* is per-connection and must never reach the
+/// loop: a peer whose fingerprint is not yet in `authorized_keys` is rejected
+/// by [`AuthorizedKeysVerifier`], and that rejection is completely routine —
+/// it is exactly the first-contact path that raises the "authorize this peer?"
+/// dialog.
+///
+/// The earlier shape drove the loop with `quic_transport::accept(&ep)`, which
+/// collapses both cases into a single `Err`, and `break`ing on it dropped the
+/// last `quinn::Endpoint` handle. With no connection alive, quinn's endpoint
+/// driver then saw `ref_count == 0 && connections.is_empty()`, shut down, and
+/// closed the UDP socket — so the daemon kept running while the port silently
+/// vanished from the listen table, and no code path ever rebinds it
+/// (`request_port_change` is a no-op). One unauthorized dial, one ALPN
+/// mismatch, one aborted `dial_any` happy-eyeballs loser, or one peer whose
+/// TOFU verifier rejected our cert killed the listener for the lifetime of
+/// the process — including, fatally, the very rejection that the pairing
+/// dialog is supposed to resolve.
+///
 /// Supervisor shape:
-/// 1. Loop on `quic_transport::accept(&ep)` to obtain `Connection`s.
-/// 2. On each new conn, spawn a supervisor that:
+/// 1. Loop on `ep.accept()` for `Incoming`s; `None` (and only `None`) breaks.
+/// 2. Await the TLS 1.3 handshake in a per-connection task — never inline on
+///    the accept loop, where a peer stalling mid-handshake would block every
+///    other peer from being accepted.
+/// 3. On each established conn, spawn a supervisor that:
 ///    - Exchanges `PROTOCOL_MAGIC` via `server_hello` (a `HelloFailed` error
 ///      exits the supervisor).
 ///    - Computes the client cert fingerprint from `peer_identity` and
@@ -412,33 +439,43 @@ fn spawn_quic_accept_task(
     spawn_local(async move {
         log::info!("QUIC listener listening on {ep:?}");
         loop {
-            match quic_transport::accept(&ep).await {
-                Ok(conn) => {
-                    let peer = Rc::new(PeerSession::from_connection(conn));
-                    let remote = peer.connection().remote_address();
-                    log::info!("QUIC peer connected: {remote}");
-                    let peer_clone = peer.clone();
-                    let tx_clone = listen_tx.clone();
-                    let quic_conns_for_supervisor = quic_conns.clone();
-                    spawn_local(async move {
-                        if let Err(e) = handle_quic_peer_supervisor(
-                            peer_clone,
-                            tx_clone,
-                            quic_conns_for_supervisor,
-                        )
-                        .await
-                        {
-                            log::warn!("QUIC peer supervisor exited with err: {e}");
-                        }
-                    });
+            // `None` — the endpoint is closed — is the *only* fatal condition.
+            // Everything else is per-connection and must leave the listener
+            // bound.
+            let Some(incoming) = ep.accept().await else {
+                log::info!("QUIC endpoint closed (accept returned None) — accept loop exiting");
+                break;
+            };
+
+            let remote = incoming.remote_address();
+            let tx_clone = listen_tx.clone();
+            let quic_conns_for_supervisor = quic_conns.clone();
+            spawn_local(async move {
+                // The TLS 1.3 handshake runs here, off the accept loop, so a
+                // peer that stalls mid-handshake cannot stop other peers from
+                // being accepted.
+                let conn = match incoming.await {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        // Routine and non-fatal: unauthorized fingerprint
+                        // (the pairing-dialog path — `AuthorizedKeysVerifier`
+                        // has already pushed `ListenEvent::Rejected` through
+                        // the rejection forwarder), ALPN mismatch, the peer's
+                        // TOFU verifier rejecting our cert, or a `dial_any`
+                        // happy-eyeballs loser being aborted. The endpoint
+                        // stays bound and keeps accepting.
+                        log::warn!("QUIC handshake from {remote} failed: {e}");
+                        return;
+                    }
+                };
+                let peer = Rc::new(PeerSession::from_connection(conn));
+                log::info!("QUIC peer connected: {remote}");
+                if let Err(e) =
+                    handle_quic_peer_supervisor(peer, tx_clone, quic_conns_for_supervisor).await
+                {
+                    log::warn!("QUIC peer supervisor exited with err: {e}");
                 }
-                Err(e) => {
-                    // QUIC accept failures usually mean the endpoint was
-                    // closed (terminate path).
-                    log::debug!("QUIC accept returned: {e}");
-                    break;
-                }
-            }
+            });
         }
     })
 }
