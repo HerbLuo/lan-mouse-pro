@@ -81,6 +81,13 @@ pub(crate) struct LanMouseConnection {
     /// When `failure_count` reaches `MAX_RETRY_FAILURES_BEFORE_OFFLINE` a `log::error`
     /// is emitted; `TransportEvent::PeerLost` is **not** pushed to IPC.
     retry_state: Rc<RefCell<HashMap<ClientHandle, RetryState>>>,
+    /// QUIC `max_idle_timeout` passed to every outbound dial. Frozen at
+    /// service startup from [`crate::config::Config::quic_idle_timeout`].
+    /// Subsequent edits via the GUI are persisted to TOML but not
+    /// picked up until the daemon restarts — same "endpoint owns its
+    /// transport config for the lifetime of the process" rule that
+    /// applies to the server-side listener.
+    idle_timeout: std::time::Duration,
 }
 
 impl LanMouseConnection {
@@ -90,6 +97,7 @@ impl LanMouseConnection {
         key: PrivateKeyDer<'static>,
         pins_dir: PathBuf,
         client_manager: ClientManager,
+        idle_timeout: std::time::Duration,
     ) -> Self {
         let (recv_tx, recv_rx) = channel();
         let quic_creds = Rc::new(QuicDialerCreds { cert_chain, key });
@@ -103,6 +111,7 @@ impl LanMouseConnection {
             recv_rx,
             recv_tx,
             retry_state: Default::default(),
+            idle_timeout,
         }
     }
 
@@ -165,6 +174,7 @@ impl LanMouseConnection {
                 self.retry_state.clone(),
                 self.recv_tx.clone(),
                 handle,
+                self.idle_timeout,
             ));
         }
         Ok(())
@@ -291,6 +301,7 @@ impl LanMouseConnection {
                 self.retry_state.clone(),
                 self.recv_tx.clone(),
                 handle,
+                self.idle_timeout,
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
@@ -329,22 +340,32 @@ struct RetryState {
 
 /// RetryState backoff constants, tuned for Mac wake reconnect UX.
 ///
-/// **Backoff curve**: 500ms → 1s → 2s → 4s → 8s (cap) → 8s → 8s → ...
+/// **Backoff curve**: 500ms → 1s → 2s → 4s → 4s (cap) → 4s → 4s → ...
 /// repeating forever.
 ///
-/// **Why 8s instead of the upstream 30s cap**: a 30s ceiling on the reconnect
+/// **Why 4s instead of the upstream 30s cap**: a 30s ceiling on the reconnect
 /// interval makes the mouse-sharing UX feel sluggish — after a Mac wakes up,
-/// the user has to wait up to 30s for any visible reaction. The 8s cap means
-/// the user only waits up to 8s for the next retry attempt (in practice it's
+/// the user has to wait up to 30s for any visible reaction. The 4s cap means
+/// the user only waits up to 4s for the next retry attempt (in practice it's
 /// faster: the peer wake-up itself triggers the next success). The
-/// `failure_count == 5` log threshold is unchanged (it fires around t=15s,
-/// which separates "short outage" from "peer really offline").
+/// `failure_count == 5` log threshold fires earlier (around t=12s instead of
+/// t=15s) which still cleanly separates "short outage" from "peer really
+/// offline".
+///
+/// **Why 4s instead of the previous 8s (2026-09-04)**: when the controlled
+/// client's network blips (Wi-Fi roam, brief switch outage, USB ethernet
+/// reset), the user observes the mouse "stuck on the controlled machine" for
+/// the duration of the longest retry wait. 4s halves that worst-case window
+/// without meaningfully increasing dial-attempt load on a permanently-offline
+/// peer (8s × N attempts and 4s × 2N attempts produce comparable background
+/// traffic after the first few seconds, since both cap at their respective
+/// ceiling).
 // TEMPORARY: retry backoff disabled for debugging — do NOT re-enable unless
 // explicitly instructed. Original values:
 //   INITIAL_RETRY_BACKOFF = Duration::from_millis(500)
 //   MAX_RETRY_BACKOFF     = Duration::from_secs(8)
 const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(500);
-const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(8);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(4);
 const MAX_RETRY_FAILURES_BEFORE_OFFLINE: u32 = 5;
 
 /// Application-layer heartbeat cadence: the controlling side periodically sends
@@ -434,6 +455,13 @@ async fn connect_to_handle(
     // → capture.rs.
     recv_tx: Sender<(ClientHandle, lan_mouse_proto::ProtoEvent)>,
     handle: ClientHandle,
+    // QUIC `max_idle_timeout` passed straight to
+    // [`quic_transport::dial_any`]. Frozen at supervisor startup
+    // from [`crate::config::Config::quic_idle_timeout`]. Outbound
+    // dials do not pick up subsequent config edits — same
+    // "endpoint owns its transport config for the lifetime of the
+    // process" rule that applies to the server-side listener.
+    quic_idle_timeout: std::time::Duration,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     let Some(ips_set) = client_manager.get_ips(handle) else {
@@ -469,6 +497,7 @@ async fn connect_to_handle(
         quic_creds.key.clone_key(),
         &pins_dir,
         &peer_key,
+        quic_idle_timeout,
     )
     .await
     {
@@ -608,6 +637,7 @@ async fn connect_to_handle(
         handle,
         remote,
         peer,
+        quic_idle_timeout,
     ));
     Ok(())
 }
@@ -640,6 +670,10 @@ async fn spawn_peer_supervisor(
     handle: ClientHandle,
     addr: SocketAddr,
     peer: Arc<PeerSession>,
+    // QUIC `max_idle_timeout` passed to the supervisor's redial
+    // spawn (`connect_to_handle`). Same frozen-at-startup value as
+    // on the dial side.
+    idle_timeout: std::time::Duration,
 ) {
     log::info!("spawn_peer_supervisor: starting for handle {handle} addr {addr}");
 
@@ -726,6 +760,7 @@ async fn spawn_peer_supervisor(
                     // since `active_addr` was cleared above).
                     local_channel::mpsc::channel::<(ClientHandle, lan_mouse_proto::ProtoEvent)>().0,
                     handle,
+                    idle_timeout,
                 ));
             } else {
                 log::info!(

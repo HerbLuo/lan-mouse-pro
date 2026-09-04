@@ -41,6 +41,27 @@ port = 4242
 # For the lowest possible input latency, at the risk of dropped keys:
 # input_channels = { mouse_button = "datagram", keyboard = "datagram" }
 
+# === QUIC transport config ===================================================
+#
+# idle_timeout_secs controls the QUIC `max_idle_timeout` used by both the
+# server-side listener and every outgoing client connection. It is the
+# master side's only death-detection signal — once no packet has arrived
+# from the peer for this many seconds, QUIC closes the connection and
+# the supervisor triggers a redial.
+#
+# Lower values shrink the "mouse stuck during a network blip" window
+# (was 10s before 2026-09-04). Raising it makes the link more tolerant
+# of long pauses but means recovery takes longer after the peer really
+# disappears. Default 5s is a LAN-friendly value: above the keep-alive
+# interval (5s) and short enough that a brief Wi-Fi roam doesn't feel
+# like a freeze.
+#
+# NOTE: changes here apply on the next daemon restart — the running
+# endpoint owns its transport config for the lifetime of the process.
+#
+# [quic]
+# idle_timeout_secs = 5
+
 # === Watchdog self-healing (FIX 4) ============================================
 #
 # Auto-recovery for "mouse stuck at screen edge" bugs. Three independent

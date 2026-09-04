@@ -270,7 +270,12 @@ pub(crate) mod test_helpers {
         cert_chain: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> crate::quic_transport::Result<Endpoint> {
-        crate::quic_transport::endpoint_with_cert(addr, cert_chain, key)
+        crate::quic_transport::endpoint_with_cert(
+            addr,
+            cert_chain,
+            key,
+            std::time::Duration::from_secs(5),
+        )
     }
 
     /// Build a `ServerName` for verifier tests. `localhost` is a valid DNS
@@ -335,6 +340,7 @@ pub(crate) mod test_helpers {
             std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0).into(),
             cert,
             key,
+            std::time::Duration::from_secs(5),
         )
         .expect("server endpoint bind");
         let addr = ep.local_addr().expect("server addr");

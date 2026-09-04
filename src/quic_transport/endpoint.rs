@@ -85,7 +85,7 @@ pub fn endpoint(addr: SocketAddr) -> Result<Endpoint> {
 /// **Production path caller**:
 /// 1. `crypto::load_or_create_server_cert()` → `(cert_chain, key)` (persisted
 ///    to `$XDG_DATA_HOME/lan-mouse/{cert,key}.pem`)
-/// 2. `endpoint_with_cert(addr, cert_chain, key)`
+/// 2. `endpoint_with_cert(addr, cert_chain, key, idle_timeout)`
 /// 3. `accept(ep)` waits for incoming connections
 ///
 /// **ALPN symmetry**: this function sets `rustls::ServerConfig.alpn_protocols`
@@ -96,8 +96,9 @@ pub fn endpoint(addr: SocketAddr) -> Result<Endpoint> {
 /// mismatch will reject the connection outright.
 ///
 /// **`transport_config`**: chained onto the config via
-/// `server_cfg.transport_config(...)` with [`super::tls::default_transport_config`]
-/// — 5s keepalive / 30s idle.
+/// `server_cfg.transport_config(...)` with
+/// [`super::tls::default_transport_config`] — 5s keepalive /
+/// caller-supplied idle_timeout.
 ///
 /// **Error normalization**: reuses existing variants — no new ones added:
 /// - `crypto::rustls_server_config` failure → `Error::Crypto(#[from])`
@@ -117,9 +118,10 @@ pub fn endpoint_with_cert(
     addr: SocketAddr,
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
+    idle_timeout: Duration,
 ) -> Result<Endpoint> {
     let rustls_server_arc = crypto::rustls_server_config(cert_chain, key)?;
-    endpoint_inner(addr, rustls_server_arc)
+    endpoint_inner(addr, rustls_server_arc, idle_timeout)
 }
 
 /// Server-mode `Endpoint` with mandatory mTLS client cert verification.
@@ -157,9 +159,10 @@ pub fn endpoint_with_verifier(
     cert_chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    idle_timeout: Duration,
 ) -> Result<Endpoint> {
     let rustls_server_arc = crypto::rustls_server_config_with_verifier(cert_chain, key, verifier)?;
-    endpoint_inner(addr, rustls_server_arc)
+    endpoint_inner(addr, rustls_server_arc, idle_timeout)
 }
 
 /// Private helper shared by `endpoint_with_cert` / `endpoint_with_verifier`:
@@ -174,9 +177,13 @@ pub fn endpoint_with_verifier(
 /// `crypto::rustls_server_config[_with_verifier]` returns). Even if the verifier
 /// internally holds an `Arc` (e.g. `Arc<RwLock<...>>`), that is its own
 /// internal state and unrelated to the server_cfg.
+///
+/// **`idle_timeout`**: caller-supplied QUIC `max_idle_timeout` (must be
+/// ≥ 5s — the keep-alive interval). See [`tls::default_transport_config`].
 fn endpoint_inner(
     addr: SocketAddr,
     rustls_server_arc: Arc<rustls::ServerConfig>,
+    idle_timeout: Duration,
 ) -> Result<Endpoint> {
     // `alpn_protocols` is a field on `rustls::ServerConfig` (not on quinn's
     // `ServerConfig`), so it must be set before wrapping into `QuicServerConfig`.
@@ -187,7 +194,7 @@ fn endpoint_inner(
     let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_server))
         .map_err(|e| Error::ClientConfig(format!("QuicServerConfig::try_from: {e}")))?;
     let mut server_cfg = ServerConfig::with_crypto(Arc::new(quic_server));
-    server_cfg.transport_config(tls::default_transport_config());
+    server_cfg.transport_config(tls::default_transport_config(idle_timeout));
 
     let endpoint_cfg = EndpointConfig::default();
     let socket = UdpSocket::bind(addr).map_err(|source| Error::Bind { addr, source })?;
@@ -272,6 +279,7 @@ pub async fn dial(
     cert: CertificateDer<'static>,
     key: PrivateKeyDer<'static>,
     pins_dir: &Path,
+    idle_timeout: Duration,
 ) -> Result<Connection> {
     // Idempotent guard: symmetric with build_quic_client_config — even if the
     // caller already invoked it once during main startup, repeatedly entering
@@ -286,7 +294,13 @@ pub async fn dial(
     // dialed IP is the peer identity here. `dial_any` cannot do this — its
     // candidate list comes from an unordered set — so it takes an explicit
     // key from the caller.
-    let cfg = tls::build_quic_client_config(vec![cert], key, pins_dir, &addr.ip().to_string())?;
+    let cfg = tls::build_quic_client_config(
+        vec![cert],
+        key,
+        pins_dir,
+        &addr.ip().to_string(),
+        idle_timeout,
+    )?;
     let conn = ep.connect_with(cfg, addr, "lan-mouse")?.await?;
     Ok(conn)
 }
@@ -330,6 +344,7 @@ pub async fn dial_any(
     key: PrivateKeyDer<'static>,
     pins_dir: &Path,
     peer_key: &str,
+    idle_timeout: Duration,
 ) -> Result<Connection> {
     install_crypto_provider();
 
@@ -340,7 +355,7 @@ pub async fn dial_any(
     // comes from an unordered `HashSet` in `connect.rs`, so it is not stable
     // across restarts. Pinning against it would re-pair (and write a new pin
     // file) whenever the set happened to iterate differently.
-    let cfg = tls::build_quic_client_config(vec![cert], key, pins_dir, peer_key)?;
+    let cfg = tls::build_quic_client_config(vec![cert], key, pins_dir, peer_key, idle_timeout)?;
 
     // (2) JoinSet collects (SocketAddr, Result<Connection, Error>).
     let mut joinset: JoinSet<(SocketAddr, Result<Connection>)> = JoinSet::new();
@@ -511,7 +526,7 @@ mod tests {
         install_crypto_provider();
         let (cert_chain, key) = ephemeral_cert();
         let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into();
-        let ep = endpoint_with_cert(addr, cert_chain, key)
+        let ep = endpoint_with_cert(addr, cert_chain, key, std::time::Duration::from_secs(5))
             .expect("endpoint_with_cert bind should not fail");
         let local = ep.local_addr().expect("endpoint must have local_addr");
         assert_ne!(local.port(), 0, "ephly port should be non-zero");
@@ -556,6 +571,7 @@ mod tests {
                 client_cert[0].clone(),
                 client_key,
                 &pins_dir,
+                std::time::Duration::from_secs(5),
             ),
         )
         .await
@@ -621,6 +637,7 @@ mod tests {
                 client_cert[0].clone(),
                 client_key,
                 &pins_dir,
+                std::time::Duration::from_secs(5),
             ),
         )
         .await
@@ -680,6 +697,7 @@ mod tests {
                     client_key,
                     &pins_dir,
                     "peer-primary-wins",
+                    std::time::Duration::from_secs(5),
                 ),
             )
             .await
@@ -728,6 +746,7 @@ mod tests {
                     client_key,
                     &pins_dir,
                     "peer-all-unreachable",
+                    std::time::Duration::from_secs(5),
                 ),
             )
             .await
@@ -829,6 +848,7 @@ mod tests {
                     client_key,
                     &pins_dir,
                     "peer-head-start-failure",
+                    std::time::Duration::from_secs(5),
                 ),
             )
             .await

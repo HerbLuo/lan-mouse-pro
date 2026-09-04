@@ -81,6 +81,7 @@ use std::{
     net::SocketAddr,
     rc::Rc,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 use thiserror::Error;
 use tokio::task::{JoinHandle, spawn_local};
@@ -197,6 +198,7 @@ impl LanMouseListener {
         cert_chain: Vec<CertificateDer<'static>>,
         key: rustls::pki_types::PrivateKeyDer<'static>,
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
+        idle_timeout: Duration,
     ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
 
@@ -240,7 +242,8 @@ impl LanMouseListener {
             Arc::new(AuthorizedKeysVerifier::new(authorized_keys).with_rejection_tx(rejection_tx));
 
         let addr = SocketAddr::new("0.0.0.0".parse().expect("invalid ip"), port);
-        let endpoint = quic_transport::endpoint_with_verifier(addr, cert_chain, key, verifier)?;
+        let endpoint =
+            quic_transport::endpoint_with_verifier(addr, cert_chain, key, verifier, idle_timeout)?;
 
         let accept_task = spawn_quic_accept_task(endpoint, listen_tx.clone(), quic_conns.clone());
 
@@ -1049,6 +1052,7 @@ mod tests {
                 server_cert_chain,
                 server_key,
                 verifier,
+                Duration::from_secs(5),
             )
             .expect("server endpoint bind");
             let server_addr = server_ep.local_addr().expect("server addr");
@@ -1068,6 +1072,7 @@ mod tests {
                 bad_cert_chain[0].clone(),
                 bad_key,
                 &ephemeral_pins_dir(),
+                std::time::Duration::from_secs(5),
             )
             .await;
             if let Ok(conn) = rejected {
@@ -1093,6 +1098,7 @@ mod tests {
                     good_cert_chain[0].clone(),
                     good_key,
                     &ephemeral_pins_dir(),
+                    std::time::Duration::from_secs(5),
                 ),
             )
             .await

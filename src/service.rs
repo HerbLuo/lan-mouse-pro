@@ -54,6 +54,12 @@ pub struct Service {
     port: u16,
     /// the public key fingerprint for (D)TLS
     public_key_fingerprint: String,
+    /// QUIC `max_idle_timeout` currently in effect (seconds). Frozen at
+    /// startup from `config.quic_idle_timeout()`; updated only via
+    /// [`Service::set_quic_idle_timeout`] (which still can't apply it
+    /// to the running endpoint — see
+    /// [`crate::quic_transport::tls::default_transport_config`]).
+    quic_idle_timeout_secs: u64,
     /// notify for pending frontend events
     frontend_event_pending: Notify,
     /// frontend events queued for sending
@@ -96,11 +102,18 @@ impl Service {
         let frontend_listener = AsyncFrontendListener::new().await?;
 
         let authorized_keys = Arc::new(RwLock::new(config.authorized_fingerprints()));
+        // QUIC `max_idle_timeout` is read once at startup and frozen for the
+        // lifetime of the daemon — both the listener endpoint and the client
+        // dials use it. GUI edits to `quic.idle_timeout_secs` are persisted
+        // to TOML but require a daemon restart to take effect (see the
+        // `FrontendRequest::SetQuicIdleTimeout` docstring).
+        let quic_idle_timeout = config.quic_idle_timeout();
         let listener = LanMouseListener::new(
             config.port(),
             cert_der.0.clone(),
             cert_der.1.clone_key(),
             authorized_keys.clone(),
+            quic_idle_timeout,
         )
         .await?;
         let client_endpoint =
@@ -117,6 +130,7 @@ impl Service {
             cert_der.1.clone_key(),
             pins_dir,
             client_manager.clone(),
+            quic_idle_timeout,
         );
 
         // input capture + emulation
@@ -131,6 +145,7 @@ impl Service {
         let resolver = DnsResolver::new()?;
 
         let port = config.port();
+        let quic_idle_timeout_secs = quic_idle_timeout.as_secs();
         let service = Self {
             config,
             capture,
@@ -139,6 +154,7 @@ impl Service {
             resolver,
             authorized_keys,
             public_key_fingerprint,
+            quic_idle_timeout_secs,
             client_manager,
             frontend_event_pending: Default::default(),
             port,
@@ -244,6 +260,7 @@ impl Service {
                 self.save_config();
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
+            FrontendRequest::SetQuicIdleTimeout(secs) => self.set_quic_idle_timeout(secs),
         }
     }
 
@@ -446,6 +463,9 @@ impl Service {
         self.notify_frontend(FrontendEvent::PublicKeyFingerprint(
             self.public_key_fingerprint.clone(),
         ));
+        self.notify_frontend(FrontendEvent::QuicConfig {
+            idle_timeout_secs: self.quic_idle_timeout_secs,
+        });
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
     }
@@ -599,6 +619,34 @@ impl Service {
         } else {
             self.notify_frontend(FrontendEvent::PortChanged(self.port, None));
         }
+    }
+
+    /// Persist a new QUIC `idle_timeout_secs` value and echo it back
+    /// to the frontend. The running endpoint is **not** rebuilt —
+    /// the value will only take effect on the next daemon restart
+    /// (see [`FrontendRequest::SetQuicIdleTimeout`]).
+    ///
+    /// Clamping + write-back mirrors [`Config::set_quic_idle_timeout`]:
+    /// the floor of 5s prevents a stale GUI write from making the
+    /// next restart panic in quinn.
+    fn set_quic_idle_timeout(&mut self, secs: u64) {
+        const MIN_SECS: u64 = 5;
+        let secs = secs.max(MIN_SECS);
+        if secs == self.quic_idle_timeout_secs {
+            // No-op; still echo so the GUI re-syncs after a value-races-restart.
+            self.notify_frontend(FrontendEvent::QuicConfig {
+                idle_timeout_secs: self.quic_idle_timeout_secs,
+            });
+            return;
+        }
+        self.config.set_quic_idle_timeout(secs);
+        self.quic_idle_timeout_secs = secs;
+        if let Err(e) = self.config.write_back() {
+            log::warn!("failed to persist quic.idle_timeout_secs: {e}");
+        }
+        self.notify_frontend(FrontendEvent::QuicConfig {
+            idle_timeout_secs: secs,
+        });
     }
 
     fn remove_client(&mut self, handle: ClientHandle) {

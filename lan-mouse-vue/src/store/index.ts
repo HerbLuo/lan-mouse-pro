@@ -36,6 +36,12 @@ export interface DaemonStore {
   /** Daemon-provided boot info (hostname, LAN IPs, web port).
    *  Populated once at startup via `fetch('/api/info')`. */
   info: InitialInfo | null
+  /** QUIC `max_idle_timeout` in seconds, last echoed by the daemon
+   *  via the `QuicConfig` event. Defaults to 5 to match the
+   *  daemon-side default — overwritten by the first `QuicConfig`
+   *  event after WS open. Changes via `setQuicIdleTimeout` only
+   *  take effect on the next daemon restart. */
+  quicIdleTimeoutSecs: number
 }
 
 const state = reactive<DaemonStore>({
@@ -49,6 +55,7 @@ const state = reactive<DaemonStore>({
   pendingConnectionAttempt: null,
   toasts: [],
   info: null,
+  quicIdleTimeoutSecs: 5,
 })
 
 /** Mirrors the daemon connectivity state for the AppHeader pill.
@@ -174,6 +181,13 @@ function applyEvent(event: FrontendEvent) {
       break
     case 'NoSuchClient':
       break
+    case 'QuicConfig':
+      // Echo from the daemon — either the initial sync after WS open
+      // or a confirmation of a `setQuicIdleTimeout` write. The
+      // template re-syncs its draft via the `watch()` in
+      // GeneralPanel.vue.
+      state.quicIdleTimeoutSecs = (value as { idle_timeout_secs: number }).idle_timeout_secs
+      break
   }
 }
 
@@ -227,6 +241,13 @@ export function addClient() {
 
 export function changePort(port: number) {
   getSocket().request({ ChangePort: port })
+}
+
+/** Persist a new QUIC `idle_timeout_secs`. The daemon writes it to
+ *  TOML and echoes the value back via the `QuicConfig` event; the
+ *  running endpoint is not rebuilt until the daemon restarts. */
+export function setQuicIdleTimeout(secs: number) {
+  getSocket().request({ SetQuicIdleTimeout: secs })
 }
 
 export function enableCapture() {

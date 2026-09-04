@@ -352,6 +352,18 @@ pub enum FrontendEvent {
     IncomingDisconnected(SocketAddr),
     /// failed connection attempt (approval for fingerprint required)
     ConnectionAttempt { fingerprint: String },
+    /// Current QUIC transport config snapshot, broadcast on
+    /// [`FrontendRequest::Enumerate`] / `Sync` so the GUI can render the
+    /// effective values, and again after every
+    /// [`FrontendRequest::SetQuicIdleTimeout`] to confirm the write.
+    ///
+    /// **Field**: `idle_timeout_secs` — the QUIC `max_idle_timeout`
+    /// currently in effect on both server and client endpoints.
+    /// Default 5 (down from the legacy 10s; lowered 2026-09-04 to
+    /// reduce the "mouse stuck during a network blip" window on the
+    /// master side, where the only death-detection signal is the QUIC
+    /// idle timer).
+    QuicConfig { idle_timeout_secs: u64 },
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -394,6 +406,13 @@ pub enum FrontendRequest {
     SetClientInputChannels(ClientHandle, InputChannelConfig),
     /// save config file
     SaveConfiguration,
+    /// Set QUIC `idle_timeout_secs`. Persists to TOML immediately and
+    /// echoes the new value back via [`FrontendEvent::QuicConfig`]. Does
+    /// **not** rebuild the running endpoint (changing transport config
+    /// at runtime would invalidate every active QUIC session); the new
+    /// value applies on the next daemon restart. The GUI surfaces this
+    /// constraint next to the input.
+    SetQuicIdleTimeout(u64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

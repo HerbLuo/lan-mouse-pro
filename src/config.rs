@@ -77,6 +77,34 @@ struct ConfigToml {
     /// `Config::watchdog_config()` to build a `crate::capture::WatchdogConfig`.
     #[serde(default)]
     watchdog: Option<TomlWatchdog>,
+    /// QUIC transport-layer configuration. All fields optional; missing
+    /// fields fall back to the defaults documented in
+    /// [`crate::quic_transport::tls`]. Applied at endpoint creation
+    /// time — changing these at runtime requires a daemon restart.
+    #[serde(default)]
+    quic: Option<TomlQuic>,
+}
+
+/// QUIC transport config (TOML side). Mirrors the subset of
+/// [`quinn::TransportConfig`] the daemon exposes to users.
+///
+/// **All fields optional**; missing → compile-time constants in
+/// [`crate::quic_transport::tls`]. `keep_alive_interval` is intentionally
+/// NOT exposed yet: lowering it below `idle_timeout` panics in quinn,
+/// and the 5s default has never been wrong on a LAN.
+///
+/// **Why `idle_timeout_secs` is user-tunable**: this is the master
+/// side's only death-detection signal — see the
+/// [`crate::connect`] docstrings on the supervisor. Lower values
+/// shrink the "mouse stuck during a network blip" window but
+/// increase the chance of a false-positive on a briefly-flaky
+/// link (Wi-Fi roam, USB ethernet reset, etc.).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct TomlQuic {
+    /// QUIC `max_idle_timeout` in seconds. Default 5.
+    /// Must be ≥ the keep-alive interval (5s) — values below that
+    /// will be clamped at the transport-config layer.
+    idle_timeout_secs: Option<u64>,
 }
 
 /// **FIX 4 — config 侧 watchdog 配置**：
@@ -613,6 +641,29 @@ impl Config {
         }
     }
 
+    /// Effective QUIC `max_idle_timeout` (seconds) → [`Duration`].
+    /// Default 5s — lowered from the legacy 10s on 2026-09-04 to
+    /// shrink the master-side death-detection window (see
+    /// [`crate::connect::spawn_peer_supervisor`]).
+    ///
+    /// **Clamp invariant**: must be ≥ the QUIC keep-alive interval
+    /// (5s) — quinn panics otherwise. Configurations below 5s are
+    /// clamped up to 5s at this layer so a stale TOML written by
+    /// an older daemon (or a misconfigured user) cannot crash the
+    /// process.
+    pub(crate) fn quic_idle_timeout(&self) -> std::time::Duration {
+        const DEFAULT: u64 = 5;
+        const MIN_SECS: u64 = 5;
+        let raw = self
+            .config_toml
+            .as_ref()
+            .and_then(|c| c.quic.as_ref())
+            .and_then(|q| q.idle_timeout_secs)
+            .unwrap_or(DEFAULT);
+        let secs = raw.max(MIN_SECS);
+        std::time::Duration::from_secs(secs)
+    }
+
     /// set configured clients
     pub fn set_clients(&mut self, clients: Vec<ConfigClient>) {
         if clients.is_empty() {
@@ -634,6 +685,27 @@ impl Config {
             .as_mut()
             .expect("config")
             .authorized_fingerprints = Some(fingerprints);
+    }
+
+    /// Persist the user's choice of QUIC `idle_timeout_secs` to the
+    /// in-memory TOML tree. Does **not** rebuild the running QUIC
+    /// endpoint — that requires a daemon restart; see the
+    /// `FrontendRequest::SetQuicIdleTimeout` docstring on the IPC
+    /// side.
+    ///
+    /// `secs` is clamped to the same `[5, ∞)` floor as
+    /// [`Config::quic_idle_timeout`] so a stale / malicious GUI write
+    /// can't make the next restart panic in quinn
+    /// (`max_idle_timeout < keep_alive_interval` is a hard error).
+    pub fn set_quic_idle_timeout(&mut self, secs: u64) {
+        const MIN_SECS: u64 = 5;
+        let secs = secs.max(MIN_SECS);
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        let toml = self.config_toml.as_mut().expect("config");
+        let q = toml.quic.get_or_insert_with(TomlQuic::default);
+        q.idle_timeout_secs = Some(secs);
     }
 
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {

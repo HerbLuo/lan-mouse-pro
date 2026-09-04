@@ -34,26 +34,46 @@ use super::{ALPN_LAN_MOUSE, Error, Result};
 /// Shared server/client `TransportConfig`:
 ///
 /// - `keep_alive_interval = 5s` — QUIC active probe.
-/// - `max_idle_timeout = 10s` — adjusted (the original 30s was too slow; the
-///   application-layer post-connect handshake already handles sub-second
-///   reconnect validation). 10s is the QUIC-level fallback; on healthy links
-///   the 5s keepalive always fires first, and the 10s idle timeout only
-///   applies on edge cases where send/ping force-close fails.
+/// - `max_idle_timeout` — caller-supplied. Defaults to **5s** at the
+///   config layer (was 10s before 2026-09-04; lowered to shrink the
+///   "mouse stuck during a network blip" window on the master side,
+///   where the only death-detection signal is the QUIC idle timer —
+///   see [`crate::connect::spawn_peer_supervisor`]).
+///
+/// **Clamp invariant**: `idle_timeout` MUST be ≥ `keep_alive_interval`
+/// (5s). Quinn panics with `ConfigurationError` on
+/// `IdleTimeout::try_from(d)` when the resulting VarInt is invalid AND
+/// with `set_max_idle_timeout_before` / `set_keep_alive_before` when
+/// the idle timeout is below the keep-alive interval — the latter is
+/// checked here via an `assert!` so the failure surfaces as a stack
+/// trace in the offending config layer rather than a runtime panic
+/// buried inside quinn.
+///
+/// On healthy links the 5s keepalive always fires first, and the idle
+/// timeout only applies on edge cases where send/ping force-close
+/// fails.
 ///
 /// `IdleTimeout::try_from(Duration)` fails if and only if `Duration` exceeds
-/// the VarInt 2^30 ms upper bound (≈ 12.4 days), and 10s is well within that
-/// range — the `expect` documents the reasoning.
+/// the VarInt 2^30 ms upper bound (≈ 12.4 days); callers pass ≤ a few
+/// minutes in practice, so the `expect` is safe.
 ///
 /// **Visibility**: `pub(super)` — only `endpoint.rs` calls
 /// `super::tls::default_transport_config`. `endpoint_inner` (in endpoint.rs)
 /// needs it for server transport configuration; `build_quic_client_config`
 /// (in this file) calls it directly.
-pub(super) fn default_transport_config() -> Arc<TransportConfig> {
+pub(super) fn default_transport_config(idle_timeout: Duration) -> Arc<TransportConfig> {
+    const KEEPALIVE: Duration = Duration::from_secs(5);
+    assert!(
+        idle_timeout >= KEEPALIVE,
+        "QUIC max_idle_timeout ({:?}) must be >= keep_alive_interval ({:?})",
+        idle_timeout,
+        KEEPALIVE,
+    );
     let mut t = TransportConfig::default();
-    t.keep_alive_interval(Some(Duration::from_secs(5)));
+    t.keep_alive_interval(Some(KEEPALIVE));
     t.max_idle_timeout(Some(
-        IdleTimeout::try_from(Duration::from_secs(10))
-            .expect("10s is far below the VarInt 2^30 ms upper bound (≈ 12.4 days)"),
+        IdleTimeout::try_from(idle_timeout)
+            .expect("idle_timeout is far below the VarInt 2^30 ms upper bound (≈ 12.4 days)"),
     ));
     Arc::new(t)
 }
@@ -77,7 +97,8 @@ pub(super) fn default_transport_config() -> Arc<TransportConfig> {
 /// - ALPN: `b"lan-mouse"` — protocol negotiated with the peer server.
 ///   Above this, the application layer has a secondary `PROTOCOL_MAGIC`
 ///   handshake.
-/// - transport: `default_transport_config()` 5s keepalive + 10s idle.
+/// - transport: `default_transport_config(idle_timeout)` 5s keepalive +
+///   caller-supplied idle_timeout (default 5s; was 10s before 2026-09-04).
 ///
 /// **`cert_chain` dual-purpose semantics**: used as the mTLS presentation
 /// chain; no longer used as a root-store trust anchor (the custom verifier is
@@ -102,6 +123,10 @@ pub(super) fn default_transport_config() -> Arc<TransportConfig> {
 /// by the caller of [`super::endpoint::install_crypto_provider`] (main.rs);
 /// `#[test]` unit tests call `install` once on the first line.
 ///
+/// **`idle_timeout`**: caller-supplied QUIC `max_idle_timeout` (must be
+/// ≥ 5s — the keep-alive interval). See [`default_transport_config`].
+/// Passed through to the [`TransportConfig`] attached below.
+///
 /// **Error normalization**: all rustls / quinn assembly errors are wrapped
 /// into [`Error::ClientConfig`] (carrying the underlying `Display`); no
 /// `From<rustls::Error>` / `From<quinn_proto::Error>` impls are introduced.
@@ -110,6 +135,7 @@ pub fn build_quic_client_config(
     key: PrivateKeyDer<'static>,
     pins_dir: &Path,
     peer_key: &str,
+    idle_timeout: Duration,
 ) -> Result<QuinnClientConfig> {
     use rustls::ClientConfig as RustlsClientConfig;
 
@@ -143,7 +169,7 @@ pub fn build_quic_client_config(
     let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client))
         .map_err(|e| Error::ClientConfig(format!("QuicClientConfig::try_from: {e}")))?;
     let mut client_cfg = QuinnClientConfig::new(Arc::new(quic_client));
-    client_cfg.transport_config(default_transport_config());
+    client_cfg.transport_config(default_transport_config(idle_timeout));
 
     Ok(client_cfg)
 }
@@ -703,8 +729,14 @@ mod tests {
         let (cert_chain, key) = ephemeral_cert();
         let pins_dir = ephemeral_pins_dir();
         let _ = std::fs::remove_dir_all(&pins_dir);
-        let cfg = build_quic_client_config(vec![cert_chain[0].clone()], key, &pins_dir, "peer-a")
-            .expect("ClientConfig assembly should not fail");
+        let cfg = build_quic_client_config(
+            vec![cert_chain[0].clone()],
+            key,
+            &pins_dir,
+            "peer-a",
+            std::time::Duration::from_secs(5),
+        )
+        .expect("ClientConfig assembly should not fail");
         let _clone: quinn::ClientConfig = cfg.clone();
     }
 
@@ -724,6 +756,7 @@ mod tests {
             server_cert,
             server_key,
             verifier,
+            std::time::Duration::from_secs(5),
         )
         .expect("server endpoint_with_verifier bind should not fail");
         let server_addr = server_ep
@@ -757,7 +790,7 @@ mod tests {
             quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client))
                 .expect("QuicClientConfig try_from");
         let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_client));
-        client_cfg.transport_config(super::default_transport_config());
+        client_cfg.transport_config(super::default_transport_config(std::time::Duration::from_secs(5)));
 
         let client_ep =
             super::super::endpoint::endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())

@@ -1,6 +1,13 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { changePort, daemonStore, enableCapture, enableEmulation, pushToast } from '@/store'
+import {
+  changePort,
+  daemonStore,
+  enableCapture,
+  enableEmulation,
+  pushToast,
+  setQuicIdleTimeout,
+} from '@/store'
 import IconCopy from '@/components/icons/IconCopy.vue'
 import IconChevron from '@/components/icons/IconChevron.vue'
 import IconMic from '@/components/icons/IconMic.vue'
@@ -14,6 +21,21 @@ const portDraft = ref<number>(daemonStore.port)
 watch(
   () => daemonStore.port,
   (v) => (portDraft.value = v),
+)
+
+// QUIC `max_idle_timeout` draft. Mirrors the port pattern — local
+// `ref` so the user can type freely, `watch` keeps it in sync with
+// the daemon's authoritative value (initial sync after WS open +
+// echoes after every `setQuicIdleTimeout` write).
+//
+// **Why `min="5"`**: the daemon clamps < 5s up to 5s anyway
+// (quinn panics if `max_idle_timeout < keep_alive_interval`); the
+// HTML attribute is purely cosmetic guidance.
+const quicIdleDraft = ref<number>(daemonStore.quicIdleTimeoutSecs)
+
+watch(
+  () => daemonStore.quicIdleTimeoutSecs,
+  (v) => (quicIdleDraft.value = v),
 )
 
 // The IP we display in the General panel. Initialised from the
@@ -103,6 +125,32 @@ function commitPort() {
   changePort(portDraft.value)
 }
 
+/** Mirror of `commitPort` for the QUIC idle-timeout input.
+ *
+ *  Sends the value to the daemon via `setQuicIdleTimeout`. The
+ *  daemon persists it to TOML but does **not** rebuild the running
+ *  endpoint — the new timeout only applies on the next daemon
+ *  restart. We surface this constraint in the template next to the
+ *  input so the user understands why their change is invisible at
+ *  runtime.
+ *
+ *  Invalid values (< 5 or non-finite) are rejected up-front so the
+ *  daemon never sees them; the daemon applies the same 5s floor
+ *  defensively, but rejecting here gives a clearer error toast. */
+function commitQuicIdle() {
+  const v = quicIdleDraft.value
+  if (!Number.isFinite(v) || v < 5 || !Number.isInteger(v)) {
+    pushToast('error', `quic.idle_timeout_secs must be an integer ≥ 5 (got ${v})`)
+    // Snap the draft back to the daemon's authoritative value so the
+    // user sees what was actually applied.
+    quicIdleDraft.value = daemonStore.quicIdleTimeoutSecs
+    return
+  }
+  if (v === daemonStore.quicIdleTimeoutSecs) return
+  setQuicIdleTimeout(v)
+  pushToast('info', `quic idle_timeout=${v}s will apply on the next daemon restart`)
+}
+
 async function copy(text: string, label = 'copied') {
   const ok = await copyToClipboard(text)
   pushToast(ok ? 'success' : 'error', ok ? label : 'copy failed')
@@ -176,12 +224,36 @@ async function copy(text: string, label = 'copied') {
           >
             <IconCopy />
           </button>
+          <!-- QUIC idle_timeout, seconds. Sits next to the port input
+               so both "endpoint-level" controls are visible together.
+               The label and helper text below explain the restart
+               requirement — without it users would expect the change
+               to take effect immediately. -->
+          <div class="quic-idle-row">
+            <span class="quic-idle-label mono">QUIC idle</span>
+            <input
+              type="number"
+              min="5"
+              step="1"
+              v-model="quicIdleDraft"
+              @change="commitQuicIdle"
+              placeholder="5"
+              class="mono"
+              style="width: 56px"
+              title="QUIC max_idle_timeout in seconds (restart required to apply)"
+            />
+            <span class="quic-idle-unit mono">s</span>
+          </div>
         </div>
         <span
           v-if="daemonStore.portError"
           style="color: var(--error); margin-top: 6px; display: block"
           >{{ daemonStore.portError }}</span
         >
+        <!-- Helper text — required because the value doesn't apply
+             live. Repeats the constraint next to the input itself so
+             users don't have to hover the input to find the title. -->
+        <div class="muted quic-idle-hint">QUIC idle timeout — applies on next daemon restart</div>
       </div>
     </div>
 
@@ -189,7 +261,7 @@ async function copy(text: string, label = 'copied') {
       <div>
         <div class="muted card-title">Certificate fingerprint (sha256)</div>
         <div style="display: flex; align-items: center; margin: 0 12px; gap: 8px">
-          <div class="mono em1" style="word-break: break-all; color: var(--fg-default);">
+          <div class="mono em1" style="word-break: break-all; color: var(--fg-default)">
             {{ daemonStore.fingerprint || '—' }}
           </div>
           <button
@@ -330,5 +402,33 @@ async function copy(text: string, label = 'copied') {
   border-radius: 999px;
   padding: 1px 6px;
   flex-shrink: 0;
+}
+
+/* QUIC idle_timeout mini-row — sits next to the port input so both
+ * endpoint-level controls live together. Kept visually subordinate
+ * (smaller font, muted label) so it doesn't compete with the port
+ * for the user's attention. */
+.quic-idle-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 12px;
+  padding-left: 12px;
+  border-left: 1px solid var(--border);
+}
+.quic-idle-label {
+  font-size: 11px;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.quic-idle-unit {
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+.quic-idle-hint {
+  font-size: 11px;
+  margin-top: 4px;
+  margin-left: 12px;
 }
 </style>

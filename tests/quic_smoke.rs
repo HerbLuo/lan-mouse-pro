@@ -64,7 +64,13 @@ fn server_endpoint(
 ) {
     let (cert_chain, key) = ephemeral_cert(tag);
     let addr: std::net::SocketAddr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into();
-    let ep = endpoint_with_cert(addr, cert_chain.clone(), key.clone_key()).expect("server ep");
+    let ep = endpoint_with_cert(
+        addr,
+        cert_chain.clone(),
+        key.clone_key(),
+        std::time::Duration::from_secs(5),
+    )
+    .expect("server ep");
     let local_addr = ep.local_addr().expect("server local addr");
     (ep, local_addr, cert_chain, key)
 }
@@ -183,6 +189,7 @@ async fn five_motion_and_five_keyboard_events_round_trip() {
         client_cert_chain[0].clone(),
         client_key.clone_key(),
         &pins_dir,
+            std::time::Duration::from_secs(5),
     )
     .await
     .expect("dial");
@@ -304,6 +311,7 @@ async fn connection_survives_ten_seconds_of_silence() {
         client_cert_chain[0].clone(),
         client_key.clone_key(),
         &pins_dir,
+            std::time::Duration::from_secs(5),
     )
     .await
     .expect("dial");

@@ -96,6 +96,7 @@ export type FrontendEvent =
     }
   | { IncomingDisconnected: string }
   | { ConnectionAttempt: { fingerprint: string } }
+  | { QuicConfig: { idle_timeout_secs: number } }
 
 export type FrontendRequest =
   | { Activate: [ClientHandle, boolean] }
@@ -116,6 +117,7 @@ export type FrontendRequest =
   | { UpdateEnterHook: [number, string | null] }
   | { SetClientInputChannels: [ClientHandle, InputChannelConfig] }
   | { SaveConfiguration: null }
+  | { SetQuicIdleTimeout: number }
 
 /**
  * Reactive WebSocket connection to the daemon's `/ws` endpoint.

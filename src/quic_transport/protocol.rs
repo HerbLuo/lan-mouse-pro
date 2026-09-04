@@ -652,6 +652,7 @@ mod tests {
             client_cert_chain[0].clone(),
             client_key,
             &pins_dir,
+                        std::time::Duration::from_secs(5),
         )
         .await
         .expect("dial");
@@ -734,6 +735,7 @@ mod tests {
                 client_cert_chain[0].clone(),
                 client_key,
                 &pins_dir,
+                            std::time::Duration::from_secs(5),
             )
             .await
             .expect("dial");
@@ -801,6 +803,7 @@ mod tests {
             client_cert_chain[0].clone(),
             client_key,
             &pins_dir,
+                        std::time::Duration::from_secs(5),
         )
         .await
         .expect("dial");

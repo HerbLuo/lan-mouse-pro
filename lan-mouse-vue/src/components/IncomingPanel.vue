@@ -8,10 +8,8 @@ const emit = defineEmits<{ 'open-authorize': [] }>()
 
 <template>
   <div class="card">
-    <div style="margin-bottom: 12px;">
-      <button @click="emit('open-authorize')">
-        Authorize
-      </button>
+    <div style="margin-bottom: 12px">
+      <button @click="emit('open-authorize')">Authorize</button>
     </div>
 
     <div
@@ -26,13 +24,14 @@ const emit = defineEmits<{ 'open-authorize': [] }>()
       </div>
     </div>
 
-    <div v-for="(description, fp) in daemonStore.authorized" :key="fp" style="display: flex; gap: 8px">
+    <div
+      v-for="(description, fp) in daemonStore.authorized"
+      :key="fp"
+      style="display: flex; gap: 8px"
+    >
       <div style="flex: 1; min-width: 0">
         <div style="font-weight: 500">{{ description }}</div>
-        <div
-          class="mono"
-          style="font-size: 11px; color: var(--fg-muted); word-break: break-all; "
-        >
+        <div class="mono" style="font-size: 11px; color: var(--fg-muted); word-break: break-all">
           {{ fp }}
         </div>
       </div>
