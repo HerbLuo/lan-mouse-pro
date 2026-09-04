@@ -674,6 +674,45 @@ impl CaptureTask {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
                         },
+                        // Pong: peer's reply to the application-layer Ping
+                        // heartbeat ([`crate::connect::ping_heartbeat_task`],
+                        // 500ms cadence). Treat it as a liveness signal —
+                        // refresh `last_progress_at` and clear the
+                        // send-failure counter, mirroring the success path
+                        // of [`CaptureEvent::Input`].
+                        //
+                        // **Why this is needed (BUG: "静止鼠标触发按键回流")**:
+                        // without an explicit Pong branch, `last_progress_at`
+                        // is only refreshed when the user is actively
+                        // producing input events (mouse motion, key press).
+                        // When the user moves the cursor onto the peer and
+                        // then stops, no Input events arrive at
+                        // `do_capture_session`, so `last_progress_at` stops
+                        // being refreshed; after
+                        // [`WATCHDOG_NO_PROGRESS_TIMEOUT`] = 8s the heavy
+                        // watchdog misclassifies "user is idle" as "peer is
+                        // unresponsive" and force-releases capture, sending
+                        // the keyboard back to the host. Pong refreshes
+                        // `last_progress_at` ~2 Hz (matched to the heartbeat
+                        // cadence), which is well below the 8s threshold and
+                        // mirrors how the peer's `ListenTask` refreshes its
+                        // own `last_response` on the corresponding Ping
+                        // frames ([`crate::emulation::ListenTask`]).
+                        //
+                        // **Pong(alive=false)** is logged at info but does
+                        // not change state — the alive check has been removed
+                        // from `send()` ([`crate::connect::LanMouseConnection::send`])
+                        // so subsequent Input events are still attempted.
+                        ProtoEvent::Pong(alive) => {
+                            if !alive {
+                                log::info!(
+                                    "Pong(alive=false) from handle {handle}: peer reports \
+                                     emulation disabled (no-op, optimistic-send still in effect)"
+                                );
+                            }
+                            self.watchdog.consecutive_send_failures = 0;
+                            self.watchdog.last_progress_at = Instant::now();
+                        }
                         _ => {}
                     }
                 },
