@@ -121,7 +121,9 @@ impl Service {
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
-        let capture = Capture::new(capture_backend, conn, config.release_bind());
+        // FIX 4：从 config.toml + env 构造 watchdog 配置，传给 Capture。
+        let watchdog_config = config.watchdog_config();
+        let capture = Capture::new(capture_backend, conn, config.release_bind(), watchdog_config);
         let emulation_backend = config.emulation_backend().map(|b| b.into());
         let emulation = Emulation::new(emulation_backend, listener);
 

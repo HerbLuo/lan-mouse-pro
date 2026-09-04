@@ -72,6 +72,44 @@ struct ConfigToml {
     /// Port for the embedded web UI. Optional; falls back to
     /// `LAN_MOUSE_WEB_PORT` / `DEFAULT_WEB_PORT` when unset.
     web_port: Option<u16>,
+    /// Watchdog self-healing configuration. All fields optional; missing
+    /// fields fall back to the constants in `src/capture.rs`. Used by
+    /// `Config::watchdog_config()` to build a `crate::capture::WatchdogConfig`.
+    #[serde(default)]
+    watchdog: Option<TomlWatchdog>,
+}
+
+/// **FIX 4 — config 侧 watchdog 配置**：
+///
+/// 全部字段都 `Option`，缺省走 `WatchdogConfig::default()`。可独立
+/// 调 4 个 check 开关 + 6 个阈值，便于对照实验。
+///
+/// **环境变量优先级更高**：`LAN_MOUSE_WATCHDOG=off` 一票否决 enabled，
+/// 与 config 字段无关（详见 `WatchdogConfig::env_override_enabled`）。
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct TomlWatchdog {
+    /// 总开关（默认 true）。
+    enabled: Option<bool>,
+    /// light tick：`State::Sending + active_client=None` 检测。
+    ghost_active_check: Option<bool>,
+    /// heavy tick：跨边风暴检测（5s 窗口内 ≥ N 次 BeginPending）。
+    crossing_storm_check: Option<bool>,
+    /// heavy tick：连续 send_input 失败累计检测。
+    send_failures_check: Option<bool>,
+    /// heavy tick：状态推进停滞超时检测。
+    no_progress_check: Option<bool>,
+    /// light tick 周期（毫秒）。
+    light_interval_ms: Option<u64>,
+    /// heavy tick 周期（秒）。
+    heavy_interval_secs: Option<u64>,
+    /// 跨边风暴滑动窗口（秒）。
+    crossing_window_secs: Option<u64>,
+    /// 跨边风暴阈值（窗口内 BeginPending 次数）。
+    crossing_storm_threshold: Option<usize>,
+    /// send failures 阈值。
+    send_failures_threshold: Option<u32>,
+    /// no-progress 超时阈值（秒）。
+    no_progress_timeout_secs: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
@@ -524,6 +562,55 @@ impl Config {
             .as_ref()
             .and_then(|c| c.release_bind.clone())
             .unwrap_or(Vec::from_iter(DEFAULT_RELEASE_KEYS.iter().cloned()))
+    }
+
+    /// **FIX 4 — 构造 `WatchdogConfig`**：
+    ///
+    /// 把 `config.toml [watchdog]` 节合并到 `WatchdogConfig::default()`。
+    /// 缺省字段直接走 default；`None` 字段同样走 default。返回值直接喂
+    /// `Capture::new(..., watchdog_config)`。
+    ///
+    /// **不读环境变量**：env override（`LAN_MOUSE_WATCHDOG=off`）由
+    /// `WatchdogConfig::env_override_enabled()` 在 `do_capture_session`
+    /// 内处理 —— 此处只负责 config 层。
+    pub(crate) fn watchdog_config(&self) -> crate::capture::WatchdogConfig {
+        use crate::capture::WatchdogConfig;
+        use std::time::Duration;
+
+        let defaults = WatchdogConfig::default();
+        let Some(w) = self.config_toml.as_ref().and_then(|c| c.watchdog.clone()) else {
+            return defaults;
+        };
+
+        WatchdogConfig {
+            enabled: w.enabled.unwrap_or(defaults.enabled),
+            ghost_active_check: w.ghost_active_check.unwrap_or(defaults.ghost_active_check),
+            crossing_storm_check: w.crossing_storm_check.unwrap_or(defaults.crossing_storm_check),
+            send_failures_check: w.send_failures_check.unwrap_or(defaults.send_failures_check),
+            no_progress_check: w.no_progress_check.unwrap_or(defaults.no_progress_check),
+            light_interval: w
+                .light_interval_ms
+                .map(Duration::from_millis)
+                .unwrap_or(defaults.light_interval),
+            heavy_interval: w
+                .heavy_interval_secs
+                .map(Duration::from_secs)
+                .unwrap_or(defaults.heavy_interval),
+            crossing_window: w
+                .crossing_window_secs
+                .map(Duration::from_secs)
+                .unwrap_or(defaults.crossing_window),
+            crossing_storm_threshold: w
+                .crossing_storm_threshold
+                .unwrap_or(defaults.crossing_storm_threshold),
+            send_failures_threshold: w
+                .send_failures_threshold
+                .unwrap_or(defaults.send_failures_threshold),
+            no_progress_timeout: w
+                .no_progress_timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(defaults.no_progress_timeout),
+        }
     }
 
     /// set configured clients

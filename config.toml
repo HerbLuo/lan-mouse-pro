@@ -1,7 +1,7 @@
 # example configuration
 
 # configure release bind
-release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
+release_bind = ["KeyA", "KeyS", "KeyD", "KeyF"]
 
 # optional port (defaults to 4242)
 port = 4242
@@ -40,3 +40,39 @@ port = 4242
 # input_channels = { mouse_button = "datagram", keyboard = "stream" }
 # For the lowest possible input latency, at the risk of dropped keys:
 # input_channels = { mouse_button = "datagram", keyboard = "datagram" }
+
+# === Watchdog self-healing (FIX 4) ============================================
+#
+# Auto-recovery for "mouse stuck at screen edge" bugs. Three independent
+# detections run in the background; any of them can be enabled / disabled /
+# threshold-tuned here for diagnostic purposes.
+#
+# Disable everything globally with env var (highest priority):
+#   LAN_MOUSE_WATCHDOG=off ./lan-mouse
+#
+# Per-check toggles:
+#   ghost_active_check    — `State::Sending + active_client=None` (200ms tick)
+#   crossing_storm_check  — BeginPending flood without state advance (3s tick)
+#   send_failures_check   — consecutive send_input failures in Sending (3s tick)
+#   no_progress_check     — state machine frozen for >no_progress_timeout_secs
+#
+# Tunable thresholds (defaults shown):
+#
+[watchdog]
+enabled = false
+# ghost_active_check        = true
+# crossing_storm_check      = true
+# send_failures_check       = true
+# no_progress_check         = true
+# light_interval_ms         = 200
+# heavy_interval_secs       = 3
+# crossing_window_secs      = 5
+# crossing_storm_threshold  = 5
+# send_failures_threshold   = 3
+# no_progress_timeout_secs  = 8
+#
+# Example: turn off just the send_failures check to test whether it's the
+# one responsible for spurious releases:
+#
+# [watchdog]
+# send_failures_check = false
