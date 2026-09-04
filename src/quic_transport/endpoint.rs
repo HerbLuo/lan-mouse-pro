@@ -459,7 +459,8 @@ const HEAD_START: Duration = Duration::from_millis(200);
 ///
 /// **Does not** proactively call `install_crypto_provider`: symmetric with
 /// [`dial`]; the caller is responsible for guarding it during main startup.
-#[allow(dead_code)](ep: &Endpoint) -> Result<Connection> {
+#[allow(dead_code)]
+pub async fn accept(ep: &Endpoint) -> Result<Connection> {
     let incoming = ep
         .accept()
         .await
