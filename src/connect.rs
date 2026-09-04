@@ -339,8 +339,12 @@ struct RetryState {
 /// faster: the peer wake-up itself triggers the next success). The
 /// `failure_count == 5` log threshold is unchanged (it fires around t=15s,
 /// which separates "short outage" from "peer really offline").
-const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(1);
-const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(8);
+// TEMPORARY: retry backoff disabled for debugging — do NOT re-enable unless
+// explicitly instructed. Original values:
+//   INITIAL_RETRY_BACKOFF = Duration::from_secs(1)
+//   MAX_RETRY_BACKOFF     = Duration::from_secs(8)
+const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(0);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(0);
 const MAX_RETRY_FAILURES_BEFORE_OFFLINE: u32 = 5;
 
 /// Application-layer heartbeat cadence: the controlling side periodically sends
