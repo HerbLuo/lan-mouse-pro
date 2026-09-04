@@ -312,8 +312,8 @@ impl LanMouseConnection {
 /// - `Clone` derive lets tests take copies of entries for assertions.
 ///
 /// **Backoff algorithm**: on failure, `backoff *= 2` with an upper cap of
-/// `MAX_RETRY_BACKOFF = 8s`. The starting value is `INITIAL_RETRY_BACKOFF = 1s`
-/// (1s → 2s → 4s → 8s cap; see the constant docstring below for the
+/// `MAX_RETRY_BACKOFF = 8s`. The starting value is `INITIAL_RETRY_BACKOFF = 500ms`
+/// (500ms → 1s → 2s → 4s → 8s cap; see the constant docstring below for the
 /// Mac/wake UX rationale).
 ///
 /// **Circuit-breaker threshold `MAX_RETRY_FAILURES_BEFORE_OFFLINE = 5`**:
@@ -329,8 +329,8 @@ struct RetryState {
 
 /// RetryState backoff constants, tuned for Mac wake reconnect UX.
 ///
-/// **Backoff curve**: 1s → 2s → 4s → 8s (cap) → 8s → 8s → ... repeating
-/// forever.
+/// **Backoff curve**: 500ms → 1s → 2s → 4s → 8s (cap) → 8s → 8s → ...
+/// repeating forever.
 ///
 /// **Why 8s instead of the upstream 30s cap**: a 30s ceiling on the reconnect
 /// interval makes the mouse-sharing UX feel sluggish — after a Mac wakes up,
@@ -341,9 +341,9 @@ struct RetryState {
 /// which separates "short outage" from "peer really offline").
 // TEMPORARY: retry backoff disabled for debugging — do NOT re-enable unless
 // explicitly instructed. Original values:
-//   INITIAL_RETRY_BACKOFF = Duration::from_secs(1)
+//   INITIAL_RETRY_BACKOFF = Duration::from_millis(500)
 //   MAX_RETRY_BACKOFF     = Duration::from_secs(8)
-const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(8);
 const MAX_RETRY_FAILURES_BEFORE_OFFLINE: u32 = 5;
 
@@ -496,7 +496,7 @@ async fn connect_to_handle(
                 }
                 _ => "",
             };
-            log::warn!("client ({handle}) dial_any failed: {e}{hint}");
+            log::warn!("client ({handle}) dial_any failed: {e}{hint} — **** start backoff ****");
             record_retry_failure(&retry_state, handle);
             connecting.lock().await.remove(&handle);
             return Err(LanMouseConnectionError::Quic(e));
@@ -508,7 +508,7 @@ async fn connect_to_handle(
     // immediately (no peer table entry to remove yet, since registration
     // hasn't happened).
     if let Err(e) = quic_transport::client_hello(&peer).await {
-        log::warn!("client ({handle}) client_hello failed: {e}");
+        log::warn!("client ({handle}) client_hello failed: {e} — **** start backoff ****");
         record_retry_failure(&retry_state, handle);
         connecting.lock().await.remove(&handle);
         return Err(LanMouseConnectionError::Quic(e));
@@ -698,12 +698,12 @@ async fn spawn_peer_supervisor(
                     log::info!(
                         "client ({handle}) conn {addr} wake-detected \
                          (peer system wake, expecting peer back soon) — \
-                         RetryState backoff triggered"
+                         RetryState backoff triggered — **** start backoff ****"
                     );
                 } else {
                     log::warn!(
                         "client ({handle}) conn {addr} closed abnormally: {reason:?} — \
-                         RetryState backoff triggered"
+                         RetryState backoff triggered — **** start backoff ****"
                     );
                 }
                 // Trigger a new dial round (spawn_local fire-and-forget).
@@ -810,11 +810,11 @@ mod tests {
     /// breaker fires once `failure_count` reaches 5 (log only, no panic — the
     /// test does not depend on log assertions).
     ///
-    /// Observed backoff sequence (INITIAL = 1s, MAX = 8s):
-    /// - 1st fail: backoff = 2s (INITIAL × 2), count = 1
-    /// - 2nd fail: backoff = 4s (INITIAL × 4), count = 2
-    /// - 3rd fail: backoff = 8s (INITIAL × 8 = MAX, **hits cap**), count = 3
-    /// - 4th fail: backoff = 8s (cap holds), count = 4
+    /// Observed backoff sequence (INITIAL = 500ms, MAX = 8s):
+    /// - 1st fail: backoff = 1s (INITIAL × 2), count = 1
+    /// - 2nd fail: backoff = 2s (INITIAL × 4), count = 2
+    /// - 3rd fail: backoff = 4s (INITIAL × 8), count = 3
+    /// - 4th fail: backoff = 8s (INITIAL × 16 = MAX, **hits cap**), count = 4
     /// - 5th fail: backoff = 8s, count = 5 (circuit-breaker log fires)
     /// - 6th fail: backoff = 8s, count = 6
     /// - 7th fail: backoff = 8s, count = 7
@@ -826,7 +826,7 @@ mod tests {
         let retry_state: Rc<RefCell<HashMap<ClientHandle, RetryState>>> = Default::default();
         let handle: ClientHandle = 42;
 
-        // 1st fail: backoff = 2 × INITIAL = 2s; count = 1
+        // 1st fail: backoff = 2 × INITIAL = 1s; count = 1
         record_retry_failure(&retry_state, handle);
         let entry = retry_state
             .borrow()
@@ -836,11 +836,11 @@ mod tests {
         assert_eq!(
             entry.backoff,
             INITIAL_RETRY_BACKOFF * 2,
-            "1st fail: backoff = 2x INITIAL = 2s"
+            "1st fail: backoff = 2x INITIAL = 1s"
         );
         assert_eq!(entry.failure_count, 1);
 
-        // 2nd fail: backoff = 4 × INITIAL = 4s; count = 2
+        // 2nd fail: backoff = 4 × INITIAL = 2s; count = 2
         record_retry_failure(&retry_state, handle);
         let entry = retry_state
             .borrow()
@@ -850,11 +850,11 @@ mod tests {
         assert_eq!(
             entry.backoff,
             INITIAL_RETRY_BACKOFF * 4,
-            "2nd fail: backoff = 4x INITIAL = 4s"
+            "2nd fail: backoff = 4x INITIAL = 2s"
         );
         assert_eq!(entry.failure_count, 2);
 
-        // 3rd fail: backoff = 8 × INITIAL = 8s = MAX, hits cap; count = 3
+        // 3rd fail: backoff = 8 × INITIAL = 4s; count = 3
         record_retry_failure(&retry_state, handle);
         let entry = retry_state
             .borrow()
@@ -862,12 +862,13 @@ mod tests {
             .cloned()
             .expect("entry exists");
         assert_eq!(
-            entry.backoff, MAX_RETRY_BACKOFF,
-            "3rd fail: backoff = 8x INITIAL = 8s = MAX, hit cap"
+            entry.backoff,
+            INITIAL_RETRY_BACKOFF * 8,
+            "3rd fail: backoff = 8x INITIAL = 4s"
         );
         assert_eq!(entry.failure_count, 3);
 
-        // 4th fail: backoff already capped at MAX, no further doubling; count = 4
+        // 4th fail: backoff = 16 × INITIAL = 8s = MAX, hits cap; count = 4
         record_retry_failure(&retry_state, handle);
         let entry = retry_state
             .borrow()
@@ -876,7 +877,7 @@ mod tests {
             .expect("entry exists");
         assert_eq!(
             entry.backoff, MAX_RETRY_BACKOFF,
-            "4th fail: cap stays at MAX"
+            "4th fail: backoff = 16x INITIAL = 8s = MAX, hit cap"
         );
         assert_eq!(entry.failure_count, 4);
 
