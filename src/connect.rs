@@ -343,8 +343,8 @@ struct RetryState {
 // explicitly instructed. Original values:
 //   INITIAL_RETRY_BACKOFF = Duration::from_secs(1)
 //   MAX_RETRY_BACKOFF     = Duration::from_secs(8)
-const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(0);
-const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(0);
+const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(8);
 const MAX_RETRY_FAILURES_BEFORE_OFFLINE: u32 = 5;
 
 /// Application-layer heartbeat cadence: the controlling side periodically sends
