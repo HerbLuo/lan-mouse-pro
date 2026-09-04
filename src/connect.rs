@@ -496,7 +496,7 @@ async fn connect_to_handle(
                 }
                 _ => "",
             };
-            log::warn!("client ({handle}) dial_any failed: {e}{hint} — **** start backoff ****");
+            log::warn!("client ({handle}) dial_any failed: {e}{hint} — **** START BACKOFF ****");
             record_retry_failure(&retry_state, handle);
             connecting.lock().await.remove(&handle);
             return Err(LanMouseConnectionError::Quic(e));
@@ -508,7 +508,7 @@ async fn connect_to_handle(
     // immediately (no peer table entry to remove yet, since registration
     // hasn't happened).
     if let Err(e) = quic_transport::client_hello(&peer).await {
-        log::warn!("client ({handle}) client_hello failed: {e} — **** start backoff ****");
+        log::warn!("client ({handle}) client_hello failed: {e} — **** START BACKOFF ****");
         record_retry_failure(&retry_state, handle);
         connecting.lock().await.remove(&handle);
         return Err(LanMouseConnectionError::Quic(e));
@@ -698,12 +698,12 @@ async fn spawn_peer_supervisor(
                     log::info!(
                         "client ({handle}) conn {addr} wake-detected \
                          (peer system wake, expecting peer back soon) — \
-                         RetryState backoff triggered — **** start backoff ****"
+                         RetryState backoff triggered — **** START BACKOFF ****"
                     );
                 } else {
                     log::warn!(
                         "client ({handle}) conn {addr} closed abnormally: {reason:?} — \
-                         RetryState backoff triggered — **** start backoff ****"
+                         RetryState backoff triggered — **** START BACKOFF ****"
                     );
                 }
                 // Trigger a new dial round (spawn_local fire-and-forget).
