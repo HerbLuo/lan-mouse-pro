@@ -456,6 +456,62 @@ async fn fetch_zones_for_monitor(
         .response()?)
 }
 
+/// STEP-2.4-FIXUP: gated publisher for the monitor watch channel.
+///
+/// Calls `fetch_monitors` only when `zones_have_changed == true`;
+/// on `Ok`, publishes the resulting `Vec<MonitorInfo>` to
+/// `monitors_tx`; on `Err`, logs and skips the publish so the
+/// watch channel stays at its previous value (callers can still
+/// see a stale list rather than a closed / empty one).
+///
+/// The flag MUST be read AFTER
+/// `tokio::join!(capture_session, handle_session_update_request)`
+/// — reading it before the join would see the value the flag held
+/// at the top of the loop iteration (always `false` after the
+/// reset on line ~483), so the fetch would never run and
+/// `monitor_changes()` updates would stall on the initial `new()`
+/// seed. See STEP-VALIDATION-M2-2.3-2.4-2.5.md §3 BUG #1.
+///
+/// Generic over `E` so unit tests don't need to construct an
+/// `ashpd::Error` (which requires a live portal). All call sites
+/// use `ashpd::Error` and benefit from `Display`.
+async fn publish_monitors_if_changed<E, F, Fut>(
+    zones_have_changed: bool,
+    monitors_tx: &watch::Sender<Vec<MonitorInfo>>,
+    fetch_monitors: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<MonitorInfo>, E>>,
+    E: std::fmt::Display,
+{
+    if !zones_have_changed {
+        return;
+    }
+    match fetch_monitors().await {
+        Ok(monitors) => {
+            log::info!(
+                "monitors changed (zones_changed event): {} monitor(s)",
+                monitors.len()
+            );
+            for m in &monitors {
+                log::info!(
+                    "  monitor: id={} name={:?} pos={:?} size={:?} primary={} scale={}",
+                    m.id,
+                    m.name,
+                    m.position,
+                    m.size,
+                    m.primary,
+                    m.scale
+                );
+            }
+            let _ = monitors_tx.send(monitors);
+        }
+        Err(e) => {
+            log::warn!("fetch_zones_for_monitor (zones_changed) failed: {e}");
+        }
+    }
+}
+
 async fn do_capture(
     input_capture: *const InputCapture,
     mut capture_event: Receiver<LibeiNotifyEvent>,
@@ -512,18 +568,15 @@ async fn do_capture(
                 None => create_session(input_capture).await?.0,
             };
 
-            // M2 STEP-2.4: refresh the published monitor list when
-            // the portal reports a zone change. Gated on
-            // `zones_have_changed` (the flag set by
-            // `handle_session_update_request` when the portal's
-            // `ZonesChanged` signal fires) so we only pay the
-            // portal DBus round-trip cost on actual changes, not on
-            // every barrier/key event cycle. The watch channel
-            // itself dedups identical Vec sends, but the
-            // `input_capture.zones(...)` IPC call ahead of the
-            // `monitors_tx.send(...)` is not free — gating here is
-            // the difference between "one fetch per portal event"
-            // and "one fetch per loop iteration".
+            // STEP-2.4 (FIXUP): refresh the published monitor list
+            // when the portal reports a zone change. The fetch is
+            // issued AFTER `tokio::join!` below — checking the flag
+            // before the join reads the value it held at the top
+            // of the loop iteration (always `false` after the
+            // reset), so `zones_have_changed` would never reflect
+            // what the future actually observed and the fetch
+            // would never run. See
+            // STEP-VALIDATION-M2-2.3-2.4-2.5.md §3 BUG #1.
             //
             // The fetch happens in the active branch because we
             // need a live `session` to query the portal. The idle
@@ -535,32 +588,6 @@ async fn do_capture(
             // channel update on the next active iteration (when a
             // fresh session is created and the fetch runs again).
             // Documented in STEP-M2-2.4 §6 遗留.
-            if zones_have_changed {
-                match fetch_zones_for_monitor(input_capture, &session).await {
-                    Ok(zones) => {
-                        let monitors = enumerate_zones(&zones);
-                        log::info!(
-                            "monitors changed (zones_changed event): {} monitor(s)",
-                            monitors.len()
-                        );
-                        for m in &monitors {
-                            log::info!(
-                                "  monitor: id={} name={:?} pos={:?} size={:?} primary={} scale={}",
-                                m.id,
-                                m.name,
-                                m.position,
-                                m.size,
-                                m.primary,
-                                m.scale
-                            );
-                        }
-                        let _ = monitors_tx.send(monitors);
-                    }
-                    Err(e) => {
-                        log::warn!("fetch_zones_for_monitor (zones_changed) failed: {e}");
-                    }
-                }
-            }
 
             let capture_session = do_capture_session(
                 input_capture,
@@ -575,6 +602,21 @@ async fn do_capture(
             let (capture_result, ()) = tokio::join!(capture_session, handle_session_update_request);
             log::debug!("capture session + session_update task done!");
 
+            // STEP-2.4 (FIXUP): gate-check + publish happens AFTER
+            // the join so the flag reflects session-time state.
+            // Gating on `zones_have_changed` (set by the future's
+            // `zones_changed.next()` arm) keeps the portal DBus
+            // round-trip cost at "one fetch per portal event"
+            // rather than "one fetch per loop iteration" — the
+            // watch channel dedups identical Vec sends, but the
+            // `input_capture.zones(...)` IPC ahead of `send` is
+            // not free.
+            publish_monitors_if_changed(zones_have_changed, &monitors_tx, || async {
+                let zones = fetch_zones_for_monitor(input_capture, &session).await?;
+                Ok::<_, ashpd::Error>(enumerate_zones(&zones))
+            })
+            .await;
+
             // disable capture
             log::debug!("disabling input capture");
             if let Err(e) = input_capture.disable(&session, Default::default()).await {
@@ -587,6 +629,16 @@ async fn do_capture(
             // propagate error from capture session
             capture_result?;
         } else {
+            // Idle branch: no live session, so even if
+            // `zones_have_changed` flips during the await below,
+            // there's no portal to query. Refreshing the idle
+            // path would require keeping a session alive
+            // permanently — an architectural change beyond
+            // STEP-2.4 scope. Idle users who hot-plug before
+            // activating a client see the watch channel update
+            // on the next active iteration (when a fresh session
+            // is created and the fetch runs again). Documented
+            // in STEP-M2-2.4 §6 遗留.
             handle_session_update_request.await;
         }
 
@@ -921,7 +973,9 @@ impl Stream for LibeiInputCapture {
 mod tests {
     use super::{
         LibeiZoneInfo, build_monitor_info_list, build_stable_id, compute_scale, pick_primary,
+        publish_monitors_if_changed,
     };
+    use crate::geometry::MonitorInfo;
 
     /// Happy path: a 2x1 layout's left region at `(0, 0)` gets
     /// `libei-zone:0,0` as its stable id with the namespace prefix.
@@ -1128,5 +1182,98 @@ mod tests {
         let monitors = build_monitor_info_list(&zones);
         assert_eq!(monitors[1].position, (0, -1080));
         assert!(!monitors[1].primary);
+    }
+
+    // ===== STEP-2.4-FIXUP regression tests =====
+    //
+    // The P1 fix moved the `if zones_have_changed` gate-check
+    // from before `tokio::join!(...)` to after it. The gate-check
+    // + publish logic was extracted into the
+    // `publish_monitors_if_changed` helper so the three behavioral
+    // invariants can be exercised without a live portal:
+    //
+    //   1. flag == false → fetch closure MUST NOT run (perf)
+    //   2. flag == true && fetch Ok → `monitors_tx` MUST be
+    //      notified with the new Vec
+    //   3. flag == true && fetch Err → `monitors_tx` MUST NOT be
+    //      notified (the watch channel stays at its previous value)
+    //
+    // macOS dev can't run libei code at all (`build.rs` only sets
+    // `cfg(libei)` on unix & !macos); these tests live behind that
+    // cfg and run on Linux CI.
+
+    /// Invariant 1: when `zones_have_changed == false` the fetch
+    /// closure is never invoked, so the no-op fast path costs zero
+    /// DBus round-trips. Catches regressions where someone
+    /// re-orders the gate-check back above `tokio::join!` and the
+    /// flag is read in its reset state (the P1 BUG).
+    #[tokio::test]
+    async fn publish_monitors_if_changed_skips_fetch_when_flag_false() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (tx, rx) = tokio::sync::watch::channel(Vec::<MonitorInfo>::new());
+        let fetch_called = AtomicBool::new(false);
+        publish_monitors_if_changed(false, &tx, || async {
+            fetch_called.store(true, Ordering::SeqCst);
+            Err::<Vec<MonitorInfo>, String>("should not be called".to_string())
+        })
+        .await;
+        assert!(
+            !fetch_called.load(Ordering::SeqCst),
+            "fetch closure must not run when zones_have_changed == false"
+        );
+        // Watch channel was never sent to, so the receiver has no
+        // pending change.
+        assert!(
+            !rx.has_changed().unwrap(),
+            "monitors_tx must not be notified when gate is closed"
+        );
+    }
+
+    /// Invariant 2: when `zones_have_changed == true` and the fetch
+    /// returns Ok, `monitors_tx` is notified with the new Vec.
+    /// Mirrors the production path `do_capture` runs after the
+    /// `tokio::join!` returns, when the future has actually polled
+    /// `zones_changed.next()`.
+    #[tokio::test]
+    async fn publish_monitors_if_changed_publishes_on_ok() {
+        let (tx, mut rx) = tokio::sync::watch::channel(Vec::<MonitorInfo>::new());
+        let monitor = MonitorInfo {
+            id: "libei-zone:0,0".into(),
+            name: "Region (0, 0)".into(),
+            position: (0, 0),
+            size: (1920, 1080),
+            primary: true,
+            scale: 1.0,
+        };
+        publish_monitors_if_changed(true, &tx, || async move {
+            Ok::<Vec<MonitorInfo>, String>(vec![monitor])
+        })
+        .await;
+        assert!(
+            rx.has_changed().unwrap(),
+            "monitors_tx must be notified when fetch succeeds"
+        );
+        let monitors = rx.borrow_and_update();
+        assert_eq!(monitors.len(), 1);
+        assert_eq!(monitors[0].id, "libei-zone:0,0");
+        assert!(monitors[0].primary);
+        assert!((monitors[0].scale - 1.0).abs() < 1e-9);
+    }
+
+    /// Invariant 3: when `zones_have_changed == true` but the
+    /// fetch returns Err, `monitors_tx` is NOT notified (the watch
+    /// channel stays at its previous value so callers keep seeing
+    /// a usable list rather than a closed / empty one).
+    #[tokio::test]
+    async fn publish_monitors_if_changed_does_not_publish_on_err() {
+        let (tx, rx) = tokio::sync::watch::channel(Vec::<MonitorInfo>::new());
+        publish_monitors_if_changed(true, &tx, || async {
+            Err::<Vec<MonitorInfo>, String>("test portal error".to_string())
+        })
+        .await;
+        assert!(
+            !rx.has_changed().unwrap(),
+            "monitors_tx must not be notified on fetch error"
+        );
     }
 }
