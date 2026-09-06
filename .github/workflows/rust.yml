@@ -1,0 +1,78 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: cargo fmt
+        run: cargo fmt --check
+
+  ci:
+    name: ${{ matrix.job }} ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+          - macos-15-intel
+        job:
+          - build
+          - check
+          - clippy
+          - test
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install libx11-dev libxtst-dev
+      - name: Install Node.js (Vue frontend build)
+        if: matrix.job == 'build'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: lan-mouse-vue/package-lock.json
+      - name: Install macOS deps
+        if: runner.os == 'macOS'
+        run: brew install librsvg
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build
+        if: matrix.job == 'build'
+        run: cargo build
+
+      - name: cargo check
+        if: matrix.job == 'check'
+        run: cargo check --workspace --all-targets --all-features
+
+      - name: cargo test
+        if: matrix.job == 'test'
+        run: cargo test --workspace --all-features
+
+      - name: cargo clippy
+        if: matrix.job == 'clippy'
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - uses: clechasseur/rs-clippy-check@v4
+        if: matrix.job == 'clippy'
+        with:
+          args: --workspace --all-targets --all-features
