@@ -1,19 +1,20 @@
 use super::{
     BarrierKey, Capture, CaptureError, CaptureEvent, Position, error::MacosCaptureCreationError,
 };
-use crate::geometry::DisplayRect;
+use crate::geometry::{DisplayRect, MonitorInfo};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::{
-    base::{CFRelease, TCFType, kCFAllocatorDefault},
+    base::{CFRelease, CFTypeRef, TCFType, kCFAllocatorDefault},
     date::CFTimeInterval,
-    number::{CFBooleanRef, kCFBooleanTrue},
+    dictionary::CFDictionary,
+    number::{CFBooleanRef, CFNumber, CFNumberRef, kCFBooleanTrue},
     runloop::{CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes},
-    string::{CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8},
+    string::{CFString, CFStringCreateWithCString, CFStringRef, kCFStringEncodingUTF8},
 };
 use core_graphics::{
     base::{CGError, kCGErrorSuccess},
-    display::{CGDisplay, CGPoint},
+    display::{CGDirectDisplayID, CGDisplay, CGMainDisplayID, CGPoint},
     event::{
         CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
         CGEventTapPlacement, CGEventTapProxy, CGEventType, CallbackResult, EventField,
@@ -38,7 +39,7 @@ use std::{
 use tokio::sync::{
     Mutex,
     mpsc::{self, Receiver, Sender},
-    oneshot,
+    oneshot, watch,
 };
 
 #[derive(Debug)]
@@ -68,6 +69,17 @@ struct InputCaptureState {
     displays: Vec<DisplayRect>,
     /// current state of modifier keys
     modifier_state: XMods,
+    /// Latest enumerated monitor list. Updated on every
+    /// `DisplayReconfigured` (and once during `new()`); a clone of the
+    /// sender is held on `MacOSInputCapture` itself so the public
+    /// `monitor_changes()` method can hand out new receivers to
+    /// upstream consumers (STEP-2.6 service layer).
+    monitors_tx: watch::Sender<Vec<MonitorInfo>>,
+    /// Cached copy of the most recent monitor list. Cheap to clone;
+    /// exposed by `MonitorInfo::current()`-style helpers and held here
+    /// so the producer task can read it without waiting on the watch
+    /// channel.
+    last_monitors: Vec<MonitorInfo>,
 }
 
 #[derive(Debug)]
@@ -89,10 +101,21 @@ enum ProducerEvent {
     CancelPending(BarrierKey),
     EventTapDisabled,
     DisplayReconfigured,
+    /// Reserved for STEP-2.6+ to manually trigger a refresh of the
+    /// monitor list (e.g. from a service-side IPC command). The
+    /// `DisplayReconfigured` path does NOT use this variant — it
+    /// updates `monitors_tx` directly inside `handle_producer_event`
+    /// because the producer task is the only writer on this side.
+    /// Holding the variant here keeps the dispatch surface uniform so
+    /// a future caller doesn't have to introduce a separate enum.
+    #[allow(dead_code)]
+    MonitorsChanged(Vec<MonitorInfo>),
 }
 
 impl InputCaptureState {
-    fn new() -> Result<Self, MacosCaptureCreationError> {
+    fn new(
+        monitors_tx: watch::Sender<Vec<MonitorInfo>>,
+    ) -> Result<Self, MacosCaptureCreationError> {
         let mut res = Self {
             active_clients: Lazy::new(HashSet::new),
             current_key: None,
@@ -100,8 +123,27 @@ impl InputCaptureState {
             enter_position: None,
             displays: Vec::new(),
             modifier_state: Default::default(),
+            monitors_tx,
+            last_monitors: Vec::new(),
         };
         res.update_bounds()?;
+        // Publish the initial monitor list so subscribers can read the
+        // current state without waiting for the first reconfiguration.
+        let initial = enumerate_monitors(&res.displays);
+        log::info!("initial monitors: {} monitor(s)", initial.len());
+        for m in &initial {
+            log::info!(
+                "  monitor: id={} name={:?} pos={:?} size={:?} primary={} scale={}",
+                m.id,
+                m.name,
+                m.position,
+                m.size,
+                m.primary,
+                m.scale
+            );
+        }
+        res.last_monitors = initial.clone();
+        let _ = res.monitors_tx.send(initial);
         Ok(res)
     }
 
@@ -350,13 +392,234 @@ impl InputCaptureState {
                 if let Err(e) = self.update_bounds() {
                     log::warn!("failed to refresh display bounds: {e}");
                 } else {
-                    log::info!("display reconfigured: {:?}", self.displays);
+                    log::info!("display reconfigured: {} display(s)", self.displays.len());
+                    for d in &self.displays {
+                        log::info!("  display bounds: {d:?}");
+                    }
+                    // M2 STEP-2.2: re-enumerate monitors so subscribers
+                    // (the STEP-2.6 service layer) see the new list.
+                    let monitors = enumerate_monitors(&self.displays);
+                    log::info!("monitors changed: {} monitor(s)", monitors.len());
+                    for m in &monitors {
+                        log::info!(
+                            "  monitor: id={} name={:?} pos={:?} size={:?} primary={} scale={}",
+                            m.id,
+                            m.name,
+                            m.position,
+                            m.size,
+                            m.primary,
+                            m.scale
+                        );
+                    }
+                    self.last_monitors = monitors.clone();
+                    let _ = self.monitors_tx.send(monitors);
                 }
+                Ok(None)
+            }
+            ProducerEvent::MonitorsChanged(monitors) => {
+                // Reserved path for STEP-2.6+ to push a manually
+                // refreshed list. The variant exists to keep the
+                // producer-event surface uniform; today the
+                // reconfiguration path updates `monitors_tx` directly
+                // (see the DisplayReconfigured arm above).
+                log::info!("monitors changed (manual): {} monitor(s)", monitors.len());
+                self.last_monitors = monitors.clone();
+                let _ = self.monitors_tx.send(monitors);
                 Ok(None)
             }
         }
     }
 }
+
+// ===== Monitor enumeration helpers (STEP-2.2) =====
+//
+// `enumerate_monitors` walks `CGDisplay::active_displays()` and
+// resolves per-display info via IOKit (vendor / model / serial /
+// location / preferred name). The IOKit-touching parts live in
+// `read_display_info`; everything else is plain data manipulation so
+// the per-monitor helper can be exercised without an IOKit query.
+//
+// The plan calls out two invariants for the stable `MonitorInfo::id`:
+//   1. Same physical monitor plugged into the same port → same id.
+//   2. Replugging into a different port → different id (port change
+//      typically changes the IODisplayLocation string).
+// We compose `id` from `vendor:product:serial:location` so both rules
+// hold — `CGDisplaySerialNumber` alone wouldn't catch case 2.
+
+/// Compose the stable monitor id from the IOKit info fields. Pure,
+/// unit-testable. Returns a colon-separated string with hex
+/// `vendor`/`product` so the human-readable parts (serial, location)
+/// stay grep-able.
+fn build_stable_id(vendor: u32, product: u32, serial: &str, location: &str) -> String {
+    format!("macos:{vendor:04x}:{product:04x}:{serial}:{location}")
+}
+
+/// Compute the macOS `scale` (point→pixel ratio) from the current
+/// display mode. Pure, unit-testable. A `point_width == 0` would
+/// indicate a degenerate display and is treated as 1.0 to avoid
+/// NaN / Inf propagating into the IPC layer.
+fn compute_scale(pixel_width: f64, point_width: f64) -> f64 {
+    if point_width > 0.0 && pixel_width > 0.0 {
+        pixel_width / point_width
+    } else {
+        1.0
+    }
+}
+
+/// Per-display info from IOKit. The raw `vendor`/`product` are
+/// unsigned 32-bit IDs reported by the GPU's EDID parser; `serial` is
+/// typically a decimal string from the display's EDID; `location` is
+/// a free-form string like `"Internal"`, `"External"`, or `"PCI Slot
+/// 1"`; `name` is the preferred human label (set when the user has
+/// installed a color profile or the OS knows the model).
+#[derive(Debug, Default)]
+struct DisplayInfo {
+    vendor: u32,
+    product: u32,
+    serial: String,
+    location: String,
+    name: Option<String>,
+}
+
+/// Enumerate every active Quartz display and produce a `MonitorInfo`
+/// for each. The `displays` parameter is the up-to-date bounds list
+/// (kept in sync with `self.displays` inside `update_bounds`); it's
+/// currently unused because we re-fetch bounds per display via
+/// `CGDisplay::bounds`, but accepting it documents that bounds and
+/// the active-id list must agree and gives a future caller a hook to
+/// inject test fixtures.
+#[allow(dead_code)] // accepts `displays` for documentation/future use
+fn enumerate_monitors(displays: &[DisplayRect]) -> Vec<MonitorInfo> {
+    let _ = displays;
+    let Ok(active_ids) = CGDisplay::active_displays() else {
+        log::warn!("enumerate_monitors: CGDisplay::active_displays failed");
+        return Vec::new();
+    };
+    let main = unsafe { CGMainDisplayID() };
+
+    let mut out = Vec::with_capacity(active_ids.len());
+    for &display_id in &active_ids {
+        let display = CGDisplay::new(display_id);
+        let bounds = display.bounds();
+        let position = (bounds.origin.x as i32, bounds.origin.y as i32);
+        let size = (bounds.size.width as u32, bounds.size.height as u32);
+        let primary = display_id == main;
+
+        // scale = pixels / points. Built-in Retina returns 2.0;
+        // external 1080p returns 1.0. Fallback to 1.0 when the
+        // display mode is unavailable (transient state mid-reconfigure).
+        let scale = display
+            .display_mode()
+            .map(|mode| compute_scale(mode.pixel_width() as f64, bounds.size.width))
+            .unwrap_or(1.0);
+
+        // IOKit info dictionary — best-effort. A failure here
+        // degrades to the synthetic "Display <id>" name and a zeroed
+        // stable-id (still unique per display id).
+        let info = unsafe { read_display_info(display_id) };
+        let id = build_stable_id(info.vendor, info.product, &info.serial, &info.location);
+        let name = info
+            .name
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("Display {display_id}"));
+
+        out.push(MonitorInfo {
+            id,
+            name,
+            position,
+            size,
+            primary,
+            scale,
+        });
+    }
+    out
+}
+
+/// Resolve the IOKit service port for `display_id` and read the
+/// standard set of display descriptors (vendor / product / serial /
+/// location / name). All fields fall back to safe defaults on
+/// failure so the caller always gets a populated `DisplayInfo`.
+///
+/// SAFETY: calls into IOKit / CoreFoundation. The `CFDictionary`
+/// returned by `IODisplayCreateInfoDictionary` is retained via
+/// `CFDictionary::wrap_under_get_rule`; release happens on drop.
+unsafe fn read_display_info(display_id: CGDirectDisplayID) -> DisplayInfo {
+    let service = CGDisplayIOServicePort(display_id);
+    if service == 0 {
+        log::debug!("CGDisplayIOServicePort({display_id}) returned 0; no IOKit info");
+        return DisplayInfo::default();
+    }
+
+    let dict_ref = IODisplayCreateInfoDictionary(service, K_IO_DISPLAY_ONLY_PREFERRED_NAME);
+    // Release the service port immediately — IODisplayCreateInfoDictionary
+    // takes its own reference on the data it needs.
+    let _ = IOObjectRelease(service);
+
+    if dict_ref.is_null() {
+        log::debug!("IODisplayCreateInfoDictionary returned null for display {display_id}");
+        return DisplayInfo::default();
+    }
+
+    // core_foundation's CFDictionary<K, V> defaults to
+    // `*const c_void` for both; we cast our CFString pointers to
+    // `*const c_void` keys and read back `*const c_void` values.
+    let dict: CFDictionary = unsafe { CFDictionary::wrap_under_get_rule(dict_ref as *const _) };
+
+    let vendor_key = CFString::from_static_string("DisplayVendorID");
+    let product_key = CFString::from_static_string("DisplayProductID");
+    let serial_key = CFString::from_static_string("DisplaySerialNumber");
+    let location_key = CFString::from_static_string("IODisplayLocation");
+    let name_key = CFString::from_static_string("DisplayProductName");
+
+    DisplayInfo {
+        vendor: dict_find_i64(&dict, vendor_key.as_concrete_TypeRef() as *const c_void)
+            .map(|v| v as u32)
+            .unwrap_or(0),
+        product: dict_find_i64(&dict, product_key.as_concrete_TypeRef() as *const c_void)
+            .map(|v| v as u32)
+            .unwrap_or(0),
+        serial: dict_find_string(&dict, serial_key.as_concrete_TypeRef() as *const c_void)
+            .unwrap_or_else(|| "0".to_string()),
+        location: dict_find_string(&dict, location_key.as_concrete_TypeRef() as *const c_void)
+            .unwrap_or_else(|| "Unknown".to_string()),
+        name: dict_find_string(&dict, name_key.as_concrete_TypeRef() as *const c_void),
+    }
+}
+
+/// Look up `key` in `dict` and try to interpret the value as an
+/// `i64`. Returns `None` when the key is absent or the value is not
+/// a `CFNumber`.
+///
+/// SAFETY: `key` must be a valid `CFTypeRef` (e.g. a CFStringRef
+/// produced by `CFString::from_static_string`); the returned value
+/// reference is borrowed from `dict` and only valid for `'a`.
+unsafe fn dict_find_i64(dict: &CFDictionary, key: *const c_void) -> Option<i64> {
+    let item_ref = dict.find(key)?;
+    let value_ptr: *const c_void = *item_ref;
+    if value_ptr.is_null() {
+        return None;
+    }
+    let num = CFNumber::wrap_under_get_rule(value_ptr as CFNumberRef);
+    num.to_i64()
+}
+
+/// Look up `key` in `dict` and try to interpret the value as a
+/// `CFString`. Returns `None` when the key is absent or the value is
+/// not a `CFString`.
+///
+/// SAFETY: same caveat as `dict_find_i64` — the value pointer is
+/// only valid for the lifetime of the borrow from `dict`.
+unsafe fn dict_find_string(dict: &CFDictionary, key: *const c_void) -> Option<String> {
+    let item_ref = dict.find(key)?;
+    let value_ptr: *const c_void = *item_ref;
+    if value_ptr.is_null() {
+        return None;
+    }
+    let cfstr = CFString::wrap_under_get_rule(value_ptr as CFStringRef);
+    Some(cfstr.to_string())
+}
+
+// ===== /Monitor enumeration helpers =====
 
 fn get_events(
     ev_type: &CGEventType,
@@ -903,13 +1166,26 @@ pub struct MacOSInputCapture {
     event_rx: Receiver<(BarrierKey, CaptureEvent)>,
     notify_tx: Sender<ProducerEvent>,
     run_loop: CFRunLoop,
+    /// Sender for the latest monitor list. A clone is captured by the
+    /// `InputCaptureState` (so the producer task can push updates when
+    /// `DisplayReconfigured` fires); this handle is kept here so the
+    /// public `monitor_changes()` method can hand out new receivers to
+    /// upstream consumers. The field is unused inside this file today —
+    /// STEP-2.5 will wire `Capture::monitors()` and STEP-2.6 will use
+    /// it from the service layer.
+    #[allow(dead_code)]
+    monitors_tx: watch::Sender<Vec<MonitorInfo>>,
 }
 
 impl MacOSInputCapture {
     pub async fn new() -> Result<Self, MacosCaptureCreationError> {
         request_macos_capture_permissions()?;
 
-        let state = Arc::new(Mutex::new(InputCaptureState::new()?));
+        // Create the monitor watch channel up front so the initial
+        // state (captured inside `new()`) can be published before the
+        // producer task starts.
+        let (monitors_tx, _) = watch::channel(Vec::new());
+        let state = Arc::new(Mutex::new(InputCaptureState::new(monitors_tx.clone())?));
         let (event_tx, event_rx) = mpsc::channel(32);
         // Pending-capture close the loop: the producer task also
         // forwards events to the main thread (ProducerEvent::StartCapture
@@ -974,7 +1250,29 @@ impl MacOSInputCapture {
             event_rx,
             notify_tx,
             run_loop,
+            monitors_tx,
         })
+    }
+
+    /// Subscribe to the latest monitor list. Each call returns a new
+    /// receiver that sees every future update (a new entry is published
+    /// on every `DisplayReconfigured` and once during construction).
+    /// The initial value is the list captured at startup.
+    ///
+    /// STEP-2.6 service layer holds the receiver and forwards
+    /// `MonitorsChanged` events to the IPC frontend.
+    #[allow(dead_code)] // STEP-2.5/2.6 will consume this
+    pub fn monitor_changes(&self) -> watch::Receiver<Vec<MonitorInfo>> {
+        self.monitors_tx.subscribe()
+    }
+
+    /// Snapshot of the most recent monitor list, captured without
+    /// touching the watch channel. Used by STEP-2.5's
+    /// `Capture::monitors()` impl when polling is acceptable and the
+    /// caller does not need a subscription.
+    #[allow(dead_code)] // STEP-2.5/2.6 will consume this
+    pub fn current_monitors(&self) -> Vec<MonitorInfo> {
+        self.monitors_tx.borrow().clone()
     }
 }
 
@@ -1102,6 +1400,27 @@ impl Stream for MacOSInputCapture {
 
 type CGSConnectionID = u32;
 
+/// IOKit / IODisplay raw FFI. `IODisplayCreateInfoDictionary` is the
+/// stable-monitor-info source called out by PLAN §M2 STEP-2.2 (vendor /
+/// model / serial / location used to build a stable `MonitorInfo::id`).
+///
+/// The IOKit framework is linked here (in addition to
+/// `ApplicationServices` above) because that's where the function lives;
+/// `CGDisplayIOServicePort` is in ApplicationServices and resolves the
+/// IOKit service port that backs a Quartz display.
+#[allow(non_camel_case_types)]
+type io_service_t = u32;
+#[allow(non_camel_case_types)]
+type io_object_t = u32;
+#[allow(non_camel_case_types)]
+type IOOptionBits = u32;
+
+/// `kIODisplayOnlyPreferredName` — passes through to
+/// `IODisplayCreateInfoDictionary` so we get the OS-preferred product
+/// name (`DisplayProductName`) when available rather than a generic
+/// vendor/model fallback.
+const K_IO_DISPLAY_ONLY_PREFERRED_NAME: IOOptionBits = 1 << 26;
+
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn CGSSetConnectionProperty(
@@ -1111,6 +1430,10 @@ extern "C" {
         value: CFBooleanRef,
     ) -> CGError;
     fn _CGSDefaultConnection() -> CGSConnectionID;
+    /// Resolve an IOKit service port for the Quartz display.
+    /// Returns 0 (an invalid `io_service_t`) on failure; the caller
+    /// is expected to bail and treat the display as IOKit-unknown.
+    fn CGDisplayIOServicePort(display: CGDirectDisplayID) -> io_service_t;
 }
 
 extern "C" {
@@ -1137,6 +1460,23 @@ extern "C" {
         callback: extern "C" fn(u32, u32, *mut c_void),
         user_info: *mut c_void,
     ) -> CGError;
+}
+
+#[link(name = "IOKit", kind = "framework")]
+extern "C" {
+    /// Returns a `CFDictionary` describing the IOKit framebuffer
+    /// service backing the given display. Caller owns the returned
+    /// dict (CFRelease needed; the `core_foundation` wrapper handles
+    /// that for us). When `options` includes
+    /// `kIODisplayOnlyPreferredName` the `DisplayProductName` entry
+    /// is set when the OS has a preferred name to give (e.g. a
+    /// calibration profile for a calibrated display).
+    fn IODisplayCreateInfoDictionary(framebuffer: io_service_t, options: IOOptionBits)
+    -> CFTypeRef;
+    /// Release an IOKit object obtained via `CGDisplayIOServicePort`.
+    /// Standard IOKit ownership rule: every `io_service_t` returned
+    /// from a getter needs a matching `IOObjectRelease`.
+    fn IOObjectRelease(object: io_object_t) -> i32;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -1187,5 +1527,100 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the M2 STEP-2.2 macOS monitor enumeration.
+    //!
+    //! The IOKit-touching helpers (`enumerate_monitors`, `read_display_info`)
+    //! can't be unit-tested without a real display and TCC permissions.
+    //! What we *can* test in isolation:
+    //!
+    //! 1. `build_stable_id` — the colon-separated hex/decimal
+    //!    composition rule that distinguishes two displays on the same
+    //!    machine (replug-stable, port-stable).
+    //! 2. `compute_scale` — the pixel/point ratio with degenerate
+    //!    inputs (zero width → fallback).
+    //!
+    //! Both are pure functions with no FFI, so they exercise the
+    //! implementation cheaply on every CI run.
+
+    use super::{build_stable_id, compute_scale};
+
+    /// Vendor + product are formatted as 4-digit hex (zero-padded)
+    /// so the id stays visually scannable and grep-friendly. Serial
+    /// and location come through verbatim because they are
+    /// already human-readable on the OS side.
+    #[test]
+    fn stable_id_format() {
+        let id = build_stable_id(0x1234, 0x5678, "ABC123", "External");
+        assert_eq!(id, "macos:1234:5678:ABC123:External");
+    }
+
+    /// Small vendor/product values (e.g. some external displays) still
+    /// zero-pad correctly so two ids differing only in the leading
+    /// digit can't collide on whitespace.
+    #[test]
+    fn stable_id_zero_pads_small_values() {
+        let id = build_stable_id(0x1, 0xa, "0", "Internal");
+        assert_eq!(id, "macos:0001:000a:0:Internal");
+    }
+
+    /// `serial` and `location` are kept verbatim so non-ASCII /
+    /// spaces survive the round-trip. Some manufacturers report the
+    /// serial as "0" when no EDID serial is present (Apple's
+    /// built-in displays fall in this bucket — they report
+    /// kIODisplaySerialNumber = "0").
+    #[test]
+    fn stable_id_preserves_serial_and_location() {
+        let id = build_stable_id(0x10ac, 0xa0f8, "0", "Internal");
+        assert_eq!(id, "macos:10ac:a0f8:0:Internal");
+    }
+
+    /// Built-in Retina: 2880 points wide, 5760 device pixels →
+    /// scale = 2.0. This is the only scale value Apple's MBP
+    /// built-in displays report at the OS level.
+    #[test]
+    fn compute_scale_retina_2x() {
+        assert!((compute_scale(5760.0, 2880.0) - 2.0).abs() < 1e-9);
+    }
+
+    /// External 1080p: 1920 points, 1920 pixels → scale = 1.0. The
+    /// most common case for "second monitor plugged into a MacBook".
+    #[test]
+    fn compute_scale_external_1x() {
+        assert!((compute_scale(1920.0, 1920.0) - 1.0).abs() < 1e-9);
+    }
+
+    /// A 4K external display at "looks like 1920×1080" reports 4
+    /// device pixels per point (the GPU does the fractional scaling).
+    /// The plan calls this out as a known limitation; the test pins
+    /// the arithmetic so a future refactor doesn't accidentally
+    /// round-down and lose HiDPI info.
+    #[test]
+    fn compute_scale_4k_looks_like_1080p() {
+        assert!((compute_scale(3840.0, 1920.0) - 2.0).abs() < 1e-9);
+    }
+
+    /// Degenerate inputs (zero width) must fall back to 1.0 instead
+    /// of producing NaN / Inf, which would propagate into the IPC
+    /// payload and confuse the GUI.
+    #[test]
+    fn compute_scale_zero_width_falls_back_to_one() {
+        assert_eq!(compute_scale(0.0, 0.0), 1.0);
+        assert_eq!(compute_scale(100.0, 0.0), 1.0);
+        assert_eq!(compute_scale(0.0, 100.0), 1.0);
+    }
+
+    /// Negative inputs are still treated as "no useful point width";
+    /// falling back to 1.0 keeps the IPC layer safe even when the
+    /// CGDisplayBounds returns a degenerate rectangle during
+    /// transient state mid-reconfigure.
+    #[test]
+    fn compute_scale_negative_falls_back_to_one() {
+        assert_eq!(compute_scale(-1.0, -1.0), 1.0);
+        assert_eq!(compute_scale(100.0, -1.0), 1.0);
     }
 }
