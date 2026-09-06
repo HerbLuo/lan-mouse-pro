@@ -73,13 +73,11 @@ struct InputCaptureState {
     /// `DisplayReconfigured` (and once during `new()`); a clone of the
     /// sender is held on `MacOSInputCapture` itself so the public
     /// `monitor_changes()` method can hand out new receivers to
-    /// upstream consumers (STEP-2.6 service layer).
+    /// upstream consumers (STEP-2.6 service layer). The watch channel
+    /// is the single source of truth — `current_monitors()` reads
+    /// from `monitors_tx.borrow()` rather than from a redundant
+    /// in-state cache.
     monitors_tx: watch::Sender<Vec<MonitorInfo>>,
-    /// Cached copy of the most recent monitor list. Cheap to clone;
-    /// exposed by `MonitorInfo::current()`-style helpers and held here
-    /// so the producer task can read it without waiting on the watch
-    /// channel.
-    last_monitors: Vec<MonitorInfo>,
 }
 
 #[derive(Debug)]
@@ -124,7 +122,6 @@ impl InputCaptureState {
             displays: Vec::new(),
             modifier_state: Default::default(),
             monitors_tx,
-            last_monitors: Vec::new(),
         };
         res.update_bounds()?;
         // Publish the initial monitor list so subscribers can read the
@@ -142,7 +139,6 @@ impl InputCaptureState {
                 m.scale
             );
         }
-        res.last_monitors = initial.clone();
         let _ = res.monitors_tx.send(initial);
         Ok(res)
     }
@@ -411,7 +407,6 @@ impl InputCaptureState {
                             m.scale
                         );
                     }
-                    self.last_monitors = monitors.clone();
                     let _ = self.monitors_tx.send(monitors);
                 }
                 Ok(None)
@@ -423,7 +418,6 @@ impl InputCaptureState {
                 // reconfiguration path updates `monitors_tx` directly
                 // (see the DisplayReconfigured arm above).
                 log::info!("monitors changed (manual): {} monitor(s)", monitors.len());
-                self.last_monitors = monitors.clone();
                 let _ = self.monitors_tx.send(monitors);
                 Ok(None)
             }
@@ -481,6 +475,26 @@ struct DisplayInfo {
     name: Option<String>,
 }
 
+impl DisplayInfo {
+    /// Build a fallback `DisplayInfo` for the case where IOKit could
+    /// not be reached. The standard `Default::default()` would produce
+    /// empty `serial` / `location`, which combined with `vendor =
+    /// 0` / `product = 0` yields a stable id (`"macos:0000:0000:"`)
+    /// that is identical across every IOKit-failed display on the
+    /// same machine. To keep the stable id unique we splice the
+    /// `display_id` into the `location` slot so the final id is at
+    /// least display-distinguishable. See `read_display_info`.
+    fn unknown(display_id: CGDirectDisplayID) -> Self {
+        Self {
+            vendor: 0,
+            product: 0,
+            serial: String::new(),
+            location: format!("unknown-{display_id}"),
+            name: None,
+        }
+    }
+}
+
 /// Enumerate every active Quartz display and produce a `MonitorInfo`
 /// for each. The `displays` parameter is the up-to-date bounds list
 /// (kept in sync with `self.displays` inside `update_bounds`); it's
@@ -514,8 +528,12 @@ fn enumerate_monitors(displays: &[DisplayRect]) -> Vec<MonitorInfo> {
             .unwrap_or(1.0);
 
         // IOKit info dictionary — best-effort. A failure here
-        // degrades to the synthetic "Display <id>" name and a zeroed
-        // stable-id (still unique per display id).
+        // degrades to the synthetic "Display <id>" name; the
+        // `read_display_info` helper bakes `display_id` into the
+        // fallback `location` so the resulting stable id remains
+        // unique across displays even when IOKit is unavailable
+        // (TCC denied, transient state). See STEP-M2-2.2-FIXUP for the
+        // id-collision regression test.
         let info = unsafe { read_display_info(display_id) };
         let id = build_stable_id(info.vendor, info.product, &info.serial, &info.location);
         let name = info
@@ -543,11 +561,29 @@ fn enumerate_monitors(displays: &[DisplayRect]) -> Vec<MonitorInfo> {
 /// SAFETY: calls into IOKit / CoreFoundation. The `CFDictionary`
 /// returned by `IODisplayCreateInfoDictionary` is retained via
 /// `CFDictionary::wrap_under_get_rule`; release happens on drop.
+/// Resolve the IOKit service port for `display_id` and read the
+/// standard set of display descriptors (vendor / product / serial /
+/// location / name). All fields fall back to safe defaults on
+/// failure so the caller always gets a populated `DisplayInfo`.
+///
+/// **Id-collision guard**: when IOKit cannot be reached (TCC denied,
+/// transient state, etc.) we cannot recover the OS-reported vendor /
+/// product / serial / location. The default-zeroed values would
+/// produce a stable id like `"macos:0000:0000:"` that is identical
+/// across displays — a violation of PLAN §M2 STEP-2.2's
+/// stable-id uniqueness invariant. To keep the id unique we bake
+/// `display_id` into the fallback `location` as `"unknown-{display_id}"`,
+/// so the resulting id is always distinguishable per display.
+/// The wire shape on the happy path is unchanged.
+///
+/// SAFETY: calls into IOKit / CoreFoundation. The `CFDictionary`
+/// returned by `IODisplayCreateInfoDictionary` is retained via
+/// `CFDictionary::wrap_under_get_rule`; release happens on drop.
 unsafe fn read_display_info(display_id: CGDirectDisplayID) -> DisplayInfo {
     let service = CGDisplayIOServicePort(display_id);
     if service == 0 {
         log::debug!("CGDisplayIOServicePort({display_id}) returned 0; no IOKit info");
-        return DisplayInfo::default();
+        return DisplayInfo::unknown(display_id);
     }
 
     let dict_ref = IODisplayCreateInfoDictionary(service, K_IO_DISPLAY_ONLY_PREFERRED_NAME);
@@ -557,7 +593,7 @@ unsafe fn read_display_info(display_id: CGDirectDisplayID) -> DisplayInfo {
 
     if dict_ref.is_null() {
         log::debug!("IODisplayCreateInfoDictionary returned null for display {display_id}");
-        return DisplayInfo::default();
+        return DisplayInfo::unknown(display_id);
     }
 
     // core_foundation's CFDictionary<K, V> defaults to
@@ -1543,11 +1579,15 @@ mod tests {
     //!    machine (replug-stable, port-stable).
     //! 2. `compute_scale` — the pixel/point ratio with degenerate
     //!    inputs (zero width → fallback).
+    //! 3. `DisplayInfo::unknown` — the IOKit-unavailable fallback that
+    //!    keeps the stable id unique across displays by splicing the
+    //!    Quartz `display_id` into the fallback `location`. Regression
+    //!    guard for the STEP-M2-2.2-FIXUP P1 id-collision bug.
     //!
-    //! Both are pure functions with no FFI, so they exercise the
+    //! All are pure functions with no FFI, so they exercise the
     //! implementation cheaply on every CI run.
 
-    use super::{build_stable_id, compute_scale};
+    use super::{DisplayInfo, build_stable_id, compute_scale};
 
     /// Vendor + product are formatted as 4-digit hex (zero-padded)
     /// so the id stays visually scannable and grep-friendly. Serial
@@ -1622,5 +1662,81 @@ mod tests {
     fn compute_scale_negative_falls_back_to_one() {
         assert_eq!(compute_scale(-1.0, -1.0), 1.0);
         assert_eq!(compute_scale(100.0, -1.0), 1.0);
+    }
+
+    // ----- DisplayInfo IOKit-unavailable fallback (STEP-M2-2.2-FIXUP) ---
+    //
+    // The P1 id-collision bug was: when IOKit returns a zeroed
+    // DisplayInfo (no service port, or the dict was null), the
+    // `build_stable_id` formula collapsed to `"macos:0000:0000:"` for
+    // every such display, so two simultaneously-failing displays
+    // would share an id. The fix splices the Quartz `display_id`
+    // into the fallback `location`. These tests pin the contract.
+
+    /// The fallback `DisplayInfo` keeps vendor/product/serial at
+    /// their zero-sentinel defaults but injects the `display_id`
+    /// into `location` so the downstream stable id remains unique.
+    /// Without this, `DisplayInfo::default()` would yield
+    /// `serial="" / location=""` and the stable id would be
+    /// `"macos:0000:0000:"` for every IOKit-failed display.
+    #[test]
+    fn display_info_unknown_encodes_display_id_in_location() {
+        let info = DisplayInfo::unknown(0x4271a80);
+        assert_eq!(info.vendor, 0);
+        assert_eq!(info.product, 0);
+        assert_eq!(info.serial, "");
+        // 0x4271a80 == 69_671_552 in decimal.
+        assert_eq!(info.location, "unknown-69671552");
+        assert!(info.name.is_none());
+    }
+
+    /// Single-display regression: when only one display fails IOKit
+    /// (the typical case — TCC denied on one service port, transient
+    /// state on one), the resulting stable id still contains the
+    /// `display_id` and is distinct from a successful IOKit read.
+    #[test]
+    fn stable_id_includes_display_id_when_iokit_unavailable_single() {
+        let info = DisplayInfo::unknown(0x1234);
+        let id = build_stable_id(info.vendor, info.product, &info.serial, &info.location);
+        assert_eq!(id, "macos:0000:0000::unknown-4660");
+        // The display_id segment MUST appear so a future regression
+        // that strips it is caught here rather than in production.
+        assert!(
+            id.contains("unknown-4660"),
+            "stable id must encode display_id when IOKit fails: {id}"
+        );
+    }
+
+    /// Multi-display regression (the actual P1 scenario): when two
+    /// displays simultaneously fail IOKit (rare but possible — TCC
+    /// revoked at process start, transient IOKit unavailability),
+    /// the produced stable ids MUST be distinct. The pre-fix code
+    /// produced two identical `"macos:0000:0000:"` strings, breaking
+    /// the stable-id uniqueness invariant called out in PLAN §M2
+    /// STEP-2.2.
+    #[test]
+    fn stable_ids_for_two_simultaneously_failed_displays_are_unique() {
+        let info_a = DisplayInfo::unknown(0x4271a80);
+        let info_b = DisplayInfo::unknown(0x4271b00);
+        let id_a = build_stable_id(
+            info_a.vendor,
+            info_a.product,
+            &info_a.serial,
+            &info_a.location,
+        );
+        let id_b = build_stable_id(
+            info_b.vendor,
+            info_b.product,
+            &info_b.serial,
+            &info_b.location,
+        );
+        assert_ne!(
+            id_a, id_b,
+            "two IOKit-failed displays must produce distinct stable ids (P1 regression guard)"
+        );
+        // Sanity: each id retains the canonical macos:vvvv:pppp prefix
+        // so existing parsers / dashboards don't need updating.
+        assert!(id_a.starts_with("macos:0000:0000:"));
+        assert!(id_b.starts_with("macos:0000:0000:"));
     }
 }

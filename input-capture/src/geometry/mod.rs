@@ -729,14 +729,20 @@ mod tests {
     // guarantee that both the backend producers and the IPC layer
     // speak the same vocabulary as the GUI.
 
-    /// A UTF-8 monitor name (CJK + accented Latin) must survive a
-    /// JSON round-trip byte-for-byte. Display names from real
-    /// hardware routinely contain non-ASCII characters.
+    /// A UTF-8 monitor name (CJK + accented Latin + em-dash) must
+    /// survive a JSON round-trip byte-for-byte. Display names from
+    /// real hardware routinely contain non-ASCII characters — a
+    /// single string carrying both scripts pins the byte-for-byte
+    /// fidelity guarantee rather than splitting it across two
+    /// smaller tests.
     #[test]
     fn monitor_info_round_trip_utf8_name() {
         let info = MonitorInfo {
             id: "EDID:0x1234abcd".into(),
-            name: "戴尔 U2723QE — 左".into(),
+            // CJK (戴尔 U2723QE — 左), em-dash (—, U+2014), and
+            // accented Latin (é, ñ, ü) in one name. macOS reports
+            // these verbatim for non-Apple vendor / model strings.
+            name: "LG UltraFine 5K áéíóú ñ — 戴尔".into(),
             position: (0, 0),
             size: (2560, 1440),
             primary: true,
@@ -748,6 +754,13 @@ mod tests {
         // Pin the wire shape so any rename_all drift is caught.
         assert!(json.contains("\"id\":\"EDID:0x1234abcd\""));
         assert!(json.contains("\"primary\":true"));
+        // Explicit byte-fidelity assertion on each non-ASCII fragment.
+        for needle in ["áéíóú", "ñ", "戴尔", "—"] {
+            assert!(
+                json.contains(needle),
+                "utf-8 fragment {needle:?} lost during serde_json round-trip"
+            );
+        }
     }
 
     /// A 2x1 horizontal layout's right display has `position.x ==
