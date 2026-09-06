@@ -6,8 +6,10 @@ use std::pin::Pin;
 
 use std::task::ready;
 use tokio::sync::mpsc::{Receiver, channel};
+use tokio::sync::watch;
 
 use super::{BarrierKey, Capture, CaptureError, CaptureEvent};
+use crate::geometry::MonitorInfo;
 
 mod event_thread;
 
@@ -18,6 +20,13 @@ pub struct WindowsInputCapture {
     // end-to-end.
     event_rx: Receiver<(BarrierKey, CaptureEvent)>,
     event_thread: EventThread,
+    /// Held here so the public `monitor_changes()` method can hand
+    /// out new receivers to upstream consumers (STEP-2.6 service
+    /// layer). The actual monitor data lives inside `event_thread`
+    /// (the message-loop thread is the sole writer); this receiver is
+    /// just a stable view into the watch channel.
+    #[allow(dead_code)] // STEP-2.5/2.6 will consume this
+    monitors_rx: watch::Receiver<Vec<MonitorInfo>>,
 }
 
 #[async_trait]
@@ -64,10 +73,34 @@ impl WindowsInputCapture {
     pub(crate) fn new() -> Self {
         let (event_tx, event_rx) = channel(10);
         let event_thread = EventThread::new(event_tx);
+        // Take an initial receiver so we can hand out additional
+        // receivers later (`subscribe` clones the channel — the
+        // original receiver is what we hold onto).
+        let monitors_rx = event_thread.monitor_changes();
         Self {
             event_thread,
             event_rx,
+            monitors_rx,
         }
+    }
+
+    /// Subscribe to the latest monitor list. Each call returns a new
+    /// receiver that sees every future update (a new entry is published
+    /// on every `WM_DISPLAYCHANGE` and once during construction).
+    /// STEP-2.6 service layer holds the receiver and forwards
+    /// `MonitorsChanged` events to the IPC frontend.
+    #[allow(dead_code)] // STEP-2.5/2.6 will consume this
+    pub(crate) fn monitor_changes(&self) -> watch::Receiver<Vec<MonitorInfo>> {
+        self.monitors_rx.clone()
+    }
+
+    /// Snapshot of the most recent monitor list, captured without
+    /// touching the watch channel. Used by STEP-2.5's
+    /// `Capture::monitors()` impl when polling is acceptable and the
+    /// caller does not need a subscription.
+    #[allow(dead_code)] // STEP-2.5/2.6 will consume this
+    pub(crate) fn current_monitors(&self) -> Vec<MonitorInfo> {
+        self.monitors_rx.borrow().clone()
     }
 }
 
