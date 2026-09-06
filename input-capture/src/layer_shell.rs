@@ -62,6 +62,7 @@ use wayland_client::{
 };
 
 use input_event::{Event, KeyboardEvent, PointerEvent};
+use tokio::sync::watch;
 
 use crate::{CaptureError, CaptureEvent};
 
@@ -69,6 +70,7 @@ use super::{
     BarrierKey, Capture, Position,
     error::{LayerShellCaptureCreationError, WaylandBindError},
 };
+use crate::geometry::MonitorInfo;
 
 struct Globals {
     compositor: wl_compositor::WlCompositor,
@@ -110,6 +112,14 @@ struct OutputInfo {
     name: String,
     position: (i32, i32),
     size: (i32, i32),
+    /// Per-output HiDPI scale factor (1 = standard density, 2 = HiDPI).
+    /// Sourced from the `wl_output::Event::Scale` event (since version
+    /// 2). Zero means "not yet received" and is treated as 1.0 when
+    /// building `MonitorInfo` — Wayland compositors guarantee a
+    /// non-zero value, but transient state mid-binding can leave us
+    /// with the `Default::default()` zero before the first `Scale`
+    /// event lands.
+    scale: i32,
 }
 
 struct State {
@@ -129,6 +139,20 @@ struct State {
     pending_events: VecDeque<(BarrierKey, CaptureEvent)>,
     outputs: Vec<Output>,
     scroll_discrete_pending: bool,
+    /// Sender for the latest monitor list. Set by [`LayerShellInputCapture::new`]
+    /// after the initial bind / dispatch round so subscribers
+    /// (the STEP-2.6 service layer) receive an initial snapshot.
+    /// `update_output_info` and `deregister_global` push a fresh
+    /// snapshot every time the geometry or the set of outputs
+    /// changes — the watch channel ignores identical sends, so a
+    /// no-op update is essentially free.
+    ///
+    /// `None` during the `new()` bind phase because the watch sender
+    /// has to be created after we have a state to publish for.
+    /// Stored as `Option<...>` rather than a default empty sender so
+    /// the dispatch hot path doesn't have to send an empty Vec
+    /// before the initial enumeration completes.
+    monitors_tx: Option<watch::Sender<Vec<MonitorInfo>>>,
 }
 
 struct Inner {
@@ -142,7 +166,21 @@ impl AsRawFd for Inner {
     }
 }
 
-pub struct LayerShellInputCapture(AsyncFd<Inner>);
+pub struct LayerShellInputCapture(
+    AsyncFd<Inner>,
+    /// Sender for the latest monitor list. A clone is held on
+    /// `State` (so `update_output_info` / `deregister_global` push
+    /// updates into the same channel); this handle is kept here so
+    /// the public `monitor_changes()` method can hand out new
+    /// receivers to upstream consumers (STEP-2.6 service layer).
+    /// `Current_monitors()` reads `borrow()` for synchronous snapshot
+    /// consumers (STEP-2.5's `Capture::monitors()` impl).
+    ///
+    /// `Option<...>` would not add value: once `new()` returns the
+    /// channel has been created and seeded; the field is therefore
+    /// always `Some` outside the (panicking) Drop path.
+    watch::Sender<Vec<MonitorInfo>>,
+);
 
 struct Window {
     buffer: wl_buffer::WlBuffer,
@@ -220,6 +258,165 @@ impl Drop for Window {
         self.buffer.destroy();
     }
 }
+
+// ===== Monitor enumeration helpers (STEP-2.4) =====
+//
+// Pure functions that turn the per-`Output` state we already keep
+// (`wl_output::info`) into the OS-agnostic `geometry::MonitorInfo`
+// the rest of the system consumes. The struct-of-private-info
+// approach mirrors the macOS `DisplayInfo` (STEP-2.2) and Windows
+// `WinDisplayInfo` (STEP-2.3) patterns: the protocol-derived shape
+// stays local; only the `MonitorInfo` projection leaves the module.
+
+/// Snapshot of one `wl_output` + `zxdg_output_v1` pair's enumerable
+/// fields, taken at the moment a `Done` event fires. Captured here
+/// rather than reusing the internal `OutputInfo` so the public
+/// `MonitorInfo` builder can be exercised in isolation by tests
+/// without dragging the full Wayland state machine along.
+#[derive(Debug, Clone)]
+struct LayerShellOutputInfo {
+    description: String,
+    name: String,
+    position: (i32, i32),
+    size: (i32, i32),
+    scale: i32,
+    /// The `wl_registry` global name. Used as a stable tie-breaker
+    /// when two outputs collapse to the same `description` (rare but
+    /// possible with KVM setups). Matches the `name` parameter the
+    /// Wayland registry hands us at bind time — distinct from
+    /// `xdg_output::Name`, which is the user-visible label.
+    global_name: u32,
+}
+
+impl LayerShellOutputInfo {
+    fn from_output(output: &Output) -> Option<Self> {
+        // We only emit an entry once both `wl_output` (geometry) and
+        // `zxdg_output_v1` (logical position/size + name) have
+        // completed their initial Done event. Until then the
+        // compositor may still be feeding partial data; emitting a
+        // half-populated entry would produce a MonitorInfo with
+        // `position = (0, 0)` that collides with the real primary.
+        let info = output.info.as_ref()?;
+        Some(Self {
+            description: info.description.clone(),
+            name: info.name.clone(),
+            position: info.position,
+            size: info.size,
+            scale: info.scale,
+            global_name: output.global.name,
+        })
+    }
+}
+
+/// Compose the stable monitor id for a `wl_output`.
+///
+/// Priority order (mirrors the Windows fallback chain from
+/// STEP-2.3 + the macOS P1-fix pattern from STEP-M2-2.2-FIXUP):
+///
+/// 1. Non-empty `xdg_output::Description` → `wl-output:<description>`
+///    — some compositors (notably wlroots-based ones like Sway /
+///    Hyprland) put EDID-derived strings here ("BOE 0x0812 ..." or
+///    "LG Electronics 27" with a serial). When present this is the
+///    most stable identifier since it tracks the physical hardware
+///    rather than the port.
+/// 2. Empty description → `wl-output:<name>@<x>,<y>` using
+///    `xdg_output::Name` plus position. Two monitors with the same
+///    `name` (a corner case on KVM switchers) but different positions
+///    are kept distinct.
+/// 3. Both empty → `wl-output:unknown-<global_name>` — registry
+///    `global_name` is unique per binding session and at least
+///    survives across screens with the same geometry.
+///
+/// The `wl-output:` prefix mirrors `macos:` / `windows:` so the
+/// stable-id namespace stays OS-tagged.
+fn build_stable_id(
+    description: &str,
+    name: &str,
+    position: (i32, i32),
+    global_name: u32,
+) -> String {
+    if !description.is_empty() {
+        format!("wl-output:{description}")
+    } else if !name.is_empty() {
+        format!("wl-output:{name}@{},{}", position.0, position.1)
+    } else {
+        format!("wl-output:unknown-{global_name}")
+    }
+}
+
+/// Convert the Wayland `wl_output::Event::Scale` factor into the
+/// `MonitorInfo::scale` field. Wayland guarantees a non-zero
+/// positive value; we treat 0 (transient state mid-binding, before
+/// the first `Scale` event has landed) as 1.0 so a stale reading
+/// can't drag the IPC layer into a divide-by-zero.
+fn compute_scale(scale: i32) -> f64 {
+    if scale > 0 { scale as f64 } else { 1.0 }
+}
+
+/// Pick the primary output. Wayland has no "primary" concept, so
+/// we adopt the OS convention used by macOS / Windows: the output
+/// whose origin is `(0, 0)` is treated as primary. If no output
+/// sits at the origin (rare but possible on a freshly-bound
+/// compositor), fall back to the first in the list so callers always
+/// have exactly one `primary = true`.
+fn pick_primary(info_list: &[LayerShellOutputInfo]) -> usize {
+    info_list
+        .iter()
+        .position(|i| i.position == (0, 0))
+        .unwrap_or(0)
+}
+
+/// Convert the per-`Output` state into the OS-agnostic `MonitorInfo`
+/// list. Pure (input is fully owned), so the unit tests can drive it
+/// with hand-built fixtures without any Wayland involvement.
+fn build_monitor_info_list(info_list: Vec<LayerShellOutputInfo>) -> Vec<MonitorInfo> {
+    if info_list.is_empty() {
+        return Vec::new();
+    }
+    let primary_idx = pick_primary(&info_list);
+    info_list
+        .into_iter()
+        .enumerate()
+        .map(|(idx, info)| {
+            let id = build_stable_id(
+                &info.description,
+                &info.name,
+                info.position,
+                info.global_name,
+            );
+            let name = if !info.description.is_empty() {
+                info.description.clone()
+            } else if !info.name.is_empty() {
+                info.name.clone()
+            } else {
+                format!("Output ({}, {})", info.position.0, info.position.1)
+            };
+            MonitorInfo {
+                id,
+                name,
+                position: info.position,
+                size: (info.size.0.max(0) as u32, info.size.1.max(0) as u32),
+                primary: idx == primary_idx,
+                scale: compute_scale(info.scale),
+            }
+        })
+        .collect()
+}
+
+/// Walk the current `state.outputs` and emit a fresh `MonitorInfo`
+/// list. Called once at startup (so subscribers see the initial
+/// state without waiting for the first hot-plug) and after every
+/// `update_output_info` (which fires on `wl_output::Done` /
+/// `zxdg_output::Done` / global add / global remove).
+fn enumerate_monitors(outputs: &[Output]) -> Vec<MonitorInfo> {
+    let info_list: Vec<LayerShellOutputInfo> = outputs
+        .iter()
+        .filter_map(LayerShellOutputInfo::from_output)
+        .collect();
+    build_monitor_info_list(info_list)
+}
+
+// ===== /Monitor enumeration helpers =====
 
 fn get_edges(outputs: &[Output], pos: Position) -> Vec<(Output, i32)> {
     outputs
@@ -337,6 +534,10 @@ impl LayerShellInputCapture {
             pending_events: VecDeque::new(),
             outputs: vec![],
             scroll_discrete_pending: false,
+            // M2 STEP-2.4: populated after the initial dispatch
+            // round so the first publish contains the freshly-bound
+            // monitor list rather than an empty Vec.
+            monitors_tx: None,
         };
 
         for global in state.global_list.contents().clone_list() {
@@ -357,9 +558,32 @@ impl LayerShellInputCapture {
         };
         state.read_guard = Some(read_guard);
 
+        // M2 STEP-2.4: create the monitor watch channel and seed it
+        // with the initial enumeration so subscribers (STEP-2.6
+        // service layer) get a non-empty list without waiting for
+        // the first hot-plug event. The watch channel is the single
+        // source of truth; subsequent `update_output_info` /
+        // `deregister_global` calls push into the same sender.
+        let (monitors_tx, _) = watch::channel(Vec::new());
+        let initial = enumerate_monitors(&state.outputs);
+        log::info!("initial monitors: {} monitor(s)", initial.len());
+        for m in &initial {
+            log::info!(
+                "  monitor: id={} name={:?} pos={:?} size={:?} primary={} scale={}",
+                m.id,
+                m.name,
+                m.position,
+                m.size,
+                m.primary,
+                m.scale
+            );
+        }
+        let _ = monitors_tx.send(initial);
+        state.monitors_tx = Some(monitors_tx.clone());
+
         let inner = AsyncFd::new(Inner { queue, state })?;
 
-        Ok(LayerShellInputCapture(inner))
+        Ok(LayerShellInputCapture(inner, monitors_tx))
     }
 
     fn add_client(&mut self, key: BarrierKey) {
@@ -375,6 +599,28 @@ impl LayerShellInputCapture {
             inner.state.focused = None;
         }
     }
+
+    /// Subscribe to the latest monitor list. Each call returns a
+    /// new receiver that sees every future update (a new entry is
+    /// published after every `wl_output::Done` /
+    /// `zxdg_output::Done` / global add / global remove, and once
+    /// during construction).
+    ///
+    /// STEP-2.6 service layer holds the receiver and forwards
+    /// `MonitorsChanged` events to the IPC frontend.
+    #[allow(dead_code)] // STEP-2.5/2.6 will consume this
+    pub fn monitor_changes(&self) -> watch::Receiver<Vec<MonitorInfo>> {
+        self.1.subscribe()
+    }
+
+    /// Snapshot of the most recent monitor list, captured without
+    /// touching the watch channel. Used by STEP-2.5's
+    /// `Capture::monitors()` impl when polling is acceptable and the
+    /// caller does not need a subscription.
+    #[allow(dead_code)] // STEP-2.5/2.6 will consume this
+    pub fn current_monitors(&self) -> Vec<MonitorInfo> {
+        self.1.borrow().clone()
+    }
 }
 
 impl State {
@@ -387,6 +633,28 @@ impl State {
         if output.has_xdg_info {
             output.info.replace(output.pending_info.clone());
             self.update_windows();
+            // M2 STEP-2.4: re-enumerate monitors so subscribers
+            // (the STEP-2.6 service layer) see the new geometry.
+            // `monitor_changes()` returns the watch sender if one
+            // is attached; on the hot-plug path a new entry was
+            // published at startup, so a hot plug simply replaces
+            // the watch value with the up-to-date list.
+            if let Some(tx) = self.monitors_tx.as_ref() {
+                let monitors = enumerate_monitors(&self.outputs);
+                log::info!("monitors changed: {} monitor(s)", monitors.len());
+                for m in &monitors {
+                    log::info!(
+                        "  monitor: id={} name={:?} pos={:?} size={:?} primary={} scale={}",
+                        m.id,
+                        m.name,
+                        m.position,
+                        m.size,
+                        m.primary,
+                        m.scale
+                    );
+                }
+                let _ = tx.send(monitors);
+            }
         }
     }
 
@@ -422,6 +690,17 @@ impl State {
                 true
             }
         });
+        // M2 STEP-2.4: refresh the published monitor list so the
+        // STEP-2.6 service layer sees the dropped output. Same
+        // single-source-of-truth path as `update_output_info`.
+        if let Some(tx) = self.monitors_tx.as_ref() {
+            let monitors = enumerate_monitors(&self.outputs);
+            log::info!(
+                "monitors changed (after global remove): {} monitor(s)",
+                monitors.len()
+            );
+            let _ = tx.send(monitors);
+        }
     }
 
     fn grab(
@@ -1014,8 +1293,20 @@ impl Dispatch<WlOutput, u32> for State {
         _qhandle: &QueueHandle<Self>,
     ) {
         log::debug!("wl_output {name} - {event:?}");
-        if let wl_output::Event::Done = event {
-            state.update_output_info(*name);
+        match event {
+            wl_output::Event::Scale { factor } => {
+                // HiDPI scale factor. Wayland compositors promise a
+                // non-zero positive value; we store it verbatim and
+                // resolve to 1.0 in `compute_scale` if a downstream
+                // snapshot fires before the first Scale event.
+                if let Some(o) = state.outputs.iter_mut().find(|o| o.global.name == *name) {
+                    o.pending_info.scale = factor;
+                }
+            }
+            wl_output::Event::Done => {
+                state.update_output_info(*name);
+            }
+            _ => {}
         }
     }
 }
@@ -1036,3 +1327,277 @@ delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore WlSurface);
 delegate_noop!(State: ignore ZwpKeyboardShortcutsInhibitorV1);
 delegate_noop!(State: ignore ZwpLockedPointerV1);
+
+// ===== Unit tests (M2 STEP-2.4) =====
+//
+// Wayland-protocol-touching code can't run on macOS CI (no live
+// `wl_registry` to bind to), so we cover the pure helpers here.
+// Same approach as the macOS STEP-2.2 / Windows STEP-2.3 unit
+// tests: exercise the id-composition rule, the i32→f64 scale
+// converter, and the `LayerShellOutputInfo` → `MonitorInfo` adapter
+// with hand-built fixtures.
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LayerShellOutputInfo, build_monitor_info_list, build_stable_id, compute_scale, pick_primary,
+    };
+
+    /// Happy path: a populated `description` (the closest Wayland-
+    /// level proxy for EDID; some compositors put EDID-derived
+    /// strings here) becomes the stable id verbatim, with the
+    /// `wl-output:` namespace prefix. Mirrors the macOS `macos:…`
+    /// and Windows `windows:…` namespace prefixes from STEP-2.2 /
+    /// STEP-2.3.
+    #[test]
+    fn stable_id_uses_description_when_present() {
+        let id = build_stable_id("LG Electronics 27UL850", "HDMI-A-1", (0, 0), 7);
+        assert_eq!(id, "wl-output:LG Electronics 27UL850");
+    }
+
+    /// Description empty + name present: splice `name` and position
+    /// into the id so two monitors with the same name but different
+    /// positions (KVM-switcher corner case) stay distinct.
+    #[test]
+    fn stable_id_falls_back_to_name_and_position() {
+        let id = build_stable_id("", "HDMI-A-1", (1920, 0), 7);
+        assert_eq!(id, "wl-output:HDMI-A-1@1920,0");
+    }
+
+    /// Both description and name empty: fall back to the Wayland
+    /// registry `global_name` so the id is at least session-unique.
+    /// Belt-and-braces against a compositor that doesn't bother
+    /// sending xdg_output::Name / Description (some embedded stacks
+    /// don't).
+    #[test]
+    fn stable_id_falls_back_to_global_name_when_both_empty() {
+        let id = build_stable_id("", "", (0, 0), 42);
+        assert_eq!(id, "wl-output:unknown-42");
+    }
+
+    /// UTF-8 description round-trips byte-for-byte (same contract
+    /// as the macOS `monitor_info_round_trip_utf8_name` test from
+    /// STEP-2.1 + the Windows `build_monitor_info_preserves_utf8_*`
+    /// test from STEP-2.3). Some manufacturers ship non-ASCII
+    /// descriptions via Sway / Hyprland.
+    #[test]
+    fn stable_id_preserves_utf8_description() {
+        let id = build_stable_id("LG UltraFine 5K áéíóú ñ — 戴尔", "HDMI-A-1", (0, 0), 7);
+        assert!(id.contains("LG UltraFine 5K áéíóú ñ — 戴尔"));
+        assert!(id.starts_with("wl-output:"));
+    }
+
+    /// `wl_output::Event::Scale { factor: 2 }` → `scale = 2.0`. The
+    /// most common HiDPI case (Retina-class / 4K HiDPI).
+    #[test]
+    fn compute_scale_two_is_two() {
+        assert!((compute_scale(2) - 2.0).abs() < 1e-9);
+    }
+
+    /// Scale factor 1 → `1.0`. The baseline non-HiDPI case.
+    #[test]
+    fn compute_scale_one_is_one() {
+        assert!((compute_scale(1) - 1.0).abs() < 1e-9);
+    }
+
+    /// Degenerate zero input (transient state mid-binding, before
+    /// the first `Scale` event lands): fall back to 1.0 so a stale
+    /// reading never propagates 0.0 to the IPC layer.
+    #[test]
+    fn compute_scale_zero_falls_back_to_one() {
+        assert_eq!(compute_scale(0), 1.0);
+    }
+
+    /// Negative input (defensive — Wayland compositors promise a
+    /// positive value but a buggy compositor could conceivably send
+    /// -1): fall back to 1.0 the same way as the zero case.
+    #[test]
+    fn compute_scale_negative_falls_back_to_one() {
+        assert_eq!(compute_scale(-1), 1.0);
+    }
+
+    /// Two outputs in a 2x1 layout: the one at `(0, 0)` is primary,
+    /// the right one at `(1920, 0)` is not.
+    #[test]
+    fn pick_primary_prefers_origin() {
+        let info_list = vec![
+            LayerShellOutputInfo {
+                description: "".into(),
+                name: "DP-1".into(),
+                position: (0, 0),
+                size: (1920, 1080),
+                scale: 1,
+                global_name: 1,
+            },
+            LayerShellOutputInfo {
+                description: "".into(),
+                name: "DP-2".into(),
+                position: (1920, 0),
+                size: (1920, 1080),
+                scale: 1,
+                global_name: 2,
+            },
+        ];
+        assert_eq!(pick_primary(&info_list), 0);
+    }
+
+    /// No output sits at the origin (rare, but possible on a freshly-
+    /// bound compositor where the only output is at an offset).
+    /// Fall back to the first entry so callers always get exactly
+    /// one `primary = true`.
+    #[test]
+    fn pick_primary_falls_back_to_first_when_no_origin() {
+        let info_list = vec![
+            LayerShellOutputInfo {
+                description: "".into(),
+                name: "DP-1".into(),
+                position: (1920, 0),
+                size: (1920, 1080),
+                scale: 1,
+                global_name: 1,
+            },
+            LayerShellOutputInfo {
+                description: "".into(),
+                name: "DP-2".into(),
+                position: (0, 1080),
+                size: (1920, 1080),
+                scale: 1,
+                global_name: 2,
+            },
+        ];
+        assert_eq!(pick_primary(&info_list), 0);
+    }
+
+    /// Happy path: a populated `LayerShellOutputInfo` produces a
+    /// `MonitorInfo` with id from description, name from description
+    /// (preferring the user-visible label over the registry name),
+    /// position / size pass through unchanged, primary = true (since
+    /// it's at the origin), scale = 2.0 for HiDPI.
+    #[test]
+    fn build_monitor_info_happy_path() {
+        let info_list = vec![LayerShellOutputInfo {
+            description: "LG UltraFine 5K".into(),
+            name: "DP-1".into(),
+            position: (0, 0),
+            size: (5120, 2880),
+            scale: 2,
+            global_name: 1,
+        }];
+        let monitors = build_monitor_info_list(info_list);
+        assert_eq!(monitors.len(), 1);
+        let m = &monitors[0];
+        assert_eq!(m.id, "wl-output:LG UltraFine 5K");
+        assert_eq!(m.name, "LG UltraFine 5K");
+        assert_eq!(m.position, (0, 0));
+        assert_eq!(m.size, (5120, 2880));
+        assert!(m.primary);
+        assert!((m.scale - 2.0).abs() < 1e-9);
+    }
+
+    /// Multiple outputs: the list preserves insertion order (which
+    /// matches the compositor's enumeration order) and the second
+    /// output is correctly marked `primary = false`.
+    #[test]
+    fn build_monitor_info_preserves_order_and_primary() {
+        let info_list = vec![
+            LayerShellOutputInfo {
+                description: "".into(),
+                name: "DP-1".into(),
+                position: (0, 0),
+                size: (1920, 1080),
+                scale: 1,
+                global_name: 1,
+            },
+            LayerShellOutputInfo {
+                description: "".into(),
+                name: "DP-2".into(),
+                position: (1920, 0),
+                size: (2560, 1440),
+                scale: 1,
+                global_name: 2,
+            },
+        ];
+        let monitors = build_monitor_info_list(info_list);
+        assert_eq!(monitors.len(), 2);
+        assert_eq!(monitors[0].name, "DP-1");
+        assert!(monitors[0].primary);
+        assert_eq!(monitors[1].name, "DP-2");
+        assert!(!monitors[1].primary);
+    }
+
+    /// Empty input → empty output. The `Capture::monitors()` caller
+    /// gets an empty Vec rather than a sentinel; this matches the
+    /// macOS / Windows empty-input behavior.
+    #[test]
+    fn build_monitor_info_empty_input() {
+        let monitors = build_monitor_info_list(vec![]);
+        assert!(monitors.is_empty());
+    }
+
+    /// Description + name both empty: name falls back to the
+    /// position-derived "Output (x, y)" label rather than going
+    /// empty on the wire. Id still has a stable
+    /// `wl-output:unknown-N` suffix from the registry global_name.
+    #[test]
+    fn build_monitor_info_falls_back_when_description_and_name_empty() {
+        let info_list = vec![LayerShellOutputInfo {
+            description: "".into(),
+            name: "".into(),
+            position: (1920, 0),
+            size: (1920, 1080),
+            scale: 1,
+            global_name: 42,
+        }];
+        let m = &build_monitor_info_list(info_list)[0];
+        assert_eq!(m.id, "wl-output:unknown-42");
+        assert_eq!(m.name, "Output (1920, 0)");
+    }
+
+    /// Negative-coordinates round-trip on `position`: a vertically
+    /// stacked layout where the primary sits at the bottom puts the
+    /// top display at `position.y = -1080`. Same contract as the
+    /// macOS / Windows tests from STEP-2.1 / STEP-2.3.
+    #[test]
+    fn build_monitor_info_preserves_negative_position() {
+        let info_list = vec![
+            LayerShellOutputInfo {
+                description: "".into(),
+                name: "DP-1".into(),
+                position: (0, 0),
+                size: (1920, 1080),
+                scale: 1,
+                global_name: 1,
+            },
+            LayerShellOutputInfo {
+                description: "".into(),
+                name: "DP-2".into(),
+                position: (0, -1080),
+                size: (1920, 1080),
+                scale: 1,
+                global_name: 2,
+            },
+        ];
+        let monitors = build_monitor_info_list(info_list);
+        assert_eq!(monitors[1].position, (0, -1080));
+        assert!(!monitors[1].primary);
+    }
+
+    /// UTF-8 description round-trips byte-for-byte through the
+    /// `LayerShellOutputInfo` → `MonitorInfo` mapping. Mirrors the
+    /// Windows `build_monitor_info_preserves_utf8_device_string`
+    /// regression guard.
+    #[test]
+    fn build_monitor_info_preserves_utf8_description() {
+        let info_list = vec![LayerShellOutputInfo {
+            description: "LG UltraFine 5K áéíóú ñ — 戴尔".into(),
+            name: "DP-1".into(),
+            position: (0, 0),
+            size: (5120, 2880),
+            scale: 2,
+            global_name: 1,
+        }];
+        let m = &build_monitor_info_list(info_list)[0];
+        assert_eq!(m.name, "LG UltraFine 5K áéíóú ñ — 戴尔");
+        assert!(m.id.contains("LG UltraFine 5K áéíóú ñ — 戴尔"));
+    }
+}
