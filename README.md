@@ -30,7 +30,7 @@ Lan Mouse encrypts all network traffic and authenticates peers using
 [TLS 1.3 over QUIC](https://datatracker.ietf.org/doc/html/rfc9000) via the
 [quinn](https://github.com/quinn-rs/quinn) 0.11 crate (rustls 0.23 with the
 `ring` crypto provider). The wire protocol is QUIC over UDP on the same
-port (default `4242`); there is no separate TCP control channel anymore.
+port (default `2268`); there is no separate TCP control channel anymore.
 
 A few things to know about the v4 transport switch:
 
@@ -354,7 +354,7 @@ It is of the form "aa:bb:cc:..."
 
 Authorized devices can be persisted using the configuration file (see [Configuration](#configuration)).
 
-If the device still can not be entered, make sure you have UDP port `4242` (or the one selected) opened up in your firewall.
+If the device still can not be entered, make sure you have UDP port `2268` (or the one selected) opened up in your firewall.
 </details>
 
 <details>
@@ -419,8 +419,8 @@ To create this file you can copy the following example config:
 # configure release bind
 release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 
-# optional port (defaults to 4242)
-port = 4242
+# optional port (defaults to 2268)
+port = 2268
 
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic
@@ -447,7 +447,7 @@ hostname = "thorium"
 # ips for ethernet and wifi
 ips = ["192.168.178.189", "192.168.178.172"]
 # optional port
-port = 4242
+port = 2268
 # optional per-client input channel modes.
 # mouse_button and keyboard each accept "datagram" (low latency, may drop
 # on packet loss) or "stream" (reliable and ordered). Mouse motion always

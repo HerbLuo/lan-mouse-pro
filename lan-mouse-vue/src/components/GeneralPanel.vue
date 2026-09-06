@@ -213,7 +213,7 @@ async function copy(text: string, label = 'copied') {
             max="65535"
             v-model="portDraft"
             @change="commitPort"
-            placeholder="4242"
+            placeholder="2268"
             class="mono"
             style="width: 66px"
           />

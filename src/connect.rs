@@ -561,14 +561,14 @@ async fn connect_to_handle(
             // from a transport / fingerprint mismatch which surfaces as a
             // different `quinn::ConnectionError` variant. Distinguishing
             // these two failure modes is the difference between "the peer
-            // daemon is down / firewall blocks UDP 4242" and "the peer's
+            // daemon is down / firewall blocks UDP 2268" and "the peer's
             // cert fingerprint changed and needs re-pinning". Without this
             // hint the operator is left guessing which half of the network
             // to inspect.
             let hint = match &e {
                 quic_transport::Error::Handshake(quinn::ConnectionError::TimedOut) => {
                     " (peer unreachable or not running lan-mouse — \
-                     verify UDP 4242 is open and `lan-mouse` is active on the remote)"
+                     verify UDP 2268 is open and `lan-mouse` is active on the remote)"
                 }
                 quic_transport::Error::Handshake(quinn::ConnectionError::TransportError(_)) => {
                     " (TLS 1.3 handshake rejected — peer cert may not be in \

@@ -111,7 +111,7 @@ function setChannel(key: 'mouse_button' | 'keyboard', ev: Event) {
                 port: Number(($event.target as HTMLInputElement).value),
               })
             "
-            placeholder="4242"
+            placeholder="2268"
           />
         </label>
         <label>

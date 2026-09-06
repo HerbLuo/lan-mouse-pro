@@ -56,7 +56,7 @@ pub enum IpcError {
     Listen(#[from] IpcListenerCreationError),
 }
 
-pub const DEFAULT_PORT: u16 = 4242;
+pub const DEFAULT_PORT: u16 = 2268;
 
 #[derive(Debug, Default, Eq, Hash, PartialEq, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -257,7 +257,7 @@ mod input_channel_tests {
         let legacy = r#"{
             "hostname": "peer-east",
             "fix_ips": [],
-            "port": 4242,
+            "port": 2268,
             "pos": "right",
             "cmd": null
         }"#;
