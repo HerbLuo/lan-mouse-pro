@@ -1,7 +1,9 @@
 use crate::config::Config;
 use clap::Args;
 use futures::StreamExt;
-use input_capture::{self, CaptureError, CaptureEvent, InputCapture, InputCaptureError, Position};
+use input_capture::{
+    self, BarrierKey, CaptureError, CaptureEvent, InputCapture, InputCaptureError, Position,
+};
 use input_event::{Event, KeyboardEvent};
 
 #[derive(Args, Clone, Debug, Eq, PartialEq)]
@@ -14,11 +16,23 @@ pub async fn run(config: Config, _args: TestCaptureArgs) -> Result<(), InputCapt
     loop {
         let mut input_capture = InputCapture::new(backend).await?;
         log::info!("creating clients");
-        input_capture.create(0, Position::Left).await?;
-        input_capture.create(4, Position::Left).await?;
-        input_capture.create(1, Position::Right).await?;
-        input_capture.create(2, Position::Top).await?;
-        input_capture.create(3, Position::Bottom).await?;
+        // STEP-1.3: wrap each Position in BarrierKey::from_pos (monitor /
+        // offset / span stay at defaults).
+        input_capture
+            .create(0, &BarrierKey::from_pos(Position::Left))
+            .await?;
+        input_capture
+            .create(4, &BarrierKey::from_pos(Position::Left))
+            .await?;
+        input_capture
+            .create(1, &BarrierKey::from_pos(Position::Right))
+            .await?;
+        input_capture
+            .create(2, &BarrierKey::from_pos(Position::Top))
+            .await?;
+        input_capture
+            .create(3, &BarrierKey::from_pos(Position::Bottom))
+            .await?;
         if let Err(e) = do_capture(&mut input_capture).await {
             log::warn!("{e} - recreating capture");
         }

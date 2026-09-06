@@ -7,8 +7,10 @@ use std::{
 
 use slab::Slab;
 
+use input_capture::BarrierKey;
 use lan_mouse_ipc::{ClientConfig, ClientHandle, ClientState, InputChannelConfig, Position};
 
+use crate::capture::{to_capture_pos, to_ipc_pos};
 use crate::config::ConfigClient;
 
 #[derive(Clone, Default)]
@@ -111,8 +113,16 @@ impl ClientManager {
             .map(|p| p as ClientHandle)
     }
 
-    /// get the client at the given position
-    pub fn client_at(&self, pos: Position) -> Option<ClientHandle> {
+    /// get the client at the given [`BarrierKey`].
+    ///
+    /// M1: compares `c.pos` against `key.pos` after converting through
+    /// the IPC position boundary (see [`to_ipc_pos`]). `monitor / offset /
+    /// span` are still defaulted (no `ClientConfig` field for them yet) so
+    /// a full `key == c.to_key()` comparison reduces to the `pos`
+    /// comparison. M3 will widen this to also check the future
+    /// `ClientConfig::monitor` field.
+    pub fn client_at(&self, key: &BarrierKey) -> Option<ClientHandle> {
+        let pos = to_ipc_pos(key.pos);
         self.clients
             .borrow()
             .iter()
@@ -133,12 +143,15 @@ impl ClientManager {
             .and_then(|(c, _)| c.hostname.clone())
     }
 
-    /// get the position of the corresponding client
-    pub(crate) fn get_pos(&self, handle: ClientHandle) -> Option<Position> {
+    /// **STEP-1.3**: get the [`BarrierKey`] for `handle`. M1: builds
+    /// `BarrierKey::from_pos(c.pos)` with default `monitor / offset /
+    /// span`. M3 will widen this to include the future
+    /// `ClientConfig::monitor` field.
+    pub(crate) fn get_key(&self, handle: ClientHandle) -> Option<BarrierKey> {
         self.clients
             .borrow()
             .get(handle as usize)
-            .map(|(c, _)| c.pos)
+            .map(|(c, _)| BarrierKey::from_pos(to_capture_pos(c.pos)))
     }
 
     /// remove a client from the list

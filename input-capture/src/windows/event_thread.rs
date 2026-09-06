@@ -33,7 +33,7 @@ use input_event::{
 
 use crate::geometry::{DisplayRect, clamp_to_display_bounds, cursor_within, entered_barrier};
 
-use super::{CaptureEvent, Position};
+use super::{BarrierKey, CaptureEvent, Position};
 
 pub(crate) struct EventThread {
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
@@ -42,7 +42,7 @@ pub(crate) struct EventThread {
 }
 
 impl EventThread {
-    pub(crate) fn new(event_tx: Sender<(Position, CaptureEvent)>) -> Self {
+    pub(crate) fn new(event_tx: Sender<(BarrierKey, CaptureEvent)>) -> Self {
         let request_buffer = Default::default();
         let (thread, thread_id) = start(event_tx, Arc::clone(&request_buffer));
         Self {
@@ -56,16 +56,16 @@ impl EventThread {
         self.signal(RequestType::Release);
     }
 
-    pub(crate) fn create(&self, pos: Position) {
-        self.client_update(ClientUpdate::Create(pos));
+    pub(crate) fn create(&self, key: BarrierKey) {
+        self.client_update(ClientUpdate::Create(key));
     }
 
-    pub(crate) fn destroy(&self, pos: Position) {
-        self.client_update(ClientUpdate::Destroy(pos));
+    pub(crate) fn destroy(&self, key: BarrierKey) {
+        self.client_update(ClientUpdate::Destroy(key));
     }
 
     /// **Pending-capture handshake (main thread entry)**: promotes the
-    /// pending Begin on `pos` to active. Called by the main thread after
+    /// pending Begin on `key` to active. Called by the main thread after
     /// the remote Ack arrives.
     ///
     /// Reuses the existing `ClientUpdate` + `RequestType::ClientUpdate`
@@ -73,18 +73,18 @@ impl EventThread {
     /// is serialized inside the Windows thread, so the pending → active
     /// transition is atomic (the hook thread and message loop share the
     /// same thread, so there are no concurrent writers).
-    pub(crate) fn start_capture(&self, pos: Position) {
-        self.client_update(ClientUpdate::StartCapture(pos));
+    pub(crate) fn start_capture(&self, key: BarrierKey) {
+        self.client_update(ClientUpdate::StartCapture(key));
     }
 
     /// **Pending-capture handshake (main thread entry)**: cancels the
-    /// pending Begin on `pos` (if any). Called by the main thread in
+    /// pending Begin on `key` (if any). Called by the main thread in
     /// these scenarios:
     /// - Enter send failed (network down)
     /// - 500ms tick detected Ack timeout
     /// - `release_bind` was pressed while pending
-    pub(crate) fn cancel_pending(&self, pos: Position) {
-        self.client_update(ClientUpdate::CancelPending(pos));
+    pub(crate) fn cancel_pending(&self, key: BarrierKey) {
+        self.client_update(ClientUpdate::CancelPending(key));
     }
 
     fn exit(&self) {
@@ -119,34 +119,34 @@ enum RequestType {
 }
 
 enum ClientUpdate {
-    Create(Position),
-    Destroy(Position),
+    Create(BarrierKey),
+    Destroy(BarrierKey),
     /// Main thread says: Ack received, promote the pending Begin on
-    /// `Position` to an active capture (cursor hidden, events consumed).
+    /// `BarrierKey` to an active capture (cursor hidden, events consumed).
     /// No-op if no pending Begin matches.
-    StartCapture(Position),
-    /// Main thread says: cancel any pending Begin on `Position`
+    StartCapture(BarrierKey),
+    /// Main thread says: cancel any pending Begin on `BarrierKey`
     /// (Ack timeout, send failure, or release-bind pressed). No-op if
     /// no pending Begin matches.
-    CancelPending(Position),
+    CancelPending(BarrierKey),
 }
 
-fn blocking_send_event(pos: Position, event: CaptureEvent) {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().blocking_send((pos, event)).unwrap())
+fn blocking_send_event(key: BarrierKey, event: CaptureEvent) {
+    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().blocking_send((key, event)).unwrap())
 }
 
 fn try_send_event(
-    pos: Position,
+    key: BarrierKey,
     event: CaptureEvent,
-) -> Result<(), TrySendError<(Position, CaptureEvent)>> {
-    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().try_send((pos, event)))
+) -> Result<(), TrySendError<(BarrierKey, CaptureEvent)>> {
+    EVENT_TX.with_borrow_mut(|tx| tx.as_mut().unwrap().try_send((key, event)))
 }
 
 thread_local! {
     /// all configured clients
-    static CLIENTS: RefCell<HashSet<Position>> = RefCell::new(HashSet::new());
+    static CLIENTS: RefCell<HashSet<BarrierKey>> = RefCell::new(HashSet::new());
     /// currently active client (cursor hidden, events consumed).
-    static ACTIVE_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
+    static ACTIVE_CLIENT: Cell<Option<BarrierKey>> = const { Cell::new(None) };
     /// Pending client (cursor still visible on the host, Enter already
     /// sent to the remote, waiting for the Ack). Mutually exclusive with
     /// [`ACTIVE_CLIENT`] — promotion clears pending, cancel clears
@@ -162,13 +162,13 @@ thread_local! {
     /// `PENDING_CLIENT` is set — the cursor stays on the host; the
     /// main thread promotes it to active via `start_capture` once the
     /// Ack arrives.
-    static PENDING_CLIENT: Cell<Option<Position>> = const { Cell::new(None) };
+    static PENDING_CLIENT: Cell<Option<BarrierKey>> = const { Cell::new(None) };
     /// Entry point captured at the moment of barrier crossing. Preserved
     /// across promotion so the eventual active Begin yields the same
     /// Motion deltas as if we'd gone active immediately.
     static PENDING_ENTRY_POINT: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
     /// input event channel
-    static EVENT_TX: RefCell<Option<Sender<(Position, CaptureEvent)>>> = const { RefCell::new(None) };
+    static EVENT_TX: RefCell<Option<Sender<(BarrierKey, CaptureEvent)>>> = const { RefCell::new(None) };
     /// position of barrier entry (active)
     static ENTRY_POINT: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
     /// previous mouse position (kept as `f64` to match the rest of the
@@ -191,7 +191,7 @@ fn get_msg() -> Option<MSG> {
 }
 
 fn start(
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: Sender<(BarrierKey, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
 ) -> (thread::JoinHandle<()>, u32) {
     /* condition variable to wait for thread id */
@@ -211,7 +211,7 @@ fn start(
 
 fn start_routine(
     ready: Arc<(Condvar, Mutex<Option<u32>>)>,
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: Sender<(BarrierKey, CaptureEvent)>,
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
 ) {
     EVENT_TX.replace(Some(event_tx));
@@ -339,15 +339,15 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
      * fresh crossing is picked up by `entered_barrier` on the next
      * WM_MOUSEMOVE, starting a new pending flow normally.
      */
-    if let Some(pending_pos) = PENDING_CLIENT.get() {
+    if let Some(pending_key) = PENDING_CLIENT.get() {
         let within = DISPLAYS.with_borrow_mut(|(displays, generation)| {
             update_display_regions(displays, generation);
-            cursor_within(curr_pos, displays, pending_pos)
+            cursor_within(curr_pos, displays, pending_key.pos)
         });
         if within {
             PENDING_CLIENT.take();
-            log::debug!("CANCEL pending {pending_pos:?} (cursor pulled back inside)");
-            blocking_send_event(pending_pos, CaptureEvent::CancelPending);
+            log::debug!("CANCEL pending {pending_key:?} (cursor pulled back inside)");
+            blocking_send_event(pending_key, CaptureEvent::CancelPending);
         }
         return false;
     }
@@ -362,8 +362,13 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         return false;
     };
 
+    // M1: lift the detected Position into a BarrierKey. monitor /
+    // offset / span stay at their legacy defaults until M2 wires
+    // monitor info end-to-end.
+    let key = BarrierKey::from_pos(pos);
+
     /* check if a client is registered for the barrier */
-    if !CLIENTS.with_borrow(|clients| clients.contains(&pos)) {
+    if !CLIENTS.with_borrow(|clients| clients.contains(&key)) {
         return false;
     }
 
@@ -371,13 +376,13 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
      * When mouse_proc sees PENDING_CLIENT (and not ACTIVE_CLIENT) it does
      * not consume events, so the cursor stays on the host and moves normally.
      */
-    PENDING_CLIENT.replace(Some(pos));
+    PENDING_CLIENT.replace(Some(key.clone()));
     let entry_point =
         DISPLAYS.with_borrow(|(displays, _)| clamp_to_display_bounds(displays, prev_pos, curr_pos));
     PENDING_ENTRY_POINT.replace(entry_point);
 
     log::debug!("PENDING @ {prev_pos:?} -> {curr_pos:?}");
-    blocking_send_event(pos, CaptureEvent::BeginPending);
+    blocking_send_event(key, CaptureEvent::BeginPending);
 
     false
 }
@@ -391,7 +396,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     }
 
     /* get active client if any */
-    let Some(pos) = ACTIVE_CLIENT.get() else {
+    let Some(key) = ACTIVE_CLIENT.get() else {
         return LRESULT(1);
     };
 
@@ -401,7 +406,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     };
 
     /* notify mainthread (drop events if sending too fast) */
-    if let Err(e) = try_send_event(pos, CaptureEvent::Input(Event::Pointer(pointer_event))) {
+    if let Err(e) = try_send_event(key, CaptureEvent::Input(Event::Pointer(pointer_event))) {
         log::warn!("e: {e}");
     }
 
@@ -498,47 +503,47 @@ fn enumerate_displays(display_rects: &mut Vec<DisplayRect>) {
 
 fn update_clients(request: ClientUpdate) {
     match request {
-        ClientUpdate::Create(pos) => {
-            CLIENTS.with_borrow_mut(|clients| clients.insert(pos));
+        ClientUpdate::Create(key) => {
+            CLIENTS.with_borrow_mut(|clients| clients.insert(key));
         }
-        ClientUpdate::Destroy(pos) => {
-            // When removing pos's client, both pending and active must be
+        ClientUpdate::Destroy(key) => {
+            // When removing the client's key, both pending and active must be
             // cleared; otherwise StartCapture / mouse_proc would still operate
-            // on the stale pos and misbehave.
-            if PENDING_CLIENT.get() == Some(pos) {
+            // on the stale key and misbehave.
+            if PENDING_CLIENT.get() == Some(key.clone()) {
                 PENDING_CLIENT.take();
             }
-            if let Some(active_pos) = ACTIVE_CLIENT.get() {
-                if pos == active_pos {
+            if let Some(active_key) = ACTIVE_CLIENT.get() {
+                if key == active_key {
                     let _ = ACTIVE_CLIENT.take();
                 }
             }
-            CLIENTS.with_borrow_mut(|clients| clients.remove(&pos));
+            CLIENTS.with_borrow_mut(|clients| clients.remove(&key));
         }
-        ClientUpdate::StartCapture(pos) => {
-            // Only promote when the pending position matches. On mismatch
+        ClientUpdate::StartCapture(key) => {
+            // Only promote when the pending key matches. On mismatch
             // (e.g. the user switched sides during pending), it's a no-op
             // and the remote Ack path naturally falls through to Idle.
-            if PENDING_CLIENT.get() != Some(pos) {
+            if PENDING_CLIENT.get() != Some(key.clone()) {
                 log::trace!(
-                    "start_capture({pos:?}) ignored: pending={:?}",
+                    "start_capture({key:?}) ignored: pending={:?}",
                     PENDING_CLIENT.get()
                 );
                 return;
             }
             PENDING_CLIENT.take();
-            ACTIVE_CLIENT.replace(Some(pos));
+            ACTIVE_CLIENT.replace(Some(key.clone()));
             ENTRY_POINT.replace(PENDING_ENTRY_POINT.get());
-            log::debug!("promoted pending client {pos:?} to active");
+            log::debug!("promoted pending client {key:?} to active");
             // Actively emit Begin to the main thread — the main thread calls
             // start_capture upon receiving the Ack, completing the
             // ack-to-begin loop.
-            blocking_send_event(pos, CaptureEvent::Begin);
+            blocking_send_event(key, CaptureEvent::Begin);
         }
-        ClientUpdate::CancelPending(pos) => {
-            if PENDING_CLIENT.get() == Some(pos) {
+        ClientUpdate::CancelPending(key) => {
+            if PENDING_CLIENT.get() == Some(key) {
                 PENDING_CLIENT.take();
-                log::debug!("cleared pending client {pos:?} (cancelled by main)");
+                log::debug!("cleared pending client {key:?} (cancelled by main)");
             }
         }
     }

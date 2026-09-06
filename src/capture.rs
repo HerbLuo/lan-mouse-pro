@@ -165,7 +165,7 @@ impl WatchdogConfig {
 
 use futures::StreamExt;
 use input_capture::{
-    CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
+    BarrierKey, CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError,
 };
 use input_event::{Event, KeyboardEvent, scancode};
 use lan_mouse_proto::ProtoEvent;
@@ -214,7 +214,11 @@ enum CaptureRequest {
     /// capture must release the mouse
     Release,
     /// add a capture client
-    Create(CaptureHandle, Position, CaptureType),
+    ///
+    /// M1: monitor / offset / span are always default (`None` / `0` /
+    /// `10000`) — see [`BarrierKey::from_pos`]. M2+ will populate them
+    /// from frontend config.
+    Create(CaptureHandle, BarrierKey, CaptureType),
     /// destory a capture client
     Destroy(CaptureHandle),
     /// reenable input capture
@@ -288,12 +292,11 @@ impl Capture {
     pub(crate) fn create(
         &self,
         handle: CaptureHandle,
-        pos: lan_mouse_ipc::Position,
+        key: &BarrierKey,
         capture_type: CaptureType,
     ) {
-        let pos = to_capture_pos(pos);
         self.request_tx
-            .send(CaptureRequest::Create(handle, pos, capture_type))
+            .send(CaptureRequest::Create(handle, key.clone(), capture_type))
             .expect("channel closed");
     }
 
@@ -362,7 +365,12 @@ struct CaptureTask {
     active_client: Option<CaptureHandle>,
     backend: Option<input_capture::Backend>,
     cancellation_token: CancellationToken,
-    captures: Vec<(CaptureHandle, Position, CaptureType)>,
+    /// Active capture clients keyed by handle. M1: every entry's `key` is
+    /// `BarrierKey::from_pos(pos)` (monitor / offset / span at defaults).
+    /// The `Vec` (rather than `HashMap`) preserves insertion order — the
+    /// `dummy` backend's round-robin schedule assumes that. Step 1 of
+    /// PLAN §M1 / STEP-1.3.
+    captures: Vec<(CaptureHandle, BarrierKey, CaptureType)>,
     conn: LanMouseConnection,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
@@ -461,26 +469,34 @@ impl WatchdogState {
 }
 
 impl CaptureTask {
-    fn add_capture(&mut self, handle: CaptureHandle, pos: Position, capture_type: CaptureType) {
-        self.captures.push((handle, pos, capture_type));
+    fn add_capture(&mut self, handle: CaptureHandle, key: &BarrierKey, capture_type: CaptureType) {
+        self.captures.push((handle, key.clone(), capture_type));
     }
 
     fn remove_capture(&mut self, handle: CaptureHandle) {
         self.captures.retain(|&(h, ..)| handle != h);
     }
 
-    fn is_default_capture_at(&self, pos: Position) -> bool {
+    /// True iff a [`CaptureType::Default`] entry shares this exact
+    /// [`BarrierKey`]. M1 (default `monitor / offset / span`) reduces to
+    /// "same pos"; M2+ widens to "same monitor + sub-range".
+    fn is_default_capture_at(&self, key: &BarrierKey) -> bool {
         self.captures
             .iter()
-            .any(|&(_, p, t)| p == pos && t == CaptureType::Default)
+            .any(|(_, k, t)| k == key && *t == CaptureType::Default)
     }
 
-    fn get_pos(&self, handle: CaptureHandle) -> Position {
+    /// Lookup the [`BarrierKey`] registered for `handle`. Returns an
+    /// owned copy (clones internally) because most call sites either
+    /// pass it on as `&BarrierKey` to the backend or store it in
+    /// [`State::Pending`] which needs ownership.
+    fn get_key(&self, handle: CaptureHandle) -> BarrierKey {
         self.captures
             .iter()
             .find(|(h, ..)| *h == handle)
             .expect("no such capture")
             .1
+            .clone()
     }
 
     fn get_type(&self, handle: CaptureHandle) -> CaptureType {
@@ -500,7 +516,7 @@ impl CaptureTask {
                 tokio::select! {
                     r = self.request_rx.recv() => match r.expect("channel closed") {
                         CaptureRequest::Reenable => break,
-                        CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
+                        CaptureRequest::Create(h, p, t) => self.add_capture(h, &p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
                         CaptureRequest::Release => { /* nothing to do */ }
                         CaptureRequest::SetReleaseBind(bind) => {
@@ -554,7 +570,7 @@ impl CaptureTask {
         let captures = self.captures.clone();
         for (handle, pos, _type) in captures {
             tokio::select! {
-                r = capture.create(handle, pos) => r?,
+                r = capture.create(handle, &pos) => r?,
                 _ = self.cancellation_token.cancelled() => return Ok(()),
             }
         }
@@ -604,9 +620,7 @@ impl CaptureTask {
             (Some(light), Some(heavy))
         } else {
             if !watchdog_globally_enabled {
-                log::info!(
-                    "watchdog disabled by LAN_MOUSE_WATCHDOG=off or watchdog.enabled=false"
-                );
+                log::info!("watchdog disabled by LAN_MOUSE_WATCHDOG=off or watchdog.enabled=false");
             } else {
                 log::info!("watchdog enabled but no individual checks active");
             }
@@ -694,7 +708,11 @@ impl CaptureTask {
                         //   ours).
                         ProtoEvent::Ack(_) => {
                             match self.state {
-                                State::Pending { handle: pending_h, started } => {
+                                State::Pending {
+                                    handle: pending_h,
+                                    ref key,
+                                    started,
+                                } => {
                                     if pending_h == handle {
                                         log::info!(
                                             "client {handle} acknowledged Enter after {:?}",
@@ -708,16 +726,15 @@ impl CaptureTask {
                                         // handle_capture_event). Note:
                                         // start_capture is idempotent; if a
                                         // cancel happens in between (user backs
-                                        // off) it's a no-op.
-                                        if let Err(e) =
-                                            capture.start_capture(self.get_pos(handle))
-                                        {
+                                        // off) it's a no-op. STEP-1.3: route
+                                        // via the key cached in Pending rather
+                                        // than re-looking-up by handle.
+                                        if let Err(e) = capture.start_capture(key) {
                                             log::warn!(
                                                 "start_capture after Ack failed: {e} \
                                                  (cancelling pending)"
                                             );
-                                            let _ =
-                                                capture.cancel_pending(self.get_pos(handle));
+                                            let _ = capture.cancel_pending(key);
                                             self.state = State::Idle;
                                         }
                                         // Stay Pending and wait for the backend's
@@ -774,13 +791,11 @@ impl CaptureTask {
                         // not change state — the alive check has been removed
                         // from `send()` ([`crate::connect::LanMouseConnection::send`])
                         // so subsequent Input events are still attempted.
-                        ProtoEvent::Pong(alive) => {
-                            if !alive {
-                                log::info!(
-                                    "Pong(alive=false) from handle {handle}: peer reports \
-                                     emulation disabled (no-op, optimistic-send still in effect)"
-                                );
-                            }
+                        ProtoEvent::Pong(false) => {
+                            log::info!(
+                                "Pong(alive=false) from handle {handle}: peer reports \
+                                 emulation disabled (no-op, optimistic-send still in effect)"
+                            );
                         }
                         _ => {}
                     }
@@ -789,8 +804,8 @@ impl CaptureTask {
                     CaptureRequest::Reenable => { /* already active */ },
                     CaptureRequest::Release => self.release_capture(capture).await?,
                     CaptureRequest::Create(h, p, t) => {
-                        self.add_capture(h, p, t);
-                        capture.create(h, p).await?;
+                        self.add_capture(h, &p, t);
+                        capture.create(h, &p).await?;
                     }
                     CaptureRequest::Destroy(h) => {
                         self.remove_capture(h);
@@ -811,16 +826,14 @@ impl CaptureTask {
                 // within 500ms → actively cancel pending and the mouse stays
                 // on the host.
                 _ = pending_tick.tick() => {
-                    if let State::Pending { handle, started } = self.state {
+                    if let State::Pending { handle, ref key, started } = self.state {
                         let elapsed = started.elapsed();
                         if elapsed >= PENDING_ACK_TIMEOUT {
                             log::warn!(
                                 "capture: BeginPending timed out after {elapsed:?} for handle {handle} \
                                  - cancelling (host cursor stays visible)"
                             );
-                            if let Err(e) =
-                                capture.cancel_pending(self.get_pos(handle))
-                            {
+                            if let Err(e) = capture.cancel_pending(key) {
                                 log::warn!("cancel_pending on timeout: {e}");
                             }
                             self.state = State::Idle;
@@ -1019,8 +1032,7 @@ impl CaptureTask {
                     break;
                 }
             }
-            if self.watchdog.recent_crossings.len()
-                >= self.watchdog_config.crossing_storm_threshold
+            if self.watchdog.recent_crossings.len() >= self.watchdog_config.crossing_storm_threshold
                 && matches!(self.state, State::Idle)
                 && self.active_client.is_none()
             {
@@ -1031,9 +1043,7 @@ impl CaptureTask {
                     self.watchdog_config.crossing_window,
                 );
                 if let Err(e) = self.release_capture(capture).await {
-                    log::warn!(
-                        "watchdog[heavy]: release_capture during storm clear failed: {e}"
-                    );
+                    log::warn!("watchdog[heavy]: release_capture during storm clear failed: {e}");
                 }
                 self.watchdog.recent_crossings.clear();
                 self.watchdog.last_progress_at = now;
@@ -1142,7 +1152,7 @@ impl CaptureTask {
             }
             // if there is no active outgoing connection at the current capture,
             // we release the capture
-            if !self.is_default_capture_at(self.get_pos(handle)) {
+            if !self.is_default_capture_at(&self.get_key(handle)) {
                 log::info!("releasing capture: no active client at this position");
                 capture.release().await?;
             }
@@ -1167,8 +1177,14 @@ impl CaptureTask {
             // still visible) → emits BeginPending. We send Enter to the peer
             // and wait for the Ack. On send failure, cancel pending directly.
             CaptureEvent::BeginPending => {
+                // STEP-1.3: cache the BarrierKey in Pending so downstream
+                // paths (Ack / timeout / release_capture) don't have to
+                // re-scan `self.captures` by handle. `get_key` clones the
+                // BarrierKey from the active capture list.
+                let key = self.get_key(handle);
                 self.state = State::Pending {
                     handle,
+                    key: key.clone(),
                     started: Instant::now(),
                 };
                 log::info!(
@@ -1180,7 +1196,7 @@ impl CaptureTask {
                 // stuck; force a release and let the next round start
                 // naturally from scratch.
                 self.watchdog.recent_crossings.push_back(Instant::now());
-                let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+                let opposite_pos = to_proto_pos(key.pos.opposite());
                 if let Err(e) = self
                     .conn
                     .send(ProtoEvent::Enter(opposite_pos), handle)
@@ -1194,7 +1210,7 @@ impl CaptureTask {
                     // cancel is an async message to the Windows thread; even
                     // if cancel_pending fails, the 500ms tick catches it and
                     // clears PENDING_CLIENT.
-                    if let Err(e) = capture.cancel_pending(self.get_pos(handle)) {
+                    if let Err(e) = capture.cancel_pending(&key) {
                         log::warn!("cancel_pending after send failure: {e}");
                     }
                     self.state = State::Idle;
@@ -1226,7 +1242,7 @@ impl CaptureTask {
             // times.
             CaptureEvent::CancelPending => {
                 log::info!("capture: CancelPending (handle={handle:?})");
-                if let Err(e) = capture.cancel_pending(self.get_pos(handle)) {
+                if let Err(e) = capture.cancel_pending(&self.get_key(handle)) {
                     log::warn!("cancel_pending: {e}");
                 }
                 if let State::Pending { handle: h, .. } = self.state {
@@ -1297,7 +1313,7 @@ impl CaptureTask {
                                 .expect("channel closed");
                         }
                         self.state = State::Sending;
-                        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
+                        let opposite_pos = to_proto_pos(self.get_key(handle).pos.opposite());
                         if let Err(e) = self
                             .conn
                             .send(ProtoEvent::Enter(opposite_pos), handle)
@@ -1375,12 +1391,15 @@ impl CaptureTask {
         // 1. release-bind pressed while in the pending state
         // 2. service.rs actively releasing (user action)
         // 3. capture::Capture Drop / destroy
-        if let State::Pending { handle, .. } = self.state {
+        if let State::Pending {
+            handle, ref key, ..
+        } = self.state
+        {
             log::info!(
                 "release_capture: was in Pending for handle {handle} - \
                  cancel_pending (no Leave to send)"
             );
-            if let Err(e) = capture.cancel_pending(self.get_pos(handle)) {
+            if let Err(e) = capture.cancel_pending(key) {
                 log::warn!("cancel_pending in release_capture: {e}");
             }
             self.state = State::Idle;
@@ -1501,7 +1520,7 @@ thread_local! {
     static PREV_LOG: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 enum State {
     #[default]
     Idle,
@@ -1510,8 +1529,15 @@ enum State {
     /// backend (the host cursor is still visible). After 500ms without
     /// Ack the [`crate::capture::CaptureTask`] cancels and goes back to
     /// [`State::Idle`].
+    ///
+    /// `key` is the [`BarrierKey`] of the capture the cursor crossed;
+    /// it was looked up from `self.captures` when the `BeginPending`
+    /// event arrived. Caching it here removes the linear
+    /// `self.captures.iter().find(...)` scan in the Ack / timeout /
+    /// `release_capture` paths (PLAN §M1 / STEP-1.3 — "事件路由改用 key").
     Pending {
         handle: CaptureHandle,
+        key: BarrierKey,
         started: Instant,
     },
     /// Capture is active (backend has promoted pending → active on Ack,
@@ -1520,12 +1546,29 @@ enum State {
     Sending,
 }
 
-fn to_capture_pos(pos: lan_mouse_ipc::Position) -> input_capture::Position {
+/// **`lan_mouse_ipc::Position` → `input_capture::Position`** —
+/// `pub(crate)` so [`crate::service`] can build a [`BarrierKey`] from
+/// the IPC-facing position carried by `EmulationEvent::Entered` /
+/// `FrontendRequest::UpdatePosition`.
+pub(crate) fn to_capture_pos(pos: lan_mouse_ipc::Position) -> input_capture::Position {
     match pos {
         lan_mouse_ipc::Position::Left => input_capture::Position::Left,
         lan_mouse_ipc::Position::Right => input_capture::Position::Right,
         lan_mouse_ipc::Position::Top => input_capture::Position::Top,
         lan_mouse_ipc::Position::Bottom => input_capture::Position::Bottom,
+    }
+}
+
+/// **`input_capture::Position` → `lan_mouse_ipc::Position`** —
+/// reverse of [`to_capture_pos`]. Used by [`crate::client::ClientManager`]
+/// to compare a [`BarrierKey`]'s `pos` field against the
+/// `lan_mouse_ipc::Position` stored in `ClientConfig`.
+pub(crate) fn to_ipc_pos(pos: input_capture::Position) -> lan_mouse_ipc::Position {
+    match pos {
+        input_capture::Position::Left => lan_mouse_ipc::Position::Left,
+        input_capture::Position::Right => lan_mouse_ipc::Position::Right,
+        input_capture::Position::Top => lan_mouse_ipc::Position::Top,
+        input_capture::Position::Bottom => lan_mouse_ipc::Position::Bottom,
     }
 }
 

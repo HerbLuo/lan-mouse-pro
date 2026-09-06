@@ -490,7 +490,12 @@ impl Service {
     fn add_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {
         let handle = Self::ENTER_HANDLE_BEGIN + self.next_trigger_handle;
         self.next_trigger_handle += 1;
-        self.capture.create(handle, pos, CaptureType::EnterOnly);
+        // STEP-1.3: wrap the IPC `pos` into a `BarrierKey` before handing
+        // it to `Capture::create`. M1 keeps `monitor / offset / span` at
+        // defaults; M3+ will lift the field to come from the frontend.
+        let key = crate::capture::to_capture_pos(pos);
+        let key = input_capture::BarrierKey::from_pos(key);
+        self.capture.create(handle, &key, CaptureType::EnterOnly);
         self.incoming_conns.insert(addr);
         self.incoming_conn_info.insert(
             handle,
@@ -595,12 +600,12 @@ impl Service {
         /* resolve dns on activate */
         self.resolve(handle);
 
-        /* deactivate potential other client at this position */
-        let Some(pos) = self.client_manager.get_pos(handle) else {
+        /* deactivate potential other client at this BarrierKey */
+        let Some(key) = self.client_manager.get_key(handle) else {
             return;
         };
 
-        if let Some(other) = self.client_manager.client_at(pos) {
+        if let Some(other) = self.client_manager.client_at(&key) {
             if other != handle {
                 self.deactivate_client(other);
             }
@@ -609,9 +614,9 @@ impl Service {
         /* activate the client */
         if self.client_manager.activate_client(handle) {
             /* notify capture and frontends */
-            self.capture.create(handle, pos, CaptureType::Default);
+            self.capture.create(handle, &key, CaptureType::Default);
             self.broadcast_client(handle);
-            log::info!("activated client {handle} ({pos})");
+            log::info!("activated client {handle} ({key:?})");
 
             // Fire-and-forget dial so an active client establishes
             // its connection immediately, even if no mouse movement

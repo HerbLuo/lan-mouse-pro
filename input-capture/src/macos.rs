@@ -1,4 +1,6 @@
-use super::{Capture, CaptureError, CaptureEvent, Position, error::MacosCaptureCreationError};
+use super::{
+    BarrierKey, Capture, CaptureError, CaptureEvent, Position, error::MacosCaptureCreationError,
+};
 use crate::geometry::DisplayRect;
 use async_trait::async_trait;
 use bitflags::bitflags;
@@ -41,17 +43,17 @@ use tokio::sync::{
 
 #[derive(Debug)]
 struct InputCaptureState {
-    /// active capture positions
-    active_clients: Lazy<HashSet<Position>>,
-    /// the currently entered capture position, if any
-    current_pos: Option<Position>,
+    /// active capture barrier keys
+    active_clients: Lazy<HashSet<BarrierKey>>,
+    /// the currently entered capture barrier key, if any
+    current_key: Option<BarrierKey>,
     /// Intermediate pending-capture state: the mouse has crossed an edge
     /// but the main thread has not yet received the Ack.
-    /// Mutually exclusive with `current_pos`. Cleared on promotion to
+    /// Mutually exclusive with `current_key`. Cleared on promotion to
     /// active and on cancel. While the backend is awaiting Ack it does
     /// not hide the cursor and does not warp it — the cursor stays on
     /// the host.
-    pending_pos: Option<Position>,
+    pending_key: Option<BarrierKey>,
     /// Position where the cursor was when it crossed the barrier — the
     /// actual previous cursor location, not a bbox-derived corner.
     /// Used as the warp target on pending->active promotion so the
@@ -71,20 +73,20 @@ struct InputCaptureState {
 #[derive(Debug)]
 enum ProducerEvent {
     Release,
-    Create(Position),
-    Destroy(Position),
+    Create(BarrierKey),
+    Destroy(BarrierKey),
     /// Legacy macOS path used `Grab` directly when there was no pending
     /// state. Retained for compatibility; new code no longer emits it.
     #[allow(dead_code)]
-    Grab(Position),
+    Grab(BarrierKey),
     /// Promotes a pending capture to active: the main thread calls
     /// `start_capture` after receiving the remote Ack and forwards it
     /// here. On promotion: warp the cursor, hide the cursor, emit Begin.
-    StartCapture(Position),
+    StartCapture(BarrierKey),
     /// Pending cancel: triggered by main-thread `cancel_pending`,
     /// network loss, or the 500ms timeout. Emits `CancelPending` if
     /// the position is still pending.
-    CancelPending(Position),
+    CancelPending(BarrierKey),
     EventTapDisabled,
     DisplayReconfigured,
 }
@@ -93,8 +95,8 @@ impl InputCaptureState {
     fn new() -> Result<Self, MacosCaptureCreationError> {
         let mut res = Self {
             active_clients: Lazy::new(HashSet::new),
-            current_pos: None,
-            pending_pos: None,
+            current_key: None,
+            pending_key: None,
             enter_position: None,
             displays: Vec::new(),
             modifier_state: Default::default(),
@@ -107,12 +109,17 @@ impl InputCaptureState {
     /// from the CGEvent (location is the position before delta is
     /// applied; location + delta is the position after). Defers all
     /// geometry to `crate::geometry::entered_barrier`, then filters to
-    /// positions that have a registered client.
-    fn crossed(&self, prev_pos: (f64, f64), curr_pos: (f64, f64)) -> Option<Position> {
+    /// positions that have a registered client. M1 builds a
+    /// `BarrierKey::from_pos(pos)` so the rest of the state can speak
+    /// in `BarrierKey` terms; the `monitor/offset/span` fields stay
+    /// at their legacy defaults until M2 wires monitor info
+    /// end-to-end.
+    fn crossed(&self, prev_pos: (f64, f64), curr_pos: (f64, f64)) -> Option<BarrierKey> {
         let pos = crate::geometry::entered_barrier(prev_pos, curr_pos, &self.displays)?;
-        if self.active_clients.contains(&pos) {
+        let key = BarrierKey::from_pos(pos);
+        if self.active_clients.contains(&key) {
             log::debug!("Crossed barrier into position: {pos:?}");
-            Some(pos)
+            Some(key)
         } else {
             None
         }
@@ -246,76 +253,76 @@ impl InputCaptureState {
     async fn handle_producer_event(
         &mut self,
         producer_event: ProducerEvent,
-    ) -> Result<Option<(Position, CaptureEvent)>, CaptureError> {
+    ) -> Result<Option<(BarrierKey, CaptureEvent)>, CaptureError> {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
             ProducerEvent::Release => {
-                if self.current_pos.is_some() {
+                if self.current_key.is_some() {
                     self.show_cursor()?;
-                    self.current_pos = None;
+                    self.current_key = None;
                 }
                 // Release must also clear any pending state (kept in
                 // sync with the Windows semantics).
-                if self.pending_pos.is_some() {
-                    self.pending_pos = None;
+                if self.pending_key.is_some() {
+                    self.pending_key = None;
                 }
                 Ok(None)
             }
-            ProducerEvent::Grab(pos) => {
+            ProducerEvent::Grab(key) => {
                 // Legacy path. New code no longer emits Grab; kept for
                 // compatibility.
-                if self.current_pos.is_none() {
+                if self.current_key.is_none() {
                     self.hide_cursor()?;
-                    self.current_pos = Some(pos);
+                    self.current_key = Some(key);
                 }
                 Ok(None)
             }
-            ProducerEvent::StartCapture(pos) => {
+            ProducerEvent::StartCapture(key) => {
                 // Pending -> Active promotion. Only runs when
-                // pending_pos matches (the user crossing a different
+                // pending_key matches (the user crossing a different
                 // edge, or having already cancelled, becomes a no-op).
-                if self.pending_pos != Some(pos) {
+                if self.pending_key.as_ref() != Some(&key) {
                     log::trace!(
-                        "StartCapture({pos:?}) ignored: pending_pos={:?}",
-                        self.pending_pos
+                        "StartCapture({key:?}) ignored: pending_key={:?}",
+                        self.pending_key
                     );
                     return Ok(None);
                 }
-                self.pending_pos = None;
-                if self.current_pos.is_none() {
+                self.pending_key = None;
+                if self.current_key.is_none() {
                     self.hide_cursor()?;
-                    self.current_pos = Some(pos);
+                    self.current_key = Some(key.clone());
                     // Use enter_position (recorded earlier in the tap
                     // callback) to warp the cursor 1px inside the edge,
                     // matching the behavior of the legacy Grab path.
-                    self.reset_cursor(pos)?;
+                    self.reset_cursor(key.pos)?;
                     // Notify the main thread: capture is now active.
-                    return Ok(Some((pos, CaptureEvent::Begin)));
+                    return Ok(Some((key, CaptureEvent::Begin)));
                 }
                 Ok(None)
             }
-            ProducerEvent::CancelPending(pos) => {
-                if self.pending_pos == Some(pos) {
-                    self.pending_pos = None;
-                    return Ok(Some((pos, CaptureEvent::CancelPending)));
+            ProducerEvent::CancelPending(key) => {
+                if self.pending_key.as_ref() == Some(&key) {
+                    self.pending_key = None;
+                    return Ok(Some((key, CaptureEvent::CancelPending)));
                 }
                 Ok(None)
             }
-            ProducerEvent::Create(p) => {
-                self.active_clients.insert(p);
+            ProducerEvent::Create(k) => {
+                self.active_clients.insert(k);
                 Ok(None)
             }
-            ProducerEvent::Destroy(p) => {
-                if let Some(current) = self.current_pos {
-                    if current == p {
+            ProducerEvent::Destroy(k) => {
+                if let Some(current) = self.current_key.as_ref() {
+                    if current == &k {
                         self.show_cursor()?;
-                        self.current_pos = None;
+                        self.current_key = None;
                     };
                 }
-                if self.pending_pos == Some(p) {
-                    self.pending_pos = None;
+                if self.pending_key.as_ref() == Some(&k) {
+                    self.pending_key = None;
                 }
-                self.active_clients.remove(&p);
+                self.active_clients.remove(&k);
                 Ok(None)
             }
             ProducerEvent::EventTapDisabled => {
@@ -323,12 +330,12 @@ impl InputCaptureState {
                 // revoked, tap-timeout, etc). Release state so we
                 // don't leave the cursor hidden even if the outer
                 // task only logs this error rather than propagating.
-                if self.current_pos.is_some() {
+                if self.current_key.is_some() {
                     self.show_cursor()?;
-                    self.current_pos = None;
+                    self.current_key = None;
                 }
-                if self.pending_pos.is_some() {
-                    self.pending_pos = None;
+                if self.pending_key.is_some() {
+                    self.pending_key = None;
                 }
                 Err(CaptureError::EventTapDisabled)
             }
@@ -557,7 +564,7 @@ fn get_events(
 fn create_event_tap<'a>(
     client_state: Arc<Mutex<InputCaptureState>>,
     notify_tx: Sender<ProducerEvent>,
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: Sender<(BarrierKey, CaptureEvent)>,
 ) -> Result<CGEventTap<'a>, MacosCaptureCreationError> {
     // Shared slot for the tap's mach port pointer. Stored as `usize`
     // because raw pointers aren't `Send`, but the integer
@@ -621,7 +628,7 @@ fn create_event_tap<'a>(
             // the user disabling event-monitoring. We can't
             // recover from this; drop captured state synchronously
             // and return Keep on this event. Otherwise the
-            // `current_pos.is_some()` branch below would drop this
+            // `current_key.is_some()` branch below would drop this
             // event (and any racing callback still in flight) back
             // into `CallbackResult::Drop`, silently eating the
             // user's clicks and keypresses while the tap winds
@@ -629,9 +636,9 @@ fn create_event_tap<'a>(
             // notify the producer loop so the service can tear
             // down cleanly.
             log::error!("CGEventTap disabled by user input, releasing capture state");
-            if state.current_pos.is_some() {
+            if state.current_key.is_some() {
                 let _ = CGDisplay::show_cursor(&CGDisplay::main());
-                state.current_pos = None;
+                state.current_key = None;
             }
             notify_tx
                 .blocking_send(ProducerEvent::EventTapDisabled)
@@ -642,8 +649,8 @@ fn create_event_tap<'a>(
         }
 
         // Are we in a client?
-        if let Some(current_pos) = state.current_pos {
-            capture_position = Some(current_pos);
+        if let Some(current_key) = state.current_key.clone() {
+            capture_position = Some(current_key.clone());
             get_events(
                 &event_type,
                 cg_ev,
@@ -663,7 +670,7 @@ fn create_event_tap<'a>(
                     | CGEventType::OtherMouseDragged
             ) {
                 state
-                    .reset_cursor(current_pos)
+                    .reset_cursor(current_key.pos)
                     .unwrap_or_else(|e| log::warn!("{e}"));
             }
         } else if matches!(event_type, CGEventType::MouseMoved) {
@@ -697,29 +704,29 @@ fn create_event_tap<'a>(
             // 2. User crossed a different edge -> switch pending and
             //    re-record enter_position.
             // 3. Still on the same edge -> do nothing (pending stands).
-            if let Some(pending_pos) = state.pending_pos {
+            if let Some(pending_key) = state.pending_key.clone() {
                 let crossed = state.crossed(prev_pos, curr_pos);
                 match crossed {
                     None => {
                         // User pulled back -> cancel pending and emit
                         // CancelPending.
-                        log::debug!("CANCEL pending {pending_pos:?} (cursor pulled back)");
-                        state.pending_pos = None;
+                        log::debug!("CANCEL pending {pending_key:?} (cursor pulled back)");
+                        state.pending_key = None;
                         // Send CancelPending immediately (with the
-                        // correct pending_pos). Bypass the unified
+                        // correct pending_key). Bypass the unified
                         // res_events batch because other cases below
                         // may still need to run on this same callback.
-                        let _ = event_tx.blocking_send((pending_pos, CaptureEvent::CancelPending));
+                        let _ = event_tx.blocking_send((pending_key, CaptureEvent::CancelPending));
                     }
-                    Some(other_pos) if other_pos != pending_pos => {
+                    Some(other_key) if other_key != pending_key => {
                         // Switched edge: cancel the old pending first,
                         // then start a new pending.
-                        log::debug!("switch pending: {pending_pos:?} -> {other_pos:?}");
+                        log::debug!("switch pending: {pending_key:?} -> {other_key:?}");
                         // Send CancelPending immediately (with the old
                         // position). Same reasoning as above: send it
                         // out-of-band rather than batching.
-                        let _ = event_tx.blocking_send((pending_pos, CaptureEvent::CancelPending));
-                        state.pending_pos = Some(other_pos);
+                        let _ = event_tx.blocking_send((pending_key, CaptureEvent::CancelPending));
+                        state.pending_key = Some(other_key.clone());
                         // STEP 0.5: enter_position records the actual
                         // cursor sample from the moment of barrier
                         // crossing (prev_pos — clamped to the union by
@@ -739,7 +746,7 @@ fn create_event_tap<'a>(
                         });
                         // The new pending goes through the unified
                         // batch (with the new position other_pos).
-                        capture_position = Some(other_pos);
+                        capture_position = Some(other_key);
                         res_events.push(CaptureEvent::BeginPending);
                     }
                     Some(_) => {
@@ -749,13 +756,13 @@ fn create_event_tap<'a>(
                         // thread to handle the same pending twice).
                     }
                 }
-            } else if let Some(new_pos) = state.crossed(prev_pos, curr_pos) {
+            } else if let Some(new_key) = state.crossed(prev_pos, curr_pos) {
                 // Brand-new edge crossing -> enter pending. Do NOT
                 // warp the cursor, do NOT hide the cursor; only record
                 // enter_position for use during the promotion phase.
-                log::debug!("PENDING enter {new_pos:?}");
-                capture_position = Some(new_pos);
-                state.pending_pos = Some(new_pos);
+                log::debug!("PENDING enter {new_key:?}");
+                capture_position = Some(new_key.clone());
+                state.pending_key = Some(new_key);
                 // STEP 0.5: enter_position records the actual
                 // pre-crossing cursor sample. See the switch-edge arm
                 // above for why this stays a CGPoint rather than a
@@ -772,11 +779,11 @@ fn create_event_tap<'a>(
             }
         }
 
-        if let Some(pos) = capture_position {
+        if let Some(key) = capture_position {
             res_events.iter().for_each(|e| {
                 // error must be ignored, since the event channel
                 // may already be closed when the InputCapture instance is dropped.
-                let _ = event_tx.blocking_send((pos, *e));
+                let _ = event_tx.blocking_send((key.clone(), *e));
             });
             // Returning Drop should stop the event from being processed
             // but core foundation still returns the event
@@ -817,7 +824,7 @@ fn create_event_tap<'a>(
 
 fn event_tap_thread(
     client_state: Arc<Mutex<InputCaptureState>>,
-    event_tx: Sender<(Position, CaptureEvent)>,
+    event_tx: Sender<(BarrierKey, CaptureEvent)>,
     notify_tx: Sender<ProducerEvent>,
     ready: std::sync::mpsc::Sender<Result<CFRunLoop, MacosCaptureCreationError>>,
     exit: oneshot::Sender<()>,
@@ -893,7 +900,7 @@ extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_i
 }
 
 pub struct MacOSInputCapture {
-    event_rx: Receiver<(Position, CaptureEvent)>,
+    event_rx: Receiver<(BarrierKey, CaptureEvent)>,
     notify_tx: Sender<ProducerEvent>,
     run_loop: CFRunLoop,
 }
@@ -946,12 +953,12 @@ impl MacOSInputCapture {
                         let mut state = state.lock().await;
                         match state.handle_producer_event(producer_event).await {
                             Err(e) => log::error!("Failed to handle producer event: {e}"),
-                            Ok(Some((pos, ev))) => {
+                            Ok(Some((key, ev))) => {
                                 // Begin / CancelPending events emitted by the producer go through
                                 // the cloned event_tx and are merged into
                                 // the same downstream stream as the tap
                                 // callback's events.
-                                let _ = producer_event_tx.send((pos, ev)).await;
+                                let _ = producer_event_tx.send((key, ev)).await;
                             }
                             Ok(None) => {}
                         }
@@ -1011,21 +1018,26 @@ impl Drop for MacOSInputCapture {
 
 #[async_trait]
 impl Capture for MacOSInputCapture {
-    async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
+    async fn create(&mut self, key: &BarrierKey) -> Result<(), CaptureError> {
+        // M1: forward the full BarrierKey through the producer-event
+        // channel. monitor / offset / span stay at their legacy
+        // defaults until M2 wires monitor info end-to-end.
+        let key = key.clone();
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
-            log::debug!("creating capture, {pos}");
-            let _ = notify_tx.send(ProducerEvent::Create(pos)).await;
+            log::debug!("creating capture, {key:?}");
+            let _ = notify_tx.send(ProducerEvent::Create(key)).await;
             log::debug!("done !");
         });
         Ok(())
     }
 
-    async fn destroy(&mut self, pos: Position) -> Result<(), CaptureError> {
+    async fn destroy(&mut self, key: &BarrierKey) -> Result<(), CaptureError> {
+        let key = key.clone();
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
-            log::debug!("destroying capture {pos}");
-            let _ = notify_tx.send(ProducerEvent::Destroy(pos)).await;
+            log::debug!("destroying capture {key:?}");
+            let _ = notify_tx.send(ProducerEvent::Destroy(key)).await;
             log::debug!("done !");
         });
         Ok(())
@@ -1041,15 +1053,16 @@ impl Capture for MacOSInputCapture {
     }
 
     /// Pending-capture handshake: the main thread calls this after the
-    /// remote Ack for Enter to promote the pending capture at `pos`
+    /// remote Ack for Enter to promote the pending capture at `key`
     /// to active. Returns synchronously — the message is dispatched
     /// to the producer task, and hide cursor + warp + emit Begin
     /// complete asynchronously.
-    fn start_capture(&mut self, pos: Position) -> Result<(), CaptureError> {
+    fn start_capture(&mut self, key: &BarrierKey) -> Result<(), CaptureError> {
+        let key = key.clone();
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
-            log::debug!("notifying StartCapture({pos:?})");
-            let _ = notify_tx.send(ProducerEvent::StartCapture(pos)).await;
+            log::debug!("notifying StartCapture({key:?})");
+            let _ = notify_tx.send(ProducerEvent::StartCapture(key)).await;
         });
         Ok(())
     }
@@ -1057,11 +1070,12 @@ impl Capture for MacOSInputCapture {
     /// Pending-capture handshake: called by the main thread on
     /// `cancel_pending`, network loss, or the 500ms timeout.
     /// Returns synchronously.
-    fn cancel_pending(&mut self, pos: Position) -> Result<(), CaptureError> {
+    fn cancel_pending(&mut self, key: &BarrierKey) -> Result<(), CaptureError> {
+        let key = key.clone();
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
-            log::debug!("notifying CancelPending({pos:?})");
-            let _ = notify_tx.send(ProducerEvent::CancelPending(pos)).await;
+            log::debug!("notifying CancelPending({key:?})");
+            let _ = notify_tx.send(ProducerEvent::CancelPending(key)).await;
         });
         Ok(())
     }
@@ -1072,9 +1086,13 @@ impl Capture for MacOSInputCapture {
 }
 
 impl Stream for MacOSInputCapture {
-    type Item = Result<(Position, CaptureEvent), CaptureError>;
+    type Item = Result<(BarrierKey, CaptureEvent), CaptureError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // M1: the event channel already carries `(BarrierKey, _)`
+        // pairs end-to-end. monitor / offset / span stay at their
+        // legacy defaults (`None` / `0` / `10000`) until M2 wires
+        // monitor info end-to-end.
         match ready!(self.event_rx.poll_recv(cx)) {
             None => Poll::Ready(None),
             Some(e) => Poll::Ready(Some(Ok(e))),

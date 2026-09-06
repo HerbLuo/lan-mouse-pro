@@ -215,6 +215,61 @@ pub fn clamp_to_display_bounds(
     (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
 }
 
+/// A stable identifier for a physical monitor.
+///
+/// Populated by M2 from per-OS enumeration (macOS `IODisplay` UUID,
+/// Windows EDID hash, Wayland `wl_output` name, libei `Zones`
+/// region-key). During M1 every barrier key uses `None` to preserve
+/// single-monitor / no-monitor-info behavior.
+pub type MonitorId = String;
+
+/// A barrier location: which edge (`pos`), which physical monitor
+/// (`monitor`), and along which sub-range (`offset`, `span`) of that
+/// edge.
+///
+/// All fields are interpreted by the per-OS backend. `offset` and
+/// `span` are in permyriad (1/10000) of the edge length: `offset =
+/// 0, span = 10000` covers the full edge; `offset = 5000, span =
+/// 2500` covers the central half-quarter of the edge.
+///
+/// `Default` produces the legacy single-edge key (`monitor = None`,
+/// full edge) so existing call sites can opt into the new type
+/// without changing behavior.
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+pub struct BarrierKey {
+    pub pos: Position,
+    pub monitor: Option<MonitorId>,
+    /// Sub-range start as permyriad (1/10000) of the edge length.
+    pub offset: u16,
+    /// Sub-range length as permyriad (1/10000) of the edge length.
+    pub span: u16,
+}
+
+impl Default for BarrierKey {
+    fn default() -> Self {
+        Self {
+            pos: Position::Left,
+            monitor: None,
+            offset: 0,
+            span: 10000,
+        }
+    }
+}
+
+impl BarrierKey {
+    /// Construct a full-edge [`BarrierKey`] for `pos` with no monitor
+    /// information. Used by M1 backends that only carry `Position`
+    /// today; will be superseded by full BarrierKey payloads in M2+.
+    pub fn from_pos(pos: Position) -> Self {
+        Self {
+            pos,
+            monitor: None,
+            offset: 0,
+            span: 10000,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,5 +611,61 @@ mod tests {
             clamp_to_display_bounds(&displays, (-5000.0, -5000.0), (100.0, 100.0)),
             (100.0, 100.0)
         );
+    }
+
+    // ----- BarrierKey (M1) -------------------------------------------
+
+    /// Default must equal a full-edge, no-monitor key. Existing call
+    /// sites that haven't been ported yet can rely on this to keep
+    /// their behavior identical to the old `Position`-keyed maps.
+    #[test]
+    fn barrier_key_default_is_full_edge_no_monitor() {
+        let k = BarrierKey::default();
+        assert_eq!(k.pos, Position::Left);
+        assert!(k.monitor.is_none());
+        assert_eq!(k.offset, 0);
+        assert_eq!(k.span, 10000);
+    }
+
+    /// `from_pos` matches `default()` for the Position half and keeps
+    /// monitor/offset/span at their legacy defaults.
+    #[test]
+    fn barrier_key_from_pos_matches_legacy_defaults() {
+        for &pos in &[
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ] {
+            let k = BarrierKey::from_pos(pos);
+            assert_eq!(k.pos, pos);
+            assert!(k.monitor.is_none());
+            assert_eq!(k.offset, 0);
+            assert_eq!(k.span, 10000);
+        }
+    }
+
+    /// BarrierKey must be usable as a HashMap key: equality and hash
+    /// are defined for all four field combinations we care about
+    /// (the `String` inside `monitor` makes it non-Copy, but it does
+    /// implement Clone + Hash + Eq).
+    #[test]
+    fn barrier_key_eq_and_hash() {
+        let a = BarrierKey {
+            pos: Position::Top,
+            monitor: None,
+            offset: 0,
+            span: 10000,
+        };
+        let b = BarrierKey {
+            pos: Position::Top,
+            monitor: Some("monitor-A".to_string()),
+            offset: 2500,
+            span: 5000,
+        };
+        let c = b.clone();
+        assert_eq!(a, BarrierKey::from_pos(Position::Top));
+        assert_eq!(b, c);
+        assert_ne!(a, b);
     }
 }
