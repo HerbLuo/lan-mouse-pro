@@ -12,6 +12,7 @@ use input_event::{Event, KeyboardEvent, scancode};
 
 pub use error::{CaptureCreationError, CaptureError, InputCaptureError};
 pub use geometry::BarrierKey;
+pub use geometry::MonitorInfo;
 
 pub mod error;
 
@@ -242,6 +243,15 @@ impl InputCapture {
         })
     }
 
+    /// Return a snapshot of the monitors currently reported by the backend.
+    ///
+    /// This is intentionally a polling API. Backends that support hot-plug
+    /// notifications keep their subscription-oriented `monitor_changes()`
+    /// method as an additional backend-specific API for the service layer.
+    pub fn monitors(&self) -> Vec<MonitorInfo> {
+        self.capture.monitors()
+    }
+
     /// check whether the given keys are pressed
     pub fn keys_pressed(&self, keys: &[scancode::Linux]) -> bool {
         keys.iter().all(|k| self.pressed_keys.contains(k))
@@ -347,6 +357,15 @@ trait Capture: Stream<Item = Result<(BarrierKey, CaptureEvent), CaptureError>> +
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;
+
+    /// Return the backend's current monitor list as a snapshot.
+    ///
+    /// Backends with monitor hot-plug support override this with their
+    /// `current_monitors()` snapshot. The empty default keeps optional or
+    /// synthetic backends compatible when they have no monitor information.
+    fn monitors(&self) -> Vec<MonitorInfo> {
+        vec![]
+    }
 
     /// Promote the pending Begin on `key` to an active capture. Called by
     /// the main thread after the remote client has Acked the Enter.
@@ -483,6 +502,17 @@ mod poll_next_tests {
         async fn terminate(&mut self) -> Result<(), CaptureError> {
             Ok(())
         }
+
+        fn monitors(&self) -> Vec<MonitorInfo> {
+            vec![MonitorInfo {
+                id: "test:monitor".to_string(),
+                name: "Test monitor".to_string(),
+                position: (0, 0),
+                size: (1920, 1080),
+                primary: true,
+                scale: 1.0,
+            }]
+        }
     }
 
     impl Stream for OneShotCapture {
@@ -511,6 +541,17 @@ mod poll_next_tests {
             id_map: HashMap::new(),
             pending: VecDeque::new(),
         }
+    }
+
+    #[test]
+    fn input_capture_monitors_delegates_to_backend() {
+        let capture = make_input_capture();
+        let monitors = capture.monitors();
+
+        assert_eq!(monitors.len(), 1);
+        assert_eq!(monitors[0].id, "test:monitor");
+        assert_eq!(monitors[0].position, (0, 0));
+        assert_eq!(monitors[0].size, (1920, 1080));
     }
 
     /// A noop-waker context used to manually poll a stream and observe

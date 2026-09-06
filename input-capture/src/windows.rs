@@ -67,6 +67,10 @@ impl Capture for WindowsInputCapture {
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         Ok(())
     }
+
+    fn monitors(&self) -> Vec<MonitorInfo> {
+        self.current_monitors()
+    }
 }
 
 impl WindowsInputCapture {

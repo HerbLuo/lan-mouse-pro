@@ -875,6 +875,10 @@ impl LanMouseInputCapture for LibeiInputCapture {
         log::debug!("done!");
         res
     }
+
+    fn monitors(&self) -> Vec<MonitorInfo> {
+        self.current_monitors()
+    }
 }
 
 impl Drop for LibeiInputCapture {

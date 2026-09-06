@@ -8,7 +8,7 @@ use futures_core::Stream;
 use input_event::PointerEvent;
 use tokio::time::{self, Instant, Interval};
 
-use super::{BarrierKey, Capture, CaptureError, CaptureEvent, Position};
+use super::{BarrierKey, Capture, CaptureError, CaptureEvent, MonitorInfo, Position};
 
 pub struct DummyInputCapture {
     start: Option<Instant>,
@@ -75,6 +75,10 @@ impl Capture for DummyInputCapture {
 
     async fn terminate(&mut self) -> Result<(), CaptureError> {
         Ok(())
+    }
+
+    fn monitors(&self) -> Vec<MonitorInfo> {
+        vec![]
     }
 }
 
