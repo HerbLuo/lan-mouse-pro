@@ -33,7 +33,7 @@ use input_event::{
 
 use crate::geometry::{DisplayRect, clamp_to_display_bounds, cursor_within, entered_barrier};
 
-use super::{BarrierKey, CaptureEvent, Position};
+use super::{BarrierKey, CaptureEvent};
 
 pub(crate) struct EventThread {
     request_buffer: Arc<Mutex<Vec<ClientUpdate>>>,
@@ -146,7 +146,14 @@ thread_local! {
     /// all configured clients
     static CLIENTS: RefCell<HashSet<BarrierKey>> = RefCell::new(HashSet::new());
     /// currently active client (cursor hidden, events consumed).
-    static ACTIVE_CLIENT: Cell<Option<BarrierKey>> = const { Cell::new(None) };
+    ///
+    /// Held in a [`RefCell`] rather than a [`Cell`] because
+    /// [`BarrierKey`] carries an `Option<String>` `monitor` field and
+    /// is therefore not `Copy`. The Windows hook + message loop run on
+    /// the same thread, so the runtime borrow is never contested in
+    /// practice — the `RefCell` exists purely so the slot can hold a
+    /// non-Copy type.
+    static ACTIVE_CLIENT: RefCell<Option<BarrierKey>> = const { RefCell::new(None) };
     /// Pending client (cursor still visible on the host, Enter already
     /// sent to the remote, waiting for the Ack). Mutually exclusive with
     /// [`ACTIVE_CLIENT`] — promotion clears pending, cancel clears
@@ -162,7 +169,7 @@ thread_local! {
     /// `PENDING_CLIENT` is set — the cursor stays on the host; the
     /// main thread promotes it to active via `start_capture` once the
     /// Ack arrives.
-    static PENDING_CLIENT: Cell<Option<BarrierKey>> = const { Cell::new(None) };
+    static PENDING_CLIENT: RefCell<Option<BarrierKey>> = const { RefCell::new(None) };
     /// Entry point captured at the moment of barrier crossing. Preserved
     /// across promotion so the eventual active Begin yields the same
     /// Motion deltas as if we'd gone active immediately.
@@ -320,7 +327,7 @@ fn start_routine(
 
 fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     if wparam.0 != WM_MOUSEMOVE as usize {
-        return ACTIVE_CLIENT.get().is_some();
+        return ACTIVE_CLIENT.with_borrow(|c| c.is_some());
     }
     let mouse_low_level: MSLLHOOKSTRUCT = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
     let curr_pos = (mouse_low_level.pt.x as f64, mouse_low_level.pt.y as f64);
@@ -328,7 +335,7 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     PREV_POS.replace(Some(curr_pos));
 
     /* While capturing: consume the event. mouse_proc returning true here leads to LRESULT(1) to swallow it. */
-    if ACTIVE_CLIENT.get().is_some() {
+    if ACTIVE_CLIENT.with_borrow(|c| c.is_some()) {
         return true;
     }
 
@@ -339,7 +346,7 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
      * fresh crossing is picked up by `entered_barrier` on the next
      * WM_MOUSEMOVE, starting a new pending flow normally.
      */
-    if let Some(pending_key) = PENDING_CLIENT.get() {
+    if let Some(pending_key) = PENDING_CLIENT.with_borrow(|c| c.clone()) {
         let within = DISPLAYS.with_borrow_mut(|(displays, generation)| {
             update_display_regions(displays, generation);
             cursor_within(curr_pos, displays, pending_key.pos)
@@ -396,7 +403,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     }
 
     /* get active client if any */
-    let Some(key) = ACTIVE_CLIENT.get() else {
+    let Some(key) = ACTIVE_CLIENT.with_borrow(|c| c.clone()) else {
         return LRESULT(1);
     };
 
@@ -416,7 +423,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 
 unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     /* get active client if any */
-    let Some(client) = ACTIVE_CLIENT.get() else {
+    let Some(client) = ACTIVE_CLIENT.with_borrow(|c| c.clone()) else {
         return CallNextHookEx(None, ncode, wparam, lparam);
     };
 
@@ -510,10 +517,10 @@ fn update_clients(request: ClientUpdate) {
             // When removing the client's key, both pending and active must be
             // cleared; otherwise StartCapture / mouse_proc would still operate
             // on the stale key and misbehave.
-            if PENDING_CLIENT.get() == Some(key.clone()) {
+            if PENDING_CLIENT.with_borrow(|c| c == &Some(key.clone())) {
                 PENDING_CLIENT.take();
             }
-            if let Some(active_key) = ACTIVE_CLIENT.get() {
+            if let Some(active_key) = ACTIVE_CLIENT.with_borrow(|c| c.clone()) {
                 if key == active_key {
                     let _ = ACTIVE_CLIENT.take();
                 }
@@ -524,10 +531,10 @@ fn update_clients(request: ClientUpdate) {
             // Only promote when the pending key matches. On mismatch
             // (e.g. the user switched sides during pending), it's a no-op
             // and the remote Ack path naturally falls through to Idle.
-            if PENDING_CLIENT.get() != Some(key.clone()) {
+            if !PENDING_CLIENT.with_borrow(|c| c == &Some(key.clone())) {
                 log::trace!(
                     "start_capture({key:?}) ignored: pending={:?}",
-                    PENDING_CLIENT.get()
+                    PENDING_CLIENT.with_borrow(|c| c.clone())
                 );
                 return;
             }
@@ -541,7 +548,7 @@ fn update_clients(request: ClientUpdate) {
             blocking_send_event(key, CaptureEvent::Begin);
         }
         ClientUpdate::CancelPending(key) => {
-            if PENDING_CLIENT.get() == Some(key) {
+            if PENDING_CLIENT.with_borrow(|c| c == &Some(key.clone())) {
                 PENDING_CLIENT.take();
                 log::debug!("cleared pending client {key:?} (cancelled by main)");
             }
