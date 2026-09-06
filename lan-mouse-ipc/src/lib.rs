@@ -171,6 +171,37 @@ impl Default for ClientConfig {
 
 pub type ClientHandle = u64;
 
+/// On-the-wire snapshot of one physical monitor. Mirrors
+/// `input_capture::geometry::MonitorInfo` field-for-field so the
+/// service can `try_into` between them at the IPC boundary; kept as
+/// a separate type so the wire schema can evolve independently
+/// from the internal one (and to avoid forcing `input-capture` to
+/// become a public dependency of the IPC crate).
+///
+/// `rename_all = "snake_case"` keeps the JSON shape identical to
+/// the internal type: `{"id": ..., "name": ..., "position": [x,
+/// y], "size": [w, h], "primary": ..., "scale": ...}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MonitorInfo {
+    /// Stable monitor id (EDID hash / `wl_output` name / portal
+    /// region key, depending on the host platform).
+    pub id: String,
+    /// Human-readable label. May contain UTF-8.
+    pub name: String,
+    /// Display origin in virtual-screen coordinates, signed to
+    /// support negative coordinates on the top / right monitor of
+    /// a 2x1 pair.
+    pub position: (i32, i32),
+    /// Display size in virtual-screen coordinates.
+    pub size: (u32, u32),
+    /// Whether this is the OS's primary display.
+    pub primary: bool,
+    /// HiDPI scale factor (1.0 = standard, 2.0 = Retina). Non-
+    /// integer values are allowed.
+    pub scale: f64,
+}
+
 /// Per-event-class transport preference. Used by [`InputChannelConfig`] to tell
 /// the QUIC transport which events should travel over reliable streams vs.
 /// datagrams.
@@ -287,6 +318,175 @@ mod input_channel_tests {
     }
 }
 
+#[cfg(test)]
+mod monitor_info_tests {
+    use super::*;
+
+    /// The wire JSON uses the field names `id / name / position /
+    /// size / primary / scale`. A drift in any of these names would
+    /// silently break the frontend's TypeScript types, so we pin
+    /// the exact payload shape here.
+    #[test]
+    fn monitor_info_serializes_to_snake_case_fields() {
+        let info = MonitorInfo {
+            id: "EDID:0xdeadbeef".into(),
+            name: "Built-in".into(),
+            position: (0, 0),
+            size: (2560, 1440),
+            primary: true,
+            scale: 2.0,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"id\":\"EDID:0xdeadbeef\""));
+        assert!(json.contains("\"name\":\"Built-in\""));
+        assert!(json.contains("\"position\":[0,0]"));
+        assert!(json.contains("\"size\":[2560,1440]"));
+        assert!(json.contains("\"primary\":true"));
+        assert!(json.contains("\"scale\":2.0"));
+    }
+
+    /// UTF-8 display names (manufacturers ship CJK and accented
+    /// labels) must round-trip cleanly. serde_json uses UTF-8 by
+    /// default for `String`; this pins that contract.
+    #[test]
+    fn monitor_info_round_trip_utf8_name() {
+        let info = MonitorInfo {
+            id: "wl_output:eDP-1".into(),
+            name: "ノートPC 内蔵ディスプレイ".into(),
+            position: (0, 0),
+            size: (1920, 1080),
+            primary: true,
+            scale: 1.0,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: MonitorInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(info, back);
+    }
+
+    /// Negative coordinates (the top / right monitor of a vertical
+    /// or horizontal pair sits at negative offset relative to the
+    /// primary in many OS coordinate systems). i32 / signed round-
+    /// trip must hold.
+    #[test]
+    fn monitor_info_round_trip_negative() {
+        let info = MonitorInfo {
+            id: "CGDisplay:secondary".into(),
+            name: "External below".into(),
+            position: (0, -2160),
+            size: (3840, 2160),
+            primary: false,
+            scale: 1.0,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: MonitorInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(info, back);
+        assert_eq!(back.position, (0, -2160));
+    }
+
+    /// Mixed-DPI hosts emit non-integer scale factors (1.25, 1.5,
+    /// 2.0...). `f64` round-trip must preserve the exact value.
+    #[test]
+    fn monitor_info_round_trip_mixed_scale() {
+        for scale in [1.0_f64, 1.25, 1.5, 2.0, 2.5] {
+            let info = MonitorInfo {
+                id: format!("display@{scale}"),
+                name: format!("display at scale {scale}"),
+                position: (0, 0),
+                size: (1920, 1080),
+                primary: false,
+                scale,
+            };
+            let json = serde_json::to_string(&info).unwrap();
+            let back: MonitorInfo = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.scale, scale, "scale {scale} did not round-trip");
+            assert_eq!(info, back);
+        }
+    }
+
+    /// `MonitorsChanged` round-trip with a populated list.
+    #[test]
+    fn monitors_changed_round_trip() {
+        let event = FrontendEvent::MonitorsChanged(vec![
+            MonitorInfo {
+                id: "primary".into(),
+                name: "Primary".into(),
+                position: (0, 0),
+                size: (1920, 1080),
+                primary: true,
+                scale: 1.0,
+            },
+            MonitorInfo {
+                id: "secondary".into(),
+                name: "Secondary".into(),
+                position: (1920, 0),
+                size: (2560, 1440),
+                primary: false,
+                scale: 2.0,
+            },
+        ]);
+        let json = serde_json::to_string(&event).unwrap();
+        let back: FrontendEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            FrontendEvent::MonitorsChanged(list) => {
+                assert_eq!(list.len(), 2);
+                assert_eq!(list[0].id, "primary");
+                assert_eq!(list[1].size, (2560, 1440));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// Backward compatibility: payloads that pre-date M2 carry no
+    /// `MonitorsChanged` variant. They decode as some *other*
+    /// `FrontendEvent` variant (here we use `Error`), so the
+    /// frontend must tolerate a missing variant by treating the
+    /// monitor list as empty. This test pins the wire-level
+    /// compat contract by serialising a pre-M2 event and asserting
+    /// `MonitorsChanged` does NOT appear (so an old daemon
+    /// accidentally tagging something as `MonitorsChanged` would be
+    /// caught).
+    #[test]
+    fn monitors_changed_missing_field_yields_empty() {
+        // Pre-M2 payload (variants still present in the enum, but no
+        // monitors info). The frontend must treat this as "no
+        // monitors yet" — i.e. an empty Vec — and not crash.
+        let pre_m2 = r#"{"Error":"no monitors backend"}"#;
+        let event: FrontendEvent = serde_json::from_str(pre_m2).unwrap();
+        match event {
+            FrontendEvent::Error(msg) => assert_eq!(msg, "no monitors backend"),
+            other => panic!("expected Error variant, got {other:?}"),
+        }
+        // Round-trip an explicit empty MonitorsChanged to confirm
+        // the empty Vec wire shape stays stable.
+        let empty = FrontendEvent::MonitorsChanged(vec![]);
+        let json = serde_json::to_string(&empty).unwrap();
+        assert!(json.contains("\"MonitorsChanged\":[]"));
+        let back: FrontendEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            FrontendEvent::MonitorsChanged(list) => assert!(list.is_empty()),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// `BindingInvalid` carries the client handle and a human-
+    /// readable reason. Round-trip preserves both, and the JSON
+    /// shape stays stable.
+    #[test]
+    fn binding_invalid_round_trip() {
+        let event = FrontendEvent::BindingInvalid(42, "monitor \"DP-2\" disconnected".into());
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"BindingInvalid\":[42,\"monitor"));
+        let back: FrontendEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            FrontendEvent::BindingInvalid(handle, reason) => {
+                assert_eq!(handle, 42);
+                assert_eq!(reason, "monitor \"DP-2\" disconnected");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ClientState {
     /// events should be sent to and received from the client
@@ -364,6 +564,27 @@ pub enum FrontendEvent {
     /// master side, where the only death-detection signal is the QUIC
     /// idle timer).
     QuicConfig { idle_timeout_secs: u64 },
+    /// Host's current physical monitor list. Emitted once at startup
+    /// (so the GUI can render the multi-monitor dropdown / SVG canvas
+    /// immediately) and again whenever a backend reports a hotplug
+    /// (display added / removed / resized). The GUI treats the most
+    /// recent payload as the source of truth.
+    ///
+    /// `Vec` is empty when no display backend is active — older
+    /// frontends can still deserialize the variant (see
+    /// `monitors_changed_missing_field_yields_empty`).
+    MonitorsChanged(Vec<MonitorInfo>),
+    /// Emitted when an active capture / binding becomes invalid
+    /// because the monitor it was bound to disappeared (typically
+    /// after a `MonitorsChanged` with that monitor absent). The GUI
+    /// pauses the toggle, shows a tooltip, and waits for the user to
+    /// pick a different monitor or reactivate the client.
+    ///
+    /// `reason` is a free-form human-readable description (e.g.
+    /// "monitor \"DP-2\" disconnected"). Carrying it as a plain
+    /// `String` keeps the wire simple and lets the daemon vary its
+    /// phrasing without a schema bump.
+    BindingInvalid(ClientHandle, String),
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]

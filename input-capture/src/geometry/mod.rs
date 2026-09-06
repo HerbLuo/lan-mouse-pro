@@ -24,6 +24,8 @@
 
 use crate::Position;
 
+use serde::{Deserialize, Serialize};
+
 /// An OS-agnostic display rectangle.
 ///
 /// Uses `f64` for every component so macOS' `CGRect` (which is
@@ -222,6 +224,55 @@ pub fn clamp_to_display_bounds(
 /// region-key). During M1 every barrier key uses `None` to preserve
 /// single-monitor / no-monitor-info behavior.
 pub type MonitorId = String;
+
+/// Snapshot of one physical monitor's geometry and metadata,
+/// produced by the per-OS backends' `enumerate_monitors()`.
+///
+/// This is the **internal domain type** used by `input-capture`
+/// backends and the `Capture::monitors()` plumbing. The IPC crate
+/// keeps a separate mirrored copy (`lan_mouse_ipc::MonitorInfo`)
+/// because the wire schema may evolve independently from the
+/// in-process one.
+///
+/// `position` is the display's origin in virtual-screen coordinates
+/// (`(x, y)`, top-left inclusive, signed because the right / top
+/// display in a horizontal pair has a negative `x` while the
+/// primary is on the left). `size` is `(width, height)` in the same
+/// coordinate space.
+///
+/// `scale` is the per-monitor HiDPI scale factor (1.0 = standard
+/// density, 2.0 = Retina / 4K equivalent). It's typed as `f64`
+/// because some compositors (Windows with mixed-DPI awareness,
+/// macOS under per-display virtual scaling) report non-integer
+/// values such as 1.25 or 1.5.
+///
+/// `#[serde(rename_all = "snake_case")]` makes the on-wire JSON
+/// look like `{"id": ..., "name": ..., "position": [x, y],
+/// "size": [w, h], "primary": ..., "scale": ...}` so the field
+/// names line up with what the frontend already expects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MonitorInfo {
+    /// Stable, OS-agnostic monitor id (EDID-derived where possible,
+    /// falls back to `wl_output` name / portal region key).
+    pub id: MonitorId,
+    /// Human-readable label (e.g. "LG UltraFine 5K"). May contain
+    /// UTF-8 (some manufacturers ship CJK / accented names); UTF-8
+    /// round-trip is verified by `monitor_info_round_trip_utf8_name`.
+    pub name: String,
+    /// Display origin in virtual-screen coordinates, signed to
+    /// allow negative coordinates on the right / top monitor in a
+    /// 2x1 layout. Verified by `monitor_info_round_trip_negative`.
+    pub position: (i32, i32),
+    /// Display size in virtual-screen coordinates.
+    pub size: (u32, u32),
+    /// Whether this is the OS's primary display.
+    pub primary: bool,
+    /// HiDPI scale factor (1.0 = standard, 2.0 = Retina). Non-
+    /// integer values are permitted on platforms that report them.
+    /// Verified by `monitor_info_round_trip_mixed_scale`.
+    pub scale: f64,
+}
 
 /// A barrier location: which edge (`pos`), which physical monitor
 /// (`monitor`), and along which sub-range (`offset`, `span`) of that
@@ -667,5 +718,84 @@ mod tests {
         assert_eq!(a, BarrierKey::from_pos(Position::Top));
         assert_eq!(b, c);
         assert_ne!(a, b);
+    }
+
+    // ----- MonitorInfo (M2) -------------------------------------------
+    //
+    // The on-wire JSON format the frontend expects is the
+    // `snake_case` projection: `{"id": "...", "name": "...",
+    // "position": [x, y], "size": [w, h], "primary": bool,
+    // "scale": f64}`. `serde_json` round-trips are the unit-test
+    // guarantee that both the backend producers and the IPC layer
+    // speak the same vocabulary as the GUI.
+
+    /// A UTF-8 monitor name (CJK + accented Latin) must survive a
+    /// JSON round-trip byte-for-byte. Display names from real
+    /// hardware routinely contain non-ASCII characters.
+    #[test]
+    fn monitor_info_round_trip_utf8_name() {
+        let info = MonitorInfo {
+            id: "EDID:0x1234abcd".into(),
+            name: "戴尔 U2723QE — 左".into(),
+            position: (0, 0),
+            size: (2560, 1440),
+            primary: true,
+            scale: 1.0,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: MonitorInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(info, back);
+        // Pin the wire shape so any rename_all drift is caught.
+        assert!(json.contains("\"id\":\"EDID:0x1234abcd\""));
+        assert!(json.contains("\"primary\":true"));
+    }
+
+    /// A 2x1 horizontal layout's right display has `position.x ==
+    /// 1920` (positive). A vertical pair where the primary sits on
+    /// the *bottom* puts the top display at `position.y == -1080`.
+    /// Signed round-trip on `position` is the contract the rest of
+    /// the plan relies on for "where is this thing in the union".
+    #[test]
+    fn monitor_info_round_trip_negative() {
+        let info = MonitorInfo {
+            id: "wl_output:DP-2".into(),
+            name: "Top display (above primary)".into(),
+            position: (-1920, -1080),
+            size: (1920, 1080),
+            primary: false,
+            scale: 2.0,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: MonitorInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(info, back);
+        assert_eq!(back.position, (-1920, -1080));
+    }
+
+    /// Mixed-DPI hosts (macOS Retina next to an external 1080p,
+    /// Windows with per-monitor v2 awareness) report fractional
+    /// scale factors. The f64 round-trip must keep the exact value.
+    #[test]
+    fn monitor_info_round_trip_mixed_scale() {
+        let info = MonitorInfo {
+            id: "CGDisplay:0x4271a80".into(),
+            name: "Built-in Retina Display".into(),
+            position: (0, 0),
+            size: (1440, 900),
+            primary: true,
+            scale: 2.0,
+        };
+        let one_point_five = MonitorInfo {
+            id: "wl_output:HDMI-A-1".into(),
+            name: "External 1080p (125%)".into(),
+            position: (1440, 0),
+            size: (1920, 1080),
+            primary: false,
+            scale: 1.25,
+        };
+        for original in [info, one_point_five] {
+            let json = serde_json::to_string(&original).unwrap();
+            let back: MonitorInfo = serde_json::from_str(&json).unwrap();
+            assert_eq!(original, back);
+        }
     }
 }
