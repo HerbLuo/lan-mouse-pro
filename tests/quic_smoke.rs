@@ -68,7 +68,7 @@ fn server_endpoint(
         addr,
         cert_chain.clone(),
         key.clone_key(),
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(30),
     )
     .expect("server ep");
     let local_addr = ep.local_addr().expect("server local addr");
@@ -189,7 +189,7 @@ async fn five_motion_and_five_keyboard_events_round_trip() {
         client_cert_chain[0].clone(),
         client_key.clone_key(),
         &pins_dir,
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
     )
     .await
     .expect("dial");
@@ -311,7 +311,7 @@ async fn connection_survives_ten_seconds_of_silence() {
         client_cert_chain[0].clone(),
         client_key.clone_key(),
         &pins_dir,
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(30),
     )
     .await
     .expect("dial");

@@ -5,6 +5,19 @@
 
 ---
 
+## #3 — pre-existing QUIC smoke test flake `connection_survives_ten_seconds_of_silence`
+
+- **触发 STEP**：M1 / STEP-1.3（首次观察到；与本 STEP 无关）
+- **现象**：`cargo test --workspace` 时 `tests/quic_smoke.rs::connection_survives_ten_seconds_of_silence` 失败，断言 "server-side connection must remain alive after 10s silence"。`git stash` 后在 commit `828cc51 init`（STEP-1.1 之前）跑同样失败 → 确认 pre-existing。
+- **根因**：`src/quic_transport/tls.rs::default_transport_config` 把 `keep_alive_interval` 硬编码 5s；测试 fixture（`server_endpoint` helper / 两个 `dial` 调用点）把 `max_idle_timeout` 也传 5s。QUIC 协议层 idle-timeout 检查与 keep-alive PING 都在 t=5s 触发 → race。t=11s 时 server-side `closed()` 已 ready，断言挂。生产 `config.rs::quic_idle_timeout` 默认同样 5s（2026-09-04 从 10s 调下来），但被 `connect.rs::pong_health_watchdog`（1.5s 阈值）覆盖，主链路不受影响 —— 只是 QUIC 协议层兜底兜不住。
+- **解决**（out-of-scope cleanup，方案 A：只动测试）：
+  - `tests/quic_smoke.rs:71 / 192 / 314` 三处 `std::time::Duration::from_secs(5)` → `std::time::Duration::from_secs(30)`。30s 与该测试 doc-comment 顶部 `keep_alive_interval = 5s, max_idle_timeout = 30s` 的描述一致（注释说"we use 10 s (well below 30 s) to assert the upper bound"，实际值原本就该 ≥ 30s）。
+  - 测试结果：`cargo test --workspace --test quic_smoke` → 2 passed；`connection_survives_ten_seconds_of_silence` 11.01s 完成。
+  - 不动生产路径（`tls.rs` / `config.rs` / `connect.rs`）—— 留给后续 cleanup PR（与 SUGGESTION-IGNORE.md #1 同批次）。
+- **解决 STEP**：out-of-scope cleanup（不在任何 PLAN STEP 内；M2 STEP-2.1 主线未被打断）
+
+---
+
 ## #1 — STEP-1.1 把 backend sig-only 兼容层提前到本步（PLAN 偏差）
 
 - **触发 STEP**：M1 / STEP-1.1
