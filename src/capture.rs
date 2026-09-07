@@ -19,22 +19,28 @@ const PENDING_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 /// actual cancellation at 500–600ms).
 const PENDING_TICK_INTERVAL: Duration = Duration::from_millis(100);
 
-/// **STEP-M2-2.6**: poll interval for detecting monitor hot-plug.
+/// **STEP-M2-2.6 / STEP-M2-2.7**: poll interval for detecting monitor
+/// hot-plug.
 ///
-/// The backend's internal `watch::Sender<Vec<MonitorInfo>>` channel
-/// surfaces display add/remove/resize events in <100ms, but the
-/// `Capture` trait object erases it — subscribers can only reach
-/// `Capture::monitors(&self) -> Vec<MonitorInfo>` through the trait.
+/// On macOS, `Capture::monitors()` re-queries Quartz directly via
+/// `CGDisplay::active_displays()` (the watch-channel subscription path
+/// is gated behind TCC authorization that we deliberately don't depend
+/// on; see `macos.rs::Capture::monitors` for the rationale). The
+/// 2-second default keeps that IOKit/CG cost in the noise (a 3-monitor
+/// setup costs roughly 3-10ms per tick, dominated by
+/// `IODisplayCreateInfoDictionary` per display) while still updating
+/// the M3 GUI dropdown within a couple of seconds of the user plugging
+/// or unplugging a display — well below the ~10s humans perceive as
+/// "laggy" for non-interactive controls, and an order of magnitude
+/// faster than any user physically notices the new screen. Drop to
+/// 1s if the dropdown is more latency-sensitive than expected; bump
+/// to 5s if the daemon is running on a power-constrained host.
 ///
-/// Polling at 1 Hz is the architectural workaround: cheap
-/// (`monitors()` is a `borrow().clone()` over a small Vec), and
-/// well within human-perceptible hot-plug latency (a user
-/// physically unplugging a display takes hundreds of ms before the
-/// OS even reports it, so sub-second polling only adds margin).
 /// Dedup against `last_monitors` ensures the
 /// `ICaptureEvent::MonitorsChanged` stream only fires on actual
-/// backend changes.
-const MONITOR_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// backend changes — the cost above is paid every tick regardless of
+/// whether anything changed.
+const MONITOR_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 // === Watchdog self-healing ====================================================
 //
