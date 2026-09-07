@@ -39,6 +39,10 @@ impl ClientManager {
             // `ConfigClient` to `ClientConfig` so the value reaches
             // the frontend editor and runtime.
             input_channels: config_client.input_channels,
+            // **M3**: forward the per-handle monitor binding. Default
+            // `None` for legacy clients; `Some(id)` for clients that
+            // the user has bound to a specific `MonitorInfo.id`.
+            monitor: config_client.monitor,
         };
         let state = ClientState {
             active: config_client.active,
@@ -115,19 +119,22 @@ impl ClientManager {
 
     /// get the client at the given [`BarrierKey`].
     ///
-    /// M1: compares `c.pos` against `key.pos` after converting through
-    /// the IPC position boundary (see [`to_ipc_pos`]). `monitor / offset /
-    /// span` are still defaulted (no `ClientConfig` field for them yet) so
-    /// a full `key == c.to_key()` comparison reduces to the `pos`
-    /// comparison. M3 will widen this to also check the future
-    /// `ClientConfig::monitor` field.
+    /// M1: compared `c.pos` against `key.pos` after converting through
+    /// the IPC position boundary (see [`to_ipc_pos`]). **M3**: now
+    /// also compares `c.monitor` against `key.monitor` so two clients
+    /// at the same position on *different* physical monitors don't
+    /// collide and deactivate each other when `activate_client` looks
+    /// up the existing occupant. `offset / span` are still defaulted
+    /// on both sides of the comparison — they will widen in M4 when
+    /// sub-edge barriers ship.
     pub fn client_at(&self, key: &BarrierKey) -> Option<ClientHandle> {
         let pos = to_ipc_pos(key.pos);
+        let monitor = key.monitor.as_deref();
         self.clients
             .borrow()
             .iter()
             .find_map(|(k, (c, s))| {
-                if s.active && c.pos == pos {
+                if s.active && c.pos == pos && c.monitor.as_deref() == monitor {
                     Some(k)
                 } else {
                     None
@@ -143,15 +150,23 @@ impl ClientManager {
             .and_then(|(c, _)| c.hostname.clone())
     }
 
-    /// **STEP-1.3**: get the [`BarrierKey`] for `handle`. M1: builds
-    /// `BarrierKey::from_pos(c.pos)` with default `monitor / offset /
-    /// span`. M3 will widen this to include the future
-    /// `ClientConfig::monitor` field.
+    /// **STEP-1.3 → STEP-M3-3.1**: get the [`BarrierKey`] for `handle`.
+    /// M1 used to build `BarrierKey::from_pos(c.pos)` with default
+    /// `monitor / offset / span`. **M3** widens this to include the
+    /// per-handle `monitor` binding from `ClientConfig`, so the
+    /// capture barrier is scoped to a specific physical monitor when
+    /// the user has chosen one. `offset / span` stay at their legacy
+    /// defaults (`0` / `10000`) — sub-edge barriers land in M4.
     pub(crate) fn get_key(&self, handle: ClientHandle) -> Option<BarrierKey> {
         self.clients
             .borrow()
             .get(handle as usize)
-            .map(|(c, _)| BarrierKey::from_pos(to_capture_pos(c.pos)))
+            .map(|(c, _)| BarrierKey {
+                pos: to_capture_pos(c.pos),
+                monitor: c.monitor.clone(),
+                offset: 0,
+                span: 10000,
+            })
     }
 
     /// remove a client from the list
@@ -240,6 +255,27 @@ impl ClientManager {
             Some((c, s)) if c.pos != pos => {
                 log::info!("update pos {handle} {} -> {}", c.pos, pos);
                 c.pos = pos;
+                s.active
+            }
+            _ => false,
+        }
+    }
+
+    /// **M3 — update the monitor binding** of the client.
+    /// Returns the client's `state.active` when the value changed,
+    /// mirroring `set_pos` exactly. The service handler uses the
+    /// bool to drive the `deactivate + activate` round-trip that
+    /// rebuilds the `BarrierKey` so the new monitor scope reaches
+    /// the capture backend — and ONLY when the client is currently
+    /// active (otherwise we'd accidentally activate a client the
+    /// user only meant to re-bind). If the client is inactive, the
+    /// new binding is honored on the next `activate_client` (which
+    /// reads `c.monitor` fresh via `get_key`).
+    pub(crate) fn set_monitor(&self, handle: ClientHandle, monitor: Option<String>) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((c, s)) if c.monitor != monitor => {
+                log::info!("update monitor {handle} {:?} -> {:?}", c.monitor, monitor);
+                c.monitor = monitor;
                 s.active
             }
             _ => false,
@@ -402,6 +438,13 @@ mod client_input_channels_tests {
                 mouse_button: ChannelMode::Stream,
                 keyboard: ChannelMode::Datagram,
             },
+            // **M3**: the test fixture predates monitor binding; the
+            // `add_with_config_preserves_input_channels` assertion is
+            // about `input_channels`, so defaulting `monitor` to
+            // `None` keeps the test focused. Add a parallel
+            // `add_with_config_preserves_monitor` test below for the
+            // monitor-binding half of the contract.
+            monitor: None,
         };
         let handle = cm.add_with_config(cfg_client);
         let (c, _) = cm.get_state(handle).unwrap();
@@ -443,5 +486,186 @@ mod client_input_channels_tests {
         assert!(cm.set_input_channels(handle, office));
         let (c, _) = cm.get_state(handle).unwrap();
         assert_eq!(c.input_channels, office);
+    }
+
+    /// **M3 — `add_with_config` carries the monitor binding through**
+    /// the `ConfigClient` → `ClientConfig` boundary. Without this,
+    /// `Config.monitor = Some(...)` set by `SaveConfiguration` would
+    /// silently drop on the next daemon restart (because the
+    /// `ClientManager` rebuilds clients from `ConfigClient`).
+    #[test]
+    fn add_with_config_preserves_monitor() {
+        let cm = ClientManager::default();
+        let cfg = ConfigClient {
+            ips: HashSet::new(),
+            hostname: Some("peer-east".into()),
+            port: DEFAULT_PORT,
+            pos: Position::Top,
+            active: false,
+            enter_hook: None,
+            input_channels: InputChannelConfig::default(),
+            monitor: Some("wl_output:eDP-1".into()),
+        };
+        let handle = cm.add_with_config(cfg);
+        let (c, _) = cm.get_state(handle).unwrap();
+        assert_eq!(c.monitor.as_deref(), Some("wl_output:eDP-1"));
+    }
+
+    /// **M3 — `add_with_config` defaults monitor to `None`** for
+    /// legacy clients whose `ConfigClient.monitor` was never set.
+    /// Pins the "no monitor key in TOML → `None` in `ClientConfig`"
+    /// contract; matches `client_config_monitor_default_when_missing`
+    /// on the IPC side and `config_defaults_when_monitor_missing` on
+    /// the config side.
+    #[test]
+    fn add_with_config_defaults_monitor_to_none() {
+        let cm = ClientManager::default();
+        let cfg = ConfigClient {
+            ips: HashSet::new(),
+            hostname: Some("legacy-peer".into()),
+            port: DEFAULT_PORT,
+            pos: Position::Right,
+            active: false,
+            enter_hook: None,
+            input_channels: InputChannelConfig::default(),
+            monitor: None,
+        };
+        let handle = cm.add_with_config(cfg);
+        let (c, _) = cm.get_state(handle).unwrap();
+        assert_eq!(c.monitor, None);
+    }
+
+    /// **M3 — `set_monitor` returns `s.active` when the value
+    /// changed**. Mirrors `set_pos` exactly: the bool tells the
+    /// service handler whether to drive the `deactivate + activate`
+    /// round-trip (only when the client is currently active). The
+    /// underlying field is updated regardless of the return value
+    /// — `false` means "no rebuild needed", not "value dropped".
+    #[test]
+    fn set_monitor_returns_active_when_value_changed() {
+        let cm = ClientManager::default();
+        let handle = cm.add_client();
+        // Fresh client → inactive. First write changes the value
+        // but the client isn't active → returns `false` (no
+        // rebuild needed). The field IS still updated.
+        assert!(!cm.set_monitor(handle, Some("DP-2".into())));
+        let (c, _) = cm.get_state(handle).unwrap();
+        assert_eq!(c.monitor.as_deref(), Some("DP-2"));
+
+        // Same value again → no change at all → `false`.
+        assert!(!cm.set_monitor(handle, Some("DP-2".into())));
+
+        // Now activate, then change → returns `true` because the
+        // client is active and the value differs.
+        cm.activate_client(handle);
+        assert!(cm.set_monitor(handle, Some("HDMI-A-1".into())));
+
+        // Same value again → no change → `false`.
+        assert!(!cm.set_monitor(handle, Some("HDMI-A-1".into())));
+
+        // Different value while active → `true`.
+        assert!(cm.set_monitor(handle, Some("DP-2".into())));
+
+        // Deactivate, then change → returns `false` (not active).
+        cm.deactivate_client(handle);
+        assert!(!cm.set_monitor(handle, None));
+
+        // Same None → no change → `false`.
+        assert!(!cm.set_monitor(handle, None));
+
+        let (c, _) = cm.get_state(handle).unwrap();
+        assert_eq!(c.monitor, None);
+    }
+
+    /// **M3 — `get_key` reflects the monitor binding**. This is the
+    /// single most important assertion for the M3 end-to-end story:
+    /// after `set_monitor`, the `BarrierKey` returned by `get_key`
+    /// must carry `Some(id)` so `activate_client` → `capture.create`
+    /// reaches the backend with a monitor-scoped key. Without this
+    /// the M1 default (`monitor: None`) would persist forever and
+    /// every user-set binding would silently no-op.
+    #[test]
+    fn get_key_includes_monitor_binding() {
+        let cm = ClientManager::default();
+        let handle = cm.add_client();
+
+        // Legacy default → key.monitor is None.
+        let key = cm.get_key(handle).expect("handle valid");
+        assert_eq!(key.monitor, None);
+
+        // Bind to DP-2 → key.monitor is Some("DP-2").
+        cm.set_monitor(handle, Some("DP-2".into()));
+        let key = cm.get_key(handle).expect("handle valid");
+        assert_eq!(key.monitor.as_deref(), Some("DP-2"));
+        // pos + offset + span still default; the change is scoped
+        // to the new field only.
+        assert_eq!(key.pos, input_capture::Position::Left);
+        assert_eq!(key.offset, 0);
+        assert_eq!(key.span, 10000);
+
+        // Bind to a different monitor → key changes accordingly.
+        cm.set_monitor(handle, Some("HDMI-A-1".into()));
+        let key = cm.get_key(handle).expect("handle valid");
+        assert_eq!(key.monitor.as_deref(), Some("HDMI-A-1"));
+
+        // Unbind (set_monitor(handle, None)) → key.monitor is None
+        // again, matching the legacy default.
+        cm.set_monitor(handle, None);
+        let key = cm.get_key(handle).expect("handle valid");
+        assert_eq!(key.monitor, None);
+    }
+
+    /// **M3 — `client_at` scopes by `(pos, monitor)`**. Two active
+    /// clients at the same position on *different* monitors must not
+    /// collide: `client_at` must look up only the one matching both
+    /// fields. This is the symmetric M3 half of `get_key_includes_monitor_binding`
+    /// — without it, activating one client would deactivate the
+    /// other (the M1 `pos`-only lookup did exactly that).
+    #[test]
+    fn client_at_scopes_by_pos_and_monitor() {
+        use input_capture::BarrierKey;
+
+        let cm = ClientManager::default();
+        let h_left = cm.add_client();
+        let h_right = cm.add_client();
+        let h_top = cm.add_client();
+        // All three are at position Top, monitors are different.
+        cm.set_pos(h_left, Position::Top);
+        cm.set_pos(h_right, Position::Top);
+        cm.set_pos(h_top, Position::Top);
+        cm.activate_client(h_left);
+        cm.activate_client(h_right);
+        cm.activate_client(h_top);
+        cm.set_monitor(h_left, Some("DP-2".into()));
+        cm.set_monitor(h_right, Some("HDMI-A-1".into()));
+        cm.set_monitor(h_top, None); // legacy "any monitor"
+
+        let key_left = BarrierKey {
+            pos: input_capture::Position::Top,
+            monitor: Some("DP-2".into()),
+            offset: 0,
+            span: 10000,
+        };
+        let key_right = BarrierKey {
+            pos: input_capture::Position::Top,
+            monitor: Some("HDMI-A-1".into()),
+            offset: 0,
+            span: 10000,
+        };
+        let key_legacy = BarrierKey {
+            pos: input_capture::Position::Top,
+            monitor: None,
+            offset: 0,
+            span: 10000,
+        };
+
+        assert_eq!(cm.client_at(&key_left), Some(h_left));
+        assert_eq!(cm.client_at(&key_right), Some(h_right));
+        // Legacy key (monitor=None) must NOT match any of the bound
+        // clients — it only matches the client that itself has
+        // monitor=None. This is the half that protects against the
+        // pre-M3 collision where activating a legacy client would
+        // deactivate a bound one.
+        assert_eq!(cm.client_at(&key_legacy), Some(h_top));
     }
 }

@@ -276,6 +276,19 @@ impl Service {
                 self.update_pos(handle, pos);
                 self.save_config();
             }
+            // **M3 — monitor binding**. The handler rebuilds the
+            // active capture barrier so the new monitor scope reaches
+            // `Capture::create` via the standard `deactivate +
+            // activate` round-trip; this is the same shape as
+            // `UpdatePosition`. `monitor = None` clears the binding
+            // (back to legacy "any monitor" behavior); `Some(id)`
+            // re-binds to a specific `MonitorInfo.id` (the GUI
+            // dropdown sources its options from the most recent
+            // `MonitorsChanged` event).
+            FrontendRequest::UpdateMonitor(handle, monitor) => {
+                self.update_monitor(handle, monitor);
+                self.save_config();
+            }
             FrontendRequest::ResolveDns(handle) => self.resolve(handle),
             FrontendRequest::Sync => self.sync_frontend(),
             FrontendRequest::RemoveAuthorizedKey(key) => {
@@ -306,6 +319,11 @@ impl Service {
                 active: s.active,
                 enter_hook: c.cmd,
                 input_channels: c.input_channels,
+                // **M3**: forward the per-handle monitor binding so
+                // `save_config` round-trips through the TOML layer
+                // unchanged. The default-None omission is handled on
+                // the `TomlClient` side (see `config_omits_monitor_field_when_none_on_writeback`).
+                monitor: c.monitor,
             })
             .collect();
         self.config.set_clients(clients);
@@ -737,6 +755,30 @@ impl Service {
     fn update_pos(&mut self, handle: ClientHandle, pos: Position) {
         // update state in event input emulator & input capture
         if self.client_manager.set_pos(handle, pos) {
+            self.deactivate_client(handle);
+            self.activate_client(handle);
+        }
+        self.broadcast_client(handle);
+    }
+
+    /// **M3 — update the monitor binding** of a client. Mirrors
+    /// `update_pos`: when the binding changes AND the client is
+    /// active, rebuild the capture barrier so the new
+    /// `BarrierKey.monitor` reaches `Capture::create`. The
+    /// `activate_client` call re-reads the BarrierKey from the
+    /// `ClientManager` (which now reflects the new monitor), so the
+    /// barrier is scoped to the chosen monitor without any explicit
+    /// "old key vs. new key" bookkeeping here.
+    ///
+    /// `monitor = None` clears the binding (legacy "any monitor");
+    /// `Some(id)` re-binds. If `id` doesn't match a currently
+    /// enumerated monitor, the binding stays put — the user can
+    /// re-pick after the next `MonitorsChanged` event. (We don't
+    /// validate against the latest monitor list here because the
+    /// user may legitimately want to set a binding slightly ahead of
+    /// a pending plug-in event.)
+    fn update_monitor(&mut self, handle: ClientHandle, monitor: Option<String>) {
+        if self.client_manager.set_monitor(handle, monitor) {
             self.deactivate_client(handle);
             self.activate_client(handle);
         }

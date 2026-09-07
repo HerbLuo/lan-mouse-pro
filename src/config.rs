@@ -155,6 +155,17 @@ struct TomlClient {
     /// config files). Missing → `InputChannelConfig::default()`.
     #[serde(default)]
     input_channels: Option<InputChannelConfig>,
+    /// **M3 — optional monitor binding**. `None` (or missing) = "any
+    /// monitor" (legacy M1 behavior); `Some(id)` binds the client to
+    /// a specific `MonitorInfo.id` (the same id the daemon broadcasts
+    /// via `FrontendEvent::MonitorsChanged`). Used by the service to
+    /// scope the capture barrier to a single physical monitor.
+    ///
+    /// `#[serde(default)]` makes the on-disk file backward-compatible:
+    /// configs written before M3 have no `monitor` key, and they must
+    /// continue to load cleanly without modification.
+    #[serde(default)]
+    monitor: Option<String>,
 }
 
 impl ConfigToml {
@@ -355,6 +366,13 @@ pub struct ConfigClient {
     /// keeps it as `Option<...>` so that the default is omitted when
     /// writing back (preserves back-compat with older config files).
     pub input_channels: InputChannelConfig,
+    /// **M3 — optional monitor binding**. `None` = any monitor (M1
+    /// default / legacy behavior); `Some(id)` = bind to a specific
+    /// `MonitorInfo.id`. Mirrors `lan_mouse_ipc::ClientConfig::monitor`
+    /// — `ConfigClient` is the in-memory bridge between the on-disk
+    /// `TomlClient` and the wire `ClientConfig`, so the field has to
+    /// be carried here too.
+    pub monitor: Option<String>,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -366,6 +384,13 @@ impl From<TomlClient> for ConfigClient {
         let port = toml.port.unwrap_or(DEFAULT_PORT);
         let pos = toml.position.unwrap_or_default();
         let input_channels = toml.input_channels.unwrap_or_default();
+        // M3: missing `monitor` key in TOML → `None` (legacy "any
+        // monitor" behavior). `#[serde(default)]` on the `TomlClient`
+        // field already deserializes missing keys to `None`, but
+        // `flatten` the explicit `unwrap_or(None)` for clarity in
+        // case the field is ever populated to something other than
+        // `None` in older serialization paths.
+        let monitor = toml.monitor;
         Self {
             ips,
             hostname,
@@ -374,6 +399,7 @@ impl From<TomlClient> for ConfigClient {
             active,
             enter_hook,
             input_channels,
+            monitor,
         }
     }
 }
@@ -401,6 +427,11 @@ impl From<ConfigClient> for TomlClient {
         } else {
             Some(client.input_channels)
         };
+        // M3: same "omit when default" pattern as `input_channels`.
+        // `None` writes nothing to disk (preserves back-compat with
+        // config files that pre-date M3 and would otherwise suddenly
+        // grow a `monitor = null` line on the next save).
+        let monitor = client.monitor;
         Self {
             hostname,
             host_name,
@@ -410,6 +441,7 @@ impl From<ConfigClient> for TomlClient {
             activate_on_startup,
             enter_hook,
             input_channels,
+            monitor,
         }
     }
 }
@@ -809,5 +841,105 @@ mod config_input_channels_tests {
             .collect();
         assert_eq!(clients.len(), 1);
         assert_eq!(clients[0].input_channels, InputChannelConfig::default());
+    }
+
+    /// **M3 — TOML `monitor` field parses**. A config file that
+    /// carries `monitor = "EDID:0xdeadbeef"` (or any other id) must
+    /// deserialize into a `ConfigClient` whose `monitor` field carries
+    /// the same string. Mirrors
+    /// `lan_mouse_ipc::client_config_monitor_round_trip` but on the
+    /// TOML side.
+    #[test]
+    fn config_parses_monitor_field() {
+        let toml = r#"
+            [[clients]]
+            hostname = "test"
+            monitor = "EDID:0xdeadbeef"
+        "#;
+        let cfg: ConfigToml = toml::from_str(toml).unwrap();
+        let clients: Vec<ConfigClient> = cfg
+            .clients
+            .unwrap_or_default()
+            .into_iter()
+            .map(From::<TomlClient>::from)
+            .collect();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].monitor.as_deref(), Some("EDID:0xdeadbeef"));
+    }
+
+    /// **M3 — TOML `monitor` missing → legacy `None`**. Pre-M3
+    /// config files have no `monitor` key on any `[[clients]]`
+    /// entry. They must continue to deserialize cleanly, with
+    /// `ConfigClient.monitor == None` (legacy "any monitor"
+    /// behavior). This is the on-disk half of the §M3 test matrix
+    /// "缺 monitor 字段 = None（向后兼容）" requirement.
+    #[test]
+    fn config_defaults_when_monitor_missing() {
+        let toml = r#"
+            [[clients]]
+            hostname = "test"
+        "#;
+        let cfg: ConfigToml = toml::from_str(toml).unwrap();
+        let clients: Vec<ConfigClient> = cfg
+            .clients
+            .unwrap_or_default()
+            .into_iter()
+            .map(From::<TomlClient>::from)
+            .collect();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].monitor, None);
+    }
+
+    /// **M3 — write-back omits `monitor = None`**. A `ConfigClient`
+    /// with `monitor = None` must serialize back to TOML without a
+    /// `monitor` key, so saving a legacy client's config file does
+    /// not introduce a stray `monitor = null` line. Round-trips a
+    /// legacy-style config through `ConfigClient → TomlClient → TOML
+    /// string` and asserts the resulting string has no `monitor`
+    /// substring.
+    #[test]
+    fn config_omits_monitor_field_when_none_on_writeback() {
+        let cfg = ConfigClient {
+            ips: HashSet::new(),
+            hostname: Some("legacy".into()),
+            port: DEFAULT_PORT,
+            pos: Position::Right,
+            active: false,
+            enter_hook: None,
+            input_channels: InputChannelConfig::default(),
+            monitor: None,
+        };
+        let toml_client: TomlClient = cfg.into();
+        let s = toml::to_string_pretty(&toml_client).unwrap();
+        assert!(
+            !s.contains("monitor"),
+            "monitor = None must be omitted from written TOML; got:\n{s}"
+        );
+    }
+
+    /// **M3 — write-back keeps a non-default `monitor`**. A
+    /// `ConfigClient` with `monitor = Some("…")` must serialize the
+    /// value back so a user's binding survives `save_config`. This
+    /// is the round-trip-half of the M3 contract, paired with
+    /// `config_omits_monitor_field_when_none_on_writeback` above to
+    /// pin both directions of the write-back path.
+    #[test]
+    fn config_keeps_monitor_field_when_some_on_writeback() {
+        let cfg = ConfigClient {
+            ips: HashSet::new(),
+            hostname: Some("bound".into()),
+            port: DEFAULT_PORT,
+            pos: Position::Right,
+            active: false,
+            enter_hook: None,
+            input_channels: InputChannelConfig::default(),
+            monitor: Some("wl_output:DP-2".into()),
+        };
+        let toml_client: TomlClient = cfg.into();
+        let s = toml::to_string_pretty(&toml_client).unwrap();
+        assert!(
+            s.contains("monitor = \"wl_output:DP-2\""),
+            "monitor = Some(...) must be written verbatim; got:\n{s}"
+        );
     }
 }

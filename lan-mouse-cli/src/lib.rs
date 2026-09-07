@@ -58,6 +58,14 @@ enum CliSubcommand {
     SetPort { id: ClientHandle, port: u16 },
     /// set position
     SetPosition { id: ClientHandle, pos: Position },
+    /// **M3 — set the monitor binding** of a client. Pass an empty
+    /// string (`""`) to clear the binding back to "any monitor"
+    /// (legacy default). Any other value is treated as a literal
+    /// `MonitorInfo.id` and forwarded as `Some(id)` on the wire.
+    /// The CLI does not validate against the current monitor list
+    /// (that's the GUI's job, via its dropdown sourced from
+    /// `MonitorsChanged`).
+    SetMonitor { id: ClientHandle, monitor: String },
     /// set ips
     SetIps { id: ClientHandle, ips: Vec<IpAddr> },
     /// re-enable capture
@@ -144,6 +152,19 @@ async fn execute(cmd: CliSubcommand) -> Result<(), CliError> {
         }
         CliSubcommand::SetPosition { id, pos } => {
             tx.request(FrontendRequest::UpdatePosition(id, pos)).await?
+        }
+        // **M3**: empty string means "clear the binding" (legacy
+        // behavior). Anything else is forwarded verbatim as
+        // `Some(id)`; the daemon does no validation against the
+        // current monitor list.
+        CliSubcommand::SetMonitor { id, monitor } => {
+            let monitor = if monitor.is_empty() {
+                None
+            } else {
+                Some(monitor)
+            };
+            tx.request(FrontendRequest::UpdateMonitor(id, monitor))
+                .await?
         }
         CliSubcommand::SetIps { id, ips } => {
             tx.request(FrontendRequest::UpdateFixIps(id, ips)).await?

@@ -154,6 +154,21 @@ pub struct ClientConfig {
     /// otherwise fail with "missing field `input_channels`".
     #[serde(default)]
     pub input_channels: InputChannelConfig,
+    /// **M3 — optional monitor binding**. `None` means "any monitor"
+    /// (legacy behavior, equivalent to the M1 default `BarrierKey`).
+    /// `Some(id)` binds this client to a specific [`MonitorInfo::id`]
+    /// so two clients at the same [`Position`] on different physical
+    /// monitors no longer collide. The id must match one of the
+    /// `MonitorInfo.id` values the daemon broadcasts via
+    /// [`FrontendEvent::MonitorsChanged`]; the frontend dropdown
+    /// sources its option list from that event.
+    ///
+    /// `#[serde(default)]` keeps the wire forward-compatible: payloads
+    /// from frontends / daemons that pre-date M3 deserialize as `None`
+    /// and behave like a legacy client. Same compat contract as
+    /// `input_channels` above.
+    #[serde(default)]
+    pub monitor: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -165,6 +180,7 @@ impl Default for ClientConfig {
             pos: Default::default(),
             cmd: None,
             input_channels: InputChannelConfig::default(),
+            monitor: None,
         }
     }
 }
@@ -315,6 +331,69 @@ mod input_channel_tests {
         let s = serde_json::to_string(&cfg).unwrap();
         let back: ClientConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.input_channels, cfg.input_channels);
+    }
+
+    /// **M3 — `monitor` field backward compat**. A pre-M3 payload
+    /// (the same `legacy` JSON the `input_channels` test above uses,
+    /// which also predates M3 because it has no `monitor` field)
+    /// must deserialize cleanly into a `ClientConfig` whose
+    /// `monitor` is `None`. Mirrors the §M3 test matrix "缺 monitor
+    /// 字段 = None（向后兼容）" requirement. The JSON has no `monitor`
+    /// key, so `#[serde(default)]` on the new field must kick in.
+    /// Without this guarantee, any old config.toml + new daemon pair
+    /// would fail to load and every pre-M3 setup would silently lose
+    /// its clients.
+    #[test]
+    fn client_config_monitor_default_when_missing() {
+        // Pre-M3 payload (same shape as `client_config_input_channels_default_when_missing`,
+        // minus `cmd` for compactness; the field set mirrors what a
+        // fresh config.toml written by STEP-2.6 / STEP-2.7 looks like).
+        let pre_m3 = r#"{
+            "hostname": "peer-east",
+            "fix_ips": [],
+            "port": 2268,
+            "pos": "right",
+            "cmd": null,
+            "input_channels": { "mouse_button": "datagram", "keyboard": "stream" }
+        }"#;
+        let cfg: ClientConfig = serde_json::from_str(pre_m3).unwrap();
+        assert_eq!(
+            cfg.monitor, None,
+            "missing `monitor` field must deserialize as None"
+        );
+    }
+
+    /// **M3 — `monitor` round-trip**. A new-build writer writes
+    /// `monitor = Some("DP-2")`; a new-build reader decodes the same
+    /// value back. Mirrors `input_channels` round-trip but for the
+    /// monitor binding. Together with the missing-field test above
+    /// this pins both directions of the wire contract.
+    #[test]
+    fn client_config_monitor_round_trip() {
+        let cfg = ClientConfig {
+            monitor: Some("wl_output:DP-2".into()),
+            ..ClientConfig::default()
+        };
+        let s = serde_json::to_string(&cfg).unwrap();
+        let back: ClientConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.monitor, cfg.monitor);
+        assert_eq!(back.monitor.as_deref(), Some("wl_output:DP-2"));
+    }
+
+    /// `monitor = None` must serialize as JSON `null` (not omitted).
+    /// This is a stable wire contract: a pre-M3 frontend reading a
+    /// new-build `monitor: null` event decodes it as the missing-field
+    /// `None` case via `#[serde(default)]`, so the wire stays
+    /// forward-compatible without bumping the schema.
+    #[test]
+    fn client_config_monitor_none_serializes_as_null() {
+        let cfg = ClientConfig::default();
+        assert_eq!(cfg.monitor, None);
+        let s = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            s.contains("\"monitor\":null"),
+            "expected `\"monitor\":null` in serialized payload; got {s}"
+        );
     }
 }
 
@@ -607,6 +686,15 @@ pub enum FrontendRequest {
     UpdatePort(ClientHandle, u16),
     /// update position
     UpdatePosition(ClientHandle, Position),
+    /// **M3 — update the monitor binding**. `monitor = None` clears
+    /// the binding (back to "any monitor"); `Some(id)` re-binds to a
+    /// specific [`MonitorInfo::id`] (must match a currently-enumerated
+    /// monitor or the `BindingInvalid` flow from M2 kicks in if the
+    /// monitor subsequently disappears). The service handler rebuilds
+    /// the active capture barrier via `destroy + create` to honor the
+    /// new [`BarrierKey::monitor`] field, identical in shape to
+    /// `UpdatePosition`.
+    UpdateMonitor(ClientHandle, Option<String>),
     /// update fix-ips
     UpdateFixIps(ClientHandle, Vec<IpAddr>),
     /// request reenabling input capture
