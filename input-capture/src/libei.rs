@@ -346,7 +346,12 @@ async fn libei_event_handler(
             .await
             .ok_or(CaptureError::EndOfStream)??;
         log::trace!("from ei: {ei_event:?}");
-        let client = current_key.get();
+        // `BarrierKey` contains `Option<MonitorId>` where `MonitorId =
+        // String`, so `Option<BarrierKey>` is not `Copy` and
+        // `Cell::get` is unusable. Clone through `as_ptr` instead —
+        // the `Cell` guarantees unique access, and the clone finishes
+        // before any await point, so the raw pointer does not escape.
+        let client = unsafe { (*current_key.as_ptr()).clone() };
         handle_ei_event(ei_event, client, &context, &event_tx, &release_session).await?;
     }
 }
