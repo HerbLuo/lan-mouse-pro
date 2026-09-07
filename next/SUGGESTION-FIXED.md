@@ -36,3 +36,18 @@
   - `capture.rs:797` `ProtoEvent::Pong(alive) { if !alive { … } }` → `ProtoEvent::Pong(false) { … }`（移除 `alive` binding，直接 pattern match 字面值）
 - **解决 STEP**：M1 / STEP-1.4
 - **未解决部分（已转移到 SUGGESTION-IGNORE.md #1）**：workspace 其余 24 处 fmt diff + 7 个 clippy warning 全部在非 M1 文件（QUIC / input-emulation / config），按 PLAN §0 scope discipline 不在 M1 close 范围内。
+
+---
+
+## #4 — STEP-2.6 Vue store / api/ipc.ts 范围扩展（leader 接受）
+
+- **触发 STEP**：M2 / STEP-2.6
+- **现象**：PLAN §M2 STEP-2.6 要求 ConnectionRow.vue 在收到 `BindingInvalid` 时高亮 + tooltip。prompt "不要做的事" 列出"不要触碰 M3 / M4 范围"括号里包含 "Vue store"。但要 surface `BindingInvalid` 到 ConnectionRow，**最少**需要：
+  - `lan-mouse-vue/src/api/ipc.ts`：把 `MonitorsChanged` + `BindingInvalid` 加入 `FrontendEvent` union（否则 TypeScript 把这两个变体当 never 类型，`applyEvent` switch 必须 fallback，否则编译报 exhaustive 检查错误）
+  - `lan-mouse-vue/src/store/index.ts`：`Connection` 加 `invalidReason: string | null` 字段 + `applyEvent` 2 个新 case 处理（`MonitorsChanged` 当前 no-op、`BindingInvalid` 写入 invalidReason）
+- **解决**（leader 决策：接受范围扩展）：
+  - 范围扩展是 STEP-2.6 必需的最少 Vue 承载层，不在 M3 dropdown / M4 canvas scope
+  - 替代方案（ConnectionRow 直接持有 WS 订阅）会重复 socket 状态机 + 复杂度高 + 不符合现有 store 单例模式，不推荐
+  - commit `63706b5` 已落地：9 处新文件 / 47 行 ConnectionRow.vue / 25 行 api/ipc.ts / 57 行 store/index.ts 全部到位
+  - 备注：SUGGESTION.md 头部规则要求"已解决 → SUGGESTION-FIXED.md"，本次归档由 leader 显式触发（之前 commit 时口头接受但漏了正式归档，导致 STEP-2.7 executor 看到 SUGGESTION.md #1 仍在没主动动 —— 这是 leader 失误）
+- **解决 STEP**：M2 / STEP-2.6 + M2 收尾归档
