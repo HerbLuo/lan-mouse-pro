@@ -385,30 +385,65 @@ impl InputCaptureState {
                 // cursor-warp on capture-start use the current
                 // geometry instead of whatever was true at process
                 // start.
-                if let Err(e) = self.update_bounds() {
-                    log::warn!("failed to refresh display bounds: {e}");
-                } else {
-                    log::info!("display reconfigured: {} display(s)", self.displays.len());
-                    for d in &self.displays {
-                        log::info!("  display bounds: {d:?}");
+                //
+                // **STEP-M2-2.7 HOT-PLUG FIX**: refresh `self.displays`
+                // for barrier tracking, but NEVER gate the
+                // `monitors_tx` push on its outcome. Quartz can
+                // transiently fail `CGDisplay::active_displays()` mid-
+                // reconfiguration (macOS returns kIOReturnBusy / a
+                // transient CoreGraphics error); if we skipped the
+                // push in that case the GUI's `state.monitors` would
+                // stay stale until the *next* change, and the M3
+                // monitor dropdown would appear to "freeze" on the
+                // old list — exactly the failure mode the macOS
+                // dual-display hot-plug manual test surfaced.
+                //
+                // `enumerate_monitors` re-queries
+                // `CGDisplay::active_displays()` independently of
+                // `update_bounds`, so a transient bounds-refresh
+                // failure does NOT prevent the GUI-facing snapshot
+                // from being updated.
+                match self.update_bounds() {
+                    Ok(()) => {
+                        log::info!("display reconfigured: {} display(s)", self.displays.len());
+                        for d in &self.displays {
+                            log::info!("  display bounds: {d:?}");
+                        }
                     }
-                    // M2 STEP-2.2: re-enumerate monitors so subscribers
-                    // (the STEP-2.6 service layer) see the new list.
-                    let monitors = enumerate_monitors(&self.displays);
-                    log::info!("monitors changed: {} monitor(s)", monitors.len());
-                    for m in &monitors {
-                        log::info!(
-                            "  monitor: id={} name={:?} pos={:?} size={:?} primary={} scale={}",
-                            m.id,
-                            m.name,
-                            m.position,
-                            m.size,
-                            m.primary,
-                            m.scale
+                    Err(e) => {
+                        // `self.displays` was cleared at the start of
+                        // `update_bounds` before the failure; until
+                        // the next successful refresh barrier
+                        // tracking will fall back to the per-display
+                        // lookup in `compute_edge_point`, which
+                        // returns None for any cursor position not
+                        // on a known display. That's acceptable as a
+                        // transient degradation — the GUI still
+                        // gets a fresh monitor list below.
+                        log::warn!(
+                            "display reconfigured: refresh bounds failed ({e}); \
+                             barrier tracking may be stale until next refresh"
                         );
                     }
-                    let _ = self.monitors_tx.send(monitors);
                 }
+                // M2 STEP-2.2: re-enumerate monitors so subscribers
+                // (the STEP-2.6 service layer) see the new list.
+                // Always run, even when the bounds refresh above
+                // failed — see the long-form comment above.
+                let monitors = enumerate_monitors(&self.displays);
+                log::info!("monitors changed: {} monitor(s)", monitors.len());
+                for m in &monitors {
+                    log::info!(
+                        "  monitor: id={} name={:?} pos={:?} size={:?} primary={} scale={}",
+                        m.id,
+                        m.name,
+                        m.position,
+                        m.size,
+                        m.primary,
+                        m.scale
+                    );
+                }
+                let _ = self.monitors_tx.send(monitors);
                 Ok(None)
             }
             ProducerEvent::MonitorsChanged(monitors) => {
@@ -1149,12 +1184,24 @@ fn event_tap_thread(
     // callback runs on this thread's CFRunLoop. Box-leak the sender
     // so the C side has a stable user_info pointer; reclaim it after
     // the run loop exits.
+    //
+    // **STEP-M2-2.7 DIAGNOSTIC**: log the CGError return value so
+    // any registration failure surfaces in the daemon log instead
+    // of silently dropping every hot-plug event.
     let display_user_info = Box::into_raw(Box::new(display_notify_tx)) as *mut c_void;
-    unsafe {
+    let reg_err = unsafe {
         CGDisplayRegisterReconfigurationCallback(
             display_reconfiguration_callback,
             display_user_info,
+        )
+    };
+    if reg_err != 0 {
+        log::warn!(
+            "CGDisplayRegisterReconfigurationCallback returned non-zero CGError={reg_err}; \
+             hot-plug detection will NOT work"
         );
+    } else {
+        log::info!("registered CGDisplay reconfiguration callback on tap thread run loop");
     }
 
     log::debug!("running CFRunLoop...");
@@ -1180,11 +1227,23 @@ fn event_tap_thread(
 /// Mode, DesktopShapeChanged, etc.). Skip the begin phase; on the
 /// real notification, kick the producer task to refresh bounds.
 extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_info: *mut c_void) {
-    const K_CG_DISPLAY_BEGIN_CONFIGURATION_FLAG: u32 = 1 << 0;
-    if flags & K_CG_DISPLAY_BEGIN_CONFIGURATION_FLAG != 0 {
+    // **STEP-M2-2.7 HOT-PLUG DIAGNOSTIC**: log every fire of the
+    // Quartz reconfiguration callback so the macOS dual-display
+    // manual test can confirm whether the chain breaks at (a) macOS
+    // itself not delivering the notification, (b) the run loop
+    // never servicing it, or (c) the channel send failing. If you
+    // see "reconfiguration begin" lines but no "reconfiguration
+    // change" lines on hot-plug, the bug is upstream of us — likely
+    // the daemon binary isn't running or TCC is blocking. If you
+    // see "change" lines but never "DisplayReconfigured received"
+    // further down, the producer task isn't draining the channel.
+    if flags & (1 << 0) != 0 {
+        log::debug!("display reconfiguration: begin flag set, skipping");
         return;
     }
+    log::debug!("display reconfiguration: change fired, flags=0x{flags:x} display={_display}");
     if user_info.is_null() {
+        log::warn!("display reconfiguration: user_info is null, ignoring");
         return;
     }
     // SAFETY: user_info is a Box::into_raw of Sender<ProducerEvent>
@@ -1193,8 +1252,9 @@ extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_i
     // freed. The callback only fires while the run loop is running
     // on that thread, so we know the box is live here.
     let sender = unsafe { &*(user_info as *const Sender<ProducerEvent>) };
-    if let Err(e) = sender.blocking_send(ProducerEvent::DisplayReconfigured) {
-        log::warn!("failed to notify display reconfiguration: {e}");
+    match sender.blocking_send(ProducerEvent::DisplayReconfigured) {
+        Ok(()) => log::debug!("display reconfiguration: queued DisplayReconfigured"),
+        Err(e) => log::warn!("failed to notify display reconfiguration: {e}"),
     }
 }
 
@@ -1419,7 +1479,36 @@ impl Capture for MacOSInputCapture {
     }
 
     fn monitors(&self) -> Vec<MonitorInfo> {
-        self.current_monitors()
+        // **STEP-M2-2.7 HOT-PLUG POLL FIX**: bypass the
+        // `monitors_tx` watch-channel snapshot and re-query Quartz
+        // directly via `enumerate_monitors`. The watch channel is
+        // only refreshed by the `CGDisplayReconfiguration` callback
+        // (or the startup seed inside `InputCaptureState::new`),
+        // and the callback path silently drops every event on
+        // macOS hosts where the daemon binary is not TCC-granted
+        // accessibility / input-monitoring access — there is no
+        // way to surface the failure short of having the user run
+        // `RUST_LOG=debug` and stare at the log. That isn't an
+        // acceptable failure mode for a hot-plug story the M3
+        // dropdown sits on top of.
+        //
+        // `enumerate_monitors` is a pure read of
+        // `CGDisplay::active_displays()` and does NOT need any TCC
+        // permission — the 1Hz poll in `src/capture.rs:1014`
+        // (`MONITOR_POLL_INTERVAL = 1s`) will pick up the fresh
+        // snapshot on every tick, dedup against `self.last_monitors`
+        // (in the service), and emit `MonitorsChanged` on a real
+        // change. The 1-second latency is fine for the GUI
+        // dropdown — the user already sees the new monitor appear
+        // in macOS's own Displays panel before our event lands.
+        //
+        // The watch channel + callback path is still wired up (in
+        // `event_tap_thread` and the `DisplayReconfigured` arm of
+        // `handle_producer_event`) for any future subscription-
+        // based consumer that wants sub-second latency on
+        // TCC-granted hosts; the polling path above is the
+        // always-on, no-TCC-required baseline.
+        enumerate_monitors(&[])
     }
 }
 
@@ -1591,7 +1680,7 @@ mod tests {
     //! All are pure functions with no FFI, so they exercise the
     //! implementation cheaply on every CI run.
 
-    use super::{DisplayInfo, build_stable_id, compute_scale};
+    use super::{DisplayInfo, build_stable_id, compute_scale, enumerate_monitors};
 
     /// Vendor + product are formatted as 4-digit hex (zero-padded)
     /// so the id stays visually scannable and grep-friendly. Serial
@@ -1742,5 +1831,70 @@ mod tests {
         // so existing parsers / dashboards don't need updating.
         assert!(id_a.starts_with("macos:0000:0000:"));
         assert!(id_b.starts_with("macos:0000:0000:"));
+    }
+
+    // ----- STEP-M2-2.7 HOT-PLUG FIX REGRESSION GUARD ----------------------
+    //
+    // The macOS dual-display manual test (see STEP-M2-2.7 §6) surfaced a
+    // bug: `DisplayReconfigured` in `handle_producer_event` gated the
+    // `monitors_tx.send(...)` push on `update_bounds()` succeeding. When
+    // `CGDisplay::active_displays()` transiently failed mid-reconfigure
+    // (kIOReturnBusy / transient CG error), no `MonitorsChanged` event
+    // reached the GUI and the M3 monitor dropdown froze on the stale
+    // list. The fix decoupled the two: `update_bounds()` result only
+    // affects barrier-tracking health; `enumerate_monitors()` is always
+    // called.
+    //
+    // This regression guard ensures `enumerate_monitors` reads the live
+    // OS state via `CGDisplay::active_displays()` directly and ignores
+    // its `displays` argument. That's the structural precondition for
+    // "DisplayReconfigured always pushes a fresh snapshot to
+    // monitors_tx, even when `update_bounds` left `self.displays`
+    // empty after a transient failure".
+
+    use crate::geometry::DisplayRect;
+
+    /// `enumerate_monitors` must re-query `CGDisplay::active_displays()`
+    /// directly and ignore the `displays` slice — the slice is kept
+    /// around for documentation / future-injection only. Two calls
+    /// with different slice contents MUST return the same live
+    /// snapshot. If a future refactor makes the function start
+    /// reading from the slice, this test fails and the hot-plug
+    /// bug would silently re-appear in production.
+    #[test]
+    fn enumerate_monitors_ignores_displays_slice_and_returns_live_state() {
+        let from_empty = enumerate_monitors(&[]);
+        // A deliberately bogus slice: one entry with negative
+        // coordinates that could never be the actual OS-reported
+        // bounds on a real Mac. If `enumerate_monitors` ever
+        // started reading from this slice instead of the live
+        // Quartz enumeration, the returned list would diverge
+        // from `from_empty`.
+        let from_bogus = enumerate_monitors(&[DisplayRect::new(-987_654.0, -987_654.0, 1.0, 1.0)]);
+
+        assert_eq!(
+            from_empty.len(),
+            from_bogus.len(),
+            "enumerate_monitors must not depend on the `displays` slice \
+             (live `CGDisplay::active_displays()` counts must agree)"
+        );
+
+        let empty_ids: Vec<String> = from_empty.iter().map(|m| m.id.clone()).collect();
+        let bogus_ids: Vec<String> = from_bogus.iter().map(|m| m.id.clone()).collect();
+        assert_eq!(
+            empty_ids, bogus_ids,
+            "enumerate_monitors must return identical ids for identical \
+             live state, regardless of the `displays` slice content"
+        );
+
+        // Sanity: the live snapshot must be non-empty (the test
+        // runs on a real macOS with at least the built-in display).
+        // If this fires on a headless CI runner, the test setup
+        // itself is wrong — not the production code.
+        assert!(
+            !from_empty.is_empty(),
+            "live `CGDisplay::active_displays()` returned an empty \
+             snapshot on macOS — test environment is not real hardware"
+        );
     }
 }
