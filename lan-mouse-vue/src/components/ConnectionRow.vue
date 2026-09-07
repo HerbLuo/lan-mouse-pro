@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { deleteClient, resolveDns, toggleClient, updateClientConfig } from '@/store'
+import { computed } from 'vue'
+import { daemonStore, deleteClient, resolveDns, toggleClient, updateClientConfig } from '@/store'
 import type { Connection } from '@/store'
-import type { ChannelMode, ClientConfig, Position } from '@/api/ipc'
+import type { ChannelMode, ClientConfig, MonitorInfo, Position } from '@/api/ipc'
 import IconChevron from '@/components/icons/IconChevron.vue'
 import IconRefresh from '@/components/icons/IconRefresh.vue'
 import IconTrash from '@/components/icons/IconTrash.vue'
@@ -22,6 +23,50 @@ function setChannel(key: 'mouse_button' | 'keyboard', ev: Event) {
   const cfg = connection.config.input_channels
   if (cfg[key] === v) return
   setField({ input_channels: { ...cfg, [key]: v } })
+}
+
+/** **STEP-M3-3.2 — monitor `<select>` binding**.
+ *
+ *  `daemonStore.monitors` is the source of truth. The current row's
+ *  binding is `connection.config.monitor` (string | null):
+ *   - `null`   → "Any (back-compat)" — the legacy pre-M3 behavior;
+ *     the daemon ignores the monitor dimension when computing the
+ *     `BarrierKey`.
+ *   - string  → must match one of `state.monitors[i].id`; the
+ *     dropdown uses `id` as the `<option :value>` so a value match
+ *     is a direct equality check. (If the daemon's binding points
+ *     at an id that no longer exists, the row stays selected to
+ *     that id but the dropdown displays no `<option>` for it —
+ *     browsers render `<select>` as a blank box in that case, which
+ *     is the visual cue to also expect a `BindingInvalid` badge.)
+ *
+ *  The tooltip on each option surfaces the monitor's geometry
+ *  (position + size + scale) so the user can disambiguate two
+ *  displays that share a name ("DELL U2415" × 2 in a row). */
+const monitorOptions = computed(() => daemonStore.monitors)
+
+function monitorLabel(m: MonitorInfo): string {
+  const tag = m.primary ? ' (primary)' : ''
+  return `${m.name}${tag}`
+}
+
+function monitorTooltip(m: MonitorInfo): string {
+  return `${m.name}\nposition: (${m.position[0]}, ${m.position[1]})\nsize: ${m.size[0]} × ${m.size[1]}\nscale: ${m.scale}`
+}
+
+/** Convert `string | null` → the string value the `<select>` binds
+ *  to. `null` is the empty string (matches the "Any" `<option>`). */
+function monitorSelectValue(): string {
+  return connection.config.monitor ?? ''
+}
+
+function setMonitor(ev: Event) {
+  const v = (ev.target as HTMLSelectElement).value
+  // empty string = "Any" sentinel; convert back to null so the
+  // wire payload matches the Rust `Option<String>` shape and a
+  // legacy pre-M3 config (which carries `null`) round-trips as a
+  // no-op against itself.
+  setField({ monitor: v === '' ? null : v })
 }
 </script>
 
@@ -145,6 +190,32 @@ function setChannel(key: 'mouse_button' | 'keyboard', ev: Event) {
             <option value="right">Right</option>
             <option value="top">Top</option>
             <option value="bottom">Bottom</option>
+          </select>
+        </label>
+        <!-- STEP-M3-3.2: per-row monitor binding. Options are
+             [Any (back-compat), ...state.monitors] in daemon order.
+             The `<select>`'s `value` binds to the row's current
+             monitor id (empty string for Any). Re-rendering
+             happens automatically when `daemonStore.monitors`
+             changes because Vue tracks the reactive read. -->
+        <label>
+          <span class="lbl">Monitor</span>
+          <select
+            :value="monitorSelectValue()"
+            @change="setMonitor($event)"
+            title="Bind this client to a specific monitor, or Any to inherit the legacy behavior"
+          >
+            <option value="" title="Any connected monitor — legacy pre-M3 behavior">
+              Any (back-compat)
+            </option>
+            <option
+              v-for="m in monitorOptions"
+              :key="m.id"
+              :value="m.id"
+              :title="monitorTooltip(m)"
+            >
+              {{ monitorLabel(m) }}
+            </option>
           </select>
         </label>
         <label class="full">

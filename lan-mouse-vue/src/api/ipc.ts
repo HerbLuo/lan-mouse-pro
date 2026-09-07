@@ -22,6 +22,20 @@ export interface ClientConfig {
   pos: Position
   cmd: string | null
   input_channels: InputChannelConfig
+  /** **M3 — optional monitor binding**. `null` means "any monitor"
+   *  (legacy behavior). `Some(id)` binds this client to a specific
+   *  [`MonitorInfo.id`] so two clients at the same [`Position`] on
+   *  different physical monitors no longer collide. The id must
+   *  match one of the `MonitorInfo.id` values the daemon broadcasts
+   *  via [`MonitorsChanged`] events; the frontend dropdown sources
+   *  its option list from those.
+   *
+   *  Mirrors `lan_mouse_ipc::ClientConfig::monitor` (added in
+   *  STEP-3.1). `null` is what an old config (pre-M3) deserializes
+   *  to thanks to `#[serde(default)]` on the Rust side; we keep the
+   *  same null contract here so the dropdown's "Any (back-compat)"
+   *  option is naturally the empty / missing case. */
+  monitor: string | null
 }
 
 export interface ClientState {
@@ -133,6 +147,15 @@ export type FrontendRequest =
   | { UpdateHostname: [ClientHandle, string | null] }
   | { UpdatePort: [ClientHandle, number] }
   | { UpdatePosition: [ClientHandle, Position] }
+  /** **M3 — re-bind a client to a specific monitor** (or clear the
+   *  binding by passing `null`). Mirrors
+   *  `lan_mouse_ipc::FrontendRequest::UpdateMonitor` added in
+   *  STEP-3.1. The daemon responds with a fresh `State` event
+   *  carrying the new `ClientConfig.monitor` plus, if the new id
+   *  doesn't match any currently-enumerated monitor, a
+   *  `BindingInvalid` event surfaced by ConnectionRow as a red
+   *  badge. */
+  | { UpdateMonitor: [ClientHandle, string | null] }
   | { UpdateFixIps: [ClientHandle, string[]] }
   | { EnableCapture: null }
   | { EnableEmulation: null }

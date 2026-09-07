@@ -6,7 +6,9 @@ import type {
   ConnState,
   DaemonSocket,
   FrontendEvent,
+  FrontendRequest,
   InitialInfo,
+  MonitorInfo,
   Position,
   Status,
   Toast,
@@ -54,6 +56,18 @@ export interface DaemonStore {
    *  event after WS open. Changes via `setQuicIdleTimeout` only
    *  take effect on the next daemon restart. */
   quicIdleTimeoutSecs: number
+  /** **STEP-M3-3.2 — latest known host monitor list**. Source of
+   *  truth for the `ConnectionRow` per-row monitor `<select>`. The
+   *  daemon pushes a fresh snapshot via the `MonitorsChanged` event
+   *  on startup and again on every hotplug. Empty array means "no
+   *  display backend active" or "haven't received the first event
+   *  yet" — both surface in the dropdown as the lone "Any
+   *  (back-compat)" option (matches the legacy pre-M3 behavior).
+   *
+   *  Replaced (not mutated in place) on each event so Vue's
+   *  `Array.from(state.monitors)` watchers in the templates pick up
+   *  the change cheaply. */
+  monitors: MonitorInfo[]
 }
 
 const state = reactive<DaemonStore>({
@@ -68,6 +82,7 @@ const state = reactive<DaemonStore>({
   toasts: [],
   info: null,
   quicIdleTimeoutSecs: 5,
+  monitors: [],
 })
 
 /** Mirrors the daemon connectivity state for the AppHeader pill.
@@ -122,7 +137,14 @@ function mergeClient(handle: ClientHandle, config: ClientConfig, cs: ClientState
   }
 }
 
-function applyEvent(event: FrontendEvent) {
+/** Dispatch a `FrontendEvent` into the singleton reactive store.
+ *
+ *  Exported as a **testable seam** so vitest can drive the
+ *  `MonitorsChanged → state.monitors` branch (and any future
+ *  state-only events) directly, without spinning up a
+ *  `DaemonSocket` mock. Mirrors the same seam pattern used for
+ *  `diffClientConfigPatch` at line 372. */
+export function applyEvent(event: FrontendEvent) {
   const key = Object.keys(event)[0] as keyof FrontendEvent
   const value = (event as Record<string, unknown>)[key]
 
@@ -209,19 +231,19 @@ function applyEvent(event: FrontendEvent) {
       state.quicIdleTimeoutSecs = (value as { idle_timeout_secs: number }).idle_timeout_secs
       break
     case 'MonitorsChanged':
-      // STEP-M2-2.6: the daemon pushes the latest host monitor
-      // list. M2 doesn't yet consume it in the UI (M3 will use
-      // it for the per-row monitor dropdown), but we acknowledge
-      // it so:
-      //   - the TypeScript switch stays exhaustive over the
-      //     FrontendEvent union (any new variant is a compile
-      //     error otherwise),
-      //   - a future debug overlay can render `state.monitors`
-      //     without re-wiring.
-      // Currently we drop the payload on the floor — `state` does
-      // not yet carry a `monitors` array (that field is M3's
-      // responsibility; see `next/PLAN-1-POSITION-MULTI-MONITOR.md`
-      // §M3 STEP-3.2).
+      // **STEP-M3-3.2**: the daemon pushes the latest host monitor
+      // list. Replace (not splice) the cached array so any
+      // ConnectionRow `<select>` bound to `Array.from(state.monitors)`
+      // re-renders. The daemon sends a snapshot on startup and again
+      // on every hotplug; the `BindingInvalid` reconciliation
+      // happens server-side (STEP-M2-2.6) and is delivered as a
+      // separate `BindingInvalid` event — we don't try to mirror that
+      // here, just keep the list current.
+      //
+      // STEP-M2-2.6 was the first wire-up (no-op) that kept the
+      // union exhaustive; this step is what actually powers the
+      // dropdown.
+      state.monitors = value as MonitorInfo[]
       break
     case 'BindingInvalid': {
       // STEP-M2-2.6: stamp the human-readable reason onto the
@@ -324,18 +346,58 @@ export function removeAuthorizedKey(fp: string) {
 export function updateClientConfig(handle: ClientHandle, patch: Partial<ClientConfig>) {
   const conn = state.clients.get(handle)
   if (!conn) return
-  if (patch.hostname !== undefined && patch.hostname !== conn.config.hostname)
-    getSocket().request({
-      UpdateHostname: [handle, patch.hostname || null],
-    })
-  if (patch.port !== undefined && patch.port !== conn.config.port)
-    getSocket().request({ UpdatePort: [handle, patch.port] })
-  if (patch.pos !== undefined && patch.pos !== conn.config.pos)
-    getSocket().request({ UpdatePosition: [handle, patch.pos] })
+  const requests = diffClientConfigPatch(handle, conn.config, patch)
+  for (const req of requests) getSocket().request(req)
+}
+
+/** Pure helper that turns a `Partial<ClientConfig>` patch into the
+ *  minimum set of `FrontendRequest`s the daemon must receive.
+ *
+ *  Splits out so the per-field diff logic can be unit-tested
+ *  without touching the live socket singleton — vitest passes a
+ *  synthetic `current` config + patch, gets back the requests, and
+ *  asserts no request is emitted when the patch is a no-op
+ *  (e.g. reselecting the same monitor in the dropdown).
+ *
+ *  Rules:
+ *  - `hostname`: undefined → ignore; empty string → null
+ *    (consistent with the legacy Vue implementation that called
+ *    `patch.hostname || null`).
+ *  - `port`: undefined → ignore; sent as `UpdatePort`.
+ *  - `pos`: undefined → ignore; sent as `UpdatePosition`.
+ *  - `input_channels`: undefined → ignore; sent as
+ *    `SetClientInputChannels` whenever the field is present in the
+ *    patch (this mirrors the legacy semantics that treated every
+ *    channel mutation as authoritative; the call site in
+ *    ConnectionRow already skips the call when the value hasn't
+ *    changed).
+ *  - **monitor (M3)**: undefined → ignore; `null` / string → sent
+ *    as `UpdateMonitor` only when the value actually differs from
+ *    `current.monitor` (so re-selecting the same monitor in the
+ *    dropdown is a wire no-op).
+ */
+export function diffClientConfigPatch(
+  handle: ClientHandle,
+  current: ClientConfig,
+  patch: Partial<ClientConfig>,
+): FrontendRequest[] {
+  const out: FrontendRequest[] = []
+  if (patch.hostname !== undefined && patch.hostname !== current.hostname)
+    out.push({ UpdateHostname: [handle, patch.hostname || null] })
+  if (patch.port !== undefined && patch.port !== current.port)
+    out.push({ UpdatePort: [handle, patch.port] })
+  if (patch.pos !== undefined && patch.pos !== current.pos)
+    out.push({ UpdatePosition: [handle, patch.pos] })
   if (patch.input_channels !== undefined)
-    getSocket().request({
-      SetClientInputChannels: [handle, patch.input_channels],
-    })
+    out.push({ SetClientInputChannels: [handle, patch.input_channels] })
+  // Normalize the empty-string sentinel (the `<option value="">`
+  // "Any (back-compat)" entry in ConnectionRow) to `null` so it's
+  // diffed against the canonical "unbound" form — mirrors the
+  // `patch.hostname || null` pattern above.
+  const monitorValue = patch.monitor === '' ? null : patch.monitor
+  if (monitorValue !== undefined && monitorValue !== current.monitor)
+    out.push({ UpdateMonitor: [handle, monitorValue] })
+  return out
 }
 
 export function resolveDns(handle: ClientHandle) {
