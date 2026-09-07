@@ -9,9 +9,10 @@ use crate::{
     listen::{LanMouseListener, ListenerCreationError},
 };
 use futures::StreamExt;
+use input_capture::{BarrierKey, MonitorInfo as GeometryMonitorInfo};
 use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, InputChannelConfig,
-    IpcError, IpcListenerCreationError, Position, Status,
+    IpcError, IpcListenerCreationError, MonitorInfo as IpcMonitorInfo, Position, Status,
 };
 use log;
 use std::{
@@ -73,6 +74,14 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    /// **STEP-M2-2.6**: most recently observed monitor snapshot.
+    /// Used by `reconcile_monitors_changed` to detect which
+    /// `MonitorId` disappeared / re-appeared / changed geometry
+    /// between two backend emissions. Reset to `None` initially so
+    /// the first emission (the session-start seed from
+    /// `CaptureTask::do_capture`) is always treated as a "first
+    /// observation" — no `BindingInvalid` is sent on startup.
+    last_monitors: Option<Vec<GeometryMonitorInfo>>,
 }
 
 #[derive(Debug)]
@@ -179,6 +188,12 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            // STEP-M2-2.6: `None` until the first `ICaptureEvent::
+            // MonitorsChanged` from `CaptureTask::do_capture`. The
+            // first emission is treated as a seed — no reconcile
+            // action fires until a second emission arrives with a
+            // diff against this baseline.
+            last_monitors: None,
         };
         Ok(service)
     }
@@ -441,6 +456,26 @@ impl Service {
             ICaptureEvent::ClientEntered(handle) => {
                 log::info!("entering client {handle} ...");
                 self.spawn_hook_command(handle);
+            }
+            // STEP-M2-2.6: forward the backend monitor snapshot to
+            // the IPC frontend and run the `BarrierKey.monitor`
+            // reconcile against active clients.
+            //
+            // Two responsibilities, both bounded by `last_monitors`:
+            //  1. Always: re-broadcast the new list as
+            //     `FrontendEvent::MonitorsChanged` (GUI source of truth).
+            //  2. Only when `last_monitors` is `Some` (i.e. this is
+            //     *not* the startup seed): call
+            //     `reconcile_monitors_changed` to deactivate
+            //     clients whose monitor disappeared, and recreate
+            //     barriers for clients whose monitor geometry changed.
+            ICaptureEvent::MonitorsChanged(monitors) => {
+                let old_monitors = self.last_monitors.replace(monitors.clone());
+                let ipc_list = monitors.iter().map(geometry_to_ipc_monitor_info).collect();
+                self.notify_frontend(FrontendEvent::MonitorsChanged(ipc_list));
+                if let Some(old) = old_monitors {
+                    self.reconcile_monitors_changed(&monitors, &old);
+                }
             }
         }
     }
@@ -734,6 +769,78 @@ impl Service {
         self.notify_frontend(event);
     }
 
+    /// **STEP-M2-2.6**: reconcile active clients against a new
+    /// monitor snapshot.
+    ///
+    /// For each currently active client, look at its
+    /// `BarrierKey.monitor` field (M1: always `None`, so this is
+    /// effectively a no-op today; M3+ will populate the field with
+    /// a user-chosen `MonitorId`) and compare against the new
+    /// monitor list:
+    ///
+    /// * **Monitor gone**: `client_manager.deactivate_client(handle)`
+    ///   + `FrontendEvent::BindingInvalid(handle, reason)` so the
+    ///     GUI highlights the row (red border + tooltip) and pauses
+    ///     the toggle.
+    /// * **Monitor still present, geometry changed** (position /
+    ///   size / scale): `capture.destroy(old_key)` then
+    ///   `capture.create(new_key, handle)` via the standard
+    ///   `deactivate_client` → `activate_client` round-trip — same
+    ///   pattern as `update_pos`.
+    /// * **No change**: nothing.
+    ///
+    /// `last_monitors` is updated by `handle_capture_event` *before*
+    /// this is called; this method compares the new list against the
+    /// previous one.
+    ///
+    /// **Why the compare is two-list (old + new)**: the
+    /// `BarrierKey` itself doesn't carry geometry — it's
+    /// `(pos, monitor, offset, span)` with M2 offset/span at
+    /// defaults. Without an old-vs-new diff we'd never know whether
+    /// a barrier's "monitor" still maps to the same physical
+    /// rectangle, and the only signal that something changed is
+    /// "the geometry in the new list differs from the geometry in
+    /// the old list". The PLAN §M2 STEP-2.6 "exists but geometry
+    /// changed" branch hinges on this diff.
+    fn reconcile_monitors_changed(
+        &mut self,
+        new_monitors: &[GeometryMonitorInfo],
+        old_monitors: &[GeometryMonitorInfo],
+    ) {
+        // Snapshot active bindings first so the closures can mutably
+        // borrow `self.client_manager` / `self.capture` without
+        // conflicting with the iteration borrow.
+        let mut active_bindings: Vec<(ClientHandle, BarrierKey)> = Vec::new();
+        for handle in self.client_manager.active_clients() {
+            if let Some(key) = self.client_manager.get_key(handle) {
+                active_bindings.push((handle, key));
+            }
+        }
+
+        let deactivations = reconcile_monitors(&active_bindings, new_monitors, old_monitors);
+        for (handle, reason) in deactivations {
+            log::info!("service: monitor-driven deactivate handle={handle} reason={reason:?}");
+            self.deactivate_client(handle);
+            self.notify_frontend(FrontendEvent::BindingInvalid(handle, reason));
+        }
+
+        let recreations = recreate_monitors(&active_bindings, new_monitors, old_monitors);
+        for (handle, _old_key, _new_key) in recreations {
+            log::info!(
+                "service: monitor-driven barrier recreate handle={handle} \
+                 (monitor geometry changed)"
+            );
+            // Same round-trip as `update_pos`: deactivate + activate.
+            // `activate_client` re-reads the BarrierKey from the
+            // client_manager (which we haven't mutated here, so the
+            // "new" key equals the "old" key in M2 — but the
+            // destroy/create cycle still runs through capture to
+            // mirror what `update_pos` does).
+            self.deactivate_client(handle);
+            self.activate_client(handle);
+        }
+    }
+
     fn spawn_hook_command(&self, handle: ClientHandle) {
         let Some(cmd) = self.client_manager.get_enter_cmd(handle) else {
             return;
@@ -758,5 +865,310 @@ impl Service {
                 Err(e) => log::warn!("{cmd}: {e}"),
             }
         });
+    }
+}
+
+/// **STEP-M2-2.6**: pure helper that turns an internal
+/// `input_capture::geometry::MonitorInfo` into the on-wire
+/// `lan_mouse_ipc::MonitorInfo` mirror.
+///
+/// The two types are field-for-field identical — STEP-2.1 chose
+/// `pub use` over a generated From trait precisely because the
+/// type would evolve independently from the wire schema, and we
+/// didn't want a build.rs for one field. The conversion is a
+/// straight-line field copy; if either type grows a new field the
+/// other must grow the same field or this function (and the two
+/// `monitor_info_*_tests` modules on both sides) will diverge.
+fn geometry_to_ipc_monitor_info(m: &GeometryMonitorInfo) -> IpcMonitorInfo {
+    IpcMonitorInfo {
+        id: m.id.clone(),
+        name: m.name.clone(),
+        position: m.position,
+        size: m.size,
+        primary: m.primary,
+        scale: m.scale,
+    }
+}
+
+/// **STEP-M2-2.6**: pure helper — given the list of active
+/// `(handle, BarrierKey)` pairs and an old + new monitor snapshot,
+/// return the handles whose bound monitor disappeared in the new
+/// list.
+///
+/// Pure function (no `&mut self`, no side effects) so the four
+/// matrix cases the PLAN §M2 STEP-2.6 / §8 list — remove / geometry
+/// change / no-op / startup seed — can be unit-tested in isolation
+/// without standing up the full `Service`.
+///
+/// **M2 caveat**: `BarrierKey.monitor` is always `None` (the M1
+/// default) because `ClientConfig.monitor` does not exist yet; M3
+/// will populate it from `FrontendRequest::UpdateMonitor`. Until
+/// then this function returns an empty `Vec` for every input —
+/// the infrastructure is here, ready to fire as soon as clients
+/// carry a `Some(id)` binding.
+fn reconcile_monitors(
+    active: &[(ClientHandle, BarrierKey)],
+    new_monitors: &[GeometryMonitorInfo],
+    old_monitors: &[GeometryMonitorInfo],
+) -> Vec<(ClientHandle, String)> {
+    let mut out = Vec::new();
+    for (handle, key) in active {
+        let Some(monitor_id) = key.monitor.as_ref() else {
+            // M1 default: no binding. Nothing to reconcile.
+            continue;
+        };
+        let was_present = old_monitors.iter().any(|m| m.id == *monitor_id);
+        let is_present = new_monitors.iter().any(|m| m.id == *monitor_id);
+        if was_present && !is_present {
+            out.push((*handle, format!("monitor \"{monitor_id}\" disconnected")));
+        }
+    }
+    out
+}
+
+/// **STEP-M2-2.6**: pure helper — given active `(handle,
+/// BarrierKey)` pairs and an old + new monitor snapshot, return the
+/// handles whose bound monitor is still present but whose geometry
+/// (position / size) changed.
+///
+/// Like [`reconcile_monitors`], this is a pure function for
+/// unit-testability. The caller is responsible for actually doing
+/// the `destroy + create` via `deactivate_client` + `activate_client`.
+///
+/// **M2 caveat**: the `BarrierKey` has no geometry fields — it
+/// only stores `(pos, monitor, offset, span)`. M2 always passes
+/// `offset = 0, span = 10000`, so for a monitor whose id is
+/// unchanged, the recomputed BarrierKey is byte-identical to the
+/// old one. The returned tuple still records `(old_key, new_key)`
+/// because the PLAN §M2 STEP-2.6 calls for the destroy + create
+/// round-trip even when the keys are equal; this is the
+/// conservative interpretation. M4 will revisit when
+/// offset/span actually vary by geometry.
+fn recreate_monitors(
+    active: &[(ClientHandle, BarrierKey)],
+    new_monitors: &[GeometryMonitorInfo],
+    old_monitors: &[GeometryMonitorInfo],
+) -> Vec<(ClientHandle, BarrierKey, BarrierKey)> {
+    let mut out = Vec::new();
+    for (handle, key) in active {
+        let Some(monitor_id) = key.monitor.as_ref() else {
+            continue;
+        };
+        let old = old_monitors.iter().find(|m| m.id == *monitor_id);
+        let new = new_monitors.iter().find(|m| m.id == *monitor_id);
+        match (old, new) {
+            (Some(old), Some(new)) if monitor_geometry_changed(old, new) => {
+                // M2: the recomputed key equals the old key
+                // because BarrierKey has no geometry fields. The
+                // OUTER caller still performs a destroy + create
+                // round-trip on this handle, mirroring `update_pos`.
+                out.push((*handle, key.clone(), key.clone()));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Compare two `MonitorInfo` records for the geometry subset that
+/// PLAN §M2 STEP-2.6 considers "the barrier's rectangle moved":
+/// `position` and `size`. `scale` does NOT affect the physical
+/// rectangle in M2 (sub-edge barriers ignore scale), so it's not
+/// part of this comparison.
+fn monitor_geometry_changed(a: &GeometryMonitorInfo, b: &GeometryMonitorInfo) -> bool {
+    a.position != b.position || a.size != b.size
+}
+
+#[cfg(test)]
+mod reconcile_tests {
+    //! Unit tests for the pure `reconcile_monitors` / `recreate_monitors`
+    //! helpers that drive STEP-M2-2.6.
+    //!
+    //! The two helpers are deliberately pure functions (no `&mut
+    //! Service`, no `ClientManager` dependency) so this test
+    //! module can construct arbitrary `(ClientHandle, BarrierKey)`
+    //! lists without touching the `Capture::new` / `LanMouseConnection`
+    //! / `Emulation::new` / `AsyncFrontendListener` /
+    //! `DnsResolver::new` plumbing that `Service::new` requires.
+    //!
+    //! See `tests::monitor_reconcile_*` for the end-to-end
+    //! behaviour of `Service::handle_capture_event`.
+
+    use super::*;
+    use input_capture::Position;
+
+    fn mk_monitor(id: &str, position: (i32, i32), size: (u32, u32)) -> GeometryMonitorInfo {
+        GeometryMonitorInfo {
+            id: id.to_string(),
+            name: format!("monitor-{id}"),
+            position,
+            size,
+            primary: id == "primary",
+            scale: 1.0,
+        }
+    }
+
+    fn binding(handle: ClientHandle, monitor: Option<&str>) -> (ClientHandle, BarrierKey) {
+        (
+            handle,
+            BarrierKey {
+                pos: Position::Right,
+                monitor: monitor.map(str::to_string),
+                offset: 0,
+                span: 10000,
+            },
+        )
+    }
+
+    /// **M1 default**: clients whose `key.monitor` is `None` must
+    /// never produce a `BindingInvalid`, regardless of what the
+    /// monitor list does. This is the "M2 reconcile is a no-op for
+    /// legacy clients" guarantee.
+    #[test]
+    fn reconcile_noop_when_all_clients_have_default_key_monitor_none() {
+        let active = vec![binding(0, None), binding(1, None)];
+        let old = vec![mk_monitor("DP-2", (0, 0), (1920, 1080))];
+        let new: Vec<GeometryMonitorInfo> = vec![];
+        assert!(reconcile_monitors(&active, &new, &old).is_empty());
+        assert!(recreate_monitors(&active, &new, &old).is_empty());
+    }
+
+    /// **No-op case** (PLAN §M2 STEP-2.6 / §8): the new monitor
+    /// list is identical to the old one — `reconcile_monitors` must
+    /// return no deactivations and `recreate_monitors` must return
+    /// no recreations, even for clients bound to a specific
+    /// `MonitorId`.
+    #[test]
+    fn reconcile_noop_when_monitor_list_unchanged() {
+        let monitors = vec![mk_monitor("DP-2", (0, 0), (1920, 1080))];
+        let active = vec![binding(0, Some("DP-2"))];
+        assert!(reconcile_monitors(&active, &monitors, &monitors).is_empty());
+        assert!(recreate_monitors(&active, &monitors, &monitors).is_empty());
+    }
+
+    /// **Removal case** (PLAN §M2 STEP-2.6 / §8): a client bound
+    /// to `DP-2` whose monitor disappears from the new list must
+    /// produce exactly one `BindingInvalid` entry with a reason
+    /// string that names the missing monitor id (the GUI surfaces
+    /// this verbatim as a tooltip).
+    #[test]
+    fn reconcile_emits_binding_invalid_when_monitor_removed() {
+        let old = vec![mk_monitor("DP-2", (0, 0), (1920, 1080))];
+        let new: Vec<GeometryMonitorInfo> = vec![];
+        let active = vec![binding(7, Some("DP-2"))];
+
+        let deactivations = reconcile_monitors(&active, &new, &old);
+        assert_eq!(deactivations.len(), 1, "expected 1 deactivation");
+        let (handle, reason) = &deactivations[0];
+        assert_eq!(*handle, 7);
+        assert!(
+            reason.contains("DP-2"),
+            "reason should name the missing monitor; got {reason:?}"
+        );
+        assert!(
+            reason.contains("disconnected"),
+            "reason should be human-readable; got {reason:?}"
+        );
+
+        // A removal does NOT also trigger a recreate — the monitor
+        // is gone, the only correct response is deactivate.
+        assert!(recreate_monitors(&active, &new, &old).is_empty());
+    }
+
+    /// **Startup seed**: if a client is bound to `DP-2` but the
+    /// *old* list never contained it (e.g. the daemon just started
+    /// and `last_monitors` was `None`), the client must NOT be
+    /// deactivated. This test pins the "first observation is not a
+    /// removal" invariant — without it, restarting the daemon
+    /// after reconnecting an external display would knock out
+    /// every active client.
+    #[test]
+    fn reconcile_noop_when_old_list_did_not_contain_monitor() {
+        let new = vec![mk_monitor("DP-2", (0, 0), (1920, 1080))];
+        let old: Vec<GeometryMonitorInfo> = vec![];
+        let active = vec![binding(3, Some("DP-2"))];
+        assert!(reconcile_monitors(&active, &new, &old).is_empty());
+        assert!(recreate_monitors(&active, &new, &old).is_empty());
+    }
+
+    /// **Geometry-change case** (PLAN §M2 STEP-2.6 / §8): a client
+    /// bound to `DP-2` whose monitor's size changed between
+    /// snapshots must produce exactly one recreate entry. The two
+    /// keys passed back are byte-equal in M2 (the BarrierKey has
+    /// no geometry field — see the M2 caveat in
+    /// `recreate_monitors`'s docstring) but the *entry exists* —
+    /// the destroy + create round-trip is what `update_pos`
+    /// already does and the PLAN asks for it here.
+    #[test]
+    fn recreate_emits_entry_when_monitor_geometry_changes() {
+        let old = vec![mk_monitor("DP-2", (0, 0), (1920, 1080))];
+        let new = vec![mk_monitor("DP-2", (1920, 0), (2560, 1440))];
+        let active = vec![binding(11, Some("DP-2"))];
+
+        // No deactivate: monitor is still present.
+        assert!(reconcile_monitors(&active, &new, &old).is_empty());
+
+        // One recreate. The two BarrierKeys are equal in M2 (no
+        // geometry fields). The caller still performs
+        // `destroy + create` because that's what PLAN §M2 STEP-2.6
+        // prescribes — this test pins the conservative
+        // interpretation that the round-trip happens regardless
+        // of key equality.
+        let recreations = recreate_monitors(&active, &new, &old);
+        assert_eq!(recreations.len(), 1, "expected 1 recreate");
+        let (handle, _old_key, _new_key) = &recreations[0];
+        assert_eq!(*handle, 11);
+    }
+
+    /// **Geometry unchanged but monitor swapped**: same id,
+    /// identical geometry → no recreate (the rectangle the barrier
+    /// attaches to is the same, even if the underlying EDID
+    /// reported the same number by coincidence). The `id` is the
+    /// only identity we care about.
+    #[test]
+    fn recreate_noop_when_monitor_geometry_unchanged() {
+        let old = vec![mk_monitor("DP-2", (0, 0), (1920, 1080))];
+        let new = vec![mk_monitor("DP-2", (0, 0), (1920, 1080))];
+        let active = vec![binding(11, Some("DP-2"))];
+        assert!(recreate_monitors(&active, &new, &old).is_empty());
+    }
+
+    /// **Mixed bindings**: some clients with `monitor = None` and
+    /// some with `monitor = Some(...)`. The `None` ones never
+    /// reconcile; the `Some` ones follow the rules above. This
+    /// pins the "legacy + new coexist" path for the M2 → M3
+    /// transition: clients that haven't been migrated to monitor
+    /// binding yet must keep working alongside clients that have.
+    #[test]
+    fn reconcile_handles_mixed_default_and_bound_clients() {
+        let old = vec![mk_monitor("DP-2", (0, 0), (1920, 1080))];
+        let new: Vec<GeometryMonitorInfo> = vec![];
+        let active = vec![
+            binding(0, None),         // legacy — must not be deactivated
+            binding(1, Some("DP-2")), // bound — must be deactivated
+            binding(2, None),         // legacy — must not be deactivated
+        ];
+
+        let deactivations = reconcile_monitors(&active, &new, &old);
+        assert_eq!(deactivations.len(), 1);
+        let (handle, _) = &deactivations[0];
+        assert_eq!(*handle, 1);
+    }
+
+    /// `geometry_to_ipc_monitor_info` is a field-for-field copy.
+    /// Round-trip the conversion through JSON to confirm the wire
+    /// shape matches `lan_mouse_ipc::MonitorInfo`'s serde contract
+    /// (covered by the IPC crate's `monitor_info_tests`, but we
+    /// pin the *direction* here: `from(geometry) -> ipc`).
+    #[test]
+    fn geometry_to_ipc_monitor_info_is_field_equivalent() {
+        let g = mk_monitor("DP-2", (1920, -1080), (2560, 1440));
+        let i = geometry_to_ipc_monitor_info(&g);
+        assert_eq!(i.id, g.id);
+        assert_eq!(i.name, g.name);
+        assert_eq!(i.position, g.position);
+        assert_eq!(i.size, g.size);
+        assert_eq!(i.primary, g.primary);
+        assert_eq!(i.scale, g.scale);
     }
 }

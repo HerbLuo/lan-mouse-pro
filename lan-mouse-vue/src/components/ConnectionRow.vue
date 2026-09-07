@@ -26,7 +26,11 @@ function setChannel(key: 'mouse_button' | 'keyboard', ev: Event) {
 </script>
 
 <template>
-  <div class="row">
+  <div
+    class="row"
+    :class="{ invalid: connection.invalidReason != null }"
+    :title="connection.invalidReason ?? ''"
+  >
     <div :class="{ summary: true, expand: connection.expanded }">
       <div style="display: flex; justify-content: flex-start">
         <label class="connection-toggle" style="margin-right: 12px">
@@ -40,6 +44,19 @@ function setChannel(key: 'mouse_button' | 'keyboard', ev: Event) {
         <div class="title">
           <div class="name">
             {{ connection.config.hostname || `client #${connection.handle}` }}
+            <!-- STEP-M2-2.6: badge surfaces the
+                 BindingInvalid reason without forcing the user
+                 to expand the row. The native `title=` on the
+                 wrapping `<div class="row">` carries the same
+                 string for the hover tooltip, so the badge
+                 text and the tooltip stay in sync visually. -->
+            <span
+              v-if="connection.invalidReason"
+              class="invalid-badge"
+              :title="connection.invalidReason"
+            >
+              ⚠ invalid
+            </span>
           </div>
           <div
             class="meta"
@@ -176,6 +193,34 @@ function setChannel(key: 'mouse_button' | 'keyboard', ev: Event) {
   border: var(--border);
   border-radius: 2px;
   padding: 12px;
+}
+/* STEP-M2-2.6: visually flag a row whose bound monitor
+   disappeared. Red outline + faint pink fill so the badge
+   reads even on a low-contrast monitor, and the cursor
+   `cursor: not-allowed` over the toggle signals "you can't
+   re-arm this until you do something". The fill is light
+   enough to leave the row text readable. */
+.row.invalid {
+  border: 1px solid #d33;
+  background: rgba(221, 51, 51, 0.06);
+}
+.row.invalid .connection-toggle {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+/* Inline badge next to the client name; the wrapping
+   `<div class="row">` also carries the same `title=` so
+   the OS-native hover tooltip shows the full reason. */
+.invalid-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: #d33;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  vertical-align: middle;
 }
 .summary {
   display: flex;

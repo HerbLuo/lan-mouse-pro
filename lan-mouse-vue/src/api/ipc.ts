@@ -97,6 +97,31 @@ export type FrontendEvent =
   | { IncomingDisconnected: string }
   | { ConnectionAttempt: { fingerprint: string } }
   | { QuicConfig: { idle_timeout_secs: number } }
+  /** STEP-M2-2.6: latest known host monitor list (id / name /
+   *  position / size / primary / scale). Mirrors the daemon's
+   *  `lan_mouse_ipc::FrontendEvent::MonitorsChanged`. M3 will
+   *  consume this for the per-row monitor dropdown; M2 only
+   *  receives it so the variant is recognized (and the TypeScript
+   *  union is exhaustive with respect to the wire). */
+  | { MonitorsChanged: MonitorInfo[] }
+  /** STEP-M2-2.6: the daemon deactivated an active client whose
+   *  bound monitor disappeared. `reason` is a human-readable
+   *  string such as `monitor "DP-2" disconnected` — surfaced
+   *  verbatim as a tooltip on the ConnectionRow. */
+  | { BindingInvalid: [ClientHandle, string] }
+
+/** STEP-M2-2.6: mirrors `lan_mouse_ipc::MonitorInfo` (and the
+ *  geometry crate's internal `MonitorInfo` — the two are
+ *  field-for-field identical; the daemon service does the
+ *  conversion at the IPC boundary). */
+export interface MonitorInfo {
+  id: string
+  name: string
+  position: [number, number]
+  size: [number, number]
+  primary: boolean
+  scale: number
+}
 
 export type FrontendRequest =
   | { Activate: [ClientHandle, boolean] }

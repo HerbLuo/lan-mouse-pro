@@ -19,6 +19,23 @@ const PENDING_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 /// actual cancellation at 500–600ms).
 const PENDING_TICK_INTERVAL: Duration = Duration::from_millis(100);
 
+/// **STEP-M2-2.6**: poll interval for detecting monitor hot-plug.
+///
+/// The backend's internal `watch::Sender<Vec<MonitorInfo>>` channel
+/// surfaces display add/remove/resize events in <100ms, but the
+/// `Capture` trait object erases it — subscribers can only reach
+/// `Capture::monitors(&self) -> Vec<MonitorInfo>` through the trait.
+///
+/// Polling at 1 Hz is the architectural workaround: cheap
+/// (`monitors()` is a `borrow().clone()` over a small Vec), and
+/// well within human-perceptible hot-plug latency (a user
+/// physically unplugging a display takes hundreds of ms before the
+/// OS even reports it, so sub-second polling only adds margin).
+/// Dedup against `last_monitors` ensures the
+/// `ICaptureEvent::MonitorsChanged` stream only fires on actual
+/// backend changes.
+const MONITOR_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 // === Watchdog self-healing ====================================================
 //
 // Background: previous fixes covered "`State::Sending` residue after
@@ -197,6 +214,27 @@ pub(crate) enum ICaptureEvent {
     /// either the remote client leaving its device region,
     /// a new device entering the screen or the release bind.
     ClientEntered(u64),
+    /// **STEP-M2-2.6**: snapshot of the backend's current monitor
+    /// list. Emitted once at session start (seed for the frontend's
+    /// `FrontendEvent::MonitorsChanged`) and again whenever the
+    /// 1 Hz poll detects a change (hot-plug).
+    ///
+    /// `service.rs` consumes this in `handle_capture_event` and
+    /// fans it out to the IPC frontend + runs the
+    /// `BarrierKey.monitor` reconcile against active clients.
+    ///
+    /// Source: `CaptureTask::do_capture_session` polls
+    /// `InputCapture::monitors()` (which forwards to the backend
+    /// trait's `monitors()` impl — see `input_capture::lib.rs`)
+    /// and dedupes against the previously emitted list before
+    /// sending. 1 Hz polling is the architectural workaround for
+    /// not having `monitor_changes()` exposed through the `Capture`
+    /// trait object — backend-specific `watch::Receiver`s are
+    /// available on each concrete backend, but the trait object
+    /// erases them. PLANNED for M3+: revisit when the barrier-key
+    /// monitor binding goes from `Option::None` default to user-
+    /// selected.
+    MonitorsChanged(Vec<input_capture::MonitorInfo>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,6 +303,8 @@ impl Capture {
             // `Option<T>` and leaves the receiver alive for the next
             // call. No swap is needed between sessions.
             peer_lost_rx,
+            // STEP-M2-2.6: tracked by `do_capture_session` for poll-dedup.
+            last_monitors: Vec::new(),
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -393,6 +433,15 @@ struct CaptureTask {
     /// calls — `local_channel::mpsc::Receiver::recv()` leaves the
     /// receiver alive on `None` returns.
     peer_lost_rx: Receiver<ClientHandle>,
+    /// **STEP-M2-2.6**: most recently emitted monitor snapshot.
+    /// Used to dedup the 1 Hz poll result against the previous
+    /// emission so the `ICaptureEvent::MonitorsChanged` stream only
+    /// fires on actual backend changes (otherwise watch-channel-
+    /// dedup at the backend is wasted by an up-cast that always
+    /// emits). Reset to `Vec::new()` at the start of every
+    /// `do_capture` so a session restart can re-emit the initial
+    /// snapshot even if the new backend reports the same list.
+    last_monitors: Vec<input_capture::MonitorInfo>,
 }
 
 /// Watchdog self-healing state:
@@ -545,6 +594,18 @@ impl CaptureTask {
             _ = self.cancellation_token.cancelled() => return Ok(()),
         };
 
+        // STEP-M2-2.6: seed the initial monitor snapshot on every
+        // session start (the previous `last_monitors` is reset to
+        // empty inside `do_capture_session` so the dedup comparison
+        // always takes this path on a fresh backend, even if the
+        // list is identical to the previous session's last seen
+        // value). Sends `ICaptureEvent::MonitorsChanged` which
+        // `service.rs` consumes to emit the very first
+        // `FrontendEvent::MonitorsChanged` to the GUI.
+        let initial = capture.monitors();
+        self.last_monitors = initial.clone();
+        let _ = self.event_tx.send(ICaptureEvent::MonitorsChanged(initial));
+
         let _capture_guard = DropGuard::new(
             self.event_tx.clone(),
             ICaptureEvent::CaptureEnabled,
@@ -626,6 +687,16 @@ impl CaptureTask {
             }
             (None, None)
         };
+
+        // STEP-M2-2.6: 1 Hz poll for monitor hot-plug. The initial
+        // snapshot was already emitted in `do_capture`; we skip the
+        // first immediate tick to avoid a redundant emission on the
+        // happy path. Dedup against `self.last_monitors` ensures we
+        // only fire `ICaptureEvent::MonitorsChanged` on a real
+        // change. See `MONITOR_POLL_INTERVAL` for the rationale.
+        let mut monitor_tick = tokio::time::interval(MONITOR_POLL_INTERVAL);
+        monitor_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        monitor_tick.tick().await;
 
         loop {
             tokio::select! {
@@ -928,6 +999,33 @@ impl CaptureTask {
                             "capture: PeerLost(handle={handle}) ignored (active_client={:?} mismatch)",
                             self.active_client
                         );
+                    }
+                }
+                // STEP-M2-2.6: monitor hot-plug poll. See
+                // `MONITOR_POLL_INTERVAL` for why we poll instead
+                // of subscribing to the backend's watch channel.
+                //
+                // Dedup against `self.last_monitors` — without
+                // this we'd emit on every tick even when nothing
+                // changed, polluting `service.rs`'s event stream
+                // and forcing it to re-broadcast
+                // `FrontendEvent::MonitorsChanged` (which the GUI
+                // would then re-render).
+                _ = monitor_tick.tick() => {
+                    let current = capture.monitors();
+                    if current != self.last_monitors {
+                        log::info!(
+                            "capture: monitor list changed ({} → {})",
+                            self.last_monitors.len(),
+                            current.len()
+                        );
+                        self.last_monitors = current.clone();
+                        if self.event_tx.send(ICaptureEvent::MonitorsChanged(current)).is_err() {
+                            // Receiver dropped (service shutting down).
+                            // Don't propagate; the cancellation token
+                            // will fire shortly and break the loop.
+                            log::debug!("capture: event_tx closed while sending MonitorsChanged");
+                        }
                     }
                 }
                 _ = self.cancellation_token.cancelled() => break,

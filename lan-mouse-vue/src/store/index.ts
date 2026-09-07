@@ -19,6 +19,18 @@ export interface Connection {
   config: ClientConfig
   state: ClientState
   expanded: boolean
+  /**
+   * STEP-M2-2.6: human-readable reason this client's binding was
+   * invalidated (e.g. `monitor "DP-2" disconnected`). `null` while
+   * the binding is healthy. The `ConnectionRow` renders a red
+   * border + tooltip when non-null and auto-clears on the next
+   * `State` event (which `activate_client` triggers after the
+   * user re-binds to a different monitor).
+   *
+   * Scoped per-handle, not global, so multiple clients can be
+   * invalid simultaneously without overwriting each other.
+   */
+  invalidReason: string | null
 }
 
 export interface DaemonStore {
@@ -92,12 +104,20 @@ function mergeClient(handle: ClientHandle, config: ClientConfig, cs: ClientState
   if (existing) {
     existing.config = config
     existing.state = cs
+    // STEP-M2-2.6: a fresh `State` event implies the daemon
+    // re-evaluated the binding (e.g. the user re-activated the
+    // client after picking a different monitor or after the
+    // unplugged display came back). Drop the previous invalid
+    // reason — the GUI badge / tooltip should not linger on
+    // a binding the daemon now considers healthy.
+    existing.invalidReason = null
   } else {
     state.clients.set(handle, {
       handle,
       config,
       state: cs,
       expanded: false,
+      invalidReason: null,
     })
   }
 }
@@ -188,6 +208,43 @@ function applyEvent(event: FrontendEvent) {
       // GeneralPanel.vue.
       state.quicIdleTimeoutSecs = (value as { idle_timeout_secs: number }).idle_timeout_secs
       break
+    case 'MonitorsChanged':
+      // STEP-M2-2.6: the daemon pushes the latest host monitor
+      // list. M2 doesn't yet consume it in the UI (M3 will use
+      // it for the per-row monitor dropdown), but we acknowledge
+      // it so:
+      //   - the TypeScript switch stays exhaustive over the
+      //     FrontendEvent union (any new variant is a compile
+      //     error otherwise),
+      //   - a future debug overlay can render `state.monitors`
+      //     without re-wiring.
+      // Currently we drop the payload on the floor — `state` does
+      // not yet carry a `monitors` array (that field is M3's
+      // responsibility; see `next/PLAN-1-POSITION-MULTI-MONITOR.md`
+      // §M3 STEP-3.2).
+      break
+    case 'BindingInvalid': {
+      // STEP-M2-2.6: stamp the human-readable reason onto the
+      // matching Connection so `ConnectionRow` can render the
+      // invalid badge + tooltip. The reason auto-clears on the
+      // next `State` event for this handle (see `mergeClient`).
+      // Silently ignored if the handle is unknown (e.g. the user
+      // deleted the client in the brief window between the daemon
+      // sending the event and the WS delivering it).
+      const [handle, reason] = value as [ClientHandle, string]
+      const conn = state.clients.get(handle)
+      if (conn) {
+        conn.invalidReason = reason
+      } else {
+        // No client by that handle — the daemon may have
+        // emitted the event right before our local delete
+        // landed. Log + drop.
+        console.warn(
+          `BindingInvalid for unknown handle ${handle} (reason: ${reason}); ignoring`,
+        )
+      }
+      break
+    }
   }
 }
 
