@@ -239,9 +239,7 @@ function applyEvent(event: FrontendEvent) {
         // No client by that handle — the daemon may have
         // emitted the event right before our local delete
         // landed. Log + drop.
-        console.warn(
-          `BindingInvalid for unknown handle ${handle} (reason: ${reason}); ignoring`,
-        )
+        console.warn(`BindingInvalid for unknown handle ${handle} (reason: ${reason}); ignoring`)
       }
       break
     }
