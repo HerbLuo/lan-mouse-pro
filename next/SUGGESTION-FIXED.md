@@ -39,6 +39,72 @@
 
 ---
 
+## #5 — STEP-M3-3.2 vitest 依赖安装被网络阻断
+
+- **触发 STEP**：M3 / STEP-M3-3.2
+- **现象**：`pnpm add -D vitest @vue/test-utils happy-dom` 在 `lan-mouse-vue/` 内两次尝试均失败：
+  - 第一次 `add -D` 在 partial-apply 后报 `ERR_PNPM_META_FETCH_FAIL`，package.json 未被改写，但 node_modules 目录里 7 个包（typescript / vue-tsc / @vue/compiler-core 等）被 pnpm 的 partial-resolve 阶段删除。
+  - 第二次 `pnpm install` 同样报 `ERR_PNPM_META_FETCH_FAIL`，无法重建。
+  - 直接 `curl https://registry.npmjs.org/vitest` 验证：`Resolving timed out after 5002ms`，npm registry 在本会话内不可达。
+- **根因**：用户机器直接出网受限（直连 npm registry 5s 超时）；非 pnpm / 仓库配置问题。
+- **解决方案**：
+  - leader 验证本机有 HTTP 代理 `127.0.0.1:8118` 可达（curl 200 in 0.96s）。
+  - executor 跑：
+    ```bash
+    export https_proxy=http://127.0.0.1:8118
+    export http_proxy=http://127.0.0.1:8118
+    pnpm install                                                       # Done in 27.7s
+    pnpm add -D vitest @vue/test-utils happy-dom                       # Done in 9.3s
+    ```
+  - 0 warnings / 0 errors / 3 新增 test devDeps (`vitest ^5.0.0` / `@vue/test-utils ^2.5.0` / `happy-dom ^20.14.0`)
+- **副作用（FIXUP 新发现）**：网络问题修了之后，vitest / vue-tsc 才有机会跑 → 暴露出 2 个 STEP-M3-3.2 留下的真 bug（`applyEvent` 未 export + `diffClientConfigPatch` 未 normalize monitor empty-string）。详见 `next/STEP-M3-3.2-FIXUP.md` 与 `next/SUGGESTION.md` #6 / #7。
+- **解决 STEP**：M3 / STEP-M3-3.2-FIXUP
+
+---
+
+## #6 — STEP-M3-3.2-FIXUP `applyEvent` 未暴露 testable seam
+
+- **触发 STEP**：M3 / STEP-M3-3.2-FIXUP
+- **现象**：`lan-mouse-vue/src/store/index.ts:140` 定义了 `function applyEvent(event: FrontendEvent)` 但没有 `export`。vitest 的 5 个 MonitorsChanged → state.monitors case 用 `const { applyEvent } = await import('./index')` 拿到的全是 `undefined`，全部 `TypeError: applyEvent is not a function`。
+- **根因**：STEP-M3-3.2 §3 抽出 `diffClientConfigPatch` 作为 testable seam 暴露了 `export`，但 `applyEvent`（真正驱动 `state.monitors` 写入的 reducer）漏了。STEP-M3-3.2 当时的 `updateClientConfig` wrapper 测试策略只覆盖了 `diffClientConfigPatch` 的纯函数维度，遗漏了 `applyEvent` 的事件维度。
+- **解决**（方案 A，leader 指示）：
+  - `lan-mouse-vue/src/store/index.ts:140` — 加 `export` 关键字 + JSDoc 标注"testable seam"，与同文件 `diffClientConfigPatch`（line 372）的 seam 模式保持一致。
+  - 名称保留 camelCase `applyEvent`（不按 Rust 习惯改 snake_case），与 Vue 端 camelCase 公共 API 约定一致。
+  - vitest 5 个 MonitorsChanged case 全绿。
+- **解决 STEP**：M3 / STEP-M3-3.2-FIXUP2
+
+## #7 — STEP-M3-3.2-FIXUP `diffClientConfigPatch` 未 normalize `monitor: ''` → `null`
+
+- **触发 STEP**：M3 / STEP-M3-3.2-FIXUP
+- **现象**：ConnectionRow.test.ts case C 失败：
+  ```
+  AssertionError: expected [ { UpdateMonitor: [ 7, '' ] } ] to deeply equal []
+  ```
+  - 测试假设 `diffClientConfigPatch(7, { monitor: null }, { monitor: '' })` → `[]`（`<option value="">` 的 "Any" sentinel 等同 null = no-op）
+  - 实现 `store/index.ts:386` `if (patch.monitor !== undefined && patch.monitor !== current.monitor) out.push(...)` 把 `''` 当成真值 string，输出 `[{ UpdateMonitor: [7, ''] }]`
+- **根因**：同函数 `hostname` 行已有 `patch.hostname || null` 的 normalize 模式（line 378-379），但 `monitor` 行没有复制这个约定。`ConnectionRow::setMonitor` 实际在调 `updateClientConfig` 前会把 `''` 转回 `null`，所以 **实际链路** 不会传 `''` —— 但 `diffClientConfigPatch` 是个 public 纯函数（已 export），单元测试有权假设边界规范化是它的契约。
+- **解决**（方案 A，leader 指示 — 实现侧 normalize）：
+  - `lan-mouse-vue/src/store/index.ts:393-399` — 加 `const monitorValue = patch.monitor === '' ? null : patch.monitor` 然后 diff 比较与 out.push 都用 normalized 值。
+  - 与 `patch.hostname || null` 模式一致，对外契约更宽松（调用方传 `''` / `null` 都视为 "Any"）。
+- **解决 STEP**：M3 / STEP-M3-3.2-FIXUP2
+
+## #8 — STEP-M3-3.2-FIXUP vitest `noUncheckedIndexedAccess` 噪音
+
+- **触发 STEP**：M3 / STEP-M3-3.2-FIXUP
+- **现象**：`pnpm type-check` 报 9 个 `Object is possibly 'undefined'` 错误，集中在 test 文件里（tsconfig 启用了 `noUncheckedIndexedAccess`，strict mode）：
+  - `ConnectionRow.test.ts:186, 190` — `opts[1]` / `opts[2]`（tooltip 测试）
+  - `ConnectionRow.test.ts:203` — `findAll('option')[0].text()`（legacy 单选项 fallback）
+  - `store/index.test.ts:165, 182` — `daemonStore.monitors[0].id`（hotplug / single monitor 测试）
+  - 加上 ConnectionRow.test.ts:5 `ClientConfig`/`ClientState`/`MonitorInfo` 3 个 type-re-export 错（也归到这一步处理）
+- **根因**：strict mode 下 array index access 返回 `T | undefined`。测试 fixture 已通过 `toHaveLength()` 或前序断言保证了索引存在，但 TS 不做跨语句的 narrowing。
+- **解决**（与 #6 / #7 合并到本 fixup，避免 STEP 数量膨胀）：
+  - `ConnectionRow.test.ts:186, 190, 203` — `opts[1]` / `opts[2]` / `opts[0]` 加 `!`（非空断言）
+  - `ConnectionRow.test.ts:203` — 同时把 `findAll('option')` 提取到 `const opts = sel.findAll('option')` 局部变量，让 `.toHaveLength(1)` 和 `opts[0]` 类型一致
+  - `ConnectionRow.test.ts:5` — 拆 type import：`Connection` 仍从 `@/store` import（它在那里 export）；`ClientConfig` / `ClientState` / `MonitorInfo` 改从 `@/api/ipc` import（这才是它们的真正定义地）
+  - `store/index.test.ts:165, 182` — `daemonStore.monitors[0]` 加 `!`
+  - **没** 关 `noUncheckedIndexedAccess`（它是项目已有 strict 设置，关掉会污染所有源码文件）
+- **解决 STEP**：M3 / STEP-M3-3.2-FIXUP2
+
 ## #4 — STEP-2.6 Vue store / api/ipc.ts 范围扩展（leader 接受）
 
 - **触发 STEP**：M2 / STEP-2.6
