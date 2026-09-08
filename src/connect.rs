@@ -106,7 +106,8 @@ pub(crate) struct LanMouseConnection {
     /// `read_stream_c_loop` runs in a hot loop and `send` is
     /// non-blocking; the receiver lives on the service's main
     /// loop (`Service::run`'s `select!` arm).
-    clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(std::net::SocketAddr, lan_mouse_proto::ProtoEvent)>,
+    clipboard_inbound_tx:
+        tokio::sync::mpsc::UnboundedSender<(std::net::SocketAddr, lan_mouse_proto::ProtoEvent)>,
 }
 
 impl LanMouseConnection {
@@ -117,6 +118,7 @@ impl LanMouseConnection {
     /// every `connect_to_handle` / supervisor's redial so all
     /// per-peer `set_clipboard_inbox` calls feed the same
     /// service-side dispatcher.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         client_endpoint: Endpoint,
         cert_chain: Vec<CertificateDer<'static>>,
@@ -125,7 +127,10 @@ impl LanMouseConnection {
         client_manager: ClientManager,
         idle_timeout: std::time::Duration,
         peer_lost_tx: Sender<ClientHandle>,
-        clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(std::net::SocketAddr, lan_mouse_proto::ProtoEvent)>,
+        clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(
+            std::net::SocketAddr,
+            lan_mouse_proto::ProtoEvent,
+        )>,
     ) -> Self {
         let (recv_tx, recv_rx) = channel();
         let quic_creds = Rc::new(QuicDialerCreds { cert_chain, key });
@@ -534,16 +539,19 @@ async fn connect_to_handle(
     // the receiver lives on `LanMouseConnection` and is consumed by
     // `capture.rs::do_capture_session` via [`LanMouseConnection::peer_lost`].
     peer_lost_tx: Sender<ClientHandle>,
-    /// **PLAN-2 / M1a STEP-1a.4** — sender for inbound clipboard
-    /// events. The successful-dial path calls
-    /// `peer.set_clipboard_inbox(Some(this.clone()))` so the
-    /// per-peer `read_stream_c_loop` (in
-    /// `quic_transport::streams`) can forward
-    /// `StreamEvent::ClipboardMeta` to the service's clipboard
-    /// dispatcher. The redial path (supervisor on peer death)
-    /// reuses the same sender so the new peer's inbox is
-    /// consistent with the old one's.
-    clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(std::net::SocketAddr, lan_mouse_proto::ProtoEvent)>,
+    // **PLAN-2 / M1a STEP-1a.4** — sender for inbound clipboard
+    // events. The successful-dial path calls
+    // `peer.set_clipboard_inbox(Some(this.clone()))` so the
+    // per-peer `read_stream_c_loop` (in
+    // `quic_transport::streams`) can forward
+    // `StreamEvent::ClipboardMeta` to the service's clipboard
+    // dispatcher. The redial path (supervisor on peer death)
+    // reuses the same sender so the new peer's inbox is
+    // consistent with the old one's.
+    clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(
+        std::net::SocketAddr,
+        lan_mouse_proto::ProtoEvent,
+    )>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     let Some(ips_set) = client_manager.get_ips(handle) else {
@@ -734,7 +742,8 @@ async fn connect_to_handle(
     // the event to the local OS clipboard. M1a only wires text;
     // image / file variants are M2a / M3a (the dispatcher drops
     // non-`ClipboardText` events for now).
-    peer.set_clipboard_inbox(Some(clipboard_inbound_tx.clone())).await;
+    peer.set_clipboard_inbox(Some(clipboard_inbound_tx.clone()))
+        .await;
 
     // Spawn the supervisor to take over the peer's lifecycle — when
     // `peer.run()` exits, it decides whether to trigger a RetryState reconnect.
@@ -831,7 +840,10 @@ async fn spawn_peer_supervisor(
     // dispatcher. Without sharing, the redial would push to a
     // throwaway channel and the dispatcher would never observe
     // clipboard events on the new connection.
-    clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(std::net::SocketAddr, lan_mouse_proto::ProtoEvent)>,
+    clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(
+        std::net::SocketAddr,
+        lan_mouse_proto::ProtoEvent,
+    )>,
 ) {
     log::info!("spawn_peer_supervisor: starting for handle {handle} addr {addr}");
 

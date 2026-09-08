@@ -23,9 +23,9 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use tokio::{process::Command, signal, sync::mpsc as tokio_mpsc, sync::Notify};
+use tokio::{process::Command, signal, sync::Notify, sync::mpsc as tokio_mpsc};
 
-use crate::clipboard::{default_backend, ClipboardBackend, ClipboardError};
+use crate::clipboard::{ClipboardBackend, default_backend};
 use lan_mouse_proto::{ClipboardText, ProtoEvent};
 use sha2::{Digest, Sha256};
 
@@ -131,6 +131,7 @@ pub struct Service {
     /// Kept on the struct (rather than passed by value) so the
     /// `Emulation` constructed in `Service::new` retains its
     /// sender for the daemon's lifetime.
+    #[allow(dead_code)]
     clipboard_inbound_tx: tokio_mpsc::UnboundedSender<(SocketAddr, ProtoEvent)>,
     /// **M1a STEP-1a.4** — 500 ms tick for the clipboard poll
     /// loop. `tokio::time::Interval` is `select!`-compatible so
@@ -197,6 +198,7 @@ impl LruFingerprints {
     /// to assert "marked" vs "not marked" without exposing the
     /// `VecDeque` to the test code.
     #[cfg(test)]
+    #[allow(dead_code)]
     fn len(&self) -> usize {
         self.items.len()
     }
@@ -304,19 +306,13 @@ impl Service {
                 Some(b)
             }
             Err(e) => {
-                log::warn!(
-                    "clipboard backend unavailable (clipboard sync disabled): {e}"
-                );
+                log::warn!("clipboard backend unavailable (clipboard sync disabled): {e}");
                 None
             }
         };
 
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(
-            emulation_backend,
-            listener,
-            clipboard_inbound_tx.clone(),
-        );
+        let emulation = Emulation::new(emulation_backend, listener, clipboard_inbound_tx.clone());
 
         // create dns resolver
         let resolver = DnsResolver::new()?;

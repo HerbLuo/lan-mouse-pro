@@ -135,3 +135,24 @@
   - `Cargo.toml`：`bytes = "1"`（生产）+ `h3 = "0.0.8"` + `h3-quinn = "0.0.10"` + `rand = "0.8"`（dev-deps for spike）。
 - **Plan 偏差**：无功能偏差；Path 1 决策依据细化（见上"根因"段），与 PLAN §3 M0b STEP-0.2 行 + §5 评审 #2 second round 完全一致。
 - **解决 STEP**：M0b / STEP-0.2
+
+---
+
+## #10 — M1a STEP-1a.4 leader-continued 隐藏引入 3 个 new clippy error（fmt / 1a.5 清理）
+
+- **触发 STEP**：M1a / STEP-1a.4（leader-continued commit `182a0ea`；executor 1a.5 首次 `cargo clippy -- -D warnings` 才暴露）
+- **现象**：commit `182a0ea` 落地后 `cargo clippy --workspace --all-targets -- -D warnings` 报 3 个新 error（之前 M0c-0.7 已确认 12 个 pre-existing 在 init commit `828cc51`，不在 M0a/M0b/M0c scope 内）：
+  1. **`src/connect.rs:541-549`** — `///` doc-comment applied to function parameter. Rust 禁止在 function parameter 上写 `///`（仅允许 `//`）。`connect_to_handle` 的 `clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<...>` 参数前的 9 行块注释用了 `///`。
+  2. **`src/connect.rs:121`** — `too_many_arguments (8/7)`. `LanMouseConnection::new` 在 1a.4 加了第 8 个参数（`clipboard_inbound_tx`），使参数数从 7/7 跳到 8/7 触发 clippy。
+  3. **`src/service.rs:201`** — `LruFingerprints::len` 标 `#[cfg(test)]` 但在 test target 内 `dead_code`。1a.4 顺手加了 test-only helper（doc-comment 写 "used by dispatcher unit tests"），但实际没在任何 test 内调用 → 1a.4 单测只覆盖了 dispatcher 行为，未用 `len` 断言。
+  4. **附带**：`src/service.rs:28` `use crate::clipboard::{ClipboardBackend, ClipboardError, default_backend}` 里的 `ClipboardError` 实际无人使用（`ServiceError` 自己 `#[derive(Error)]` 而非 `From<ClipboardError>` 桥接），1a.4 引入但未在 `Service::new` / dispatcher 任何路径引用。
+- **根因**：leader-continued 模式下 session 重启后 leader 直接接管 commit，未跑 `cargo clippy -- -D warnings`（之前 M0a executor 撞 429 后 leader 接力 commit 时跑过；M0c-0.7 也跑过）。M1a 1a.4 走的是"diff 验证 + 报告"的快速通道，遗漏 `cargo clippy -D warnings` 这一关。
+- **解决方案**（M1a / STEP-1a.5）：
+  - `src/connect.rs:541-549`：`///` → `//`（行注释；不是公开 API 的 doc-comment，仅内部 rationale）
+  - `src/connect.rs:121`：`#[allow(clippy::too_many_arguments)]` 加在 `pub(crate) fn new` 上（与同文件 M0c-0.7 P2.3 spawn 风格分裂同样的"局部小 allow" 策略；M1a 末段不重构 function signature）
+  - `src/service.rs:201`：`#[cfg(test)]` 后加 `#[allow(dead_code)]`（保留 helper 给后续 1b.1 / 1b.3 阶段使用，避免 1a.5 删 API 撕扯 1a.4 已建立的契约）
+  - `src/service.rs:28`：`use` 行移除 `ClipboardError`
+- **预防措施（建议记入 AGENTS.md workflow）**：leader-continued 模式 commit 后**必须** `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` 三连通过才能写 `done` 报告。这是 PLAN §0 scope discipline 的硬约束，不是软建议。
+- **Plan 偏差**：0 处功能性偏差（运行时行为完全正确；3 个 error 全部是 lint-level），但 1a.4 "0 new clippy" 的口径被突破 —— 文档记录为"1a.4 隐藏 3 个 lint error，1a.5 清理"
+- **解决 STEP**：M1a / STEP-1a.5
+
