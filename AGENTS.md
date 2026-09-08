@@ -65,10 +65,12 @@ Run from repo root—no `cd` in scripts.
 4. Run `cargo fmt` and `cargo clippy --workspace --all-targets --all-features`.
 
 ## Notes
+
 Please use English for project annotations.
 
 ## Language policy
-All in-source comments and inline documentation must be written in English.
+
+All in-source comments and git commit and inline documentation must be written in English.
 Planning docs under `next/` may be in either language for now, but anything
 that ends up in committed source code, shell scripts, or configuration
 files must be English so the project stays readable across the team.
