@@ -27,7 +27,7 @@ use tokio::task::{JoinHandle, spawn_local};
 use lan_mouse_proto::ProtoEvent;
 
 use super::Error;
-use super::protocol::read_frame;
+use super::protocol::{read_frame, read_stream_c_frame};
 use super::session::PeerSession;
 
 /// mpsc channel capacity used by the stream B reader task.
@@ -80,6 +80,16 @@ pub enum StreamEvent {
     Reliable(ProtoEvent),
     /// High-frequency event read from the QUIC datagram channel.
     Datagram(ProtoEvent),
+    /// Clipboard metadata event read from Stream C
+    /// (`ClipboardText` / `ClipboardImage` / `ClipboardFiles` /
+    /// `FileTransferOffer` / `FileTransferResponse` /
+    /// `FileTransferCancel` / `ClipboardRequest`). Decoded via the
+    /// proto VarCodec dispatcher (`read_stream_c_frame`).
+    ///
+    /// **M0c**: the reader task is wired up in M0c STEP-0.5b; the
+    /// dispatch target is the peer session's `clipboard_inbox`
+    /// (forwarded to the service inbox in M1a+).
+    ClipboardMeta(ProtoEvent),
 }
 
 /// Ownership wrapper for a single bidirectional stream.
@@ -192,6 +202,12 @@ pub struct ReadStreams {
     pub b: tokio_mpsc::Receiver<StreamEvent>,
     /// `JoinHandle` for the Stream B reader task.
     pub join_b: JoinHandle<std::result::Result<(), Error>>,
+    /// mpsc receiver for events read from Stream C (ClipboardMeta
+    /// category — clipboard / file-transfer metadata). Wired up in
+    /// M0c STEP-0.5b via [`read_stream_c_loop`].
+    pub c: tokio_mpsc::Receiver<StreamEvent>,
+    /// `JoinHandle` for the Stream C reader task.
+    pub join_c: JoinHandle<std::result::Result<(), Error>>,
 }
 
 /// Stream B reader task.
@@ -249,6 +265,63 @@ where
             }
             Err(e) => {
                 log::info!("stream B reader exiting (IO closed): {e}");
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Stream C reader task (M0c STEP-0.5b).
+///
+/// **Responsibilities**: read `stream_bunch.c.recv` in a loop, call
+/// [`read_stream_c_frame`] (the var-codec frame decoder — no
+/// `MAX_EVENT_SIZE` cap), decode into a `ProtoEvent`, wrap it as
+/// `StreamEvent::ClipboardMeta(...)`, and send it through the mpsc
+/// queue via `tx.send().await`.
+///
+/// **Three categories of error handling** (mirrors
+/// [`read_stream_b_loop`]):
+/// - `Error::HelloFailed(msg)` when `msg.starts_with("decode stream C frame")` →
+///   codec decode failure (a single corrupted frame): log a `warn!` and
+///   skip the current frame, continuing the loop without exiting the task.
+/// - Other IO errors (peer close / reset / `Error::Truncated`) → the task
+///   exits and returns `Err`.
+///
+/// **Backpressure**: identical to [`read_stream_b_loop`] — blocking
+/// `tx.send().await` propagates flow control back to the peer's stream
+/// C write.
+///
+/// **Receiver-drop exit**: same as stream B — `tx.send().await`
+/// returning `Err(SendError)` is a clean shutdown.
+///
+/// **Why a dedicated reader (not reusing stream B's)**: stream C
+/// carries var-codec payloads (clipboard text / images / files up to
+/// `MAX_FRAME_SIZE`). The fixed-size `read_frame` rejects `len >
+/// MAX_EVENT_SIZE` (21) which would reject every valid clipboard
+/// frame.
+#[allow(dead_code)]
+pub async fn read_stream_c_loop<R>(
+    mut recv: R,
+    tx: tokio_mpsc::Sender<StreamEvent>,
+) -> std::result::Result<(), Error>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        match read_stream_c_frame(&mut recv).await {
+            Ok(event) => {
+                // Blocking sender — same backpressure semantics as stream B.
+                if tx.send(StreamEvent::ClipboardMeta(event)).await.is_err() {
+                    log::info!("stream C reader: receiver dropped, exiting cleanly");
+                    return Ok(());
+                }
+            }
+            Err(Error::HelloFailed(msg)) if msg.starts_with("decode stream C frame") => {
+                log::warn!("stream C: skip frame (decode error): {msg}");
+                continue;
+            }
+            Err(e) => {
+                log::info!("stream C reader exiting (IO closed): {e}");
                 return Err(e);
             }
         }
@@ -330,8 +403,12 @@ pub async fn read_loop(
     // (3) Stream A is held by the caller (parameter borrow), no internal spawn.
     //     Reduces task count and removes an mpsc layer.
 
-    // (4) Stream C: dropped immediately — honors the PLAN §9 M1 boundary.
-    drop(bunch.c);
+    // (4) Stream C: M0c STEP-0.5b — spawn `read_stream_c_loop`
+    //     (replaces the pre-M0c `drop(bunch.c)`). The reader pushes
+    //     `StreamEvent::ClipboardMeta(event)` onto the mpsc; the
+    //     main loop's select! arm forwards to `peer.clipboard_inbox`.
+    let (tx_c, rx_c) = tokio_mpsc::channel::<StreamEvent>(READ_STREAM_BUFFER_CAP);
+    let join_c = spawn_local(read_stream_c_loop(bunch.c.recv, tx_c));
 
     // (5) `bunch.a` (Stream A's cached `Bidi<SendStream>`) is dropped
     //     automatically at the end of the bunch move. Harmless: the caller
@@ -340,10 +417,15 @@ pub async fn read_loop(
 
     log::info!(
         "read_loop: stream B reader spawned (cap={READ_STREAM_BUFFER_CAP}), \
-         stream C dropped (M1 §9 boundary)"
+         stream C reader spawned (M0c STEP-0.5b)"
     );
 
-    Ok(ReadStreams { b: rx_b, join_b })
+    Ok(ReadStreams {
+        b: rx_b,
+        join_b,
+        c: rx_c,
+        join_c,
+    })
 }
 
 /// Datagram event reader task.
@@ -592,6 +674,107 @@ mod tests {
 
         drop(write_half);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join_b).await;
+    }
+
+    /// **M0c STEP-0.5b** — Stream C reader task (`read_stream_c_loop`)
+    /// reads a var-codec frame from a duplex stream, wraps it as
+    /// `StreamEvent::ClipboardMeta`, and forwards it via the mpsc
+    /// queue. This is the unit-level contract for the stream C
+    /// reader used in `PeerSession::run`'s `ClipboardMeta` arm.
+    #[tokio::test]
+    async fn stream_c_loop_round_trip_clipboard_meta() {
+        use super::super::protocol::write_stream_c_frame;
+        let (mut write_half, read_half) = tokio::io::duplex(8192);
+
+        let (tx, mut rx) = tokio_mpsc::channel::<StreamEvent>(READ_STREAM_BUFFER_CAP);
+        let join_c = tokio::spawn(read_stream_c_loop(read_half, tx));
+
+        // Construct a `ClipboardText` event (var-codec) and write it
+        // via `write_stream_c_frame` — same wire path
+        // `PeerSession::send_stream_c` uses.
+        let event = ProtoEvent::ClipboardText(lan_mouse_proto::ClipboardText {
+            fingerprint: [0x11; 32],
+            sha256: [0x22; 32],
+            size: 5,
+            content_inline: Some(b"hello".to_vec()),
+        });
+        write_stream_c_frame(&mut write_half, &event)
+            .await
+            .expect("write_stream_c_frame");
+        drop(write_half);
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("mpsc recv timed out")
+            .expect("mpsc recv succeeded");
+
+        match received {
+            StreamEvent::ClipboardMeta(got) => {
+                let got_dbg = format!("{got:?}");
+                let expected_dbg = format!("{event:?}");
+                assert_eq!(
+                    got_dbg, expected_dbg,
+                    "Stream C reader should forward the same ClipboardText written via write_stream_c_frame"
+                );
+            }
+            other => panic!("event category should be ClipboardMeta, got: {other:?}"),
+        }
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join_c).await;
+    }
+
+    /// **M0c STEP-0.5b** — Stream C reader task's backpressure
+    /// semantics: when the receiver is idle, the sender must block
+    /// rather than drop frames (mirror of the stream B test
+    /// above).
+    #[tokio::test]
+    async fn stream_c_backpressure_blocks_when_receiver_idle() {
+        use super::super::protocol::write_stream_c_frame;
+        let (mut write_half, read_half) = tokio::io::duplex(8192);
+
+        // Capacity 2 — test sends 5 frames.
+        let (tx, mut rx) = tokio_mpsc::channel::<StreamEvent>(2);
+        let join_c = tokio::spawn(read_stream_c_loop(read_half, tx));
+
+        let events: Vec<ProtoEvent> = (0..5)
+            .map(|i| {
+                ProtoEvent::ClipboardText(lan_mouse_proto::ClipboardText {
+                    fingerprint: [i as u8; 32],
+                    sha256: [0u8; 32],
+                    size: 0,
+                    content_inline: None,
+                })
+            })
+            .collect();
+        for event in &events {
+            write_stream_c_frame(&mut write_half, event)
+                .await
+                .expect("write_stream_c_frame");
+        }
+
+        let mut got: Vec<String> = Vec::with_capacity(events.len());
+        for _ in 0..events.len() {
+            let received = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("drain timed out")
+                .expect("drain recv q succeeded");
+            match received {
+                StreamEvent::ClipboardMeta(got_event) => {
+                    got.push(format!("{got_event:?}"));
+                }
+                other => panic!("event category should be ClipboardMeta, got: {other:?}"),
+            }
+        }
+
+        let events_dbg: Vec<String> = events.iter().map(|e| format!("{e:?}")).collect();
+        assert_eq!(
+            got, events_dbg,
+            "after 5 var-codec frames round-trip, order and content should match \
+             (backpressure = blocking sender, no frames lost)"
+        );
+
+        drop(write_half);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join_c).await;
     }
 
     /// Stream C handling — honors the §9 M1 boundary (no reader task).

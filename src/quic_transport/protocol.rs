@@ -576,6 +576,108 @@ pub async fn read_any_frame(recv: &mut RecvStream) -> std::result::Result<ProtoE
     read_frame(recv).await
 }
 
+/// Encode a `ProtoEvent` as a length-prefixed StreamC frame.
+///
+/// **Wire format**: `[u32 BE body_len][body bytes...]` where
+/// `body bytes` is the VarCodec output from
+/// [`lan_mouse_proto::ProtoEvent::into()`] (`From<ProtoEvent> for
+/// Vec<u8>`). The body carries the type byte + length-prefixed fields
+/// (per the codec's `VarCodec` impl).
+///
+/// **No MAX_EVENT_SIZE cap**: stream C is the var-codec carrier
+/// (clipboard / file-transfer payloads may exceed 21 bytes — the
+/// 32-byte `ClipboardText { fingerprint, sha256 }` baseline plus
+/// optional `content_inline` bytes blows past the hot-path cap
+/// immediately).
+///
+/// **Why a separate function (not reusing [`write_frame`])**:
+/// `write_frame` encodes via the fixed-size `From<ProtoEvent> for
+/// ([u8; MAX_EVENT_SIZE], usize)` path (route_input guarantees only
+/// fixed variants reach it). StreamC carries VarCodec variants, so
+/// it needs the `From<ProtoEvent> for Vec<u8>` dispatcher.
+///
+/// **Error unification**: IO errors collapse into
+/// [`Error::HelloFailed`] (matches the convention used by
+/// [`write_frame`] — the variant name is misleading but it is the
+/// canonical "stream write failure" variant in this module).
+pub async fn write_stream_c_frame<W>(
+    send: &mut W,
+    event: &ProtoEvent,
+) -> std::result::Result<(), Error>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use lan_mouse_proto::ProtoEvent;
+    let body: Vec<u8> = match event {
+        // VarCodec variants — use the top-level dispatcher.
+        v @ (ProtoEvent::ClipboardText(_)
+        | ProtoEvent::ClipboardImage(_)
+        | ProtoEvent::ClipboardFiles(_)
+        | ProtoEvent::FileTransferOffer(_)
+        | ProtoEvent::FileTransferResponse(_)
+        | ProtoEvent::FileTransferCancel(_)
+        | ProtoEvent::ClipboardRequest(_)) => Vec::<u8>::from(v.clone()),
+        // Fixed variants routed to StreamC (shouldn't happen given
+        // route_input, but the dispatcher still works — encode them
+        // as VarCodec and the receiver's TryFrom<&[u8]> dispatches
+        // them to the fixed branch).
+        _ => Vec::<u8>::from(event.clone()),
+    };
+    send.write_u32(body.len() as u32)
+        .await
+        .map_err(|e| Error::HelloFailed(format!("write stream C length: {e}")))?;
+    if !body.is_empty() {
+        send.write_all(&body)
+            .await
+            .map_err(|e| Error::HelloFailed(format!("write stream C body: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Read a length-prefixed StreamC frame and decode it as a
+/// `ProtoEvent` via the universal `TryFrom<&[u8]>` dispatcher.
+///
+/// **Wire format**: `[u32 BE body_len][body bytes...]`. The body is
+/// fed to `ProtoEvent::try_from(&[u8])` which dispatches on the type
+/// byte (fixed vs var-codec).
+///
+/// **No MAX_EVENT_SIZE cap**: stream C payloads may exceed 21 bytes
+/// (VarCodec clipboard / file-transfer frames).
+///
+/// **Memory profile**: `body_len` is the peer's declared length; the
+/// reader allocates exactly `body_len` bytes. The dispatcher slices
+/// into the read buffer — no extra allocation.
+///
+/// **Error unification**:
+/// - I/O error on `read_u32` / `read_exact` → [`Error::HelloFailed`]
+/// - Decode error from `ProtoEvent::try_from(&[u8])` →
+///   [`Error::HelloFailed`] (the codec's `ProtocolError` is converted
+///   to a single string for the variant).
+pub async fn read_stream_c_frame<R>(recv: &mut R) -> std::result::Result<ProtoEvent, Error>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let len = recv
+        .read_u32()
+        .await
+        .map_err(|e| Error::HelloFailed(format!("read stream C length: {e}")))?
+        as usize;
+    let mut body = vec![0u8; len];
+    match recv.read_exact(&mut body).await {
+        Ok(_bytes_read) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(Error::Truncated);
+        }
+        Err(e) => {
+            return Err(Error::HelloFailed(format!(
+                "read stream C body ({len} bytes): {e}"
+            )));
+        }
+    }
+    lan_mouse_proto::ProtoEvent::try_from(body.as_slice())
+        .map_err(|e| Error::HelloFailed(format!("decode stream C frame: {e}")))
+}
+
 /// Watchdog for the application-layer Hello handshake.
 ///
 /// **Purpose**: a successful QUIC mTLS handshake does **not** guarantee
@@ -1054,5 +1156,136 @@ mod tests {
         assert_eq!(route_input(&cfg, &hello()), Channel::StreamA);
         assert_eq!(route_input(&cfg, &ping()), Channel::StreamA);
         assert_eq!(route_input(&cfg, &pong()), Channel::StreamA);
+    }
+
+    // === StreamC wire codec (M0c STEP-0.5a + STEP-0.5b) =====================
+
+    use super::{read_stream_c_frame, write_stream_c_frame};
+
+    /// Construct a non-trivial `ClipboardText` for codec round-trip tests.
+    fn clipboard_text_with_inline() -> lan_mouse_proto::ProtoEvent {
+        use lan_mouse_proto::{ClipboardText, ProtoEvent};
+        ProtoEvent::ClipboardText(ClipboardText {
+            fingerprint: [0xAB; 32],
+            sha256: [0xCD; 32],
+            size: 16,
+            content_inline: Some(b"hello, world!".to_vec()),
+        })
+    }
+
+    /// `write_stream_c_frame` + `read_stream_c_frame` over a `tokio::io::DuplexStream`
+    /// must round-trip a var-codec event. This is the codec contract
+    /// that the StreamC reader task relies on (M0c STEP-0.5b).
+    #[tokio::test]
+    async fn stream_c_frame_round_trip_clipboard_text() {
+        let (mut write_half, mut read_half) = tokio::io::duplex(4096);
+        let event = clipboard_text_with_inline();
+        let event_dbg = format!("{event:?}");
+
+        let writer = tokio::spawn(async move {
+            write_stream_c_frame(&mut write_half, &event)
+                .await
+                .expect("write_stream_c_frame");
+            drop(write_half);
+        });
+
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_stream_c_frame(&mut read_half),
+        )
+        .await
+        .expect("read_stream_c_frame timed out")
+        .expect("read_stream_c_frame should succeed");
+
+        let received_dbg = format!("{received:?}");
+        assert_eq!(
+            received_dbg, event_dbg,
+            "var-codec round-trip should preserve the ClipboardText body"
+        );
+
+        writer.await.expect("writer task");
+    }
+
+    /// StreamC accepts payloads **larger** than `MAX_EVENT_SIZE`
+    /// (21 bytes) — the fixed-size `read_frame` would reject them
+    /// as `FrameTooLarge`. This test pins the discriminator that
+    /// `listen.rs::server_accept_bi_task` uses
+    /// (`len > MAX_EVENT_SIZE` → StreamC).
+    #[tokio::test]
+    async fn stream_c_frame_handles_payloads_larger_than_max_event_size() {
+        let (mut write_half, mut read_half) = tokio::io::duplex(8192);
+        // 1 KiB inline (well past MAX_EVENT_SIZE).
+        use lan_mouse_proto::{ClipboardText, ProtoEvent};
+        let big_inline = vec![0xEEu8; 1024];
+        let event = ProtoEvent::ClipboardText(ClipboardText {
+            fingerprint: [0x55; 32],
+            sha256: [0x66; 32],
+            size: big_inline.len() as u64,
+            content_inline: Some(big_inline.clone()),
+        });
+
+        let writer = tokio::spawn(async move {
+            write_stream_c_frame(&mut write_half, &event)
+                .await
+                .expect("write_stream_c_frame");
+            drop(write_half);
+        });
+
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_stream_c_frame(&mut read_half),
+        )
+        .await
+        .expect("read_stream_c_frame timed out")
+        .expect("read_stream_c_frame should succeed");
+
+        match received {
+            ProtoEvent::ClipboardText(ct) => {
+                assert_eq!(ct.fingerprint, [0x55; 32]);
+                assert_eq!(ct.sha256, [0x66; 32]);
+                assert_eq!(ct.size, 1024);
+                assert_eq!(
+                    ct.content_inline.as_deref(),
+                    Some(big_inline.as_slice()),
+                    "1 KiB inline payload must round-trip byte-for-byte"
+                );
+            }
+            other => panic!("expected ClipboardText, got {other:?}"),
+        }
+
+        writer.await.expect("writer task");
+    }
+
+    /// `read_stream_c_frame` should reject a truncated body (peer
+    /// closed mid-frame) with `Error::Truncated` rather than a
+    /// decode error — mirrors `read_frame`'s semantics.
+    #[tokio::test]
+    async fn stream_c_frame_truncated_body_returns_truncated() {
+        let (mut write_half, mut read_half) = tokio::io::duplex(4096);
+        let writer = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            // Declare a 32-byte body, write only 4.
+            write_half.write_u32(32).await.expect("write length");
+            write_half
+                .write_all(&[0u8; 4])
+                .await
+                .expect("write partial body");
+            drop(write_half);
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_stream_c_frame(&mut read_half),
+        )
+        .await
+        .expect("read_stream_c_frame timed out");
+
+        match result {
+            Err(super::Error::Truncated) => {}
+            Err(other) => panic!("expected Error::Truncated, got {other:?}"),
+            Ok(event) => panic!("truncated stream C frame should not decode, got event: {event:?}"),
+        }
+
+        writer.await.expect("writer task");
     }
 }

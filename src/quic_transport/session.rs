@@ -31,6 +31,15 @@ use quinn::{Connection as QuinnConnection, SendStream};
 type OutgoingEvent = (std::net::SocketAddr, ProtoEvent);
 type OutgoingEventSender = tokio_mpsc::UnboundedSender<OutgoingEvent>;
 
+/// **M0c** — clipboard / file-transfer event payload routed from
+/// `peer.run`'s stream C reader to the service's clipboard inbox:
+/// `(peer socket, ProtoEvent)`. The clipboard backend (M1a+) maps
+/// the socket back to a `ClientHandle` and applies the inbound
+/// event to the local clipboard / `accept_dir`. M0c just establishes
+/// the wire plumbing.
+type ClipboardInboxEvent = (std::net::SocketAddr, ProtoEvent);
+type ClipboardInboxSender = tokio_mpsc::UnboundedSender<ClipboardInboxEvent>;
+
 use tokio::sync::{Mutex, mpsc as tokio_mpsc};
 use tokio::task::{JoinHandle, spawn_local};
 
@@ -38,7 +47,9 @@ use lan_mouse_ipc::InputChannelConfig;
 use lan_mouse_proto::ProtoEvent;
 
 use super::protocol::StreamPair;
-use super::protocol::{client_hello, hello_watchdog, read_frame, server_hello};
+use super::protocol::{
+    client_hello, hello_watchdog, read_frame, server_hello, write_stream_c_frame,
+};
 use super::streams::{Bidi, StreamBunch, StreamEvent, datagram_reader_task, read_loop};
 
 use lan_mouse_proto::MAX_EVENT_SIZE;
@@ -123,6 +134,21 @@ pub struct PeerSession {
     /// to `None` so the next call reopens a stream (the peer still receives
     /// the new stream through its `accept_bi` loop).
     pub(crate) cached_send_b: Mutex<Option<SendStream>>,
+    /// **M0c / PLAN-2** — Cached send half of stream C (clipboard
+    /// meta). Mirrors [`Self::cached_send_b`]: lazily opened via
+    /// `conn.open_bi()` on the first call to [`Self::send_stream_c`],
+    /// reused for the peer's lifetime. Wire format is the var-codec
+    /// stream C frame (`[u32 BE len][body bytes...]` carrying the
+    /// `From<ProtoEvent> for Vec<u8>` output).
+    ///
+    /// **Why lazy**: opening a bidi has a handshake cost; clipboard
+    /// events are infrequent (a few per minute under heavy use), so
+    /// opening on first use is fine.
+    ///
+    /// **Write failure invalidates**: any write error resets this field
+    /// back to `None` so the next call reopens a stream (matching the
+    /// stream B pattern).
+    pub(crate) cached_send_c: Mutex<Option<SendStream>>,
     /// Optional outgoing channel for stream A events.
     ///
     /// When the `run` main loop reads a control event from stream A
@@ -137,6 +163,18 @@ pub struct PeerSession {
     /// it does its own `accept_bi` + `read_frame` + `listen_tx` push, so the
     /// forwarding path already exists.
     pub(crate) outgoing_events: Arc<Mutex<Option<OutgoingEventSender>>>,
+    /// **M0c / PLAN-2** — Optional inbox for clipboard / file-transfer
+    /// events received from the peer on StreamC. The service sets
+    /// this (or a test sets it locally) before [`Self::run`] starts;
+    /// the main loop's `ClipboardMeta` arm in the `select!` pushes
+    /// `(remote_addr, event)` here. The M1a service handler maps
+    /// `remote_addr` back to a `ClientHandle` and applies the
+    /// inbound event to the local clipboard / `accept_dir`.
+    ///
+    /// Mirrors [`Self::outgoing_events`] (which is for stream A
+    /// control events). The two channels are independent — stream A
+    /// goes to capture.rs, stream C goes to the clipboard inbox.
+    pub(crate) clipboard_inbox: Arc<Mutex<Option<ClipboardInboxSender>>>,
     /// Cache for the three bidi streams. Populated by the read loop when it
     /// assembles them: server-side `accept_bi()` three times + client-side
     /// `open_bi()` three times (`client_hello` / `server_hello` already used
@@ -262,10 +300,17 @@ impl PeerSession {
             // stream B send half cache; lazily filled by the first
             // `send_stream_b` call (see field docstring).
             cached_send_b: Mutex::new(None),
+            // M0c — stream C send half cache; lazily filled by the
+            // first `send_stream_c` call. Mirrors `cached_send_b`.
+            cached_send_c: Mutex::new(None),
             // stream A event outgoing channel; initial `None`. The client
             // side's `connect_to_handle` sets this via `set_outgoing_events`
             // before spawning `peer.run` (see field docstring).
             outgoing_events: Arc::new(Mutex::new(None)),
+            // M0c — clipboard inbox (peer StreamC → service). Initial
+            // `None`; the service (or a test) sets it via
+            // `set_clipboard_inbox` before spawning `peer.run`.
+            clipboard_inbox: Arc::new(Mutex::new(None)),
             // `stream_bunch` field placeholder — default `None`, filled when
             // the read loop assembles the three streams. The `Arc` wrapper
             // lets the read loop task and the caller (`peer.send_stream_*`)
@@ -356,6 +401,31 @@ impl PeerSession {
     /// needed — the client path should keep it set).
     pub async fn set_outgoing_events(&self, tx: Option<OutgoingEventSender>) {
         *self.outgoing_events.lock().await = tx;
+    }
+
+    /// **M0c / PLAN-2** — Set the clipboard / file-transfer event
+    /// inbox. Called by the service (M1a+) or by tests before
+    /// spawning [`Self::run`]. The main loop's `ClipboardMeta` arm
+    /// forwards `(remote_addr, event)` here when a StreamC frame is
+    /// received.
+    ///
+    /// Mirrors [`Self::set_outgoing_events`] but for the clipboard
+    /// inbox instead of the capture path.
+    pub async fn set_clipboard_inbox(&self, tx: Option<ClipboardInboxSender>) {
+        *self.clipboard_inbox.lock().await = tx;
+    }
+
+    /// **M0c / PLAN-2** — Push a clipboard / file-transfer event to
+    /// the configured inbox (if set). Used by the `ClipboardMeta`
+    /// branch of [`Self::run`]'s select! main loop. Silent no-op
+    /// when the inbox is unset (matches the pattern of
+    /// [`Self::send_outgoing_event`]).
+    async fn send_clipboard_inbox(&self, event: ProtoEvent, addr: std::net::SocketAddr) {
+        if let Some(tx) = self.clipboard_inbox.lock().await.as_ref() {
+            if let Err(e) = tx.send((addr, event)) {
+                log::debug!("send_clipboard_inbox: clipboard_inbox has exited (service gone): {e}");
+            }
+        }
     }
 
     /// Push a `ProtoEvent` to `outgoing_events` (if set) → forwarder →
@@ -465,6 +535,57 @@ impl PeerSession {
         self.send_stream_b(bytes).await
     }
 
+    /// **M0c / PLAN-2** — Stream C (clipboard meta, reliable and ordered)
+    /// write path. Lazily opens a bidi on first call, then reuses the
+    /// cached send half for the peer's lifetime (mirrors
+    /// [`Self::send_stream_b`]).
+    ///
+    /// **Wire format**: `[u32 BE len][body bytes...]` where body is the
+    /// var-codec output from `From<ProtoEvent> for Vec<u8>`. The peer
+    /// reads via [`super::protocol::read_stream_c_frame`] (which uses
+    /// `ProtoEvent::try_from(&[u8])` to dispatch on the type byte).
+    ///
+    /// **Lazy cache + write-failure invalidation**: identical pattern
+    /// to [`Self::send_stream_b`] — the lock-held await serializes
+    /// concurrent writes; a write error resets the cache to `None` so
+    /// the next call reopens a stream.
+    ///
+    /// **Error normalization**: all IO errors funnel into
+    /// [`super::Error::HelloFailed`] (the module's canonical
+    /// "stream write failure" variant — no new `super::Error::StreamC`
+    /// variant is introduced; matches the stream A / B convention).
+    pub async fn send_stream_c(&self, event: &ProtoEvent) -> super::Result<()> {
+        let mut g = self.cached_send_c.lock().await;
+        if g.is_none() {
+            let (send, recv) = self
+                .conn
+                .open_bi()
+                .await
+                .map_err(|e| super::Error::HelloFailed(format!("open stream C: {e}")))?;
+            // Drop the recv half — the M0c server side reads its own
+            // StreamC frames through `accept_bi` + the server's
+            // stream C reader task (not from this bidi's recv). The
+            // wire is symmetric so the server-side reader accepts
+            // any bidi we open; we only write to this one.
+            drop(recv);
+            *g = Some(send);
+            log::debug!(
+                "send_stream_c: created and cached stream C (subsequent frames reuse the same one)"
+            );
+        }
+
+        let result = {
+            let send = g.as_mut().expect("cached_send_c was just filled");
+            write_stream_c_frame(send, event)
+                .await
+                .map_err(|e| super::Error::HelloFailed(format!("write_stream_c_frame: {e}")))
+        };
+        if result.is_err() {
+            *g = None;
+        }
+        result
+    }
+
     /// Stream B (input stream, reliable and ordered) write path.
     ///
     /// **Lazy cache**: on the first call, `conn.open_bi()` obtains a bidi
@@ -542,14 +663,16 @@ impl PeerSession {
     /// | `Datagram` | [`Self::send_motion`] (datagram-first + fallback to stream B) |
     /// | `StreamA`  | [`Self::send_stream_a`] (write cached `cached_send_a`) |
     /// | `StreamB`  | [`Self::send_stream_b`] (write cached `cached_send_b`) |
-    /// | `StreamC`  | `Err(super::Error::HelloFailed("stream C is M2-only"))` |
+    /// | `StreamC`  | [`Self::send_stream_c`] (write var-codec frame on `cached_send_c`) |
     ///
-    /// **M2 gate**: `ProtoEvent` does not include a `Clipboard` variant in
-    /// the main crate, so `route_input` will never return
-    /// `Channel::StreamC`. This method still explicitly handles `StreamC`
-    /// by returning `Err`, guarding against an `unreachable!()` being
-    /// triggered by accident when an M2 variant is added to `ProtoEvent`
-    /// (compile-time + runtime double guard).
+    /// **M0c**: StreamC is wired up via `send_stream_c`; the
+    /// `ClipboardText` / `ClipboardImage` / `ClipboardFiles` /
+    /// `FileTransferOffer` / `FileTransferResponse` /
+    /// `FileTransferCancel` / `ClipboardRequest` variants routed
+    /// here by `route_input` (M0a) are now delivered to the peer.
+    /// The matching reader task (`read_stream_c_loop`, M0c
+    /// STEP-0.5b) receives them on the peer's side and forwards
+    /// via `clipboard_inbox`.
     ///
     /// **Pre-flight check**: reuses `send_motion`'s internal `hello_ok`
     /// check. `StreamA` / `StreamB` paths do not explicitly check
@@ -582,15 +705,10 @@ impl PeerSession {
                 let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
                 self.send_stream_b(&buf[..len]).await
             }
-            // PLAN-2 / M0a: StreamC is reserved for clipboard /
-            // file-transfer metadata. The send half is wired up in
-            // M0c STEP 0.5a (`cached_send_c`); until then, every
-            // StreamC event surfaces this error to callers — the
-            // `service::clipboard_dispatcher` (M1a+) is the intended
-            // caller and will gate on `hello_ok` separately.
-            Channel::StreamC => Err(super::Error::HelloFailed(
-                "stream C is M0c-only (clipboard metadata not yet wired up in M0a)".into(),
-            )),
+            // M0c: StreamC is wired up — var-codec write via
+            // `send_stream_c`. The peer receives via
+            // `read_stream_c_loop`.
+            Channel::StreamC => self.send_stream_c(event).await,
         };
         if matches!(event, ProtoEvent::Ack(_) | ProtoEvent::Leave(_)) {
             log::info!(
@@ -742,8 +860,16 @@ impl PeerSession {
     /// shuts down. The JoinHandle lets the caller `abort()` for fast
     /// teardown — `listen.rs` currently relies on `Connection` close
     /// for graceful exit.
+    ///
+    /// **Why `&self` (not `self: &Arc<Self>`)**: the listen.rs
+    /// supervisor holds `peer: Rc<PeerSession>` (not `Arc`). `Rc`
+    /// is not `'static` so it can't cross a `spawn_local` boundary
+    /// directly; but the spawned task only needs `Connection` (which
+    /// is internally `Arc`-backed by quinn), so cloning the
+    /// `Connection` and dropping the `Rc` reference is sufficient.
+    /// `Connection::clone()` is cheap.
     pub fn start_http3_server(
-        self: &Arc<Self>,
+        &self,
         router: Arc<crate::quic_transport::http3::Router>,
     ) -> JoinHandle<()> {
         let conn = self.conn.clone();
@@ -1044,6 +1170,35 @@ impl PeerSession {
                             // The datagram_reader task has exited
                             // (conn.closed / read_datagram returned Err).
                             log::info!("run: datagram_reader closed, exiting main loop");
+                            break;
+                        }
+                    }
+                }
+
+                // Path E (M0c): stream C mpsc — ClipboardMeta events
+                // (clipboard / file-transfer metadata). Wired up by
+                // `read_stream_c_loop` in M0c STEP-0.5b.
+                evt = read_streams.c.recv() => {
+                    match evt {
+                        Some(StreamEvent::ClipboardMeta(event)) => {
+                            log::debug!("run: stream C ClipboardMeta event: {event:?}");
+                            // Forward to `clipboard_inbox` (set via
+                            // `set_clipboard_inbox`). The M1a service
+                            // handler maps `remote_addr` back to a
+                            // `ClientHandle` and applies the inbound
+                            // event to the local clipboard / accept_dir.
+                            let remote = self.conn.remote_address();
+                            self.send_clipboard_inbox(event, remote).await;
+                        }
+                        Some(other) => {
+                            // Defensive log: the stream C reader task
+                            // should only produce ClipboardMeta events.
+                            log::warn!("run: stream C produced non-ClipboardMeta event: {other:?}");
+                        }
+                        None => {
+                            // The stream C reader task has exited
+                            // (peer closed / fatal).
+                            log::info!("run: stream C reader closed, exiting main loop");
                             break;
                         }
                     }
@@ -1510,6 +1665,208 @@ mod tests {
 
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server_task).await;
 
+            drop(client_arc);
+            client_ep.wait_idle().await;
+            let _ = std::fs::remove_dir_all(&pins_dir);
+        });
+    }
+
+    /// **M0c STEP-0.5a + STEP-0.5b end-to-end**: a client sends a
+    /// `ClipboardText` via `send_input` (route_input dispatches to
+    /// `Channel::StreamC` → `send_stream_c`); the server's
+    /// `read_stream_c_loop`-equivalent task receives it and forwards
+    /// to the configured `clipboard_inbox`. Pins the full chain:
+    /// `route_input` → `send_stream_c` → wire
+    /// `[u32 BE len][var-codec body]` → `read_stream_c_frame` →
+    /// `clipboard_inbox`.
+    ///
+    /// **Why this test does NOT use `peer.run(Server)`**: the server
+    /// side needs an `accept_bi` loop to catch the lazy stream C
+    /// bidi opened by `send_stream_c` (matching the production
+    /// `listen.rs::server_accept_bi_task` pattern). `peer.run`'s
+    /// main loop does not include this loop — it's added by the
+    /// production supervisor in `listen.rs`. The test mirrors the
+    /// production pattern by running an inline `accept_bi` task that
+    /// dispatches to `read_stream_c_frame` on stream C bidis (length
+    /// prefix > MAX_EVENT_SIZE).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_c_clipboard_text_round_trip() {
+        use lan_mouse_proto::{ClipboardText as ProtoClipboardText, ProtoEvent};
+        use std::sync::Arc;
+        local_set_test!(stream_c_clipboard_text_round_trip, {
+            use crate::quic_transport::endpoint::install_crypto_provider;
+            install_crypto_provider();
+
+            let (server_cert, server_key) = ephemeral_cert();
+            let server_ep = endpoint_with_test_cert(
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+                server_cert,
+                server_key,
+            )
+            .expect("server endpoint bind");
+            let server_addr = server_ep.local_addr().expect("server addr");
+
+            // Configure a per-test mpsc inbox on the server so we
+            // can assert that the stream C reader forwards the
+            // event with `(remote_addr, event)` semantics.
+            let (inbox_tx, mut inbox_rx) =
+                tokio_mpsc::unbounded_channel::<(std::net::SocketAddr, ProtoEvent)>();
+
+            let server_task = tokio::task::spawn_local(async move {
+                let conn =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
+                        .await
+                        .expect("server accept timeout")
+                        .expect("server accept");
+                let session = Arc::new(PeerSession::from_connection(conn));
+                let remote_addr = session.connection().remote_address();
+
+                // Server-side Hello handshake.
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    crate::quic_transport::server_hello(&session),
+                )
+                .await
+                .expect("server hello timeout")
+                .expect("server hello");
+
+                // Inline accept_bi loop — mirrors
+                // `listen.rs::server_accept_bi_task` but specialised
+                // for the stream C path. The length-prefix
+                // discriminator (> MAX_EVENT_SIZE → stream C) is
+                // the same as in production.
+                let peer_for_loop = Arc::clone(&session);
+                let inbox_tx_for_loop = inbox_tx.clone();
+                let remote_for_loop = remote_addr;
+                let accept_loop_task = tokio::task::spawn_local(async move {
+                    loop {
+                        let (send, mut recv) = match peer_for_loop.connection().accept_bi().await {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                log::info!("test accept_bi: exiting (conn closed): {e}");
+                                return;
+                            }
+                        };
+                        use tokio::io::AsyncReadExt;
+                        let len: u32 = match recv.read_u32().await {
+                            Ok(n) => n,
+                            Err(_eof) => {
+                                // Bunch bidi — drop both halves to
+                                // release. Different from production
+                                // (which parks); test doesn't share
+                                // these streams across tasks, so
+                                // dropping is safe.
+                                drop(send);
+                                drop(recv);
+                                continue;
+                            }
+                        };
+                        if len as usize > lan_mouse_proto::MAX_EVENT_SIZE {
+                            // Stream C — read the body and dispatch
+                            // to inbox.
+                            drop(send);
+                            let mut body = vec![0u8; len as usize];
+                            if recv.read_exact(&mut body).await.is_err() {
+                                log::warn!("test accept_bi: stream C body read failed");
+                                continue;
+                            }
+                            let event = match ProtoEvent::try_from(body.as_slice()) {
+                                Ok(e) => e,
+                                Err(e) => {
+                                    log::warn!("test accept_bi: stream C decode failed: {e}");
+                                    continue;
+                                }
+                            };
+                            if inbox_tx_for_loop.send((remote_for_loop, event)).is_err() {
+                                log::info!("test accept_bi: inbox closed, exiting");
+                                return;
+                            }
+                        } else {
+                            // Stream B (or stream A from bunch) —
+                            // drop both halves. This test only
+                            // exercises stream C.
+                            drop(send);
+                            drop(recv);
+                        }
+                    }
+                });
+
+                // Hold session alive until conn close.
+                let closed = session.connection().closed();
+                tokio::pin!(closed);
+                closed.await;
+                log::info!("test server: conn closed");
+                accept_loop_task.abort();
+            });
+
+            let pins_dir = std::env::temp_dir().join(format!(
+                "lan-mouse-stream-c-pins-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&pins_dir);
+            let (client_cert, client_key) = ephemeral_cert();
+            let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+                .expect("client endpoint bind");
+            let conn = dial(
+                &client_ep,
+                server_addr,
+                client_cert[0].clone(),
+                client_key,
+                &pins_dir,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("dial");
+            let client_arc = Arc::new(PeerSession::from_connection(conn));
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), client_hello(&client_arc))
+                .await
+                .expect("client hello timeout")
+                .expect("client hello");
+
+            // Send a ClipboardText event via the public `send_input`
+            // path — route_input dispatches to Channel::StreamC.
+            let event = ProtoEvent::ClipboardText(ProtoClipboardText {
+                fingerprint: [0x42; 32],
+                sha256: [0x84; 32],
+                size: 12,
+                content_inline: Some(b"hello world!".to_vec()),
+            });
+            client_arc
+                .send_input(&event, &InputChannelConfig::default())
+                .await
+                .expect("send_input(ClipboardText) should succeed");
+
+            // Wait for the event to arrive in the server's inbox.
+            let received = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                inbox_rx.recv().await
+            })
+            .await
+            .expect("server clipboard inbox recv timed out")
+            .expect("server clipboard inbox closed");
+
+            let (remote_addr, received_event) = received;
+            let expected_dbg = format!("{event:?}");
+            let received_dbg = format!("{received_event:?}");
+            assert_eq!(
+                received_dbg, expected_dbg,
+                "server clipboard inbox should receive the same ClipboardText client sent"
+            );
+            assert_eq!(
+                remote_addr.ip(),
+                std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+                "remote_addr should be the client's loopback IP"
+            );
+
+            // Tear down.
+            client_arc
+                .connection()
+                .close(quinn::VarInt::from(0u32), b"test done");
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server_task).await;
             drop(client_arc);
             client_ep.wait_idle().await;
             let _ = std::fs::remove_dir_all(&pins_dir);

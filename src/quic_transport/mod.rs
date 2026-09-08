@@ -46,7 +46,8 @@ pub use crate::quic_transport::{
         install_crypto_provider,
     },
     protocol::{
-        Channel, HELLO_TIMEOUT, client_hello, read_any_frame, read_frame, route_input, server_hello,
+        Channel, HELLO_TIMEOUT, client_hello, read_any_frame, read_frame, read_stream_c_frame,
+        route_input, server_hello, write_stream_c_frame,
     },
     session::{PeerRole, PeerSession, should_retry_after_close},
     streams::StreamBunch,

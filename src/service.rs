@@ -304,6 +304,22 @@ impl Service {
             }
             FrontendRequest::SaveConfiguration => self.save_config(),
             FrontendRequest::SetQuicIdleTimeout(secs) => self.set_quic_idle_timeout(secs),
+            // **M0c / PLAN-2**: daemon-global clipboard config.
+            // Persists to TOML `[clipboard]` section. M1a wires the
+            // `service::clipboard::apply_config` runtime effect; for
+            // M0c we just persist + log so the value survives restart.
+            FrontendRequest::SetClipboardConfig(cfg) => {
+                self.set_clipboard_config(cfg);
+            }
+            // **M0c / PLAN-2**: per-peer clipboard opt-in. Persists
+            // to TOML `[[clients]]` `enable_clipboard_to` field and
+            // echoes back via the standard `FrontendEvent::State`
+            // push. M1a gates `service::clipboard_dispatcher` on this
+            // flag; for M0c we just persist.
+            FrontendRequest::SetEnableClipboardTo(handle, enable) => {
+                self.set_enable_clipboard_to(handle, enable);
+                self.save_config();
+            }
         }
     }
 
@@ -324,6 +340,11 @@ impl Service {
                 // unchanged. The default-None omission is handled on
                 // the `TomlClient` side (see `config_omits_monitor_field_when_none_on_writeback`).
                 monitor: c.monitor,
+                // **M0c / PLAN-2**: forward the per-peer clipboard
+                // opt-in flag. Default-true omission is handled on
+                // the `TomlClient` side (see
+                // `config_omits_enable_clipboard_to_when_true_on_writeback`).
+                enable_clipboard_to: c.enable_clipboard_to,
             })
             .collect();
         self.config.set_clients(clients);
@@ -821,6 +842,44 @@ impl Service {
     /// choice is locked in at dial time via `PeerSession::with_config`.
     fn update_input_channels(&mut self, handle: ClientHandle, cfg: InputChannelConfig) {
         if self.client_manager.set_input_channels(handle, cfg) {
+            self.broadcast_client(handle);
+        }
+    }
+
+    /// **M0c / PLAN-2** — handler for
+    /// [`FrontendRequest::SetClipboardConfig`]. Persists the
+    /// daemon-global `[clipboard]` section to TOML. The runtime
+    /// effect (`service::clipboard::apply_config` gating the
+    /// dispatcher on `ignore_*` / `auto_accept_files` / etc.) is
+    /// M1a; for M0c we just persist + log so the value survives
+    /// restart. The runtime will pick the new value up on the next
+    /// daemon restart (matches the
+    /// `FrontendRequest::SetQuicIdleTimeout` contract).
+    fn set_clipboard_config(&mut self, cfg: lan_mouse_ipc::ClipboardConfig) {
+        self.config.set_clipboard_config(cfg.clone());
+        if let Err(e) = self.config.write_back() {
+            log::warn!("failed to persist [clipboard] section: {e}");
+        }
+        log::info!(
+            "clipboard config updated (M0c — runtime effect wired in M1a): \
+             auto_accept_files={}, ignore_text={}, ignore_images={}, ignore_files={}, \
+             accept_dir={:?}",
+            cfg.auto_accept_files,
+            cfg.ignore_text,
+            cfg.ignore_images,
+            cfg.ignore_files,
+            cfg.accept_dir,
+        );
+    }
+
+    /// **M0c / PLAN-2** — handler for
+    /// [`FrontendRequest::SetEnableClipboardTo`]. Updates the
+    /// per-peer `ClientConfig.enable_clipboard_to` field and saves
+    /// to TOML. Echoes the new state via the standard `FrontendEvent
+    /// ::State` push so the GUI re-syncs (matches the M3
+    /// `set_monitor` / M0 `set_input_channels` contract).
+    fn set_enable_clipboard_to(&mut self, handle: ClientHandle, enable: bool) {
+        if self.client_manager.set_enable_clipboard_to(handle, enable) {
             self.broadcast_client(handle);
         }
     }

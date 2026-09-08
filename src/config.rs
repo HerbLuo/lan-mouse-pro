@@ -17,7 +17,7 @@ use toml;
 use toml_edit::{self, DocumentMut};
 
 use lan_mouse_cli::CliArgs;
-use lan_mouse_ipc::{DEFAULT_PORT, InputChannelConfig, Position};
+use lan_mouse_ipc::{ClipboardConfig, DEFAULT_PORT, InputChannelConfig, Position};
 
 use input_event::scancode::{
     self,
@@ -83,6 +83,12 @@ struct ConfigToml {
     /// time — changing these at runtime requires a daemon restart.
     #[serde(default)]
     quic: Option<TomlQuic>,
+    /// **M0c / PLAN-2** — daemon-global clipboard config. The
+    /// `[clipboard]` TOML section. Optional; missing section →
+    /// legacy default (auto-accept off / ignore-* off / accept_dir
+    /// = None). Mirrors `lan_mouse_ipc::ClipboardConfig`.
+    #[serde(default)]
+    clipboard: Option<TomlClipboard>,
 }
 
 /// QUIC transport config (TOML side). Mirrors the subset of
@@ -105,6 +111,34 @@ struct TomlQuic {
     /// Must be ≥ the keep-alive interval (5s) — values below that
     /// will be clamped at the transport-config layer.
     idle_timeout_secs: Option<u64>,
+}
+
+/// **M0c / PLAN-2** — daemon-global clipboard config (TOML side).
+/// Mirrors the subset of [`lan_mouse_ipc::ClipboardConfig`] the
+/// daemon persists. Carries no `ClientHandle` because the clipboard
+/// listener is daemon-global.
+///
+/// **Wire compat**: every field is `Option<T>` + `#[serde(default)]`
+/// so a pre-M0c TOML (no `[clipboard]` section, or a section missing
+/// some fields) deserializes cleanly into the legacy default
+/// (auto-accept off / ignore-* off / accept_dir = None).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct TomlClipboard {
+    /// See [`lan_mouse_ipc::ClipboardConfig::auto_accept_files`].
+    #[serde(default)]
+    auto_accept_files: Option<bool>,
+    /// See [`lan_mouse_ipc::ClipboardConfig::accept_dir`].
+    #[serde(default)]
+    accept_dir: Option<PathBuf>,
+    /// See [`lan_mouse_ipc::ClipboardConfig::ignore_text`].
+    #[serde(default)]
+    ignore_text: Option<bool>,
+    /// See [`lan_mouse_ipc::ClipboardConfig::ignore_images`].
+    #[serde(default)]
+    ignore_images: Option<bool>,
+    /// See [`lan_mouse_ipc::ClipboardConfig::ignore_files`].
+    #[serde(default)]
+    ignore_files: Option<bool>,
 }
 
 /// **FIX 4 — config 侧 watchdog 配置**：
@@ -166,6 +200,14 @@ struct TomlClient {
     /// continue to load cleanly without modification.
     #[serde(default)]
     monitor: Option<String>,
+    /// **M0c / PLAN-2** — per-peer clipboard push opt-in. Default
+    /// `true` (push clipboard to this peer — legacy behavior). GUI
+    /// per-row checkbox writes `false` here to opt a specific peer
+    /// out. `#[serde(default)]` keeps the on-disk file
+    /// backward-compatible: pre-M0c configs (no
+    /// `enable_clipboard_to` key) load as `true`.
+    #[serde(default)]
+    enable_clipboard_to: Option<bool>,
 }
 
 impl ConfigToml {
@@ -373,6 +415,10 @@ pub struct ConfigClient {
     /// `TomlClient` and the wire `ClientConfig`, so the field has to
     /// be carried here too.
     pub monitor: Option<String>,
+    /// **M0c / PLAN-2** — per-peer clipboard push opt-in. Default
+    /// `true` (push clipboard to this peer). Mirrors
+    /// `lan_mouse_ipc::ClientConfig::enable_clipboard_to`.
+    pub enable_clipboard_to: bool,
 }
 
 impl From<TomlClient> for ConfigClient {
@@ -391,6 +437,12 @@ impl From<TomlClient> for ConfigClient {
         // case the field is ever populated to something other than
         // `None` in older serialization paths.
         let monitor = toml.monitor;
+        // M0c: missing `enable_clipboard_to` in TOML → `true`
+        // (legacy "push clipboard to every peer" behavior). The
+        // `#[serde(default)]` on the `TomlClient` field already
+        // gives us `true`, but keep the explicit `unwrap_or(true)`
+        // for symmetry with `monitor`.
+        let enable_clipboard_to = toml.enable_clipboard_to.unwrap_or(true);
         Self {
             ips,
             hostname,
@@ -400,6 +452,7 @@ impl From<TomlClient> for ConfigClient {
             enter_hook,
             input_channels,
             monitor,
+            enable_clipboard_to,
         }
     }
 }
@@ -432,6 +485,16 @@ impl From<ConfigClient> for TomlClient {
         // config files that pre-date M3 and would otherwise suddenly
         // grow a `monitor = null` line on the next save).
         let monitor = client.monitor;
+        // M0c: same "omit when default" pattern — `true` is the
+        // legacy default, so we omit it from the written TOML
+        // (preserves back-compat with config files that pre-date
+        // M0c and would otherwise suddenly grow a spurious
+        // `enable_clipboard_to = true` line on the next save).
+        let enable_clipboard_to = if client.enable_clipboard_to {
+            None
+        } else {
+            Some(false)
+        };
         Self {
             hostname,
             host_name,
@@ -442,6 +505,7 @@ impl From<ConfigClient> for TomlClient {
             enter_hook,
             input_channels,
             monitor,
+            enable_clipboard_to,
         }
     }
 }
@@ -744,6 +808,52 @@ impl Config {
         q.idle_timeout_secs = Some(secs);
     }
 
+    /// **M0c / PLAN-2** — get the persisted clipboard config. Reads
+    /// the TOML `[clipboard]` section; missing section → legacy
+    /// default (auto-accept off / ignore-* off / accept_dir = None).
+    /// Used by `Service::set_clipboard_config` and (in M1a+) by the
+    /// clipboard backend to seed its runtime state.
+    pub fn clipboard_config(&self) -> ClipboardConfig {
+        let Some(toml) = self.config_toml.as_ref() else {
+            return ClipboardConfig::default();
+        };
+        let Some(cb) = toml.clipboard.as_ref() else {
+            return ClipboardConfig::default();
+        };
+        ClipboardConfig {
+            auto_accept_files: cb.auto_accept_files.unwrap_or(false),
+            accept_dir: cb.accept_dir.clone(),
+            ignore_text: cb.ignore_text.unwrap_or(false),
+            ignore_images: cb.ignore_images.unwrap_or(false),
+            ignore_files: cb.ignore_files.unwrap_or(false),
+        }
+    }
+
+    /// **M0c / PLAN-2** — persist a clipboard config. Mirrors
+    /// [`Config::set_quic_idle_timeout`] — the actual runtime effect
+    /// is wired up in M1a (clipboard backend reads via
+    /// [`Config::clipboard_config`] at startup; per-write refresh is
+    /// future work).
+    pub fn set_clipboard_config(&mut self, cfg: ClipboardConfig) {
+        if self.config_toml.is_none() {
+            self.config_toml = Some(Default::default());
+        }
+        let toml = self.config_toml.as_mut().expect("config");
+        let cb = toml.clipboard.get_or_insert_with(TomlClipboard::default);
+        // Omit-on-default pattern — true / false / `None` write back as
+        // `None` so legacy defaults don't grow spurious `[clipboard]`
+        // section entries on the next save.
+        cb.auto_accept_files = if cfg.auto_accept_files {
+            None
+        } else {
+            Some(false)
+        };
+        cb.accept_dir = cfg.accept_dir;
+        cb.ignore_text = if cfg.ignore_text { None } else { Some(false) };
+        cb.ignore_images = if cfg.ignore_images { None } else { Some(false) };
+        cb.ignore_files = if cfg.ignore_files { None } else { Some(false) };
+    }
+
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {
         log::info!("reading config from {:?}", self.config_path);
 
@@ -912,6 +1022,8 @@ mod config_input_channels_tests {
             enter_hook: None,
             input_channels: InputChannelConfig::default(),
             monitor: None,
+            // M0c: legacy default = true (omit from writeback).
+            enable_clipboard_to: true,
         };
         let toml_client: TomlClient = cfg.into();
         let s = toml::to_string_pretty(&toml_client).unwrap();
@@ -938,12 +1050,86 @@ mod config_input_channels_tests {
             enter_hook: None,
             input_channels: InputChannelConfig::default(),
             monitor: Some("wl_output:DP-2".into()),
+            // M0c: default = true (no effect on the M3 assertion).
+            enable_clipboard_to: true,
         };
         let toml_client: TomlClient = cfg.into();
         let s = toml::to_string_pretty(&toml_client).unwrap();
         assert!(
             s.contains("monitor = \"wl_output:DP-2\""),
             "monitor = Some(...) must be written verbatim; got:\n{s}"
+        );
+    }
+
+    // === M0c / PLAN-2 — enable_clipboard_to write-back tests =================
+
+    /// **M0c — write-back omits `enable_clipboard_to = true`** (the
+    /// legacy default). Saving a legacy client's config must not
+    /// introduce a spurious `enable_clipboard_to = true` line. Pairs
+    /// with `config_keeps_enable_clipboard_to_field_when_false_on_writeback`
+    /// below for the round-trip half.
+    #[test]
+    fn config_omits_enable_clipboard_to_when_true_on_writeback() {
+        let cfg = ConfigClient {
+            ips: HashSet::new(),
+            hostname: Some("legacy".into()),
+            port: DEFAULT_PORT,
+            pos: Position::Right,
+            active: false,
+            enter_hook: None,
+            input_channels: InputChannelConfig::default(),
+            monitor: None,
+            enable_clipboard_to: true,
+        };
+        let toml_client: TomlClient = cfg.into();
+        let s = toml::to_string_pretty(&toml_client).unwrap();
+        assert!(
+            !s.contains("enable_clipboard_to"),
+            "enable_clipboard_to = true (legacy default) must be omitted; got:\n{s}"
+        );
+    }
+
+    /// **M0c — write-back keeps `enable_clipboard_to = false`** (the
+    /// user explicitly opted this peer out). Pinning this prevents
+    /// the GUI checkbox from silently losing its value on save.
+    #[test]
+    fn config_keeps_enable_clipboard_to_field_when_false_on_writeback() {
+        let cfg = ConfigClient {
+            ips: HashSet::new(),
+            hostname: Some("opted-out".into()),
+            port: DEFAULT_PORT,
+            pos: Position::Right,
+            active: false,
+            enter_hook: None,
+            input_channels: InputChannelConfig::default(),
+            monitor: None,
+            enable_clipboard_to: false,
+        };
+        let toml_client: TomlClient = cfg.into();
+        let s = toml::to_string_pretty(&toml_client).unwrap();
+        assert!(
+            s.contains("enable_clipboard_to = false"),
+            "enable_clipboard_to = false must be written verbatim; got:\n{s}"
+        );
+    }
+
+    /// **M0c — read-back defaults `enable_clipboard_to = true`** when
+    /// the TOML has no key. Mirrors the wire-level `#[serde(default)]`
+    /// contract from `lan_mouse_ipc::ClientConfig`. A legacy config
+    /// file (no `enable_clipboard_to` line) must deserialize to a
+    /// `ConfigClient` with `enable_clipboard_to = true`.
+    #[test]
+    fn config_defaults_enable_clipboard_to_true_on_readback() {
+        let toml_str = r#"
+hostname = "legacy"
+port = 2268
+position = "right"
+"#;
+        let toml_client: TomlClient = toml::from_str(toml_str).unwrap();
+        let cfg: ConfigClient = toml_client.into();
+        assert!(
+            cfg.enable_clipboard_to,
+            "missing enable_clipboard_to key must default to true"
         );
     }
 }

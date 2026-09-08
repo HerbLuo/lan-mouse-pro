@@ -43,6 +43,10 @@ impl ClientManager {
             // `None` for legacy clients; `Some(id)` for clients that
             // the user has bound to a specific `MonitorInfo.id`.
             monitor: config_client.monitor,
+            // **M0c / PLAN-2**: forward the per-peer clipboard
+            // opt-in flag. Default `true` for legacy clients
+            // (matches the `#[serde(default)]` wire compat contract).
+            enable_clipboard_to: config_client.enable_clipboard_to,
         };
         let state = ClientState {
             active: config_client.active,
@@ -282,6 +286,25 @@ impl ClientManager {
         }
     }
 
+    /// **M0c / PLAN-2** — set the per-peer `enable_clipboard_to`
+    /// flag. Returns `true` only when the value changed (mirrors the
+    /// `set_input_channels` / `set_monitor` flow:
+    /// return-bool-on-change → broadcast → save_config).
+    pub(crate) fn set_enable_clipboard_to(&self, handle: ClientHandle, enable: bool) -> bool {
+        match self.clients.borrow_mut().get_mut(handle as usize) {
+            Some((c, s)) if c.enable_clipboard_to != enable => {
+                log::info!(
+                    "update enable_clipboard_to {handle} {} -> {}",
+                    c.enable_clipboard_to,
+                    enable
+                );
+                c.enable_clipboard_to = enable;
+                s.active
+            }
+            _ => false,
+        }
+    }
+
     /// update the enter hook command of the client
     pub(crate) fn set_enter_hook(&self, handle: ClientHandle, enter_hook: Option<String>) {
         if let Some((c, _s)) = self.clients.borrow_mut().get_mut(handle as usize) {
@@ -445,6 +468,10 @@ mod client_input_channels_tests {
             // `add_with_config_preserves_monitor` test below for the
             // monitor-binding half of the contract.
             monitor: None,
+            // **M0c**: legacy default = true (matches
+            // `client_config_input_channels_default_when_missing` and
+            // the wire compat contract).
+            enable_clipboard_to: true,
         };
         let handle = cm.add_with_config(cfg_client);
         let (c, _) = cm.get_state(handle).unwrap();
@@ -505,6 +532,8 @@ mod client_input_channels_tests {
             enter_hook: None,
             input_channels: InputChannelConfig::default(),
             monitor: Some("wl_output:eDP-1".into()),
+            // M0c default
+            enable_clipboard_to: true,
         };
         let handle = cm.add_with_config(cfg);
         let (c, _) = cm.get_state(handle).unwrap();
@@ -529,6 +558,8 @@ mod client_input_channels_tests {
             enter_hook: None,
             input_channels: InputChannelConfig::default(),
             monitor: None,
+            // M0c default
+            enable_clipboard_to: true,
         };
         let handle = cm.add_with_config(cfg);
         let (c, _) = cm.get_state(handle).unwrap();

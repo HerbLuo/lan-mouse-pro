@@ -4,15 +4,13 @@ use std::{
     fmt::Display,
     io,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     str::FromStr,
 };
 use thiserror::Error;
 
 #[cfg(unix)]
-use std::{
-    env,
-    path::{Path, PathBuf},
-};
+use std::{env, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -169,6 +167,27 @@ pub struct ClientConfig {
     /// `input_channels` above.
     #[serde(default)]
     pub monitor: Option<String>,
+    /// **M0c / PLAN-2** — whether this peer should receive clipboard pushes from the
+    /// local daemon. Default `true` (a missing field on the wire deserializes as
+    /// `true`, so a pre-M0c config.toml + new daemon pair continues to push
+    /// clipboard to every configured client). The GUI per-row checkbox writes
+    /// `false` to opt a specific peer out.
+    ///
+    /// `#[serde(default)]` matches the `input_channels` /
+    /// `monitor` contract — backward-compatible with pre-M0c wire
+    /// payloads.
+    ///
+    /// `#[serde(default)]` matches the `input_channels` /
+    /// `monitor` contract — backward-compatible with pre-M0c wire
+    /// payloads. The default value comes from a `const fn` rather than
+    /// `Default` because we want every `ClientConfig::default()` to
+    /// carry `enable_clipboard_to = true` (the "M0c legacy" behavior).
+    #[serde(default = "default_enable_clipboard_to")]
+    pub enable_clipboard_to: bool,
+}
+
+fn default_enable_clipboard_to() -> bool {
+    true
 }
 
 impl Default for ClientConfig {
@@ -181,6 +200,10 @@ impl Default for ClientConfig {
             cmd: None,
             input_channels: InputChannelConfig::default(),
             monitor: None,
+            // M0c default = true (legacy behavior — clipboard pushes to
+            // every peer; matches the `#[serde(default)]` contract for
+            // pre-M0c wire payloads).
+            enable_clipboard_to: true,
         }
     }
 }
@@ -395,6 +418,211 @@ mod input_channel_tests {
             "expected `\"monitor\":null` in serialized payload; got {s}"
         );
     }
+
+    // === M0c / PLAN-2 — enable_clipboard_to (per-peer) ===================
+
+    /// **M0c wire compat**: a pre-M0c payload (no `enable_clipboard_to`
+    /// field) must deserialize as `enable_clipboard_to = true` — the
+    /// legacy "push clipboard to every peer" default. Mirrors the
+    /// `monitor` / `input_channels` compat tests.
+    #[test]
+    fn client_config_enable_clipboard_to_defaults_to_true_when_missing() {
+        let pre_m0c = r#"{
+            "hostname": "peer-east",
+            "fix_ips": [],
+            "port": 2268,
+            "pos": "right",
+            "cmd": null,
+            "input_channels": { "mouse_button": "datagram", "keyboard": "stream" },
+            "monitor": null
+        }"#;
+        let cfg: ClientConfig = serde_json::from_str(pre_m0c).unwrap();
+        assert!(
+            cfg.enable_clipboard_to,
+            "missing `enable_clipboard_to` field must default to true (legacy behavior)"
+        );
+    }
+
+    /// **M0c round-trip**: a new-build writer writes
+    /// `enable_clipboard_to = false`; a new-build reader decodes the
+    /// same value back.
+    #[test]
+    fn client_config_enable_clipboard_to_round_trip() {
+        let cfg = ClientConfig {
+            enable_clipboard_to: false,
+            ..ClientConfig::default()
+        };
+        let s = serde_json::to_string(&cfg).unwrap();
+        let back: ClientConfig = serde_json::from_str(&s).unwrap();
+        assert!(!back.enable_clipboard_to);
+    }
+
+    /// `ClientConfig::default()` must carry `enable_clipboard_to = true`
+    /// — the legacy default. This pins the `Default` impl alongside
+    /// the `#[serde(default)]` contract.
+    #[test]
+    fn client_config_default_has_enable_clipboard_to_true() {
+        let cfg = ClientConfig::default();
+        assert!(
+            cfg.enable_clipboard_to,
+            "ClientConfig::default() must carry enable_clipboard_to = true"
+        );
+    }
+}
+
+#[cfg(test)]
+mod clipboard_config_tests {
+    use super::*;
+
+    /// `ClipboardConfig::default()` — legacy "all sync enabled,
+    /// auto-accept off, accept_dir = None" shape.
+    #[test]
+    fn clipboard_config_default_is_legacy_shape() {
+        let cfg = ClipboardConfig::default();
+        assert!(!cfg.auto_accept_files);
+        assert_eq!(cfg.accept_dir, None);
+        assert!(!cfg.ignore_text);
+        assert!(!cfg.ignore_images);
+        assert!(!cfg.ignore_files);
+    }
+
+    /// Round-trip with all fields populated.
+    #[test]
+    fn clipboard_config_round_trip_populated() {
+        let cfg = ClipboardConfig {
+            auto_accept_files: true,
+            accept_dir: Some(PathBuf::from("/tmp/received")),
+            ignore_text: true,
+            ignore_images: false,
+            ignore_files: true,
+        };
+        let s = serde_json::to_string(&cfg).unwrap();
+        let back: ClipboardConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    /// **Wire compat**: a payload missing every field (an empty `{}`
+    /// or a payload that only carries unrelated fields) must
+    /// deserialize as the legacy default. The combination of
+    /// `#[serde(default)]` on each field + `Default for
+    /// ClipboardConfig` makes this the canonical compat contract.
+    #[test]
+    fn clipboard_config_missing_fields_default_to_legacy() {
+        let empty = "{}";
+        let cfg: ClipboardConfig = serde_json::from_str(empty).unwrap();
+        assert_eq!(cfg, ClipboardConfig::default());
+    }
+
+    /// **Wire compat**: a payload missing one specific field
+    /// (`accept_dir`) must deserialize with the rest preserved. This
+    /// pins the per-field `#[serde(default)]` contract — a future
+    /// payload that drops `accept_dir` while keeping the others
+    /// still round-trips cleanly.
+    #[test]
+    fn clipboard_config_partial_missing_accept_dir() {
+        let payload = r#"{
+            "auto_accept_files": true,
+            "ignore_text": true
+        }"#;
+        let cfg: ClipboardConfig = serde_json::from_str(payload).unwrap();
+        assert!(cfg.auto_accept_files);
+        assert!(cfg.ignore_text);
+        assert_eq!(cfg.accept_dir, None);
+        assert!(!cfg.ignore_images);
+        assert!(!cfg.ignore_files);
+    }
+
+    /// `FrontendRequest::SetClipboardConfig` round-trip — the wire
+    /// shape is `{"SetClipboardConfig":{...}}` (single-key object,
+    /// matches the serde default for tuple variants).
+    #[test]
+    fn request_set_clipboard_config_round_trip() {
+        let cfg = ClipboardConfig {
+            auto_accept_files: true,
+            accept_dir: Some(PathBuf::from("/Users/me/Downloads")),
+            ignore_text: false,
+            ignore_images: false,
+            ignore_files: false,
+        };
+        let req = FrontendRequest::SetClipboardConfig(cfg.clone());
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains("\"SetClipboardConfig\""));
+        let back: FrontendRequest = serde_json::from_str(&s).unwrap();
+        match back {
+            FrontendRequest::SetClipboardConfig(c) => assert_eq!(c, cfg),
+            other => panic!("expected SetClipboardConfig, got {other:?}"),
+        }
+    }
+
+    /// `FrontendRequest::SetEnableClipboardTo(handle, bool)` round-trip.
+    #[test]
+    fn request_set_enable_clipboard_to_round_trip() {
+        let req = FrontendRequest::SetEnableClipboardTo(7, false);
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains("\"SetEnableClipboardTo\":[7,false]"));
+        let back: FrontendRequest = serde_json::from_str(&s).unwrap();
+        match back {
+            FrontendRequest::SetEnableClipboardTo(h, b) => {
+                assert_eq!(h, 7);
+                assert!(!b);
+            }
+            other => panic!("expected SetEnableClipboardTo, got {other:?}"),
+        }
+    }
+
+    /// `FrontendEvent::ClipboardState` round-trip — pins the JSON
+    /// shape `"ClipboardState":{...}` so the Vue frontend's
+    /// `FrontendEvent` union has a stable wire contract.
+    #[test]
+    fn event_clipboard_state_round_trip() {
+        let event = FrontendEvent::ClipboardState {
+            last_text_ts: Some(1700000000000),
+            last_image_ts: None,
+            last_file_ts: Some(1700000005000),
+            last_source: Some("peer-west".into()),
+        };
+        let s = serde_json::to_string(&event).unwrap();
+        assert!(s.contains("\"ClipboardState\""));
+        assert!(s.contains("\"last_source\":\"peer-west\""));
+        let back: FrontendEvent = serde_json::from_str(&s).unwrap();
+        match back {
+            FrontendEvent::ClipboardState {
+                last_text_ts,
+                last_image_ts,
+                last_file_ts,
+                last_source,
+            } => {
+                assert_eq!(last_text_ts, Some(1700000000000));
+                assert_eq!(last_image_ts, None);
+                assert_eq!(last_file_ts, Some(1700000005000));
+                assert_eq!(last_source.as_deref(), Some("peer-west"));
+            }
+            other => panic!("expected ClipboardState, got {other:?}"),
+        }
+    }
+
+    /// **Wire compat**: a `ClipboardState` payload missing every
+    /// timestamp + `last_source` deserializes as the all-None default
+    /// — `#[serde(default)]` per field keeps the contract.
+    #[test]
+    fn event_clipboard_state_missing_fields_default_to_none() {
+        // Empty body: deserialize as all-None via #[serde(default)].
+        let back: FrontendEvent = serde_json::from_str(r#"{"ClipboardState":{}}"#).unwrap();
+        match back {
+            FrontendEvent::ClipboardState {
+                last_text_ts,
+                last_image_ts,
+                last_file_ts,
+                last_source,
+            } => {
+                assert_eq!(last_text_ts, None);
+                assert_eq!(last_image_ts, None);
+                assert_eq!(last_file_ts, None);
+                assert_eq!(last_source, None);
+            }
+            other => panic!("expected ClipboardState, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -566,6 +794,45 @@ mod monitor_info_tests {
     }
 }
 
+/// **M0c / PLAN-2** — daemon-global clipboard configuration. The
+/// clipboard listener is daemon-global (one OS clipboard feeds all
+/// peers) and the receive directory is also global — this struct lives
+/// at `lan_mouse_ipc::ClipboardConfig` (not under `ClientConfig`),
+/// per PLAN §5 评审 #4 second round.
+///
+/// Every field carries `#[serde(default)]` so a payload missing any
+/// subset of fields deserializes as the legacy default
+/// (auto-accept off / ignore-* off / `accept_dir = None`). The
+/// `Default` impl matches that legacy shape.
+///
+/// Frontend request: [`FrontendRequest::SetClipboardConfig`]. TOML
+/// key: `[clipboard]` section in `config.toml`.
+#[derive(Debug, Default, Eq, PartialEq, Clone, Serialize, Deserialize)]
+pub struct ClipboardConfig {
+    /// Auto-accept incoming `ClipboardFiles` (no Toaster prompt). The
+    /// files land in `accept_dir`. Default `false` — the user must
+    /// explicitly opt in via the GUI checkbox (M3b wiring).
+    #[serde(default)]
+    pub auto_accept_files: bool,
+    /// Receive directory for auto-accepted files. `None` means
+    /// "daemon default" (typically `$HOME/Downloads/lan-mouse` or the
+    /// OS-appropriate temp dir — wired in M3b).
+    #[serde(default)]
+    pub accept_dir: Option<PathBuf>,
+    /// Disable text sync (do not push / pull text via StreamC). The
+    /// `#[serde(default)]` makes "missing field = false (text sync
+    /// enabled)" — pre-M0c payloads deserialize to the legacy
+    /// "all sync enabled" state.
+    #[serde(default)]
+    pub ignore_text: bool,
+    /// Disable image sync. Same compat contract as `ignore_text`.
+    #[serde(default)]
+    pub ignore_images: bool,
+    /// Disable file sync. Same compat contract as `ignore_text`.
+    #[serde(default)]
+    pub ignore_files: bool,
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ClientState {
     /// events should be sent to and received from the client
@@ -664,6 +931,22 @@ pub enum FrontendEvent {
     /// `String` keeps the wire simple and lets the daemon vary its
     /// phrasing without a schema bump.
     BindingInvalid(ClientHandle, String),
+    /// **M0c / PLAN-2** — clipboard state snapshot (timestamp of last
+    /// text / image / file sync + the peer hostname / fingerprint that
+    /// most recently pushed to the local clipboard).
+    ///
+    /// `last_text_ts` / `last_image_ts` / `last_file_ts` are
+    /// milliseconds since the UNIX epoch (`None` means "never").
+    /// `last_source` carries the peer hostname / fingerprint so the
+    /// GUI can render the "clipboard was just changed by <peer>"
+    /// amber highlight (PLAN §3 M4 STEP-4.4 + 评审 #6 second round)
+    /// — `None` means "the change originated locally".
+    ClipboardState {
+        last_text_ts: Option<u64>,
+        last_image_ts: Option<u64>,
+        last_file_ts: Option<u64>,
+        last_source: Option<String>,
+    },
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -722,6 +1005,17 @@ pub enum FrontendRequest {
     /// value applies on the next daemon restart. The GUI surfaces this
     /// constraint next to the input.
     SetQuicIdleTimeout(u64),
+    /// **M0c / PLAN-2** — set daemon-global clipboard config.
+    /// Persists to TOML `[clipboard]` section immediately and echoes
+    /// the new value back. Carries no `ClientHandle` because the
+    /// clipboard listener is daemon-global (one OS clipboard feeds
+    /// all peers, PLAN §5 评审 #4 second round).
+    SetClipboardConfig(ClipboardConfig),
+    /// **M0c / PLAN-2** — set the per-peer `enable_clipboard_to`
+    /// flag. Persists to TOML `[[clients]]` `enable_clipboard_to`
+    /// field immediately and echoes back. Distinct from
+    /// [`SetClipboardConfig`] which is daemon-global.
+    SetEnableClipboardTo(ClientHandle, bool),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]

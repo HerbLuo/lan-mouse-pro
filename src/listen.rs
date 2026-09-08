@@ -731,6 +731,22 @@ async fn handle_quic_peer_supervisor(
         parked_streams.clone(),
     ));
 
+    // **M0c / STEP-0.5b** — spawn the HTTP/3-lite server on this
+    // peer's QUIC `Connection`. `http3.rs::default_router()` registers
+    // 5 routes: `/healthz` 200 + 4 stubs (`/clipboard/text/{sha256}`
+    // 404, etc.) that M1a/M2a/M3a fill with cache lookups. The
+    // server-side spawn was added in M0b STEP-0.3+0.4 but never
+    // triggered — `listen.rs` was the only caller path and was
+    // deliberately untouched per the M0b scope discipline. M0c wires
+    // it up here.
+    //
+    // The spawned task runs until the underlying `Connection`
+    // closes (`accept_bi()` returns `Err`). The `JoinHandle` is
+    // dropped immediately — `listen.rs` currently relies on
+    // `Connection` close for graceful exit (matching the M0b
+    // `start_http3_server` docstring contract).
+    let _http3_join = peer.start_http3_server(crate::quic_transport::http3::default_router());
+
     // (6) Loop read_frame(recv_a) → ListenEvent::Msg
     //
     // Error dispatch:
@@ -854,7 +870,8 @@ async fn server_accept_bi_task(
         };
 
         // Try to read the first frame's length — discriminator between
-        // bunch bidi (EOF) and real stream B (valid u32).
+        // bunch bidi (EOF), real stream B (valid u32 ≤ MAX_EVENT_SIZE),
+        // and real stream C (valid u32 > MAX_EVENT_SIZE — M0c).
         use tokio::io::AsyncReadExt;
         let len: u32 = match recv.read_u32().await {
             Ok(n) => n,
@@ -872,6 +889,27 @@ async fn server_accept_bi_task(
                 continue;
             }
         };
+
+        // **M0c STEP-0.5b** — Stream C discriminator: a length-prefix
+        // greater than `MAX_EVENT_SIZE` (21 bytes) is a var-codec
+        // frame (`ClipboardText` baseline is 64B = 32 fingerprint +
+        // 32 sha256; other var-codec variants are larger). Spawn a
+        // dedicated stream C reader task that calls
+        // `read_stream_c_frame` and forwards each decoded event to
+        // `listen_tx` (matching the existing ListenEvent::Msg
+        // pipeline). The send half is dropped — the server's
+        // clipboard push path uses its own `cached_send_c` bidi
+        // opened via `PeerSession::send_stream_c`, NOT this
+        // accepted bidi (each side opens its own bidi).
+        if len as usize > lan_mouse_proto::MAX_EVENT_SIZE {
+            log::debug!(
+                "server accept_bi: stream C first frame length={len} (> MAX_EVENT_SIZE={}), dispatching to stream C reader",
+                lan_mouse_proto::MAX_EVENT_SIZE
+            );
+            drop(send);
+            spawn_local(server_stream_c_reader_task(recv, listen_tx.clone(), addr));
+            continue;
+        }
 
         // Real stream B — drop `send` (the client has dropped its own recv,
         // so the server's `send` has no peer-side reader; dropping is a
@@ -939,6 +977,60 @@ async fn server_stream_reader_task(
             }
             Err(e) => {
                 log::info!("server stream reader: stream ended ({addr}): {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// **M0c STEP-0.5b** — server-side Stream C reader task. Spawned by
+/// [`server_accept_bi_task`] when the length-prefix discriminator
+/// shows `len > MAX_EVENT_SIZE` (a var-codec frame, not the
+/// fixed-codec stream B frame).
+///
+/// **Responsibilities**: read var-codec frames via
+/// [`quic_transport::read_stream_c_frame`] (no `MAX_EVENT_SIZE`
+/// cap — accepts `ClipboardText` / `ClipboardImage` / `ClipboardFiles`
+/// / `FileTransferOffer` / `FileTransferResponse` / `FileTransferCancel`
+/// / `ClipboardRequest`), and push each decoded event to
+/// `listen_tx` as `ListenEvent::Msg` (matching the existing
+/// pipeline: `emulation::ListenTask` → `EmulationEvent::Message` →
+/// service).
+///)
+/// **Error dispatch**: decode error → `log::warn` + skip frame
+/// (mirrors stream B's skip-frame semantics); EOF / IO error → exit
+/// task (peer closed the bidi).
+///
+/// **Push to `listen_tx` (not `clipboard_inbox`)**: the existing
+/// `ListenTask` already routes `EmulationEvent::Message` to the
+/// service. Pushing through the same channel keeps the dispatch
+/// pipeline uniform — the service's M1a `clipboard::apply_event`
+/// handler can decide whether the event is a clipboard event and
+/// route to the clipboard backend, vs. ignoring other variants.
+/// Routing directly to `peer.clipboard_inbox` would duplicate the
+/// pipeline for events that ListenTask already understands.
+async fn server_stream_c_reader_task(
+    mut recv: quinn::RecvStream,
+    listen_tx: Sender<ListenEvent>,
+    addr: SocketAddr,
+) {
+    loop {
+        match quic_transport::read_stream_c_frame(&mut recv).await {
+            Ok(event) => {
+                log::debug!("server stream C reader: from {addr}: {event}");
+                if listen_tx.send(ListenEvent::Msg { event, addr }).is_err() {
+                    log::debug!("server stream C reader: listen_tx closed, exiting");
+                    return;
+                }
+            }
+            Err(quic_transport::Error::HelloFailed(msg))
+                if msg.starts_with("decode stream C frame") =>
+            {
+                log::warn!("server stream C reader: skip frame (decode error): {msg}");
+                continue;
+            }
+            Err(e) => {
+                log::info!("server stream C reader: stream ended ({addr}): {e}");
                 return;
             }
         }
