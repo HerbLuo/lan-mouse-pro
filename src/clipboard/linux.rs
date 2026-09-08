@@ -112,10 +112,7 @@ impl LinuxClipboard {
                     .into(),
             )
         })?;
-        Ok(Self {
-            tool,
-            cached: None,
-        })
+        Ok(Self { tool, cached: None })
     }
 }
 
@@ -184,7 +181,9 @@ impl ClipboardBackend for LinuxClipboard {
             .as_mut()
             .expect("stdin must be piped (just spawned with Stdio::piped)")
             .write_all(text.as_bytes())
-            .map_err(|e| ClipboardError::Io(format!("write {} stdin: {e}", self.tool_binary_name())))?;
+            .map_err(|e| {
+                ClipboardError::Io(format!("write {} stdin: {e}", self.tool_binary_name()))
+            })?;
         drop(child.stdin.take());
         let status = child
             .wait()

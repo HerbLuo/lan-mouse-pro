@@ -52,7 +52,7 @@ use windows_sys::Win32::Foundation::{CloseClipboard, GetLastError, HGLOBAL, HWND
 use windows_sys::Win32::System::DataExchange::{
     EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
-use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 
 use super::{ClipboardBackend, ClipboardError};
 

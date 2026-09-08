@@ -92,7 +92,10 @@ impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
-        clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(std::net::SocketAddr, lan_mouse_proto::ProtoEvent)>,
+        clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(
+            std::net::SocketAddr,
+            lan_mouse_proto::ProtoEvent,
+        )>,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
         let (request_tx, request_rx) = channel();
@@ -177,7 +180,8 @@ struct ListenTask {
     /// poll method) — not via `select!`. Cloning the `tokio`
     /// sender into each per-listener `ListenTask` keeps the
     /// dispatcher's `select!` integration simple.
-    clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(SocketAddr, lan_mouse_proto::ProtoEvent)>,
+    clipboard_inbound_tx:
+        tokio::sync::mpsc::UnboundedSender<(SocketAddr, lan_mouse_proto::ProtoEvent)>,
 }
 
 impl ListenTask {

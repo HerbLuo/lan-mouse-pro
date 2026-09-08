@@ -421,7 +421,9 @@ impl Capture {
     /// not need per-peer ack semantics — clipboard push is
     /// best-effort and the next user copy recovers the link.
     pub(crate) fn send_event(&self, event: ProtoEvent, handle: ClientHandle) {
-        let _ = self.request_tx.send(CaptureRequest::SendClip(event, handle));
+        let _ = self
+            .request_tx
+            .send(CaptureRequest::SendClip(event, handle));
     }
 }
 

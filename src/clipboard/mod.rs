@@ -80,10 +80,10 @@
 // contains a single struct implementing `ClipboardBackend`. The
 // `default_backend()` factory below selects the right one at compile
 // time so the daemon never branches on `cfg!` at runtime.
-#[cfg(target_os = "macos")]
-mod macos;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -315,7 +315,11 @@ mod tests {
     #[test]
     fn dummy_backend_round_trip() {
         let mut backend = DummyBackend::new();
-        assert_eq!(backend.current_text(), None, "fresh dummy backend should be empty");
+        assert_eq!(
+            backend.current_text(),
+            None,
+            "fresh dummy backend should be empty"
+        );
         backend.set_text("hello").expect("set_text should succeed");
         assert_eq!(backend.current_text(), Some("hello".to_string()));
     }

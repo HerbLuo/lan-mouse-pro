@@ -162,7 +162,9 @@ mod tests {
 
     /// Helper: acquire the test lock, ignoring poisoning.
     fn lock_for_test() -> std::sync::MutexGuard<'static, ()> {
-        CLIPBOARD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        CLIPBOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Smoke test: `new()` returns `Ok` on any macOS host where
@@ -238,7 +240,10 @@ mod tests {
         let read_back = backend
             .current_text()
             .expect("current_text after set_text(\"\") should return Some(\"\")");
-        assert_eq!(read_back, "", "empty string must round-trip as empty string");
+        assert_eq!(
+            read_back, "",
+            "empty string must round-trip as empty string"
+        );
     }
 
     /// Multi-byte UTF-8 round-trip — macOS clipboard is UTF-8 native;
@@ -258,7 +263,10 @@ mod tests {
         let read_back = backend
             .current_text()
             .expect("current_text after utf8 set_text");
-        assert_eq!(read_back, payload, "multi-byte UTF-8 must round-trip byte-for-byte");
+        assert_eq!(
+            read_back, payload,
+            "multi-byte UTF-8 must round-trip byte-for-byte"
+        );
     }
 
     /// RAII guard that restores the original clipboard on drop. Used
