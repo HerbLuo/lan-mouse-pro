@@ -24,14 +24,16 @@
 ┌──────────────────────────────────────────────────────────────────┐
 │ input-capture::geometry                                           │
 │  - DisplayRect { x, y, w, h }          (per-OS 枚举的原始矩形)    │
+│  - DisplayBound { rect, monitor_id }   (per-OS 枚举的矩形+id)    │
 │  - BarrierKey { pos, monitor, offset, span }   (主键)             │
+│  - crossed_pure / activation_pure       (CI 可单测的纯几何查询)   │
 │  - exposed_segments(Vec<DisplayRect>) -> Vec<EdgeSegment>          │
 │      切分显示器并集的外轮廓为最大暴露线段                           │
 └──────────────────────────────────────────────────────────────────┘
         ▲ 枚举                     ▲ 主键                       ▲ 计算
         │                          │                            │
 ┌───────┴────────┐         ┌───────┴────────┐         ┌─────────┴──────┐
-│  macOS/Windows/│         │ InputCapture   │         │ FrontendEvent  │
+│  macOS/Windows/│         │ InputCapture   │         │ FrontendEvent   │
 │  Wayland/libei │ ───POS──>  position_map:  │ ───IPCSOCK──> LayoutChanged│
 │  backends      │      +key  HashMap<BK,Vec<Handle>>  │ MonitorsChanged│
 └────────────────┘         └────────────────┘         └────────────────┘
@@ -57,9 +59,9 @@
 | **M0** macOS 正确性 | ~0.4h（实测 ~15m） | macOS 多屏边触发不再"只最左屏" | — | ✅ 已完成 |
 | **M1** BarrierKey 重构 | ~1.8h | （内部）单屏行为零变化 | M0 | 待启动 |
 | **M2** 显示器枚举 + 热插拔 | ~3.5h | WebSocket 收到 monitors 列表；拔插触发 `BindingInvalid` | M1 | 待启动 |
-| **M3** 显示器绑定 UI | ~1.5h | **解决用户问题**：选 monitor 即可 | M2 | 待启动 |
+| **M3** 显示器绑定 UI | 3.5h（含 3.4-3.6 M3 落地回归 bug 修复 ~2h） | **解决用户问题**：选 monitor 即可 | M2 | 进行中（含 3.4-3.6 修复） |
 | **M4** 暴露边段 + 画布 | ~9h | SVG 画布可视化拖拽挂 client；libei 后端降级 | M3 | 待启动 |
-| **合计** | **~16h** | | | |
+| **合计** | **~18h** | | | |
 
 > **时间校准说明**：M0 计划 2.3h，实测 AI ~15m、人类 ~25m。整体估时按 ~1/3 系数下调，STEP 粒度按 AI 单次执行 ~30 分钟合并。
 
@@ -143,7 +145,7 @@
 ### M3 — 显示器绑定 UI
 
 **目标**：用户能在 GUI 把 client 绑到具体显示器；同一 `Position` 不同显示器可绑不同 client。
-**AI 估时**：~1.5 小时
+**AI 估时**：~3.5 小时（含 3.4-3.6 M3 自身引入型回归 bug 修复 ~2h）
 **依赖**：M2
 
 **人类准备**：
@@ -157,15 +159,25 @@
 | 3.1 | 30m | **后端链路**：`lan-mouse-ipc::ClientConfig.monitor: Option<String>`（Default 不变，缺字段 = None）；`TomlClient.monitor: Option<String>` + `ConfigClient::From<&TomlClient>` / `From<&ConfigClient>`（保存时 `None` 不写入）；`FrontendRequest::UpdateMonitor(handle, Option<String>)`；`lan-mouse-cli::SetMonitor` 子命令；`src/service.rs::update_monitor(handle, monitor)`：根据当前 `pos` 和新 `monitor` 算新 `BarrierKey`（offset/span 仍默认）；`capture.destroy(old_key)` → `capture.create(new_key, handle)`；若 active 先 deactivate 再 activate；`save_config` 落盘；反序列化测试覆盖缺字段兼容 | `lan-mouse-ipc/src/lib.rs`、`src/config.rs`、`lan-mouse-cli/src/lib.rs`、`src/service.rs` | 旧 config 仍能反序列化；新字段可选；单测：改 monitor 后 BarrierKey 实际变更 |
 | 3.2 | 30m | **前端链路**：Vue `api/ipc.ts` 新增 `MonitorInfo` 类型 + `MonitorsChanged` event + `UpdateMonitor` request；Vue `store/index.ts` 维护 `state.monitors: MonitorInfo[]`，`onMounted` 监听 `MonitorsChanged`，`updateClientConfig` 加 monitor 字段 diff/send + type guard；`components/ConnectionRow.vue` 在 position `<select>` 后面加 monitor `<select>`，options = `[<Any>, ...state.monitors.map(...)]`，label tooltip 显示显示器 position/size；空选项 = "Any (back-compat)" | `lan-mouse-vue/src/api/ipc.ts`、`lan-mouse-vue/src/store/index.ts`、`lan-mouse-vue/src/components/ConnectionRow.vue` | 浏览器 console 看到 monitors 同步到 store；dropdown 渲染正确；vitest 单测 + snapshot 覆盖三种 case |
 | 3.3 | 30m | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cd lan-mouse-vue && pnpm build`；真机双屏 + L 形 + 旧 config + Linux 后端回归（人类配合） | — | **用户报告问题解决** + 所有 case 通过 |
+| 3.4 | 40m | **macOS + layer_shell backend 感知 monitor（修复 #1 + 同形 bug #3）**：<br>• macOS 部分：(a) 在 `geometry/mod.rs` 新增 `pub struct DisplayBound { rect: DisplayRect, monitor_id: Option<MonitorId> }`；(b) 在 `macos.rs` 新增纯函数 `fn build_display_bounds(active_ids: &[CGDirectDisplayID], monitors: &[MonitorInfo]) -> Vec<DisplayBound>` —— **以 `enumerate_monitors`（STEP-2.2 产出的 `Vec<MonitorInfo>`）为单一信息源**：把 `monitor.position` 直接映射成 `rect.x/y`、`monitor.size` 映射成 `rect.w/h`，避免当前「`update_bounds` 走一遍 `CGDisplay::active_displays + bounds()`，`enumerate_monitors` 再走一遍 `CGDisplay::active_displays + IOKit`」的双 Quartz 调用与瞬态不一致；(c) `InputCaptureState.displays: Vec<DisplayRect>` 升级为 `Vec<DisplayBound>`；(d) `update_bounds` 退化为薄包装：`CGDisplay::active_displays()` 拿 id + 调 `enumerate_monitors_for_ids(&active_ids)`（新签名，与现有 helper 共用 IOKit 代码）→ 调纯 `build_display_bounds` 构造 `Vec<DisplayBound>`；(e) `crossed()` 内部查询逻辑抽到 `geometry/mod.rs::crossed_pure(prev, curr, displays: &[DisplayBound], active: &HashSet<BarrierKey>) -> Option<BarrierKey>`（半开约定 + `display_containing` 找 prev_pos 所在 display 的 idx → 取 `monitor_id` 构造完整 `BarrierKey` → `active.contains(&key)`），`crossed()` 退化为薄包装（`FFI` 调用 + `crossed_pure`）。<br>• layer_shell 同形 bug（与 macOS `crossed` 不同形，但同因）：`Capture::create` / `destroy` 当前的 `self.add_client(BarrierKey::from_pos(key.pos))`（layer_shell.rs:902 / 908）剥掉 `monitor / offset / span`。改为接完整 `&BarrierKey`：`add_client(key.clone())` / `delete_client(key.clone())`，并相应调整 `add_client` / `delete_client` 签名（不再做 `from_pos` 重建）。<br>• 4×2 矩阵单测在 `geometry/mod.rs`（CI 可跑，无需 FFI）。明确半开约定：`display_containing` 在 `(x, y)` 处左/上含、右/下不含；两屏接缝 `(1920.0, 540.0)` 在横排 2x1 下归到 `display_0`（左侧）。测试矩阵每个 case 写清 `(prev_pos, curr_pos, active_clients)` 三元组与断言 key：<br>  - C1: prev 在 display_0 中心 → curr 越过 top → active 含 `monitor: Some(d0.id)` 的 Top key → hit（query key = `Some(d0.id)`）<br>  - C2: prev 在 display_1 中心 → curr 越过 top → active 含 `monitor: Some(d1.id)` 的 Top key → hit<br>  - C3: prev 在 display_0 → curr 越过 top → active **不含** d0.monitor 的 Top key、只含 `monitor: None` 的 Top key → miss<br>  - C4: prev 在接缝 `(1920.0, 540.0)` → curr 越过 top → 归到 d0；active 含 `monitor: Some(d0.id)` → hit；active 含 `monitor: Some(d1.id)` → miss<br>  - C5: prev 屏外 → entered_barrier 返回 None → 直接 miss<br>  - C6: prev 在 display_0 → curr 越过 top → active 含 `monitor: Some(d0.id)` 的 Top key + `monitor: Some(d1.id)` 的 Top key → 只 d0 命中（query 是 d0）<br>  - C7: 2x1 横排左穿到右：prev 在 display_0 右边缘外侧 → curr 越过 right → active 含 d0.monitor 的 Right key → hit<br>  - C8: 镜像对照 prev 在 display_1 左边缘外侧 → curr 越过 left → active 含 d1.monitor 的 Left key → hit（d0.monitor Left 不命中）<br>• `build_display_bounds` 单测：构造 `active_ids + monitors` fixture → 断言 id 唯一、`display_containing` 拿到的 idx 对应的 monitor_id 一致、`Vec` 长度 = `active_ids.len()`<br>• layer_shell 单测：构造 `state.active_positions` 注入完整 `BarrierKey { monitor: Some("wl-output-name"), pos: Top, ... }`，确认 `add_client` 不剥字段 | `input-capture/src/geometry/mod.rs`（加 `DisplayBound` + `crossed_pure`）、`input-capture/src/macos.rs`（新增 `build_display_bounds` + `enumerate_monitors_for_ids` + 改 `update_bounds` + `crossed` 薄包装）、`input-capture/src/layer_shell.rs`（改 `Capture::create` / `destroy` + 改 `add_client` / `delete_client` 签名） | `cargo test -p input-capture::geometry` 全绿（含 4×2 矩阵 8 个 case + `build_display_bounds` 单测）；`cargo test -p input-capture::layer_shell`（cfg gate）全绿；旧 macOS 单测零回归；`Cargo.lock` 不变 |
+| 3.5 | 40m | **Windows backend 感知 monitor（修复 #2）+ libei sanity 测试重构**：<br>• Windows 部分：(a) `DISPLAYS: RefCell<(Vec<DisplayRect>, i32)>` 升级为 `DISPLAYS: RefCell<(Vec<DisplayBound>, i32)>`；(b) `update_display_regions` 利用 STEP-2.3 已就绪的 `enumerate_displays_inner() -> Vec<WinDisplayInfo>` 单源（已有 `bounds` + `device_id`），**不再做 bounds 中心点匹配** —— 直接 `WinDisplayInfo.device_id` 经 `build_stable_id` 生成 `windows:...` 稳定 id，与每个 `WinDisplayInfo` 的 `bounds` 一一对应，构造 `Vec<DisplayBound>`；(c) `check_client_activation` 内部查询逻辑抽到 `geometry/mod.rs::activation_pure(prev, curr, displays: &[DisplayBound], active: &HashSet<BarrierKey>) -> Option<BarrierKey>`（与 `crossed_pure` 同形，复用同一套「display_containing + idx → monitor_id」逻辑）；`check_client_activation` 退化为薄包装；(d) 单测在 `geometry/mod.rs`（CI 可跑），无需 `MSLLHOOKSTRUCT` / `WPARAM` 构造。<br>• **dummy backend**：`dummy.rs:180-190` 已有 `with_keys_preserves_monitor_offset_span` 单测（STEP-1.2 落地），覆盖「完整 BarrierKey round-robin 不剥 monitor 字段」语义，**无需新增**。3.5 在完成标志里只引用、不重复写。<br>• **libei sanity**：现有 `select_barriers(zones: &Zones, ...)` 接收 `ashpd::desktop::input_capture::Zones`（`pub struct` 但字段全私有），`Region` 同样无 pub 构造器；测试无法注入 fixture。重构签名：`select_barriers(regions: &[(u32, u32, i32, i32)], clients: &[BarrierKey], ...) -> (Vec<ICBarrier>, HashMap<BarrierID, BarrierKey>)` 接受纯 `(width, height, x_offset, y_offset)` 元组 vec；外层 `update_barriers` 薄包装：把 `Zones.regions()` 的 `width/height/x_offset/y_offset` 提取成元组 vec，调 `select_barriers`。单测：构造 `regions = vec![(1920, 1080, 1920, 0)]`（横排 2x1 右屏）+ `clients = vec![BarrierKey { monitor: Some("region-1"), pos: Top, ... }, BarrierKey { monitor: None, pos: Top, ... }]` → 断言返回 `barriers.len() == 2`（两条都进入 barrier 列表）+ `key_for_barrier` map 含两条 key（防回归：以前 libei 之所以天然兼容只是因为它把整个 `active_clients` vec 喂给 EIS，没有「重建查询 key」这一步；现在显式加单测锁住这一行为，避免后人重构时引入与 macOS / Windows 同形 bug） | `input-capture/src/geometry/mod.rs`（加 `activation_pure`）、`input-capture/src/windows/event_thread.rs`（`DISPLAYS` 升级 + `update_display_regions` 用 `WinDisplayInfo.device_id` + `check_client_activation` 薄包装）、`input-capture/src/libei.rs`（`select_barriers` 签名重构 + `update_barriers` 薄包装） | `cargo test -p input-capture::geometry` 全绿（含 Windows `activation_pure` 6 个 case）；`cargo test -p input-capture::libei`（cfg gate）全绿；`cargo test -p input-capture::dummy` 全绿（复用 STEP-1.2 已有的 round-robin 单测，无需新增）；Windows 单测覆盖 prev_pos 在 display_0/display_1/屏外 × active key `monitor: Some / None` |
+| 3.6 | 20m | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace`；真机回归（人类配合） | — | L1 全绿 + 用户报告问题在真机真解决（macOS / Windows / Linux Wayland layer_shell 三平台各跑一遍） |
 
 **M3 里程碑交付**：
 - GUI 多显示器下拉框，按显示器名称展示
 - 选 monitor 后实时生效（无需重启）
 - 旧 config（无 `monitor` 字段）= 任意显示器，行为不变
+- ⚠️ **M3 落地回归 bug（由 3.4 / 3.5 收尾修复）**：M3.1 把 `monitor` 字段写入 `active_clients` 的 BarrierKey 后，**四个 backend** 的 query / 存储路径仍按旧语义忽略 `monitor` 字段：
+  - **macOS**（`input-capture/src/macos.rs:155-164` `crossed()`）：用 `BarrierKey::from_pos(pos)` 构造查询 key（monitor 钉死为 None），与 `active_clients` 里 `monitor: Some("macos:0000:0000::unknown-1")` 的 key 永远不等价，导致 100% 边缘检测 miss。
+  - **Windows**（`input-capture/src/windows/event_thread.rs:437-445` `check_client_activation`）：完全相同的模式，同样 100% miss。
+  - **layer_shell**（`input-capture/src/layer_shell.rs:898-911`）：`Capture::create` / `destroy` 用 `BarrierKey::from_pos(key.pos)` 重建 key 再 `add_client` / `delete_client`，剥掉 `monitor / offset / span`。layer_shell 不做 `crossed()` 风格查询（查询就是同一份 HashSet），所以 barrier 仍能触发，但用户效果是"M3 dropdown 在 layer_shell 上完全无效果"。
+  - **libei**：天然不受影响（`input-capture/src/libei.rs:677-678` 直接喂整个 `active_clients` vec 给 EIS `set_pointer_barriers`，不重建查询 key），但 3.5 仍加显式单测锁住这一行为防回归。
+  - 修复范围 scope guard：仅修这个回归 bug + 同形 layer_shell bug，**不扩展** M4 `exposed_segments` / `sub-edge`（offset / span）维度。
 
 **M3 已知限制**（补丁 #4）：
 - **L 形错位排布**（一个显示器在另一个显示器上方错位 N 像素）下，错位重叠区的 boundary 行为由 OS 决定，本计划不保证 boundary 一定按用户指定的 monitor 收敛。M4 画布编辑器会用**不同颜色高亮**错位区（多 monitor 覆盖同一逻辑边），但 binding 选择仍按用户在 dropdown 里指定的 monitor 为准；用户需自行理解"这一段被另一个 monitor 部分遮挡"。
 - **混合 DPI**：本计划不修。若两个显示器 scale factor 不同（如 1.0 + 2.0），monitor 粒度 binding 仍按 OS 坐标计算，可能在用户感知上"位置不对"。这是独立的 bug，需后续 PLAN。
+- **M3 落地回归 bug（3.4 / 3.5 收尾）**：见上方"M3 里程碑交付"第 4 条 + STEP-3.4 / 3.5。性质是 M3 自身的引入型 bug（monitor 字段加进了 BarrierKey 主键，但 macOS / Windows backend 的查询 key + layer_shell 的存储 key 仍按旧语义构造），不是 OS / 硬件限制，因此单独 STEP 修复而非列入"已知限制"长期背负。3.4 / 3.5 完工后此限制项关闭。
 
 ---
 
@@ -187,7 +199,7 @@
 |---|---|---|---|---|
 | 4.1 | 30m | **exposed_segments 算法 + 单测**：`geometry/hull.rs::exposed_segments(Vec<DisplayRect>) -> Vec<EdgeSegment>` — 扫描每条 pos 边，收集在垂直方向**实际暴露**的线段（看 span 是否被邻居完全遮挡）；`EdgeSegment { pos, monitor_id, x_start, x_end }`（或 y for top/bottom）；单测覆盖 2x1、3x1、L 形错位 200px、上下不等高（双屏 1080p+4K） | 新建 `input-capture/src/geometry/hull.rs` | `cargo test -p input-capture::geometry` 全部 case 绿 |
 | 4.2 | 30m | **exposed_segments 边界 case 调试**：针对 4.1 单测失败的 case 重写算法（不等高 + 部分遮挡的双行 + 旋转显示器 + 镜像排布）；每发现一个 edge case 加单测；`hull::debug_print(displays)` 函数打印 segments（用于人工对照 + snapshot test） | `input-capture/src/geometry/hull.rs` | 5 种排布（含镜像）全绿；debug_print 与手算结果一致 |
-| 4.3 | 30m | **layer_shell 子边屏障（backend 逻辑）**：用 `set_margin` + `set_size` 把 1px 表面推到目标段（`Anchor::Top + margin.top + set_size(1, h*span/10000)`）；同时设置 input region 显式 1px×N 像素；macOS 在 `crossed` 额外检查 prev/curr.y（或 x）是否落在 `[min + offset/10000 * extent, ... + span/10000 * extent)`；windows 改 `is_within_dp_boundary` 加 range 参数；backend 单测覆盖 offset=5000, span=5000 / 0 / 10000 边界值 | `input-capture/src/macos.rs`、`input-capture/src/windows/event_thread.rs`、`input-capture/src/layer_shell.rs` | 编译期 assert 边界值；逻辑路径单测绿 |
+| 4.3 | 30m | **layer_shell 子边屏障（backend 逻辑）**：用 `set_margin` + `set_size` 把 1px 表面推到目标段（`Anchor::Top + margin.top + set_size(1, h*span/10000)`）；同时设置 input region 显式 1px×N 像素；macOS 在 `crossed_pure` 额外检查 prev/curr.y（或 x）是否落在 `[min + offset/10000 * extent, ... + span/10000 * extent)`；windows 改 `activation_pure` 加 range 参数；backend 单测覆盖 offset=5000, span=5000 / 0 / 10000 边界值 | `input-capture/src/macos.rs`、`input-capture/src/windows/event_thread.rs`、`input-capture/src/layer_shell.rs` | 编译期 assert 边界值；逻辑路径单测绿 |
 | 4.4 | 30m | **layer_shell 子边屏障（合成器适配）**：Sway 对 sub-pixel margin 取整到 1px → 实测最小 surface 尺寸；Hyprland 在多 monitor 不同 scale 下 margin 缩放行为；如合成器实际不支持 ≤N px surface，runtime 检测并降级为全边；前端在画布上隐藏 offset/span slider（runtime detection：`segments[i].max_span == 10000` 时隐藏 slider） | `input-capture/src/layer_shell.rs` + 文档 | 文档记录每种合成器支持情况；runtime detection 标记生效 |
 | 4.5 | 30m | **libei 子边屏障降级 + 文档**：发现并记录 portal `Zones.regions()` 不支持 sub-region；libei backend `Capture::create` **忽略 offset/span 参数**（仅按 monitor + pos 创建全边屏障）；ConnectionRow monitor dropdown tooltip 加 "(portal 后端：monitor 粒度上限)"；`docs/limitations.md` 补一段；libei backend 单测覆盖传入 offset/span 时实际仍为 monitor 全边 | `input-capture/src/libei.rs`、`lan-mouse-vue/src/components/ConnectionRow.vue`、新建 `docs/limitations.md` | libei 单测绿；portal 文档引用；ConnectionRow tooltip 文案 |
 | 4.6 | 30m | **IPC + service**：`FrontendEvent::LayoutChanged { monitors: Vec<MonitorInfo>, segments: Vec<EdgeSegmentWire> }`（serde round-trip 单测）；`src/service.rs` 在 monitors 变更后调 `exposed_segments(monitors)` 一并发出；启动时主动发一次 | `lan-mouse-ipc/src/lib.rs`、`src/service.rs` | console 收到 `LayoutChanged` |
@@ -211,11 +223,11 @@
 | M0 | 0.4h（实测 0.25h） | macOS 多屏边触发回归 + 单屏零差异 | ✅ 已完成 |
 | M1 | 1.8h | 单屏零差异回归（GUI 走一遍 config → activate → 触发边） | 待启动 |
 | M2 | 3.5h | 三平台拔插测试 + BindingInvalid 链路 | 待启动 |
-| M3 | 1.5h | 双屏下 dropdown 选 monitor + L 形错位已知限制验证 + Linux 后端 + 旧 config 兼容 | 待启动 |
+| M3 | 3.5h（含 3.4-3.6 M3 落地回归 bug 修复 ~2h：macOS + layer_shell + Windows backend + libei sanity 测试重构） | 双屏下 dropdown 选 monitor + L 形错位已知限制验证 + Linux 后端 + 旧 config 兼容 + macOS/Windows/Linux layer_shell 真双屏下修复 100% 边缘检测 miss / dropdown 无效果 | 进行中（含 3.4-3.6 修复） |
 | M4 | 9h | 3 种排布下画布交互 + KDE/Sway/Hyprland 真机 + libei 降级 + 单屏降级 + 拔插动画 | 待启动 |
-| **合计** | **~16h** | | |
+| **合计** | **~18h** | | |
 
-> **校准系数**：M0 计划 2.3h → 实测 0.4h（约 1/6）。其余里程碑按 ~1/3 系数下调（原估时 25h → 现 16h）。M4 因子边屏障合成器踩坑风险高，保留较多 buffer。
+> **校准系数**：M0 计划 2.3h → 实测 0.4h（约 1/6）。其余里程碑按 ~1/3 系数下调（原估时 25h → 现 16h）。M3 因 3.4-3.6 收尾回归 bug 修复（4 个 backend + libei sanity + 几何纯函数化）+2h。M4 因子边屏障合成器踩坑风险高，保留较多 buffer。
 
 **M3 完成时 = 用户报告问题解决**（核心目标达成）
 **M4 完成时 = 产品形态达标**（与 ShareMouse/Deskflow 同级 UX，libei 后端除外）
@@ -310,6 +322,18 @@
 | **人类** | 旧 config（无 `monitor` 字段）加载后 dropdown 默认显示 "Any" 且行为不变 | config 文件对比 + smoke | 3.1 / 3.3 |
 | **人类** | Linux Wayland (layer_shell) 后端跑一遍 dropdown | 与 macOS 一致 | 3.3 |
 | **人类** | L 形错位排布下 dropdown 选择行为 + UI 显示"已知限制"提示 | 截图 + 一句话结论 | 3.2（PATCH 4） |
+| 自动 | `cargo test -p input-capture::geometry crossed_pure_4x2` ：8 个 case（C1-C8 见 STEP-3.4）覆盖 prev_pos 在 display_0 / display_1 / 接缝 / 屏外 × active key `monitor: Some(d0) / Some(d1) / None`；每条断言 query key 的 `monitor` 字段非硬编码 None | 全绿（≥ 8 case） | 3.4 |
+| 自动 | `cargo test -p input-capture::geometry build_display_bounds_pure`：构造 `active_ids + monitors` fixture → 断言 id 唯一、`display_containing` 拿到的 idx 对应的 `monitor_id` 一致、`Vec` 长度 = `active_ids.len()` | 全绿 | 3.4 |
+| 自动 | `cargo test -p input-capture::layer_shell capture_create_preserves_monitor`（cfg gate）：构造 `state.active_positions` 注入完整 `BarrierKey { monitor: Some("wl-output-name"), pos: Top, ... }`，确认 `Capture::create` 后 `state.active_positions` 内的 key 含 `monitor: Some(...)`，未被剥字段 | 全绿 | 3.4 |
+| 自动 | `cargo test -p input-capture::geometry activation_pure_4x2`（Windows `check_client_activation` 纯函数版）：6 个 case 覆盖 prev_pos 在 display_0 / display_1 / 屏外 × active key `monitor: Some("win:…") / None`；断言 query key 的 `monitor` 非硬编码 None | 全绿（≥ 6 case） | 3.5 |
+| 自动 | `cargo test -p input-capture::libei select_barriers_with_monitor_field`（cfg gate）：构造 `regions = vec![(1920, 1080, 1920, 0)]`（横排 2x1 右屏）+ `clients = vec![BarrierKey { monitor: Some("region-1"), pos: Top, ... }, BarrierKey { monitor: None, pos: Top, ... }]` → 断言返回 `barriers.len() == 2` 且 `key_for_barrier` map 含两条 key | 全绿 | 3.5 |
+| 自动 | `cargo test -p input-capture::dummy with_keys_preserves_monitor_offset_span`（已在 STEP-1.2 落地，`dummy.rs:180-190`）：3.5 复用既有单测，无需新增 | 仍绿 | 3.5（引用） |
+| 自动 | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo test --workspace` | 全绿 | 3.6 |
+| **人类** | macOS 真双屏（**修复 3.4 真机真解决**）：dropdown 选右屏绑 `top` → cursor 移到右屏顶部 → 真切到对端（主控 `capture.rs` 日志看到 `activated client 0` + `stream C dropped` + 对端 libei 收到 `Enter`）；cursor 移到左屏顶部 → 不切；记录 daemon log + 屏幕录像 | 录屏 + daemon log 关键三行 | 3.6 |
+| **人类** | Windows 真双屏（**修复 3.5 真机真解决**）：同上行为（设 `top` 绑定右屏 → cursor 在右屏顶部切换；cursor 在左屏顶部不切） | 录屏 + daemon log | 3.6 |
+| **人类** | Linux Wayland (layer_shell) 真机（**修复 3.4 同形 bug 真机真解决**）：dropdown 选右屏绑 `top` → cursor 在右屏顶部 → 触发对端切换（layer_shell 用 edge barrier，行为正确 = 「dropdown 生效」） | 录屏 + daemon log | 3.6 |
+| **人类** | Linux GNOME Wayland (libei) 真机：libei backend 不受影响（libei 天然兼容，但 3.5 单测已锁住）；dropdown 选择与 3.3 同 | 与 macOS dropdown 行为一致 | 3.6 |
+| **人类** | 旧 config（无 `monitor` 字段）+ 单 monitor 场景：行为不变（**回归保护**，确认 3.4-3.6 没有把 "monitor=None = 任意显示器" 的语义改坏） | config 文件对比 + smoke | 3.6 |
 
 ### M4 — 暴露边段 + 画布编辑器
 
