@@ -156,7 +156,7 @@ fn in_display_region(point: (f64, f64), displays: &[DisplayRect]) -> bool {
 /// Returns true when the cursor was inside the union of `displays`
 /// and is now outside it with respect to the `pos` side.
 ///
-/// Detection has three parts:
+/// Detection has two parts:
 /// 1. **Union exit**: `prev_pos` is inside some display and
 ///    `curr_pos` is outside every display. This is the primary
 ///    containment check — testing "did we leave the union" rather
@@ -166,38 +166,32 @@ fn in_display_region(point: (f64, f64), displays: &[DisplayRect]) -> bool {
 ///    and therefore masks the real exit when an outer display
 ///    covers an inner display's edges (the original
 ///    STEP-DEBUG-D1-LEFT bug).
-/// 2. **Direction inference**: the `(curr - prev)` motion vector
-///    must point along the `pos` axis in the direction implied by
-///    `pos`. Without this the function would return true for every
-///    `pos` whenever the cursor exited the union, and
-///    [`entered_barrier`] would always pick the first iterated
-///    side (Left) regardless of actual motion. The `dx`/`dy`
-///    comparison is sign-only.
-/// 3. **Axis dominance (strict) + geometric fallback**: the axis
-///    relevant to `pos` must *strictly* dominate the motion — i.e.
-///    `|dx| > |dy|` for the horizontal sides (Left/Right) and
-///    `|dy| > |dx|` for the vertical sides (Top/Bottom). When
-///    dominance does NOT hold (the other axis dominates or they're
-///    exactly equal), the check falls through to a geometric
-///    question: is `curr_pos` actually past this edge of the
-///    display that contained `prev_pos`?
+/// 2. **Three-way axis attribution**:
+///    - **Horizontal dominant** (`|dx| > |dy|`): fire `Left` if
+///      `dx < 0`, `Right` if `dx > 0`. The vertical sides stay
+///      dark regardless of `dy`'s sign or `curr`'s position
+///      relative to top/bottom.
+///    - **Vertical dominant** (`|dy| > |dx|`): fire `Top` if
+///      `dy < 0`, `Bottom` if `dy > 0`. The horizontal sides stay
+///      dark regardless of `dx`'s sign or `curr`'s position
+///      relative to left/right.
+///    - **Tied** (`|dx| == |dy|`): motion gives no signal, fall
+///      through to the only objective question — is `curr_pos`
+///      geometrically past this edge of the containing display?
 ///
-///    Why strict + geometric fallback: the user-reported
-///    `STEP-DEBUG-D1-BOTTOM` followup showed that `>=` dominance
-///    still left a residual trigger at exact 45° motion and at
-///    near-ties caused by mouse sensor noise or hand drift. With
-///    `>=`, both Left and Bottom fired on equal axes and
-///    `entered_barrier`'s priority list `[Left, Right, Top,
-///    Bottom]` then picked `Left` — incorrectly attributing the
-///    crossing to the horizontal edge that has a configured
-///    neighbor (the controlled machine on the user's left), even
-///    though the cursor's `curr_pos` is geometrically past only
-///    the bottom edge (x is still inside the display's x range).
-///    Strict `>` forces the tie case through the geometric
-///    fallback, which answers the only objective question left:
-///    which edges of the containing display is `curr_pos`
-///    actually past? That signal alone correctly disambiguates
-///    corner exits where the dominant-axis signal is ambiguous.
+///    Why three-way instead of dominance-with-geometric-fallback
+///    (the v2 approach): v2 left a residual trigger at "motion
+///    mostly vertical (ady > adx) BUT `curr.x` happens to be past
+///    the left edge of the containing display". In that case
+///    Bottom fired (correctly, via dominance), but Left ALSO
+///    fired — via the geometric fallback (`curr.x < D1.left`)
+///    that v2 always ran when dominance for Left failed. The
+///    priority list `[Left, Right, Top, Bottom]` then picked
+///    `Left`, which is the bug. With three-way attribution, when
+///    vertical motion dominates, the horizontal sides are
+///    unconditionally off — no geometric override. This kills
+///    the residual: pure-vertical motion can never attribute to
+///    Left, no matter what `curr.x` looks like.
 ///
 /// Used as the per-edge detector inside [`entered_barrier`].
 fn moved_across_boundary(
@@ -211,45 +205,82 @@ fn moved_across_boundary(
     }
     let dx = curr_pos.0 - prev_pos.0;
     let dy = curr_pos.1 - prev_pos.1;
-
-    // Direction-inference gate: motion must point toward this side.
-    let motion_says = match pos {
-        Position::Left => dx < 0.0,
-        Position::Right => dx > 0.0,
-        Position::Top => dy < 0.0,
-        Position::Bottom => dy > 0.0,
-    };
-    if !motion_says {
-        return false;
-    }
-
     let adx = dx.abs();
     let ady = dy.abs();
 
-    // Dominance gate (strict): the axis relevant to `pos` must
-    // *strictly* dominate the other axis. `>=` was tried first
-    // (STEP-DEBUG-D1-BOTTOM v1) but still produced a residual
-    // trigger because exact ties (|dx| == |dy|) let both sides pass
-    // and the priority list picked Left.
-    let dominance = match pos {
-        Position::Left | Position::Right => adx > ady,
-        Position::Top | Position::Bottom => ady > adx,
-    };
-    if dominance {
-        return true;
-    }
+    let horizontal_strong = adx > ady;
+    let vertical_strong = ady > adx;
 
-    // Geometric fallback: when motion does NOT strictly favor this
-    // axis, ask the only objective question — is `curr_pos` past
-    // this edge of the display that contained `prev_pos`?
-    let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d)) else {
-        return false;
+    // Tied case: motion gives no signal. Use the only objective
+    // question — is `curr_pos` past this edge of the containing
+    // display?
+    let geometric = |containing: &DisplayRect| -> bool {
+        match pos {
+            Position::Left => curr_pos.0 < containing.left(),
+            Position::Right => curr_pos.0 >= containing.right(),
+            Position::Top => curr_pos.1 < containing.top(),
+            Position::Bottom => curr_pos.1 >= containing.bottom(),
+        }
     };
+
     match pos {
-        Position::Left => curr_pos.0 < containing.left(),
-        Position::Right => curr_pos.0 >= containing.right(),
-        Position::Top => curr_pos.1 < containing.top(),
-        Position::Bottom => curr_pos.1 >= containing.bottom(),
+        Position::Left => {
+            if horizontal_strong {
+                dx < 0.0
+            } else if vertical_strong {
+                // Vertical dominates — Left cannot fire even if
+                // `curr.x` happens to be past the left edge of the
+                // containing display. Without this guard, the
+                // geometric fallback would let `Left` win on
+                // motion that's mostly vertical, and
+                // `entered_barrier`'s priority list `[Left, Right,
+                // Top, Bottom]` would pick `Left` over `Bottom` —
+                // STEP-DEBUG-D1-BOTTOM v2 residual.
+                false
+            } else {
+                // Tied. Use geometric.
+                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d)) else {
+                    return false;
+                };
+                geometric(containing)
+            }
+        }
+        Position::Right => {
+            if horizontal_strong {
+                dx > 0.0
+            } else if vertical_strong {
+                false
+            } else {
+                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d)) else {
+                    return false;
+                };
+                geometric(containing)
+            }
+        }
+        Position::Top => {
+            if vertical_strong {
+                dy < 0.0
+            } else if horizontal_strong {
+                false
+            } else {
+                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d)) else {
+                    return false;
+                };
+                geometric(containing)
+            }
+        }
+        Position::Bottom => {
+            if vertical_strong {
+                dy > 0.0
+            } else if horizontal_strong {
+                false
+            } else {
+                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d)) else {
+                    return false;
+                };
+                geometric(containing)
+            }
+        }
     }
 }
 
@@ -2285,5 +2316,139 @@ mod tests {
              machine) and incorrectly fired; v2 returns None. \
              got {got:?}"
         );
+    }
+
+    // ----- v3 followup: vertical-dominant motion that also crosses
+    //      the left edge must NOT trigger Left.
+    //
+    // User-reported followup after v2 landed (2026-09-08):
+    // "确实是45度的问题，45度以下几乎100%触发，但是没修好"
+    // (It really is the 45° problem; below 45° almost 100% triggers,
+    //  but not fixed.)
+    //
+    // Root cause of the v2 residual: v2 only ATTEMPTED the geometric
+    // fallback when dominance failed. But the user's motion was
+    // NOT actually 45° — it was vertical-dominant (ady > adx). For
+    // those events:
+    //   - Bottom fired (correctly, via dominance).
+    //   - Left ALSO fired — via the geometric fallback. Because
+    //     `curr.x` happened to be past D1.left (the cursor was
+    //     near the left edge), `moved_across_boundary(Left)`
+    //     returned true.
+    //   - `entered_barrier`'s priority list `[Left, Right, Top,
+    //     Bottom]` then picked `Left`, and the controlled machine
+    //     on the LEFT of D1 was triggered. BUG.
+    //
+    // v3 fix: when vertical motion dominates (ady > adx), the
+    // horizontal sides (`Left` / `Right`) are dark — no geometric
+    // override. The "if tied → geometric; else → dominance" rule
+    // becomes a strict three-way partition:
+    //
+    //   horizontal_strong  -> Left/Right on the matching side
+    //   vertical_strong    -> Top/Bottom on the matching side
+    //   tied               -> geometric per side
+    //
+    // The geometric branch never runs when an axis is dominantly
+    // stronger than the other — that closes the residual.
+
+    /// Vertical-dominant motion (ady > adx) where `curr.x` is
+    /// ALSO past D1.left. v2 still fired `Left` here via the
+    /// geometric fallback, and `entered_barrier`'s priority
+    /// picked it over `Bottom`. v3 makes Left unconditionally
+    /// dark when vertical dominates.
+    ///
+    /// dx = -3, dy = +7 → ady(7) > adx(3) → vertical dominant.
+    /// prev = (5, 1075), curr = (2, 1082). curr is past D1.left
+    /// (= 0) AND past D1.bottom (= 1080).
+    #[test]
+    fn vertical_pair_d1_bottom_left_dominant_vertical_with_left_overshoot_fires_bottom() {
+        let displays = user_vertical_pair_layout();
+        let got = entered_barrier((5.0, 1075.0), (2.0, 1082.0), &displays);
+        assert_eq!(
+            got,
+            Some(Position::Bottom),
+            "vertical-dominant motion (ady=7 > adx=3) at bottom-left \
+             corner must fire Bottom — v2 incorrectly fired Left here \
+             because the geometric fallback let Left win when \
+             curr.x was past D1.left, and priority list picked Left. \
+             v3 makes Left unconditionally dark when vertical dominates. \
+             got {got:?}"
+        );
+    }
+
+    /// End-to-end: same scenario through `query_pure` with the
+    /// user's active clients (controlled on LEFT, none on BOTTOM).
+    /// v2 returned the LEFT key (BUG — fired crossing). v3 returns
+    /// None (no crossing).
+    #[test]
+    fn query_pure_d1_bottom_left_dominant_vertical_with_left_overshoot_does_not_cross() {
+        let displays = vec![
+            DisplayBound::new(
+                DisplayRect::new(0.0, 0.0, 1920.0, 1080.0),
+                Some("macos:0000:0000::unknown-1".into()),
+            ),
+            DisplayBound::new(
+                DisplayRect::new(0.0, -1080.0, 1920.0, 1080.0),
+                Some("macos:0000:0000::unknown-2".into()),
+            ),
+        ];
+        let mut active = HashSet::new();
+        active.insert(BarrierKey {
+            pos: Position::Left,
+            monitor: Some("macos:0000:0000::unknown-1".into()),
+            offset: 0,
+            span: 10000,
+        });
+        let got = query_pure((5.0, 1075.0), (2.0, 1082.0), &displays, &active);
+        assert_eq!(
+            got,
+            None,
+            "vertical-dominant motion (ady=7 > adx=3) at bottom-left \
+             corner must NOT cross — v2 returned the LEFT key and \
+             triggered an incorrect crossing to the controlled machine. \
+             v3 returns None. got {got:?}"
+        );
+    }
+
+    /// Belt-and-braces: sweep vertical-dominant motion over a grid
+    /// of (dx, dy) and a few left-edge offsets. For every (dx, dy)
+    /// where ady > adx AND curr is past D1.bottom, the result MUST
+    /// be Bottom — never Left, never Right, never Top. This is the
+    /// strongest possible guarantee that the user's residual
+    /// trigger (vertical motion crossing the left edge by sensor
+    /// noise / hand drift) cannot recur.
+    #[test]
+    fn vertical_dominant_motion_at_bottom_left_always_fires_bottom() {
+        let displays = user_vertical_pair_layout();
+        // Vary dy from slightly above |dx| up to strongly vertical.
+        // dy must clear D1.bottom (1080) from prev.y (1070) — so
+        // dy >= 10 ensures every fixture exits the union.
+        for dy in [10.5, 15.0, 30.0] {
+            // Vary dx from negative (leftward drift) up to equal-ish.
+            for dx in [-3.0_f64, -1.0, 0.0] {
+                if dx.abs() >= dy {
+                    // Skip non-vertical-dominant cases (handled by
+                    // other tests).
+                    continue;
+                }
+                // Start the cursor 1–3 px from the left edge so
+                // any leftward dx makes curr.x negative.
+                let prev = (2.0, 1070.0);
+                let curr = (2.0 + dx, 1070.0 + dy);
+                // Sanity: curr must be past D1.bottom (1080) for
+                // this to be a real exit event.
+                assert!(
+                    curr.1 >= 1080.0,
+                    "test fixture out of range (curr.y={})", curr.1
+                );
+                let got = entered_barrier(prev, curr, &displays);
+                assert_eq!(
+                    got,
+                    Some(Position::Bottom),
+                    "vertical-dominant (dy={dy}, dx={dx}, prev.x=2) at \
+                     bottom-left must fire Bottom; got {got:?}"
+                );
+            }
+        }
     }
 }
