@@ -845,9 +845,24 @@ impl CaptureTask {
                                         log::info!("client {handle} acknowledged the connection!");
                                         self.state = State::Sending;
                                     } else {
-                                        log::warn!(
-                                            "client {handle} acknowledged -- but no active_client \
-                                             (stale Ack after timeout, ignoring)"
+                                        // Expected race after release_capture: the
+                                        // peer may still send an Ack in response to
+                                        // the Leave we just dispatched. The Ack
+                                        // arrives after we've already torn down
+                                        // `active_client` and reset state to Idle;
+                                        // this is the normal post-Leave ack path,
+                                        // not an error. Log at trace level so the
+                                        // GUI log isn't dominated by one line per
+                                        // round-trip. The warn was historically
+                                        // introduced to catch a different bug
+                                        // (Pending-timeout-then-late-Ack causing
+                                        // state/backend desync — fixed by this
+                                        // branch's own `active_client.is_some()`
+                                        // guard, so the loud warning is no longer
+                                        // pulling its weight).
+                                        log::trace!(
+                                            "Ack from handle {handle} after release_capture \
+                                             (post-Leave ack; state=Idle, ignoring)"
                                         );
                                     }
                                 }
