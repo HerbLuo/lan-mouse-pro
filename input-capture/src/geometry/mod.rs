@@ -156,7 +156,7 @@ fn in_display_region(point: (f64, f64), displays: &[DisplayRect]) -> bool {
 /// Returns true when the cursor was inside the union of `displays`
 /// and is now outside it with respect to the `pos` side.
 ///
-/// Detection has two parts:
+/// Detection has three parts:
 /// 1. **Union exit**: `prev_pos` is inside some display and
 ///    `curr_pos` is outside every display. This is the primary
 ///    containment check — testing "did we leave the union" rather
@@ -172,8 +172,22 @@ fn in_display_region(point: (f64, f64), displays: &[DisplayRect]) -> bool {
 ///    `pos` whenever the cursor exited the union, and
 ///    [`entered_barrier`] would always pick the first iterated
 ///    side (Left) regardless of actual motion. The `dx`/`dy`
-///    comparison is sign-only; magnitude doesn't matter for
-///    direction attribution.
+///    comparison is sign-only.
+/// 3. **Axis dominance**: the axis relevant to `pos` must dominate
+///    the motion — i.e. `|dx| >= |dy|` for the horizontal sides
+///    (Left/Right) and `|dy| >= |dx|` for the vertical sides
+///    (Top/Bottom). This is what disambiguates diagonal exits
+///    through a display corner (the user-reported
+///    STEP-DEBUG-D1-BOTTOM bug): when the cursor exits the
+///    bottom-left corner with mostly-downward motion, the sign
+///    check alone would fire BOTH `Left` (dx < 0) and `Bottom`
+///    (dy > 0), and `entered_barrier`'s priority list
+///    `[Left, Right, Top, Bottom]` would then pick `Left` —
+///    incorrectly attributing the crossing to the horizontal edge
+///    that has a configured neighbor (the controlled machine on
+///    the user's left), even though the cursor clearly moved
+///    downward off the bottom edge. Requiring dominance breaks
+///    that ambiguity: `Bottom` fires, `Left` does not.
 ///
 /// Used as the per-edge detector inside [`entered_barrier`].
 fn moved_across_boundary(
@@ -187,11 +201,13 @@ fn moved_across_boundary(
     }
     let dx = curr_pos.0 - prev_pos.0;
     let dy = curr_pos.1 - prev_pos.1;
+    let adx = dx.abs();
+    let ady = dy.abs();
     match pos {
-        Position::Left => dx < 0.0,
-        Position::Right => dx > 0.0,
-        Position::Top => dy < 0.0,
-        Position::Bottom => dy > 0.0,
+        Position::Left => dx < 0.0 && adx >= ady,
+        Position::Right => dx > 0.0 && adx >= ady,
+        Position::Top => dy < 0.0 && ady >= adx,
+        Position::Bottom => dy > 0.0 && ady >= adx,
     }
 }
 
@@ -1848,6 +1864,228 @@ mod tests {
         assert!(
             in_bounds((-1.0, 491.0), &displays, Position::Bottom),
             "D1.bottom=982 > 491, so in_bounds for Bottom is true"
+        );
+    }
+
+    // ----- vertically stacked monitors, bottom-edge regression --------
+    //
+    // User-reported scenario (2026-09-08, STEP-DEBUG-D1-BOTTOM):
+    //   D1 (bottom): pos=(0,0)    size=(1920,1080) primary=true
+    //   D2 (top):    pos=(0,-1080) size=(1920,1080) primary=false
+    //
+    // Two monitors stacked vertically; primary (D1) on the bottom,
+    // secondary (D2) above it on the same x range. Configured:
+    // client monitor = Display1 (bottom), side = Left.
+    //
+    // User reported four behaviors, of which three were as expected:
+    //   1. cursor leaves D1's LEFT edge → cross to controlled machine ✓
+    //   2. cursor leaves D1's RIGHT edge → no crossing ✓
+    //   3. cursor leaves D1's TOP edge (y=0 seam) → moves into D2,
+    //      which is local, not a barrier ✓
+    //   4. cursor leaves D1's BOTTOM edge → BUG: ALSO crossed to
+    //      the controlled machine (should NOT cross — no neighbor on
+    //      bottom).
+    //
+    // Pre-fix root cause: `moved_across_boundary` decided sides by
+    // sign of `dx`/`dy` alone. When the cursor exited D1's bottom-
+    // left corner with mostly-downward motion (e.g. (100, 1075) →
+    // (99, 1081), dx=-1, dy=+6) BOTH `Left` (dx < 0) and `Bottom`
+    // (dy > 0) returned true. `entered_barrier`'s priority list
+    // `[Left, Right, Top, Bottom]` then picked `Left` first, the
+    // query looked up `Left` in the registered clients, and found
+    // the controlled machine — incorrectly attributing the diagonal
+    // exit to the horizontal edge.
+    //
+    // Post-fix: `moved_across_boundary` requires the relevant axis
+    // to dominate (`|dx| >= |dy|` for Left/Right, `|dy| >= |dx|`
+    // for Top/Bottom). In the same example, `|dy|=6 > |dx|=1` so
+    // `Left` returns false and `Bottom` returns true → no spurious
+    // crossing.
+    //
+    // These tests are the regression guard for that scenario —
+    // see STEP-DEBUG-D1-BOTTOM for the full investigation trace.
+
+    /// User's exact vertical-pair layout. D1 origin (0,0), D2
+    /// origin (0, -1080). Both 1080p, same x range.
+    fn user_vertical_pair_layout() -> Vec<DisplayRect> {
+        vec![
+            DisplayRect::new(0.0, 0.0, 1920.0, 1080.0),    // D1 (bottom / primary)
+            DisplayRect::new(0.0, -1080.0, 1920.0, 1080.0), // D2 (top)
+        ]
+    }
+
+    /// Cursor pushed off the LEFT edge of D1 (purely horizontal,
+    /// dy=0): `entered_barrier` must fire `Left`. The registered
+    /// clients contain a `Left` key for D1, so this triggers a
+    /// crossing to the controlled machine (positive control —
+    /// already worked before the fix).
+    #[test]
+    fn vertical_pair_d1_left_pure_horizontal_fires_left() {
+        let displays = user_vertical_pair_layout();
+        let got = entered_barrier((1.0, 500.0), (-1.0, 500.0), &displays);
+        assert_eq!(
+            got,
+            Some(Position::Left),
+            "expected Left barrier when exiting D1's left edge in \
+             vertical-pair layout, got {got:?}"
+        );
+    }
+
+    /// Cursor pushed off the RIGHT edge of D1: no neighbor is
+    /// registered on the right side, but the function itself still
+    /// fires `Right` (the registered-clients lookup downstream is
+    /// what suppresses the actual crossing).
+    #[test]
+    fn vertical_pair_d1_right_pure_horizontal_fires_right() {
+        let displays = user_vertical_pair_layout();
+        let got = entered_barrier((1919.0, 500.0), (1921.0, 500.0), &displays);
+        assert_eq!(
+            got,
+            Some(Position::Right),
+            "expected Right barrier when exiting D1's right edge in \
+             vertical-pair layout, got {got:?}"
+        );
+    }
+
+    /// Cursor pushed off the BOTTOM edge of D1 (purely vertical,
+    /// dx=0): `entered_barrier` must fire `Bottom`. There's no
+    /// Bottom neighbor configured, so the downstream lookup yields
+    /// no crossing. This case alone was already correct before the
+    /// fix — the bug only surfaced on the diagonal motion below.
+    #[test]
+    fn vertical_pair_d1_bottom_pure_vertical_fires_bottom() {
+        let displays = user_vertical_pair_layout();
+        let got = entered_barrier((500.0, 1079.0), (500.0, 1081.0), &displays);
+        assert_eq!(
+            got,
+            Some(Position::Bottom),
+            "expected Bottom barrier when exiting D1's bottom edge \
+             in vertical-pair layout, got {got:?}"
+        );
+    }
+
+    /// Cursor pushed off the TOP edge of D1 into D2: `curr` lands
+    /// inside D2 (D2.y ∈ [-1080, 0)), so `in_display_region(curr)`
+    /// is true and `entered_barrier` returns `None`. No barrier
+    /// crossing — the cursor is moving between two local displays.
+    #[test]
+    fn vertical_pair_d1_top_into_d2_is_not_barrier() {
+        let displays = user_vertical_pair_layout();
+        let got = entered_barrier((500.0, 1.0), (500.0, -1.0), &displays);
+        assert_eq!(
+            got,
+            None,
+            "expected no barrier crossing when moving from D1 into \
+             D2 along the y=0 seam, got {got:?}"
+        );
+    }
+
+    /// THE BUG: cursor pushed diagonally down-and-slightly-left out
+    /// of D1's bottom-left corner. Pre-fix this returned
+    /// `Some(Left)` (because the priority list picked Left first),
+    /// which then matched the controlled-machine Left key in
+    /// `query_pure` and triggered an incorrect crossing. Post-fix
+    /// (dominance check) this returns `Some(Bottom)` — which has no
+    /// configured neighbor, so no crossing fires.
+    ///
+    /// dx = -1, dy = +6 → |dy| > |dx|, so Bottom dominates.
+    #[test]
+    fn vertical_pair_d1_bottom_left_diagonal_fires_bottom_not_left() {
+        let displays = user_vertical_pair_layout();
+        let got = entered_barrier((100.0, 1075.0), (99.0, 1081.0), &displays);
+        assert_eq!(
+            got,
+            Some(Position::Bottom),
+            "expected Bottom (not Left) when exiting D1's bottom-\
+             left corner with mostly-downward motion — pre-fix \
+             the priority list wrongly picked Left here, \
+             got {got:?}"
+        );
+    }
+
+    /// Mirror of the bug: cursor pushed down-and-slightly-RIGHT
+    /// out of D1's bottom-right corner. Pre-fix this returned
+    /// `Some(Left)` because dx < 0 still held (the sign check
+    /// ignores dominance); however in this symmetric case dx > 0
+    /// so the actual pre-fix bug was the Left + Bottom combo
+    /// returning Left via the priority list — wait, with dx > 0
+    /// pre-fix returns Right (priority) then Bottom also fires.
+    /// Post-fix: dy dominates, Bottom fires, Right does not.
+    /// Either way, Bottom is the right answer.
+    ///
+    /// dx = +1, dy = +6 → |dy| > |dx|, so Bottom dominates.
+    #[test]
+    fn vertical_pair_d1_bottom_right_diagonal_fires_bottom_not_right() {
+        let displays = user_vertical_pair_layout();
+        let got = entered_barrier((1900.0, 1075.0), (1901.0, 1081.0), &displays);
+        assert_eq!(
+            got,
+            Some(Position::Bottom),
+            "expected Bottom (not Right) when exiting D1's bottom-\
+             right corner with mostly-downward motion, \
+             got {got:?}"
+        );
+    }
+
+    /// End-to-end `query_pure` regression for the user's bug:
+    /// the active set contains ONLY `Left @ D1.id` (the controlled
+    /// machine). The cursor exits D1's bottom-left corner
+    /// diagonally. Pre-fix this returned the `Left` key (BUG —
+    /// the user observed the wrong-side crossing). Post-fix it
+    /// returns `None` (correct — no crossing because Bottom has
+    /// no configured neighbor).
+    #[test]
+    fn query_pure_d1_bottom_left_diagonal_does_not_cross() {
+        let displays = vec![
+            DisplayBound::new(
+                DisplayRect::new(0.0, 0.0, 1920.0, 1080.0),
+                Some("macos:0000:0000::unknown-1".into()),
+            ),
+            DisplayBound::new(
+                DisplayRect::new(0.0, -1080.0, 1920.0, 1080.0),
+                Some("macos:0000:0000::unknown-2".into()),
+            ),
+        ];
+        let mut active = HashSet::new();
+        active.insert(BarrierKey {
+            pos: Position::Left,
+            monitor: Some("macos:0000:0000::unknown-1".into()),
+            offset: 0,
+            span: 10000,
+        });
+        let got = query_pure(
+            (100.0, 1075.0),  // prev: inside D1, near bottom-left
+            (99.0, 1081.0),   // curr: outside the union below-left
+            &displays,
+            &active,
+        );
+        assert_eq!(
+            got,
+            None,
+            "expected query_pure to NOT cross when exiting D1's \
+             bottom-left corner diagonally — pre-fix this returned \
+             the Left key (controlled machine) and incorrectly \
+             fired the crossing. got {got:?}"
+        );
+    }
+
+    /// Belt-and-braces: a more strongly horizontal exit (|dx| > |dy|)
+    /// should correctly attribute to `Left`, NOT to `Bottom`. Pins
+    /// that the dominance check works in the *opposite* direction
+    /// too — i.e. when the cursor really is moving mostly leftward
+    /// through a corner exit, Left still wins.
+    ///
+    /// dx = -5, dy = +1 → |dx| > |dy|, so Left dominates.
+    #[test]
+    fn vertical_pair_d1_bottom_left_horizontal_dominant_fires_left() {
+        let displays = user_vertical_pair_layout();
+        let got = entered_barrier((100.0, 1079.0), (95.0, 1080.0), &displays);
+        assert_eq!(
+            got,
+            Some(Position::Left),
+            "expected Left (not Bottom) when exiting D1's bottom-\
+             left corner with mostly-leftward motion, \
+             got {got:?}"
         );
     }
 }
