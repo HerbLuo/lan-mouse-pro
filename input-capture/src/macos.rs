@@ -301,14 +301,6 @@ impl InputCaptureState {
         log::debug!("handling event: {producer_event:?}");
         match producer_event {
             ProducerEvent::Release => {
-                // [debug(temp):H3] reverse-Enter race diagnosis — log so we
-                // can verify the producer actually receives the Release
-                // event that capture::release_capture queues via spawn_local.
-                log::trace!(
-                    "debug(temp) producer received Release from capture task current_key={:?} pending_key={:?}",
-                    self.current_key,
-                    self.pending_key,
-                );
                 if self.current_key.is_some() {
                     self.show_cursor()?;
                     self.current_key = None;
@@ -1514,11 +1506,6 @@ impl Capture for MacOSInputCapture {
     }
 
     async fn release(&mut self) -> Result<(), CaptureError> {
-        // [debug(temp):H3] reverse-Enter race diagnosis — log entry so we
-        // can verify the fire-and-forget spawn_local actually fires for
-        // every release call (rather than being silently dropped if the
-        // producer task is dead / channel full / notify_tx closed).
-        log::trace!("debug(temp) Capture::release called, queueing Release to producer");
         let notify_tx = self.notify_tx.clone();
         tokio::task::spawn_local(async move {
             log::debug!("notifying Release");

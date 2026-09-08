@@ -315,14 +315,7 @@ impl LanMouseListener {
                     Err(e) => log::warn!("reply QUIC send to {addr} failed: {e}"),
                 }
             }
-            // [debug(temp):H2] reverse-Enter race diagnosis — when the peer
-            // is missing, surface the full set of currently-known conns so
-            // we can see whether this is the "addr changed after reconnect"
-            // race the report hypothesises.
-            None => log::warn!(
-                "debug(temp) WARN stale addr addr={addr:?} conns={:?}; dropping {event}",
-                self.quic_conns.borrow().keys().collect::<Vec<_>>(),
-            ),
+            None => log::warn!("reply: peer {addr} not in quic_conns; dropping {event}"),
         }
     }
 
