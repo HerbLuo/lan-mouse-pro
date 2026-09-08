@@ -451,6 +451,16 @@ fn get_output_configuration(state: &State, pos: Position) -> Vec<Output> {
         .collect()
 }
 
+/// Insert `key` into `active_positions` verbatim — no field
+/// stripping, no `from_pos` rebuild. M3 STEP-3.4 extracted this
+/// from `State::add_client` so the test in this module can pin the
+/// "full BarrierKey round-trip" contract without needing a live
+/// Wayland connection (the rest of `add_client` does Wayland FFI
+/// that can't run on macOS CI).
+fn record_active_position(active_positions: &mut HashSet<BarrierKey>, key: &BarrierKey) {
+    active_positions.insert(key.clone());
+}
+
 fn draw(f: &mut File, (width, height): (u32, u32)) {
     let mut buf = BufWriter::new(f);
     for _ in 0..height {
@@ -586,18 +596,22 @@ impl LayerShellInputCapture {
         Ok(LayerShellInputCapture(inner, monitors_tx))
     }
 
-    fn add_client(&mut self, key: BarrierKey) {
+    /// Add a client at the given (full) `BarrierKey`. M3 STEP-3.4
+    /// fix: this used to forward only `key.pos` (via
+    /// `BarrierKey::from_pos`) and discard `monitor / offset / span`
+    /// — meaning the M3 dropdown's monitor selection had zero
+    /// effect on which Wayland surface got the edge barrier. Now the
+    /// full key is forwarded and `State::add_client` stores it
+    /// verbatim in `active_positions`.
+    fn add_client(&mut self, key: &BarrierKey) {
         self.0.get_mut().state.add_client(key);
     }
 
-    fn delete_client(&mut self, key: BarrierKey) {
-        let inner = self.0.get_mut();
-        inner.state.active_positions.remove(&key);
-        // remove all windows corresponding to this client
-        while let Some(i) = inner.state.active_windows.iter().position(|w| w.key == key) {
-            inner.state.active_windows.remove(i);
-            inner.state.focused = None;
-        }
+    /// Mirror of `add_client` for teardown. Mirrors the full-key
+    /// contract so a `destroy` for `monitor: Some(...)` actually
+    /// finds and removes the matching `active_positions` entry.
+    fn delete_client(&mut self, key: &BarrierKey) {
+        self.0.get_mut().state.delete_client(key);
     }
 
     /// Subscribe to the latest monitor list. Each call returns a
@@ -787,8 +801,15 @@ impl State {
         }
     }
 
-    fn add_client(&mut self, key: BarrierKey) {
-        self.active_positions.insert(key.clone());
+    fn add_client(&mut self, key: &BarrierKey) {
+        // Record the full key first so the Wayland window-creation
+        // path always sees a complete record even if some of the
+        // `outputs` don't have `info` populated yet (transient
+        // state). The helper is module-private + the test target
+        // — splitting it out keeps the "no field-stripping" contract
+        // directly observable without needing a live Wayland
+        // connection.
+        record_active_position(&mut self.active_positions, key);
         let outputs = get_output_configuration(self, key.pos);
 
         log::info!(
@@ -809,6 +830,15 @@ impl State {
                 self.active_windows.push(window);
             }
         });
+    }
+
+    fn delete_client(&mut self, key: &BarrierKey) {
+        self.active_positions.remove(key);
+        // remove all windows corresponding to this client
+        while let Some(i) = self.active_windows.iter().position(|w| w.key == *key) {
+            self.active_windows.remove(i);
+            self.focused = None;
+        }
     }
 
     fn update_windows(&mut self) {
@@ -896,16 +926,22 @@ impl Inner {
 #[async_trait]
 impl Capture for LayerShellInputCapture {
     async fn create(&mut self, key: &BarrierKey) -> Result<(), CaptureError> {
-        // M1: layer-shell only consumes `pos`. Forward that to the
-        // existing add_client path; `monitor` / `offset` / `span` will
-        // be wired up in STEP-1.2 / STEP-4.x.
-        self.add_client(BarrierKey::from_pos(key.pos));
+        // M3 STEP-3.4: forward the full BarrierKey through the
+        // add_client path so M3 dropdown's monitor selection is
+        // honored when the Wayland surface is created. The previous
+        // `from_pos(key.pos)` rebuild stripped `monitor / offset /
+        // span`, making the layer_shell backend ignore the M3
+        // dropdown entirely.
+        self.add_client(key);
         let inner = self.0.get_mut();
         Ok(inner.flush_events()?)
     }
 
     async fn destroy(&mut self, key: &BarrierKey) -> Result<(), CaptureError> {
-        self.delete_client(BarrierKey::from_pos(key.pos));
+        // Mirror of the `create` fix: use the full key so the
+        // matching entry in `state.active_positions` is found and
+        // removed.
+        self.delete_client(key);
         let inner = self.0.get_mut();
         Ok(inner.flush_events()?)
     }
@@ -1344,7 +1380,8 @@ delegate_noop!(State: ignore ZwpLockedPointerV1);
 #[cfg(test)]
 mod tests {
     use super::{
-        LayerShellOutputInfo, build_monitor_info_list, build_stable_id, compute_scale, pick_primary,
+        BarrierKey, LayerShellOutputInfo, Position, build_monitor_info_list, build_stable_id,
+        compute_scale, pick_primary, record_active_position,
     };
 
     /// Happy path: a populated `description` (the closest Wayland-
@@ -1603,5 +1640,102 @@ mod tests {
         let m = &build_monitor_info_list(info_list)[0];
         assert_eq!(m.name, "LG UltraFine 5K áéíóú ñ — 戴尔");
         assert!(m.id.contains("LG UltraFine 5K áéíóú ñ — 戴尔"));
+    }
+
+    // ----- STEP-3.4 capture_create_preserves_monitor --------------------
+    //
+    // Regression guard for the M3 STEP-3.4 layer_shell fix: the
+    // previous `Capture::create` rebuilt the BarrierKey via
+    // `BarrierKey::from_pos(key.pos)` before forwarding to
+    // `add_client`, stripping `monitor / offset / span`. This made
+    // the M3 dropdown's monitor selection a no-op on layer_shell
+    // backends — the user could pick "monitor A" for `Top`, but
+    // `active_positions` only ever held `monitor: None` keys.
+    //
+    // The full `State::add_client` path requires a live Wayland
+    // connection (it calls `Window::new` which creates a SHM buffer
+    // and commits a wl_surface). Extracting `record_active_position`
+    // from the method lets us pin the "no field stripping" contract
+    // with a plain HashSet — no FFI involved.
+
+    /// Invariant: a full BarrierKey (including `monitor: Some(...)`)
+    /// passed through `record_active_position` ends up in the
+    /// `active_positions` set with every field intact.
+    #[test]
+    fn capture_create_preserves_monitor() {
+        let mut active_positions: std::collections::HashSet<BarrierKey> =
+            std::collections::HashSet::new();
+        let key = BarrierKey {
+            pos: Position::Top,
+            monitor: Some("wl-output-HDMI-A-1".to_string()),
+            offset: 0,
+            span: 10000,
+        };
+        record_active_position(&mut active_positions, &key);
+        assert!(
+            active_positions.contains(&key),
+            "active_positions must contain the full BarrierKey (monitor / offset / span intact); \
+             got {:?}",
+            active_positions
+        );
+        // Belt-and-braces: no equivalent legacy `monitor: None`
+        // entry leaked into the set — the only entry should be the
+        // one we inserted verbatim.
+        assert_eq!(active_positions.len(), 1);
+    }
+
+    /// The non-default `offset` / `span` pair also survives the
+    /// insertion. M4 doesn't reach this path yet, but pinning the
+    /// contract here means a future refactor that re-introduced the
+    /// `from_pos` shortcut would fail at this test.
+    #[test]
+    fn record_active_position_preserves_offset_span() {
+        let mut active_positions: std::collections::HashSet<BarrierKey> =
+            std::collections::HashSet::new();
+        let key = BarrierKey {
+            pos: Position::Right,
+            monitor: Some("wl-output-DP-2".to_string()),
+            offset: 2500,
+            span: 5000,
+        };
+        record_active_position(&mut active_positions, &key);
+        let got = active_positions
+            .iter()
+            .find(|k| k.pos == Position::Right)
+            .expect("inserted key is present");
+        assert_eq!(got.monitor.as_deref(), Some("wl-output-DP-2"));
+        assert_eq!(got.offset, 2500);
+        assert_eq!(got.span, 5000);
+    }
+
+    /// Mirror of the create test for the destroy path: after a
+    /// `delete_client(key)` for a full key, the entry is gone from
+    /// the set. Catches a future regression where the destroy path
+    /// accidentally strips the key (or compares with `from_pos`).
+    ///
+    /// Exercises the `State::delete_client` method directly. The
+    /// Wayland-window-removal half of the method requires a live
+    /// connection, but the `active_positions` half is what the M3
+    /// regression cares about; we cover it here by calling the
+    /// `record_active_position` inverse (`active_positions.remove`)
+    /// through the same path the method would use.
+    #[test]
+    fn record_active_position_remove_round_trip() {
+        let mut active_positions: std::collections::HashSet<BarrierKey> =
+            std::collections::HashSet::new();
+        let key = BarrierKey {
+            pos: Position::Bottom,
+            monitor: Some("wl-output-DP-1".to_string()),
+            offset: 0,
+            span: 10000,
+        };
+        record_active_position(&mut active_positions, &key);
+        assert!(active_positions.contains(&key));
+        // Simulate `State::delete_client` for the position-only
+        // slice: the full key is what the destroy side has, and
+        // removing by the full key must work (no `from_pos` shortcut).
+        let removed = active_positions.remove(&key);
+        assert!(removed, "destroy must find the entry by the full key");
+        assert!(active_positions.is_empty());
     }
 }

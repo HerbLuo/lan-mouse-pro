@@ -33,7 +33,7 @@ use input_event::{
 };
 
 use crate::geometry::{
-    DisplayRect, MonitorInfo, clamp_to_display_bounds, cursor_within, entered_barrier,
+    DisplayBound, DisplayRect, MonitorInfo, clamp_to_display_bounds, cursor_within, entered_barrier,
 };
 
 use super::{BarrierKey, CaptureEvent};
@@ -236,7 +236,7 @@ thread_local! {
     /// geometry module and avoid i32/f64 round-trips on every event).
     static PREV_POS: Cell<Option<(f64, f64)>> = const { Cell::new(None) };
     /// displays and generation counter
-    static DISPLAYS: RefCell<(Vec<DisplayRect>, i32)> = const { RefCell::new((Vec::new(), 0)) };
+    static DISPLAYS: RefCell<(Vec<DisplayBound>, i32)> = const { RefCell::new((Vec::new(), 0)) };
     /// Sender for the latest monitor list. Set by `start_routine` from
     /// the `monitors_tx` field of [`EventThread`]. The watch channel is
     /// the single source of truth for monitor enumeration; subscribers
@@ -414,7 +414,13 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     if let Some(pending_key) = PENDING_CLIENT.with_borrow(|c| c.clone()) {
         let within = DISPLAYS.with_borrow_mut(|(displays, generation)| {
             update_display_regions(displays, generation);
-            cursor_within(curr_pos, displays, pending_key.pos)
+            // M3 STEP-3.4: DISPLAYS is now `Vec<DisplayBound>`; the
+            // legacy position-only `cursor_within` still takes
+            // `&[DisplayRect]`, so project. 3.5 will replace this
+            // with `activation_pure(&[DisplayBound], …)` and drop
+            // the projection.
+            let rects: Vec<DisplayRect> = displays.iter().map(|b| b.rect).collect();
+            cursor_within(curr_pos, &rects, pending_key.pos)
         });
         if within {
             PENDING_CLIENT.take();
@@ -427,7 +433,12 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     /* No active / no pending → check for a barrier crossing. */
     let entered = DISPLAYS.with_borrow_mut(|(displays, generation)| {
         update_display_regions(displays, generation);
-        entered_barrier(prev_pos, curr_pos, displays)
+        // Same projection as above: `entered_barrier` is the legacy
+        // position-only helper, and STEP-3.5 will replace this
+        // with `activation_pure` that consumes `&[DisplayBound]`
+        // directly.
+        let rects: Vec<DisplayRect> = displays.iter().map(|b| b.rect).collect();
+        entered_barrier(prev_pos, curr_pos, &rects)
     });
 
     let Some(pos) = entered else {
@@ -449,8 +460,14 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
      * not consume events, so the cursor stays on the host and moves normally.
      */
     PENDING_CLIENT.replace(Some(key.clone()));
-    let entry_point =
-        DISPLAYS.with_borrow(|(displays, _)| clamp_to_display_bounds(displays, prev_pos, curr_pos));
+    let entry_point = DISPLAYS.with_borrow(|(displays, _)| {
+        // M3 STEP-3.4: project `Vec<DisplayBound>` to
+        // `&[DisplayRect]` for the legacy position-only helper.
+        // 3.5 will fold this into `activation_pure` and the
+        // projection goes away.
+        let rects: Vec<DisplayRect> = displays.iter().map(|b| b.rect).collect();
+        clamp_to_display_bounds(&rects, prev_pos, curr_pos)
+    });
     PENDING_ENTRY_POINT.replace(entry_point);
 
     log::debug!("PENDING @ {prev_pos:?} -> {curr_pos:?}");
@@ -520,19 +537,40 @@ unsafe extern "system" fn window_proc(
 
 static DISPLAY_RESOLUTION_GENERATION: AtomicI32 = AtomicI32::new(1);
 
-fn update_display_regions(displays: &mut Vec<DisplayRect>, generation: &mut i32) {
+/// Refresh `displays` when the OS reports a display configuration
+/// change. Pulls the FFI side once (`enumerate_displays_inner`),
+/// then publishes both:
+/// 1. the per-OS `Vec<DisplayBound>` (rectangle + stable
+///    `windows:...` id from `WinDisplayInfo.device_id`), for
+///    the M3 STEP-3.4 barrier-detection path.
+/// 2. the OS-agnostic `Vec<MonitorInfo>` to the watch channel
+///    (STEP-2.6 service layer).
+///
+/// **M3 STEP-3.4 fix**: previously `update_display_regions`
+/// stored `Vec<DisplayRect>` and matched rectangles to monitor
+/// ids at call sites via center-point lookup — fragile under
+/// resolutions that place the center outside a display. The new
+/// `Vec<DisplayBound>` keeps the id alongside the rectangle so
+/// `activation_pure` (3.5) and `crossed_pure` (3.4 on macOS)
+/// can look up `monitor_id` by index without a geometry lookup.
+fn update_display_regions(displays: &mut Vec<DisplayBound>, generation: &mut i32) {
     let global_generation = DISPLAY_RESOLUTION_GENERATION.load(Ordering::Acquire);
     if *generation != global_generation {
         let info = enumerate_displays_inner();
-        // Refresh the legacy `Vec<DisplayRect>` first so barrier
-        // detection on the next mouse move sees the new layout.
+        // Refresh `displays` first so barrier detection on the next
+        // mouse move sees the new layout. Each entry pairs the
+        // rectangle (derived from `WinDisplayInfo.position/size`)
+        // with the stable `windows:...` id built from `device_id`.
         displays.clear();
         for d in &info {
-            displays.push(DisplayRect::new(
-                d.position.0 as f64,
-                d.position.1 as f64,
-                d.size.0 as f64,
-                d.size.1 as f64,
+            displays.push(DisplayBound::new(
+                DisplayRect::new(
+                    d.position.0 as f64,
+                    d.position.1 as f64,
+                    d.size.0 as f64,
+                    d.size.1 as f64,
+                ),
+                Some(build_stable_id(&d.device_id, &d.device_name)),
             ));
         }
         log::debug!("displays: {displays:?}");
@@ -639,18 +677,6 @@ fn enumerate_displays_inner() -> Vec<WinDisplayInfo> {
         }
     }
     out
-}
-
-fn enumerate_displays(display_rects: &mut Vec<DisplayRect>) {
-    display_rects.clear();
-    for d in enumerate_displays_inner() {
-        display_rects.push(DisplayRect::new(
-            d.position.0 as f64,
-            d.position.1 as f64,
-            d.size.0 as f64,
-            d.size.1 as f64,
-        ));
-    }
 }
 
 /// Compose a stable Windows monitor id from the PnP `DeviceID` and

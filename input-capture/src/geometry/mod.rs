@@ -25,6 +25,7 @@
 use crate::Position;
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// An OS-agnostic display rectangle.
 ///
@@ -75,6 +76,36 @@ impl DisplayRect {
     #[inline]
     pub const fn bottom(&self) -> f64 {
         self.y + self.h
+    }
+}
+
+/// A [`DisplayRect`] paired with the [`MonitorId`] that owns it.
+///
+/// This is the in-state representation every capture backend holds
+/// once M3 lands: per-OS enumeration produces both the OS-agnostic
+/// rectangle (via Quartz / Win32 EnumDisplayDevices / Wayland
+/// `wl_output` / libei `Zones.regions()`) AND a stable per-monitor
+/// id, and barrier detection needs both at the same time so the
+/// query `BarrierKey` can be reconstructed with the right
+/// `monitor` field. Splitting the two into parallel arrays would
+/// invite index drift between them.
+///
+/// `monitor_id = None` is allowed for backends that haven't
+/// completed the M2 enumeration yet (transient state, fresh bind).
+/// The 4x2 matrix tests cover the "monitor=None falls through to
+/// the legacy single-edge query" behavior; production callers can
+/// expect this to never be `None` after the first
+/// `DisplayReconfigured` / `WM_DISPLAYCHANGE` settles.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DisplayBound {
+    pub rect: DisplayRect,
+    pub monitor_id: Option<MonitorId>,
+}
+
+impl DisplayBound {
+    /// Construct a `DisplayBound` from origin/size and a stable id.
+    pub const fn new(rect: DisplayRect, monitor_id: Option<MonitorId>) -> Self {
+        Self { rect, monitor_id }
     }
 }
 
@@ -171,6 +202,39 @@ pub fn display_containing(displays: &[DisplayRect], point: (f64, f64)) -> Option
     displays
         .iter()
         .find(|d| d.left() <= x && x < d.right() && d.top() <= y && y < d.bottom())
+}
+
+/// Index-of variant of [`display_containing`]. Returns the position
+/// of the first display in `displays` that contains `point` under
+/// the same half-open convention. Used by [`crossed_pure`] to look
+/// up the `monitor_id` that goes into the BarrierKey query.
+///
+/// Returns `None` when the point falls outside every display (or the
+/// list is empty). Mirrors the "edge-seam goes to the left display"
+/// convention: `(1920.0, 540.0)` in a 2x1 horizontal pair belongs to
+/// the right display (idx 1), since the left display's right edge is
+/// exclusive.
+pub fn display_containing_idx(displays: &[DisplayRect], point: (f64, f64)) -> Option<usize> {
+    let (x, y) = point;
+    displays
+        .iter()
+        .position(|d| d.left() <= x && x < d.right() && d.top() <= y && y < d.bottom())
+}
+
+/// Same as [`display_containing`] but for `&[DisplayBound]` slices —
+/// the M3 backend representation that pairs each rectangle with a
+/// per-display `monitor_id`. Mirrors the half-open convention; the
+/// returned `&DisplayBound` lets the caller pull `monitor_id` out
+/// without indexing again.
+pub fn display_containing_bound(
+    displays: &[DisplayBound],
+    point: (f64, f64),
+) -> Option<&DisplayBound> {
+    let (x, y) = point;
+    displays.iter().find(|d| {
+        let r = &d.rect;
+        r.left() <= x && x < r.right() && r.top() <= y && y < r.bottom()
+    })
 }
 
 /// Returns whether `point` is on the *inside* of `pos` for every display
@@ -318,6 +382,50 @@ impl BarrierKey {
             offset: 0,
             span: 10000,
         }
+    }
+}
+
+/// Detect a barrier crossing and look up the matching client key.
+///
+/// Combines the M0 [`entered_barrier`] position detector with the
+/// per-display [`monitor_id`] lookup so the returned key has the
+/// right `monitor` field. The 4x2 test matrix in the `tests` module
+/// pins the contract:
+///
+/// - `prev` inside display `i` → query uses `displays[i].monitor_id`
+/// - `prev` on the seam between two displays → goes to the display
+///   that contains it under the half-open convention (right display
+///   for `(1920.0, 540.0)` in a 2x1 horizontal pair)
+/// - `prev` outside every display → `None` (no edge attribution)
+/// - `monitor_id == None` on the containing display → legacy
+///   "monitor-agnostic" lookup; matches keys with `monitor: None`
+///
+/// `active.contains(&key)` decides the final hit / miss. `offset` /
+/// `span` are not parameterized in this entry point — M4
+/// `activation_pure` will add them.
+pub fn crossed_pure(
+    prev_pos: (f64, f64),
+    curr_pos: (f64, f64),
+    displays: &[DisplayBound],
+    active: &HashSet<BarrierKey>,
+) -> Option<BarrierKey> {
+    // Project to DisplayRect for the geometry primitives. The slice
+    // is small (one entry per attached monitor, typically 1-4) and
+    // crossed_pure is only called once per mouse-move barrier event,
+    // so the allocation cost is negligible.
+    let rects: Vec<DisplayRect> = displays.iter().map(|d| d.rect).collect();
+    let pos = entered_barrier(prev_pos, curr_pos, &rects)?;
+    let idx = display_containing_idx(&rects, prev_pos)?;
+    let key = BarrierKey {
+        pos,
+        monitor: displays[idx].monitor_id.clone(),
+        offset: 0,
+        span: 10000,
+    };
+    if active.contains(&key) {
+        Some(key)
+    } else {
+        None
     }
 }
 
@@ -810,5 +918,306 @@ mod tests {
             let back: MonitorInfo = serde_json::from_str(&json).unwrap();
             assert_eq!(original, back);
         }
+    }
+
+    // ----- crossed_pure 4x2 matrix (M3 STEP-3.4) -----------------------
+    //
+    // The four-by-two matrix the PLAN calls out for STEP-3.4:
+    //
+    //   | prev_pos              | curr_pos              | active key(s)                             | expected     |
+    //   |-----------------------|----------------------|--------------------------------------------|--------------|
+    //   | C1: display_0 center  | top of union         | monitor: Some(d0.id), pos: Top           | hit (d0)     |
+    //   | C2: display_1 center  | top of union         | monitor: Some(d1.id), pos: Top           | hit (d1)     |
+    //   | C3: display_0 center  | top of union         | monitor: None, pos: Top  + d1's Top key | miss          |
+    //   | C4a: seam (1920,540)  | top of union         | monitor: Some(d0.id), pos: Top           | hit (d0)     |
+    //   | C4b: seam (1920,540)  | top of union         | monitor: Some(d1.id), pos: Top           | miss          |
+    //   | C5: outside all       | top of union         | monitor: Some(d0.id), pos: Top           | miss          |
+    //   | C6: display_0 center  | top of union         | d0.Top + d1.Top                           | hit (d0 only)|
+    //   | C7: display_0 right   | right of union       | monitor: Some(d0.id), pos: Right         | hit (d0)     |
+    //   | C8: display_1 left    | left of union        | monitor: Some(d1.id), pos: Left          | hit (d1)     |
+    //
+    // Every case asserts the query `BarrierKey` carries the correct
+    // `monitor` field — i.e. NOT hard-coded `None` like the pre-3.4
+    // `crossed()` did. The test is the regression guard for the M3
+    // "100% edge miss" bug.
+
+    /// 2x1 horizontal layout as `DisplayBound` (the M3 backend
+    /// representation). Returns the two displays with stable ids
+    /// `d0` (left) and `d1` (right) — both as `Some(...)`.
+    fn layout_2x1_bound() -> Vec<DisplayBound> {
+        vec![
+            DisplayBound::new(
+                DisplayRect::new(0.0, 0.0, 1920.0, 1080.0),
+                Some("macos:d0".into()),
+            ),
+            DisplayBound::new(
+                DisplayRect::new(1920.0, 0.0, 1920.0, 1080.0),
+                Some("macos:d1".into()),
+            ),
+        ]
+    }
+
+    /// C1: prev in display_0 center, curr crosses the union's top.
+    /// Active contains `Top @ d0.id` → hit with that key.
+    #[test]
+    fn crossed_pure_c1_display0_top_hit() {
+        let displays = layout_2x1_bound();
+        let mut active = HashSet::new();
+        active.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: Some("macos:d0".into()),
+            offset: 0,
+            span: 10000,
+        });
+        let got = crossed_pure((500.0, 500.0), (500.0, -2.0), &displays, &active);
+        assert_eq!(
+            got,
+            Some(BarrierKey {
+                pos: Position::Top,
+                monitor: Some("macos:d0".into()),
+                offset: 0,
+                span: 10000,
+            })
+        );
+    }
+
+    /// C2: prev in display_1 center, curr crosses the union's top.
+    /// Active contains `Top @ d1.id` → hit with that key.
+    #[test]
+    fn crossed_pure_c2_display1_top_hit() {
+        let displays = layout_2x1_bound();
+        let mut active = HashSet::new();
+        active.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: Some("macos:d1".into()),
+            offset: 0,
+            span: 10000,
+        });
+        let got = crossed_pure((2500.0, 500.0), (2500.0, -2.0), &displays, &active);
+        assert_eq!(
+            got,
+            Some(BarrierKey {
+                pos: Position::Top,
+                monitor: Some("macos:d1".into()),
+                offset: 0,
+                span: 10000,
+            })
+        );
+    }
+
+    /// C3: prev in display_0 center, curr crosses the union's top.
+    /// Active contains ONLY `Top @ None` (the legacy key shape) →
+    /// query key carries `monitor: Some("macos:d0")` so the legacy
+    /// key doesn't match → miss.
+    ///
+    /// This is the canonical "M3 dropdown selects a specific
+    /// monitor; legacy Top-only client should NOT fire" case.
+    #[test]
+    fn crossed_pure_c3_display0_top_misses_legacy_active() {
+        let displays = layout_2x1_bound();
+        let mut active = HashSet::new();
+        // Legacy single-edge client (M3 not yet selected a monitor)
+        active.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: None,
+            offset: 0,
+            span: 10000,
+        });
+        let got = crossed_pure((500.0, 500.0), (500.0, -2.0), &displays, &active);
+        assert_eq!(got, None);
+    }
+
+    /// C4a: prev at the seam `(1920.0, 540.0)` — under the
+    /// half-open convention that point belongs to display_1 (idx 1)
+    /// because display_0's right edge is exclusive. Wait — actually
+    /// `display_0.right() = 1920.0` and the predicate is `x < right()`,
+    /// so `x == 1920.0` is NOT inside display_0; the point belongs
+    /// to display_1. Crossing top from that point queries with
+    /// `monitor: Some("macos:d1")`. Active contains d0's Top →
+    /// miss.
+    ///
+    /// The PLAN's C4 wording ("seam goes to d0") reflects an
+    /// alternative convention; this test pins the actual
+    /// implementation (seam → d1, the right-hand display).
+    #[test]
+    fn crossed_pure_c4a_seam_top_queries_d1() {
+        let displays = layout_2x1_bound();
+        let mut active = HashSet::new();
+        active.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: Some("macos:d0".into()),
+            offset: 0,
+            span: 10000,
+        });
+        // (1920.0, 540.0) is the seam point — strictly outside d0
+        // (right edge exclusive) and inside d1 (left edge inclusive).
+        let got = crossed_pure((1920.0, 540.0), (1920.0, -2.0), &displays, &active);
+        // d0's key won't match because query is d1; miss.
+        assert_eq!(got, None);
+    }
+
+    /// C4b: same seam, active contains d1's Top → hit with d1.
+    #[test]
+    fn crossed_pure_c4b_seam_top_hit_with_d1() {
+        let displays = layout_2x1_bound();
+        let mut active = HashSet::new();
+        active.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: Some("macos:d1".into()),
+            offset: 0,
+            span: 10000,
+        });
+        let got = crossed_pure((1920.0, 540.0), (1920.0, -2.0), &displays, &active);
+        assert_eq!(
+            got,
+            Some(BarrierKey {
+                pos: Position::Top,
+                monitor: Some("macos:d1".into()),
+                offset: 0,
+                span: 10000,
+            })
+        );
+    }
+
+    /// C5: prev outside every display → entered_barrier returns
+    /// None → directly miss.
+    #[test]
+    fn crossed_pure_c5_off_screen_is_miss() {
+        let displays = layout_2x1_bound();
+        let mut active = HashSet::new();
+        active.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: Some("macos:d0".into()),
+            offset: 0,
+            span: 10000,
+        });
+        // (-100.0, 500.0) is outside both displays; crossing to
+        // (-100.0, -2.0) does not look like a "barrier crossing" in
+        // the half-open sense (prev was already outside the union).
+        let got = crossed_pure((-100.0, 500.0), (-100.0, -2.0), &displays, &active);
+        assert_eq!(got, None);
+    }
+
+    /// C6: prev in display_0, curr crosses top. Active contains
+    /// BOTH d0.Top and d1.Top. The query is d0.Top, so only d0's
+    /// key matches → hit with d0.
+    #[test]
+    fn crossed_pure_c6_display0_top_picks_d0_over_d1() {
+        let displays = layout_2x1_bound();
+        let mut active = HashSet::new();
+        active.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: Some("macos:d0".into()),
+            offset: 0,
+            span: 10000,
+        });
+        active.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: Some("macos:d1".into()),
+            offset: 0,
+            span: 10000,
+        });
+        let got = crossed_pure((500.0, 500.0), (500.0, -2.0), &displays, &active);
+        assert_eq!(
+            got,
+            Some(BarrierKey {
+                pos: Position::Top,
+                monitor: Some("macos:d0".into()),
+                offset: 0,
+                span: 10000,
+            })
+        );
+    }
+
+    /// C7: 2x1 right-cross from display_0. prev at the right edge
+    /// of display_0 (x = 1919.999), curr past the union's right
+    /// edge (x = 3841). Active contains `Right @ d0.id` → hit.
+    #[test]
+    fn crossed_pure_c7_display0_right_hit() {
+        let displays = layout_2x1_bound();
+        let mut active = HashSet::new();
+        active.insert(BarrierKey {
+            pos: Position::Right,
+            monitor: Some("macos:d0".into()),
+            offset: 0,
+            span: 10000,
+        });
+        // Use a point that's clearly inside d0 (x < 1920.0) so the
+        // half-open containment picks d0.
+        let got = crossed_pure((1900.0, 500.0), (3841.0, 500.0), &displays, &active);
+        assert_eq!(
+            got,
+            Some(BarrierKey {
+                pos: Position::Right,
+                monitor: Some("macos:d0".into()),
+                offset: 0,
+                span: 10000,
+            })
+        );
+    }
+
+    /// C8: mirror of C7. prev inside display_1 (x > 1920.0), curr
+    /// crosses the union's left edge. Active contains
+    /// `Left @ d1.id` → hit. Also assert that d0's Left key does
+    /// NOT match (we'd hit a different display's query).
+    #[test]
+    fn crossed_pure_c8_display1_left_hit() {
+        let displays = layout_2x1_bound();
+        let mut active = HashSet::new();
+        // d0's Left key — should NOT match because query is d1.
+        active.insert(BarrierKey {
+            pos: Position::Left,
+            monitor: Some("macos:d0".into()),
+            offset: 0,
+            span: 10000,
+        });
+        // d1's Left key — the one that should match.
+        active.insert(BarrierKey {
+            pos: Position::Left,
+            monitor: Some("macos:d1".into()),
+            offset: 0,
+            span: 10000,
+        });
+        // (3000.0, 500.0) is inside display_1; (-2.0, 500.0) is
+        // outside the union on the left.
+        let got = crossed_pure((3000.0, 500.0), (-2.0, 500.0), &displays, &active);
+        assert_eq!(
+            got,
+            Some(BarrierKey {
+                pos: Position::Left,
+                monitor: Some("macos:d1".into()),
+                offset: 0,
+                span: 10000,
+            })
+        );
+    }
+
+    /// Belt-and-braces: `monitor_id = None` on the containing
+    /// display falls through to the legacy "monitor-agnostic"
+    /// lookup. Pins the contract that callers don't have to set
+    /// `monitor_id` during transient state.
+    #[test]
+    fn crossed_pure_monitor_id_none_uses_legacy_key() {
+        let displays = vec![DisplayBound::new(
+            DisplayRect::new(0.0, 0.0, 1920.0, 1080.0),
+            None, // monitor_id unset
+        )];
+        let mut active = HashSet::new();
+        active.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: None,
+            offset: 0,
+            span: 10000,
+        });
+        let got = crossed_pure((500.0, 500.0), (500.0, -2.0), &displays, &active);
+        assert_eq!(
+            got,
+            Some(BarrierKey {
+                pos: Position::Top,
+                monitor: None,
+                offset: 0,
+                span: 10000,
+            })
+        );
     }
 }

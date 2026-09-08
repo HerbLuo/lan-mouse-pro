@@ -1,7 +1,7 @@
 use super::{
     BarrierKey, Capture, CaptureError, CaptureEvent, Position, error::MacosCaptureCreationError,
 };
-use crate::geometry::{DisplayRect, MonitorInfo};
+use crate::geometry::{DisplayBound, DisplayRect, MonitorInfo};
 use async_trait::async_trait;
 use bitflags::bitflags;
 use core_foundation::{
@@ -61,12 +61,16 @@ struct InputCaptureState {
     /// peer sees a sensible Motion delta, and as the diagnostic point
     /// for debug logging.
     enter_position: Option<CGPoint>,
-    /// All currently-attached displays as axis-aligned rectangles.
-    /// Re-fetched on display reconfiguration; the backend holds the
-    /// union representation rather than a precomputed bbox so it can
-    /// answer per-display queries (which display contained the cursor,
-    /// which display owns the edge being crossed, etc.).
-    displays: Vec<DisplayRect>,
+    /// All currently-attached displays paired with their stable
+    /// [`MonitorId`]. Re-fetched on display reconfiguration; the
+    /// backend holds the per-display representation rather than a
+    /// precomputed bbox so it can answer per-display queries (which
+    /// display contained the cursor, which display owns the edge
+    /// being crossed, etc.). The M3 STEP-3.4 change upgraded the
+    /// element type from `DisplayRect` to `DisplayBound` so the
+    /// barrier-detection query can carry the right `monitor` field
+    /// instead of always being `None`.
+    displays: Vec<DisplayBound>,
     /// current state of modifier keys
     modifier_state: XMods,
     /// Latest enumerated monitor list. Updated on every
@@ -143,28 +147,25 @@ impl InputCaptureState {
         Ok(res)
     }
 
-    /// Detect a barrier crossing. Takes the cursor's prev/curr sample
-    /// from the CGEvent (location is the position before delta is
-    /// applied; location + delta is the position after). Defers all
-    /// geometry to `crate::geometry::entered_barrier`, then filters to
-    /// positions that have a registered client. M1 builds a
-    /// `BarrierKey::from_pos(pos)` so the rest of the state can speak
-    /// in `BarrierKey` terms; the `monitor/offset/span` fields stay
-    /// at their legacy defaults until M2 wires monitor info
-    /// end-to-end.
+    /// Detect a barrier crossing. Thin wrapper around the pure
+    /// `crossed_pure` geometry helper: the CGEvent-side work (read
+    /// prev/curr, build the query key) is trivial enough to live
+    /// inline; everything testable (position detection, monitor-id
+    /// lookup, key match) is in `geometry::crossed_pure`.
     fn crossed(&self, prev_pos: (f64, f64), curr_pos: (f64, f64)) -> Option<BarrierKey> {
-        let pos = crate::geometry::entered_barrier(prev_pos, curr_pos, &self.displays)?;
-        let key = BarrierKey::from_pos(pos);
-        if self.active_clients.contains(&key) {
-            log::debug!("Crossed barrier into position: {pos:?}");
-            Some(key)
-        } else {
-            None
-        }
+        let key = crate::geometry::crossed_pure(
+            prev_pos,
+            curr_pos,
+            &self.displays,
+            &self.active_clients,
+        )?;
+        log::debug!("Crossed barrier into: {key:?}");
+        Some(key)
     }
 
     /// Re-fetch the list of active displays from Quartz and store them
-    /// as axis-aligned rectangles. Called on startup and on every
+    /// as `DisplayBound` entries (axis-aligned rectangle + stable
+    /// `monitor_id`). Called on startup and on every
     /// `CGDisplayReconfiguration` notification.
     ///
     /// **Important**: this clears `displays` before refilling, so a
@@ -174,19 +175,24 @@ impl InputCaptureState {
     /// held a single `Bounds` struct whose `xmin/xmax/ymin/ymax`
     /// could only ever expand; that made the cursor "stick" to a
     /// stale corner after unplugging a monitor.
+    ///
+    /// **M3 STEP-3.4 single-source-of-truth fix**: previously
+    /// `update_bounds` walked `CGDisplay::active_displays + bounds()`
+    /// while `enumerate_monitors` walked the same `active_displays`
+    /// again + `IODisplayCreateInfoDictionary`, with no guarantee
+    /// the two saw the same list mid-reconfigure. Now both paths go
+    /// through `enumerate_monitors_for_ids(&active_ids)` which
+    /// shares the IOKit code, and the bounds are derived from the
+    /// resulting `MonitorInfo.position/size` (no double Quartz
+    /// query). The pure `build_display_bounds` adapter (testable in
+    /// isolation) joins the two lists by index — both come from the
+    /// same `active_ids` iteration order, so the join is
+    /// deterministic.
     fn update_bounds(&mut self) -> Result<(), MacosCaptureCreationError> {
         let active_ids =
             CGDisplay::active_displays().map_err(MacosCaptureCreationError::ActiveDisplays)?;
-        self.displays.clear();
-        for d in &active_ids {
-            let bounds = CGDisplay::new(*d).bounds();
-            self.displays.push(DisplayRect::new(
-                bounds.origin.x,
-                bounds.origin.y,
-                bounds.size.width,
-                bounds.size.height,
-            ));
-        }
+        let monitors = enumerate_monitors_for_ids(&active_ids);
+        self.displays = build_display_bounds(&active_ids, &monitors);
 
         log::debug!("Updated displays: {0:?}", self.displays);
         Ok(())
@@ -233,16 +239,16 @@ impl InputCaptureState {
     /// warp to a stale union bbox, the very bug we're fixing.
     fn compute_edge_point(&self, prev_pos: (f64, f64), pos: Position) -> Option<CGPoint> {
         let edge_offset = 1.0;
-        let display = crate::geometry::display_containing(&self.displays, prev_pos)?;
+        let display = crate::geometry::display_containing_bound(&self.displays, prev_pos)?;
         let mut p = CGPoint {
             x: prev_pos.0,
             y: prev_pos.1,
         };
         match pos {
-            Position::Left => p.x = display.left() + edge_offset,
-            Position::Right => p.x = display.right() - edge_offset,
-            Position::Top => p.y = display.top() + edge_offset,
-            Position::Bottom => p.y = display.bottom() - edge_offset,
+            Position::Left => p.x = display.rect.left() + edge_offset,
+            Position::Right => p.x = display.rect.right() - edge_offset,
+            Position::Top => p.y = display.rect.top() + edge_offset,
+            Position::Bottom => p.y = display.rect.bottom() - edge_offset,
         }
         Some(p)
     }
@@ -537,17 +543,38 @@ impl DisplayInfo {
 /// `CGDisplay::bounds`, but accepting it documents that bounds and
 /// the active-id list must agree and gives a future caller a hook to
 /// inject test fixtures.
+///
+/// **M3 STEP-3.4 single-source-of-truth refactor**: this function
+/// used to walk `CGDisplay::active_displays + bounds()` AND
+/// `IODisplayCreateInfoDictionary` on its own. The IOKit-touching
+/// work has been extracted into [`enumerate_monitors_for_ids`] so
+/// both `enumerate_monitors` (used by the public
+/// `Capture::monitors()` API) and `update_bounds` share the same
+/// Quartz → IOKit walk. The bounds rectangle is then derived from
+/// the resulting `MonitorInfo.position/size` via [`build_display_bounds`]
+/// instead of doing a second `CGDisplay::bounds()` call.
 #[allow(dead_code)] // accepts `displays` for documentation/future use
-fn enumerate_monitors(displays: &[DisplayRect]) -> Vec<MonitorInfo> {
+fn enumerate_monitors(displays: &[DisplayBound]) -> Vec<MonitorInfo> {
     let _ = displays;
     let Ok(active_ids) = CGDisplay::active_displays() else {
         log::warn!("enumerate_monitors: CGDisplay::active_displays failed");
         return Vec::new();
     };
+    enumerate_monitors_for_ids(&active_ids)
+}
+
+/// Single-source-of-truth helper: given the active Quartz display
+/// IDs, walk each one through IOKit to compose a stable
+/// `MonitorInfo`. Pure(ish) on the FFI boundary — every per-display
+/// field extraction is plain data manipulation once the OS handles
+/// are in hand. `update_bounds` and the public
+/// `Capture::monitors()` both go through this helper so a transient
+/// Quartz state during hot-plug produces a single coherent list.
+fn enumerate_monitors_for_ids(active_ids: &[CGDirectDisplayID]) -> Vec<MonitorInfo> {
     let main = unsafe { CGMainDisplayID() };
 
     let mut out = Vec::with_capacity(active_ids.len());
-    for &display_id in &active_ids {
+    for &display_id in active_ids {
         let display = CGDisplay::new(display_id);
         let bounds = display.bounds();
         let position = (bounds.origin.x as i32, bounds.origin.y as i32);
@@ -586,6 +613,41 @@ fn enumerate_monitors(displays: &[DisplayRect]) -> Vec<MonitorInfo> {
         });
     }
     out
+}
+
+/// Build the per-backend `Vec<DisplayBound>` from the active Quartz
+/// IDs and the matching `Vec<MonitorInfo>`. Pure (the IOKit work
+/// has already happened inside `enumerate_monitors_for_ids`), so
+/// unit tests can exercise it with hand-built fixtures — no FFI.
+///
+/// The two lists are joined by index on the assumption that
+/// `enumerate_monitors_for_ids` iterates `active_ids` in the same
+/// order it received them. The Quartz API guarantees this on
+/// success; the test pins the invariant.
+///
+/// `active_ids` is currently unused inside the function body but
+/// is kept in the signature so the caller documents the
+/// one-display-per-id contract and so a future length-mismatch
+/// assertion can slot in here without changing the signature.
+fn build_display_bounds(
+    active_ids: &[CGDirectDisplayID],
+    monitors: &[MonitorInfo],
+) -> Vec<DisplayBound> {
+    let _ = active_ids;
+    monitors
+        .iter()
+        .map(|m| {
+            DisplayBound::new(
+                DisplayRect::new(
+                    m.position.0 as f64,
+                    m.position.1 as f64,
+                    m.size.0 as f64,
+                    m.size.1 as f64,
+                ),
+                Some(m.id.clone()),
+            )
+        })
+        .collect()
 }
 
 /// Resolve the IOKit service port for `display_id` and read the
@@ -1680,7 +1742,10 @@ mod tests {
     //! All are pure functions with no FFI, so they exercise the
     //! implementation cheaply on every CI run.
 
-    use super::{DisplayInfo, build_stable_id, compute_scale, enumerate_monitors};
+    use super::{
+        DisplayInfo, MonitorInfo, build_display_bounds, build_stable_id, compute_scale,
+        enumerate_monitors,
+    };
 
     /// Vendor + product are formatted as 4-digit hex (zero-padded)
     /// so the id stays visually scannable and grep-friendly. Serial
@@ -1852,7 +1917,7 @@ mod tests {
     // monitors_tx, even when `update_bounds` left `self.displays`
     // empty after a transient failure".
 
-    use crate::geometry::DisplayRect;
+    use crate::geometry::{DisplayBound, DisplayRect};
 
     /// `enumerate_monitors` must re-query `CGDisplay::active_displays()`
     /// directly and ignore the `displays` slice — the slice is kept
@@ -1870,7 +1935,10 @@ mod tests {
         // started reading from this slice instead of the live
         // Quartz enumeration, the returned list would diverge
         // from `from_empty`.
-        let from_bogus = enumerate_monitors(&[DisplayRect::new(-987_654.0, -987_654.0, 1.0, 1.0)]);
+        let from_bogus = enumerate_monitors(&[DisplayBound::new(
+            DisplayRect::new(-987_654.0, -987_654.0, 1.0, 1.0),
+            None,
+        )]);
 
         assert_eq!(
             from_empty.len(),
@@ -1896,5 +1964,114 @@ mod tests {
             "live `CGDisplay::active_displays()` returned an empty \
              snapshot on macOS — test environment is not real hardware"
         );
+    }
+
+    // ----- STEP-3.4 build_display_bounds_pure --------------------------
+    //
+    // Pins the contract that `build_display_bounds` is the single
+    // join point between Quartz's active-display enumeration and
+    // the per-OS `MonitorInfo` list. The three properties the PLAN
+    // calls out:
+    //
+    //   1. id 唯一   — every emitted `DisplayBound` carries a
+    //                 distinct `monitor_id`, derived 1:1 from the
+    //                 input `MonitorInfo.id`s.
+    //   2. idx 一致 — `display_containing` on the emitted rects
+    //                 returns the same idx as the source
+    //                 `MonitorInfo` list, so the barrier-detection
+    //                 query carries the right `monitor` field.
+    //   3. length   — `len(out) == active_ids.len() ==
+    //                 monitors.len()`. The single-source-of-truth
+    //                 refactor would silently lose displays if a
+    //                 future change skipped IDs.
+
+    use crate::geometry::display_containing_bound;
+    use std::collections::HashSet;
+
+    fn monitor(id: &str, x: i32, y: i32, w: u32, h: u32) -> MonitorInfo {
+        MonitorInfo {
+            id: id.to_string(),
+            name: format!("Display {id}"),
+            position: (x, y),
+            size: (w, h),
+            primary: false,
+            scale: 1.0,
+        }
+    }
+
+    /// Happy path: 2x1 horizontal pair. Two active IDs, two
+    /// MonitorInfo entries, two DisplayBound entries. Ids are
+    /// unique, indices line up with the source list, and the
+    /// length matches.
+    #[test]
+    fn build_display_bounds_pure_2x1_layout() {
+        let active_ids = vec![0xAAAA_u32, 0xBBBB_u32];
+        let monitors = vec![
+            monitor("macos:aaaa", 0, 0, 1920, 1080),
+            monitor("macos:bbbb", 1920, 0, 1920, 1080),
+        ];
+        let bounds = build_display_bounds(&active_ids, &monitors);
+        assert_eq!(bounds.len(), 2);
+        assert_eq!(bounds.len(), active_ids.len());
+
+        let ids: HashSet<String> = bounds.iter().filter_map(|b| b.monitor_id.clone()).collect();
+        assert_eq!(ids.len(), 2, "monitor_ids must be unique");
+
+        // Index-of via display_containing_bound lines up with the
+        // source list: prev on d0 → idx 0, prev on d1 → idx 1.
+        let d0 = display_containing_bound(&bounds, (500.0, 500.0)).expect("d0 contains (500, 500)");
+        let d1 =
+            display_containing_bound(&bounds, (2500.0, 500.0)).expect("d1 contains (2500, 500)");
+        assert_eq!(d0.monitor_id.as_deref(), Some("macos:aaaa"));
+        assert_eq!(d1.monitor_id.as_deref(), Some("macos:bbbb"));
+    }
+
+    /// Empty input → empty output. The caller must always be able
+    /// to overwrite `self.displays` without losing old entries on
+    /// the empty case.
+    #[test]
+    fn build_display_bounds_pure_empty_input() {
+        let bounds = build_display_bounds(&[], &[]);
+        assert!(bounds.is_empty());
+    }
+
+    /// Single-display regression: the function still produces one
+    /// entry with the right id when there's only one active
+    /// monitor (the most common case on a laptop).
+    #[test]
+    fn build_display_bounds_pure_single_display() {
+        let active_ids = vec![0x1234_u32];
+        let monitors = vec![monitor("macos:1234", 0, 0, 2880, 1800)];
+        let bounds = build_display_bounds(&active_ids, &monitors);
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0].monitor_id.as_deref(), Some("macos:1234"));
+        assert_eq!(bounds[0].rect.left(), 0.0);
+        assert_eq!(bounds[0].rect.top(), 0.0);
+        assert_eq!(bounds[0].rect.right(), 2880.0);
+        assert_eq!(bounds[0].rect.bottom(), 1800.0);
+    }
+
+    /// 3x1 horizontal: three displays, three ids, indices preserve
+    /// source order. Catches a future "off-by-one in the
+    /// map-and-collect" regression.
+    #[test]
+    fn build_display_bounds_pure_3x1_preserves_order() {
+        let active_ids = vec![1_u32, 2, 3];
+        let monitors = vec![
+            monitor("d-a", 0, 0, 1920, 1080),
+            monitor("d-b", 1920, 0, 1920, 1080),
+            monitor("d-c", 3840, 0, 1920, 1080),
+        ];
+        let bounds = build_display_bounds(&active_ids, &monitors);
+        assert_eq!(bounds.len(), 3);
+        assert_eq!(bounds[0].monitor_id.as_deref(), Some("d-a"));
+        assert_eq!(bounds[1].monitor_id.as_deref(), Some("d-b"));
+        assert_eq!(bounds[2].monitor_id.as_deref(), Some("d-c"));
+
+        // Display_containing_idx lookup uses the same order: a
+        // point clearly inside d-b lands on idx 1.
+        let hit =
+            display_containing_bound(&bounds, (2500.0, 500.0)).expect("d-b contains (2500, 500)");
+        assert_eq!(hit.monitor_id.as_deref(), Some("d-b"));
     }
 }
