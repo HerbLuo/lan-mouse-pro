@@ -104,6 +104,12 @@ rand = "0.8"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
 
+# M1a STEP-1a.3 — Windows clipboard backend (`OpenClipboard` /
+# `GetClipboardData` / `SetClipboardData` via `windows-sys`). Only
+# pulled in when compiling for `target_os = "windows"`.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_DataExchange"] }
+
 [features]
 default = [
     "layer_shell_capture",
