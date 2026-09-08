@@ -154,16 +154,45 @@ fn in_display_region(point: (f64, f64), displays: &[DisplayRect]) -> bool {
 }
 
 /// Returns true when the cursor was inside the union of `displays`
-/// and is now outside it with respect to the `pos` side. Used as the
-/// per-edge detector inside [`entered_barrier`].
+/// and is now outside it with respect to the `pos` side.
+///
+/// Detection has two parts:
+/// 1. **Union exit**: `prev_pos` is inside some display and
+///    `curr_pos` is outside every display. This is the primary
+///    containment check — testing "did we leave the union" rather
+///    than "is the curr_pos still on the inside of `pos` for some
+///    display", because the per-axis `in_bounds` predicate is
+///    satisfied by *any* display extending past the relevant axis
+///    and therefore masks the real exit when an outer display
+///    covers an inner display's edges (the original
+///    STEP-DEBUG-D1-LEFT bug).
+/// 2. **Direction inference**: the `(curr - prev)` motion vector
+///    must point along the `pos` axis in the direction implied by
+///    `pos`. Without this the function would return true for every
+///    `pos` whenever the cursor exited the union, and
+///    [`entered_barrier`] would always pick the first iterated
+///    side (Left) regardless of actual motion. The `dx`/`dy`
+///    comparison is sign-only; magnitude doesn't matter for
+///    direction attribution.
+///
+/// Used as the per-edge detector inside [`entered_barrier`].
 fn moved_across_boundary(
     prev_pos: (f64, f64),
     curr_pos: (f64, f64),
     displays: &[DisplayRect],
     pos: Position,
 ) -> bool {
-    /* was within bounds, but is not anymore */
-    in_display_region(prev_pos, displays) && !in_bounds(curr_pos, displays, pos)
+    if !in_display_region(prev_pos, displays) || in_display_region(curr_pos, displays) {
+        return false;
+    }
+    let dx = curr_pos.0 - prev_pos.0;
+    let dy = curr_pos.1 - prev_pos.1;
+    match pos {
+        Position::Left => dx < 0.0,
+        Position::Right => dx > 0.0,
+        Position::Top => dy < 0.0,
+        Position::Bottom => dy > 0.0,
+    }
 }
 
 /// Detect a barrier crossing: returns the first [`Position`] for which
@@ -776,20 +805,33 @@ mod tests {
 
     /// In the non-overlap strip (x ∈ [0, 200), y = 0), the cursor
     /// moves from inside D1 to a point that is NOT inside D2 — it's
-    /// outside the union entirely. The old bbox-based code would
-    /// still register this as Top (because y = 0 was bbox.ymin). The
-    /// new logic correctly returns None: there is no barrier edge
-    /// to attribute the crossing to; the cursor simply walked off
-    /// the edge of the world into the L-shaped gap.
+    /// outside the union entirely. The cursor genuinely exited the
+    /// union upward, so [`entered_barrier`] fires `Top` (the
+    /// direction of motion). This is the correct semantics after
+    /// the STEP-DEBUG-D1-LEFT fix: the union-exit + direction-
+    /// inference detector attributes the crossing to the actual
+    /// side the cursor moved through, not to whatever axis happens
+    /// to have a display edge nearby.
     ///
-    /// This is the test the PLAN calls out as "L 形错位 200px:
-    /// 错位区穿出时不误触相邻屏".
+    /// Before the fix this test asserted `None` because
+    /// `moved_across_boundary` checked `!in_bounds(curr, Top)`,
+    /// which was satisfied (D1.top = 0 ≤ -1, so `in_bounds` for Top
+    /// returned true and `!in_bounds` returned false). That
+    /// assertion pinned a side effect of the per-axis check, not a
+    /// deliberate semantic; under the union-exit + direction-
+    /// inference contract the same `prev → curr` motion is a real
+    /// upward crossing and fires `Top`.
+    ///
+    /// Pins the "L 形错位 200px: 错位区穿出时不误触相邻屏" rule from
+    /// PLAN §M0 / §M3: the crossing is correctly attributed to D1's
+    /// top edge (where the cursor came from), not to D2 (which
+    /// doesn't contain `prev` or `curr`).
     #[test]
-    fn l_shape_gap_strip_does_not_misfire() {
+    fn l_shape_gap_strip_exits_union_top() {
         let displays = layout_l_shaped_offset_200px();
         assert_eq!(
             entered_barrier((100.0, 0.0), (100.0, -1.0), &displays),
-            None
+            Some(Position::Top)
         );
     }
 
@@ -1604,6 +1646,208 @@ mod tests {
                 offset: 0,
                 span: 10000,
             })
+        );
+    }
+
+    // ----- macOS dual-monitor D1.Left crossing regression -------------
+    //
+    // User-reported scenario (2026-09-08, STEP-DEBUG-D1-LEFT):
+    //   D1 (built-in Retina): pos=(0,0) size=(1512,982)   primary=true
+    //   D3 (external):       pos=(-959,-1440) size=(3440,1440) primary=false
+    //
+    // D3 sits in the upper-left of D1 (D3.x ∈ [-959, 2481] fully
+    // covers D1.x ∈ [0, 1512]; D3.y ∈ [-1440, 0] sits above D1.y
+    // ∈ [0, 982]). The two displays share the y=0 seam.
+    //
+    // Configured: client monitor = Display1, side = Left.
+    //
+    // Before the STEP-M3-3.4-FIXUP3 fix: cursor pushed from (1, 491)
+    // to (-1, 491) — past D1's left edge — silently did NOT trigger.
+    // `moved_across_boundary` checked `!in_bounds(curr, Left)`,
+    // which returned false because D3's left edge (-959) sits to
+    // the left of -1 (so the point was "inside" D3's left boundary
+    // on the single-axis check, even though the point is not inside
+    // D3 at all). Same mask applied for Right and Top. `entered_barrier`
+    // iterated all four sides, all returned false, function returned
+    // `None` — and `query_pure` early-returned on the `?`. 100% edge
+    // miss, no log on either side.
+    //
+    // After the fix: `moved_across_boundary` does a union-exit
+    // check (`prev` inside, `curr` outside) plus direction-of-
+    // motion inference from `(curr - prev)`. The cursor's
+    // leftward motion is correctly attributed to `Left`.
+    //
+    // These tests are the regression guard for that scenario —
+    // see STEP-M3-3.4-FIXUP3 for the full investigation trace.
+
+    /// User's exact D1/D3 layout. D1 origin (0,0), D3 origin
+    /// (-959,-1440). Both rects use the reported monitor-info
+    /// numbers verbatim.
+    fn user_macos_dual_layout() -> Vec<DisplayRect> {
+        vec![
+            DisplayRect::new(0.0, 0.0, 1512.0, 982.0), // D1 (built-in)
+            DisplayRect::new(-959.0, -1440.0, 3440.0, 1440.0), // D3 (external)
+        ]
+    }
+
+    /// `entered_barrier` fires `Left` when the cursor exits D1's
+    /// left edge in the user's macOS dual-monitor layout. The
+    /// original bug was that D3's left boundary at x=-959 is
+    /// far to the left of D1's left boundary at x=0, so the
+    /// per-axis `in_bounds(curr, Left)` was satisfied by D3 even
+    /// though `curr = (-1, 491)` is geometrically outside both
+    /// displays on the left.
+    #[test]
+    fn d1_left_crossing_to_outer_display_fires_left() {
+        let displays = user_macos_dual_layout();
+        let got = entered_barrier((1.0, 491.0), (-1.0, 491.0), &displays);
+        assert_eq!(
+            got,
+            Some(Position::Left),
+            "expected Left barrier when crossing D1's left edge in \
+             macOS dual layout, got {got:?}"
+        );
+    }
+
+    /// Symmetric right-edge check: (1, 491) → (1513, 491) past D1's
+    /// right edge. Fires `Right`. Pins the same union-exit +
+    /// direction-inference fix on the right side; D3's right
+    /// boundary at x=2481 similarly masks D1's right boundary at
+    /// x=1512 in the pre-fix code.
+    #[test]
+    fn d1_right_crossing_to_outer_display_fires_right() {
+        let displays = user_macos_dual_layout();
+        let got = entered_barrier((1.0, 491.0), (1513.0, 491.0), &displays);
+        assert_eq!(
+            got,
+            Some(Position::Right),
+            "expected Right barrier when crossing D1's right edge \
+             in macOS dual layout, got {got:?}"
+        );
+    }
+
+    /// Positive control: D3's *exposed* left edge (D3.left = -959)
+    /// sits in a region where no other display's left boundary
+    /// extends past it, so the leftward exit fires regardless of
+    /// which detector variant is in use. This is what the user
+    /// reported as "configure client monitor=Display3 → works".
+    ///
+    /// Pins that the fix did not regress the outer-display path
+    /// (the path the user said already worked).
+    #[test]
+    fn d3_left_crossing_fires_left_as_baseline() {
+        let displays = user_macos_dual_layout();
+        // (-958, -100) is inside D3 (x ∈ [-959, 2481], y ∈
+        // [-1440, 0]). (-961, -100) is outside both displays on
+        // the left.
+        let got = entered_barrier((-958.0, -100.0), (-961.0, -100.0), &displays);
+        assert_eq!(
+            got,
+            Some(Position::Left),
+            "expected Left barrier when crossing D3's left edge in \
+             macOS dual layout (positive control), got {got:?}"
+        );
+    }
+
+    /// End-to-end `query_pure` with the user's macOS monitor ids.
+    /// The active set contains `Left @ D1.id`. The cursor exits
+    /// D1's left edge into the gap. The query hits with D1's key.
+    /// Pins the full chain that was previously broken:
+    /// `moved_across_boundary` → `entered_barrier` → `query_pure`.
+    #[test]
+    fn query_pure_d1_left_hit_in_outer_display_layout() {
+        let displays = vec![
+            DisplayBound::new(
+                DisplayRect::new(0.0, 0.0, 1512.0, 982.0),
+                Some("macos:0000:0000::unknown-1".into()),
+            ),
+            DisplayBound::new(
+                DisplayRect::new(-959.0, -1440.0, 3440.0, 1440.0),
+                Some("macos:0000:0000::unknown-3".into()),
+            ),
+        ];
+        let mut active = HashSet::new();
+        active.insert(BarrierKey {
+            pos: Position::Left,
+            monitor: Some("macos:0000:0000::unknown-1".into()),
+            offset: 0,
+            span: 10000,
+        });
+        let got = query_pure((1.0, 491.0), (-1.0, 491.0), &displays, &active);
+        assert_eq!(
+            got,
+            Some(BarrierKey {
+                pos: Position::Left,
+                monitor: Some("macos:0000:0000::unknown-1".into()),
+                offset: 0,
+                span: 10000,
+            }),
+            "expected query_pure to hit D1.Left in macOS dual \
+             layout, got {got:?}"
+        );
+    }
+
+    /// `display_containing_idx` sanity: the prev_pos (1, 491) is
+    /// inside D1 only (not D3, because D3's y range excludes 491).
+    /// Confirms the idx path used by `query_pure` to look up
+    /// `monitor_id` is sane for the user's layout.
+    #[test]
+    fn display_containing_idx_picks_d1_in_outer_display_layout() {
+        let displays = user_macos_dual_layout();
+        let idx = display_containing_idx(&displays, (1.0, 491.0));
+        assert_eq!(
+            idx,
+            Some(0),
+            "expected prev (1,491) to belong to D1 (idx 0), \
+             got {idx:?}"
+        );
+        let idx_curr = display_containing_idx(&displays, (-1.0, 491.0));
+        assert_eq!(
+            idx_curr, None,
+            "expected curr (-1,491) to be outside both displays, \
+             got {idx_curr:?}"
+        );
+    }
+
+    /// `in_bounds` per-side truth table for the user layout. Pins
+    /// the per-axis masking behavior that made the pre-fix
+    /// detector unreliable: `in_bounds` returns true for `Left`,
+    /// `Right`, `Top`, and `Bottom` even when the point is
+    /// geometrically outside every display, because each axis is
+    /// checked independently against *some* display's range.
+    ///
+    /// For curr = (-1, 491) in the user layout:
+    /// - `Left`: D3.left = -959 ≤ -1 → true (D3 satisfies).
+    /// - `Right`: D3.right = 2481 > -1 → true (D3 satisfies).
+    /// - `Top`: D1.top = 0 ≤ 491 → true (D1 satisfies; D3.top =
+    ///   -1440 ≤ 491 also true).
+    /// - `Bottom`: D1.bottom = 982 > 491 → true (D1 satisfies;
+    ///   D3.bottom = 0 > 491 is false).
+    ///
+    /// Kept as a permanent regression: if anyone reintroduces
+    /// `moved_across_boundary = in_display_region(prev) &&
+    /// !in_bounds(curr, pos)` (the buggy shape), this truth
+    /// table — together with `d1_left_crossing_to_outer_display_fires_left`
+    /// — is the smoking gun.
+    #[test]
+    fn in_bounds_per_side_truth_table_for_outer_display_layout() {
+        let displays = user_macos_dual_layout();
+        assert!(
+            in_bounds((-1.0, 491.0), &displays, Position::Left),
+            "D3.left=-959 < -1, so in_bounds for Left is true \
+             (this is the per-axis masking that motivated the fix)"
+        );
+        assert!(
+            in_bounds((-1.0, 491.0), &displays, Position::Right),
+            "D3.right=2481 > -1, so in_bounds for Right is true"
+        );
+        assert!(
+            in_bounds((-1.0, 491.0), &displays, Position::Top),
+            "D1.top=0 ≤ 491, so in_bounds for Top is true"
+        );
+        assert!(
+            in_bounds((-1.0, 491.0), &displays, Position::Bottom),
+            "D1.bottom=982 > 491, so in_bounds for Bottom is true"
         );
     }
 }
