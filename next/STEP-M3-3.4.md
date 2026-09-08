@@ -64,7 +64,7 @@ PLAN §3 第 163 行 3.5 表格要求把 `DISPLAYS` 升级到 `Vec<DisplayBound>
 |---|---|
 | `cargo build -p input-capture` | ✅ 0 error / 0 warning |
 | `cargo build --workspace` | ✅ 0 error / 0 warning |
-| `cargo test -p input-capture` | ✅ **62 passed** / 0 failed |
+| `cargo test -p input-capture` | ✅ **62 passed** / 0 failed（含 16 个新单测：9 `crossed_pure_c1-c8` + 4 `build_display_bounds_pure_*` + 3 layer_shell cfg-gated；旧 46 个保留零回归） |
 | `cargo test --workspace` | ✅ 全绿（input-capture 62 + lan-mouse 67 + capture_test 7 + emulation_test 2 + 15 + 5 + dummy 全保留） |
 | `cargo check -p input-capture --target x86_64-pc-windows-gnu --features layer_shell` | ✅ Windows 跨编译 0 error / 0 warning |
 | `cargo fmt --check -p input-capture` | ✅ 0 diff |
