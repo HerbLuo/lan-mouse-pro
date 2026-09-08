@@ -31,6 +31,7 @@ pub use quinn::{Connection, Endpoint};
 pub(crate) const ALPN_LAN_MOUSE: &[u8] = b"lan-mouse";
 
 pub mod endpoint;
+pub mod http3;
 pub mod protocol;
 pub mod session;
 pub mod streams;
