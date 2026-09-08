@@ -1485,6 +1485,45 @@ impl CaptureTask {
             self.active_client,
         );
 
+        // **STEP-M3-3.6-FIXUP2 (H6 fix):** when the daemon has never
+        // actively captured (state=Idle, active_client=None), there is
+        // nothing to release — skip the OS-level `capture.release()`.
+        //
+        // Why this matters: on the slave daemon every master→slave
+        // `Enter` causes `emulation.rs` to fire
+        // `EmulationEvent::ReleaseNotify` unconditionally before the
+        // matched `Entered` event. The slave has not captured anything
+        // (the user is on the master), but the old code still called
+        // `capture.release()` → libei `notify_release.notify_waiters()`
+        // → `do_capture_session` cancel/disable/close + rebuild loop.
+        // During the rebuild window the slave's EnterOnly barrier
+        // (registered via `add_incoming`) is temporarily absent from
+        // the libei portal, so the user's reverse-switch attempt
+        // (cursor crossing the slave's left edge) does not fire
+        // `Activated` and the reverse-Enter fails (~70% confidence per
+        // STEP-DEBUG-M3-REVERSE-ENTER-R2.md H6).
+        //
+        // By skipping the OS-level release when there is no active
+        // capture we keep the existing libei session alive and the
+        // EnterOnly barrier stays armed. The master→slave Entered
+        // path that follows immediately still installs / re-arms the
+        // barrier through the normal `add_incoming` AddCapture cycle.
+        if should_skip_release(&self.state, self.active_client) {
+            log::trace!(
+                "release_capture: state=Idle + active_client=None; \
+                 skipping capture.release() — EnterOnly barriers preserved \
+                 for reverse-Enter"
+            );
+            // Reset the watchdog so a skipped release does not leave
+            // stale send-failure / crossing-storm state behind. This
+            // matches what the existing Pending and Sending paths do
+            // before returning (cheap, no peer side-effects).
+            self.watchdog.consecutive_send_failures = 0;
+            self.watchdog.recent_crossings.clear();
+            self.watchdog.last_progress_at = Instant::now();
+            return Ok(());
+        }
+
         // Pending-capture special path: if we are still waiting for the Ack,
         // the host has not actually captured the mouse yet (active_client is
         // None and pressed_keys may still be empty), so we do not need to
@@ -1657,6 +1696,29 @@ enum State {
     Sending,
 }
 
+/// **STEP-M3-3.6-FIXUP2 (H6 fix):** decides whether [`CaptureTask::release_capture`]
+/// should take its no-op early-return path.
+///
+/// Returns `true` when there is genuinely nothing to release on the
+/// backend side — the daemon never transitioned out of `Idle` and never
+/// promoted a client to `active_client`. In that case skipping
+/// `capture.release()` is required so we do not poke the libei
+/// `notify_release` notify-waiters on the slave daemon (which would
+/// otherwise tear down the session and, during the rebuild window,
+/// drop the EnterOnly barrier that is needed for reverse-Enter).
+///
+/// The helper is intentionally narrow: the OR-with-`active_client`
+/// variant handles the brief transitional windows where
+/// `active_client.replace(handle)` (capture.rs line 1397) has run but
+/// `self.state = State::Sending` (line 1403) has not yet, and the
+/// inverse window where `self.active_client.take()` (line 1530) has
+/// run but `self.state = State::Idle` (line 1594) has not. Both
+/// windows are short but they exist, so the helper treats "either
+/// state is non-Idle OR active_client is Some" as "there is work".
+fn should_skip_release(state: &State, active_client: Option<ClientHandle>) -> bool {
+    matches!(state, State::Idle) && active_client.is_none()
+}
+
 /// **`lan_mouse_ipc::Position` → `input_capture::Position`** —
 /// `pub(crate)` so [`crate::service`] can build a [`BarrierKey`] from
 /// the IPC-facing position carried by `EmulationEvent::Entered` /
@@ -1784,5 +1846,84 @@ mod watchdog_tests {
         // 推第 3 条 —— 触达阈值（>=）。
         state.recent_crossings.push_back(now);
         assert!(state.recent_crossings.len() >= cfg.crossing_storm_threshold);
+    }
+}
+
+// === STEP-M3-3.6-FIXUP2 — H6 release-skip decision tests ====================
+//
+// `should_skip_release` is the pure decision function that
+// `release_capture` consults at its top to decide whether to take
+// the no-op early-return path (preserving the libei EnterOnly
+// barrier during reverse-Enter on the slave daemon). These tests
+// pin the four relevant state×active_client combinations:
+//
+//   1. Idle + None              → SKIP (the fix)
+//   2. Idle + Some              → DO NOT SKIP (transition window:
+//      active_client was just replaced, state has not flipped yet)
+//   3. Pending + None           → DO NOT SKIP (Ack expected)
+//   4. Sending + Some           → DO NOT SKIP (real capture to release)
+//
+// The behavioral effect — "capture.release() is not called on the
+// backend when we skip" — follows from (1) returning true; the
+// early-return path in `release_capture` is the only consumer of
+// this predicate, and it does not touch the `capture: &mut
+// InputCapture` parameter before returning Ok(()).
+#[cfg(test)]
+mod release_skip_tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// **H6 fix primary case**: a slave daemon that has never
+    /// captured (state=Idle, active_client=None) must skip the
+    /// OS-level release. This is the branch that preserves the
+    /// EnterOnly barrier for reverse-Enter; regressing it brings
+    /// back the reverse-Enter fail documented in
+    /// STEP-DEBUG-M3-REVERSE-ENTER-R2.md.
+    #[test]
+    fn skip_release_when_idle_and_no_active_client() {
+        assert!(should_skip_release(&State::Idle, None));
+    }
+
+    /// **Transient window**: `active_client.replace(handle)` runs at
+    /// line 1397 BEFORE `self.state = State::Sending` at line 1403,
+    /// so for a brief moment the state is still Idle while
+    /// `active_client` is Some. We must not skip in that window —
+    /// the capture is logically active.
+    #[test]
+    fn do_not_skip_release_when_idle_but_active_client_some() {
+        assert!(!should_skip_release(&State::Idle, Some(42)));
+    }
+
+    /// **Pending Ack**: the master sent `Enter` and is waiting for
+    /// `Ack`. The state machine still has work to do (cancel_pending
+    /// if release arrives, otherwise promote to Sending). Skip must
+    /// NOT fire here.
+    #[test]
+    fn do_not_skip_release_when_pending() {
+        let state = State::Pending {
+            handle: 42,
+            key: BarrierKey::default(),
+            started: Instant::now(),
+        };
+        assert!(!should_skip_release(&state, None));
+    }
+
+    /// **Sending + active client**: the normal "user pressed
+    /// release-bind while sending" case. Must release the capture
+    /// (synthesise key-ups + send Leave + backend release).
+    #[test]
+    fn do_not_skip_release_when_sending() {
+        assert!(!should_skip_release(&State::Sending, Some(7)));
+    }
+
+    /// **Sending + None transient window**: `self.active_client.take()`
+    /// at line 1530 runs BEFORE `self.state = State::Idle` at line
+    /// 1594, so we can see Sending + None during the release itself.
+    /// We must still release the OS-level capture (the backend
+    /// `capture.release()` is the whole point of release_capture in
+    /// the Sending branch).
+    #[test]
+    fn do_not_skip_release_when_sending_with_active_client_cleared() {
+        assert!(!should_skip_release(&State::Sending, None));
     }
 }
