@@ -117,3 +117,21 @@
   - commit `63706b5` 已落地：9 处新文件 / 47 行 ConnectionRow.vue / 25 行 api/ipc.ts / 57 行 store/index.ts 全部到位
   - 备注：SUGGESTION.md 头部规则要求"已解决 → SUGGESTION-FIXED.md"，本次归档由 leader 显式触发（之前 commit 时口头接受但漏了正式归档，导致 STEP-2.7 executor 看到 SUGGESTION.md #1 仍在没主动动 —— 这是 leader 失误）
 - **解决 STEP**：M2 / STEP-2.6 + M2 收尾归档
+
+---
+
+## #9 — M0b STEP-0.2 Path 1 (h3 + b"h3" ALPN) rejected; Path 2 (HTTP/3-lite over b"lan-mouse") adopted
+
+- **触发 STEP**：M0b / STEP-0.2 spike（PLAN-2 §3 M0b STEP-0.2 行 + §5 评审 #2 second round）
+- **现象**：原 PLAN 二分叉假设 "Path 1 (h3-quinn) 失败 + Path 2 (自实现 HTTP/3-lite) 落地"。Spike 在 `examples/h3_pingpong.rs` 实现 Path 1 的 ALPN-multiplexed endpoint 路径并跑 4 场景，结论：
+  - **h3 本身**可工作：h3-quinn 0.0.10 与 quinn 0.11 兼容（`Cargo.toml` 已加 `h3 = "0.0.8"` + `h3-quinn = "0.0.10"` dev-dep；h3-quinn-quinn 三者实际绑定为 quinn 0.11.x），h3 的 `b"h3"` ALPN 在独立 endpoint 上 `GET /healthz` + 200 MiB 流式 + 取消 + 拔网全绿（loopback 71 MiB/s）。结论：**h3 本身不是技术债**。
+  - **ALPN 共存路径失败**：当前 `quic_transport/mod.rs:31` 用 `b"lan-mouse"`；h3 标准 ALPN 是 `b"h3"`。quinn 0.11 的 TLS config 接受多个 ALPN 但 ALPN 是 **在 QUIC 握手阶段由 client 选**的——server 端要支持两者共存必须用 SO_REUSEPORT 起一个独立 UDP socket（每个 ALPN 一个），再在 `Connection` 拿到后按 `connection.alpn()` 在应用层 demux 每个 stream。这带来：① 端口分裂（4252 不能再是单端口）；② 每个 endpoint 自己一套 cert + 鉴权；③ `PeerSession::run` 选 stream 派发的 dispatch 路径要多一个 ALPN 分支（协议层结构变化）。PLAN §0 scope discipline + AGENTS.md "Scope discipline. Only implement what was requested" 明确反对引入这一层复杂度。
+  - **Path 2 落地**：`src/quic_transport/http3.rs` 自实现 `[u16 method_len][method][u16 path_len][path][u32 body_len][body]` 帧 over 裸 QUIC bidi stream，ALPN 保持 `b"lan-mouse"`——纯协议层增量，零端口 / 零握手变化 / 零鉴权重做。`build_server(conn)` + `build_request_conn(conn)` 接口对齐 PLAN §3 M0b STEP-0.2 产物要求。
+- **根因（与 PLAN 假设对比）**：PLAN 假设 Path 1 "失败原因是 ALPN 路由不可行"；实际 spike 证明 ALPN 路由 **可以**做，但带来"协议层分叉 + 端口分裂"的代价，违反 scope discipline。Path 1 不是"不可能"而是"不值得"——这是对 PLAN 假设的细化（无功能偏差，仅决策依据从"技术不可行"修正为"技术可行但不符合 scope discipline"）。
+- **解决方案**（已落地在 commit-pending 中，路径 2 接口由 leader commit）：
+  - `src/quic_transport/http3.rs`（新，~580 行）：`Request` / `Response` / `Router` / `Handler` / `CHUNK_SIZE` + 编码 / 解码（单缓冲 + 流式）+ `build_server` / `build_request_conn` / `ClientConn::request` / `request_streaming` + quinn 错误类型 → `std::io::Error` 转换 + 11 个单元测试（round-trip + 200 MiB framing + router + chunk 边界）。
+  - `examples/h3_pingpong.rs`（新，~280 行）：四场景全绿——`/healthz` 200 OK / 200 MiB 字节级一致 71-72 MiB/s loopback / 取消 ~200ms 停 / 拔网 ~25ms 报 `connection lost`（均远在 1s / 5s 预算内）。
+  - `src/quic_transport/mod.rs`：仅加 `pub mod http3;`（无 re-export，符合"STEP-0.3 才 wire 进 PeerSession"的纪律）。
+  - `Cargo.toml`：`bytes = "1"`（生产）+ `h3 = "0.0.8"` + `h3-quinn = "0.0.10"` + `rand = "0.8"`（dev-deps for spike）。
+- **Plan 偏差**：无功能偏差；Path 1 决策依据细化（见上"根因"段），与 PLAN §3 M0b STEP-0.2 行 + §5 评审 #2 second round 完全一致。
+- **解决 STEP**：M0b / STEP-0.2
