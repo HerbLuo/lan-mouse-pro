@@ -2,12 +2,12 @@
 //!
 //! Before this module existed, the same set of pure helpers
 //! (`is_within_dp_region`, `is_within_dp_boundary`, `in_bounds`,
-//! `in_display_region`, `moved_across_boundary`, `entered_barrier`,
-//! `cursor_within`, `clamp_to_display_bounds`) lived inside
-//! `windows/display_util.rs` and were only accessible from the Windows
-//! backend. macOS meanwhile implemented its own (subtly different)
-//! copy in `macos::Bounds` based on a single axis-aligned bounding box
-//! — a representation that cannot model real-world multi-display
+//! `in_display_region`, `entered_barrier`, `cursor_within`,
+//! `clamp_to_display_bounds`) lived inside `windows/display_util.rs`
+//! and were only accessible from the Windows backend. macOS
+//! meanwhile implemented its own (subtly different) copy in
+//! `macos::Bounds` based on a single axis-aligned bounding box —
+//! a representation that cannot model real-world multi-display
 //! layouts where displays overlap or sit at different heights.
 //!
 //! This module unifies both behind a single representation:
@@ -193,135 +193,54 @@ fn in_display_region(point: (f64, f64), displays: &[DisplayRect]) -> bool {
 ///    the residual: pure-vertical motion can never attribute to
 ///    Left, no matter what `curr.x` looks like.
 ///
-/// Used as the per-edge detector inside [`entered_barrier`].
-fn moved_across_boundary(
-    prev_pos: (f64, f64),
-    curr_pos: (f64, f64),
-    displays: &[DisplayRect],
-    pos: Position,
-) -> bool {
-    if !in_display_region(prev_pos, displays) || in_display_region(curr_pos, displays) {
-        return false;
-    }
-    let dx = curr_pos.0 - prev_pos.0;
-    let dy = curr_pos.1 - prev_pos.1;
-    let adx = dx.abs();
-    let ady = dy.abs();
-
-    let horizontal_strong = adx > ady;
-    let vertical_strong = ady > adx;
-
-    // Tied case: motion gives no signal. Use the only objective
-    // question — is `curr_pos` past this edge of the containing
-    // display?
-    let geometric = |containing: &DisplayRect| -> bool {
-        match pos {
-            Position::Left => curr_pos.0 < containing.left(),
-            Position::Right => curr_pos.0 >= containing.right(),
-            Position::Top => curr_pos.1 < containing.top(),
-            Position::Bottom => curr_pos.1 >= containing.bottom(),
-        }
-    };
-
-    match pos {
-        Position::Left => {
-            if horizontal_strong {
-                dx < 0.0
-            } else if vertical_strong {
-                // Vertical dominates — Left cannot fire even if
-                // `curr.x` happens to be past the left edge of the
-                // containing display. Without this guard, the
-                // geometric fallback would let `Left` win on
-                // motion that's mostly vertical, and
-                // `entered_barrier`'s priority list `[Left, Right,
-                // Top, Bottom]` would pick `Left` over `Bottom` —
-                // STEP-DEBUG-D1-BOTTOM v2 residual.
-                false
-            } else {
-                // Tied. Use geometric.
-                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d))
-                else {
-                    return false;
-                };
-                geometric(containing)
-            }
-        }
-        Position::Right => {
-            if horizontal_strong {
-                dx > 0.0
-            } else if vertical_strong {
-                false
-            } else {
-                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d))
-                else {
-                    return false;
-                };
-                geometric(containing)
-            }
-        }
-        Position::Top => {
-            if vertical_strong {
-                dy < 0.0
-            } else if horizontal_strong {
-                false
-            } else {
-                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d))
-                else {
-                    return false;
-                };
-                geometric(containing)
-            }
-        }
-        Position::Bottom => {
-            if vertical_strong {
-                dy > 0.0
-            } else if horizontal_strong {
-                false
-            } else {
-                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d))
-                else {
-                    return false;
-                };
-                geometric(containing)
-            }
-        }
-    }
-}
-
 /// Detect a barrier crossing: returns the first [`Position`] for which
 /// the cursor moved from "inside some display" to "outside on this
 /// side". The result is `None` when the cursor stayed inside or
 /// jumped straight across the union (which physically shouldn't
 /// happen for normal mouse motion).
 ///
-/// Detection contract (v4):
+/// Detection contract (v5):
 /// 1. **Union exit**: `prev_pos` must be inside some display,
 ///    `curr_pos` outside every display.
-/// 2. **Axis attribution**:
-///    - **Horizontal dominant** (`|dx| > |dy|`): fire `Left`/`Right`
-///      on the matching direction. Vertical sides stay dark.
-///    - **Vertical dominant** (`|dy| > |dx|`): fire `Top`/`Bottom`
-///      on the matching direction. Horizontal sides stay dark.
-///    - **Tied** (`|dx| == |dy|`): motion gives no signal. Inspect
-///      which edges of the **containing display** `curr_pos` is
-///      genuinely past (geometric check). If exactly one edge is
-///      past, fire that edge. If zero edges (e.g. `curr_pos` sits
-///      inside the union under a different containment rule), or
-///      two or more edges (the corner exit case), return `None` —
-///      corner exits in the tied axis are genuinely ambiguous
-///      between the two adjacent sides, and firing either picks
-///      wrong roughly half the time. Returning `None` keeps the
-///      cursor in the local machine until the user pushes far
-///      enough along a single axis for that axis to dominate.
+/// 2. **Geometric edge crossing** — inspect which edges of the
+///    **containing display** `curr_pos` is genuinely past:
+///    - **Zero edges**: shouldn't happen (we already verified
+///      `curr_pos` is outside every display). Treat as None.
+///    - **One edge**: `curr_pos` crossed exactly one edge of the
+///      containing display. That edge is the geometric attribution.
+///      Require the motion direction (`dx`/`dy` sign) to agree with
+///      that edge — if not, return None (the motion vector points
+///      away from the geometric crossing, the user did not intend
+///      this edge).
+///    - **Two or more edges**: corner exit. The corner exit is
+///      genuinely ambiguous (e.g. exiting the bottom-left corner of
+///      D1 could be either a Left exit or a Bottom exit depending
+///      on the user's intent, which is unobservable). Return None —
+///      the user pushes further along a single axis until the
+///      dominant axis wins.
 ///
-/// Why return `None` on tied corner exits (v4 fix): v3 fell through
-/// to per-side geometric and let both adjacent sides pass on a
-/// tied corner exit. The priority list `[Left, Right, Top, Bottom]`
-/// then picked `Left` first, which still triggered the controlled-
-/// machine `Left` key on a corner exit the user intended as
-/// `Bottom` (the v3-residual bug reported after STEP-DEBUG-D1-
-/// BOTTOM v3). v4 makes the tied corner exit a hard "ambiguous —
-/// do not fire" case.
+/// Why v5 (geometric + direction consistency) over v3 (axis
+/// dominance) and v4 (tied → None): both v3 and v4 had a residual
+/// where the dominant axis's `dx < 0` / `dx > 0` / `dy < 0` /
+/// `dy > 0` branch fired on corner exits WITHOUT checking whether
+/// `curr_pos` was actually past that geometric edge. Real-device
+/// repro: cursor pinned at D1's bottom-left corner by macOS Quartz
+/// clamp, sensor noise / hand drift produces a delta with
+/// `|dx| >> |dy|` (e.g. `dx = -150, dy = +10`), `curr_pos` exits
+/// the union on BOTH D1.left and D1.bottom. v3/v4 fired `Left`
+/// (priority list) regardless of the geometric crossing, hitting
+/// the controlled-machine Left key. v5 requires the geometric
+/// crossing AND motion direction to agree, killing the residual.
+///
+/// Cost vs. v3: v5 returns `None` on cases where v3 fired a side
+/// via axis-dominance alone. The v3 test
+/// `vertical_pair_d1_bottom_left_horizontal_dominant_fires_left`
+/// (dx=-5, dy=+1, curr past only D1.bottom) is the only
+/// user-observable behaviour change: v3 fired `Left`, v5 fires
+/// `Bottom` (geometric attribution, direction agreed with `dy>0`).
+/// This is the right call — when the cursor is geometrically past
+/// D1.bottom, the barrier the user actually crossed is D1.bottom,
+/// not D1.left, even when the motion was mostly horizontal.
 pub fn entered_barrier(
     prev_pos: (f64, f64),
     curr_pos: (f64, f64),
@@ -330,56 +249,68 @@ pub fn entered_barrier(
     if !in_display_region(prev_pos, displays) || in_display_region(curr_pos, displays) {
         return None;
     }
-    let dx = curr_pos.0 - prev_pos.0;
-    let dy = curr_pos.1 - prev_pos.1;
-    let adx = dx.abs();
-    let ady = dy.abs();
-
-    if adx > ady {
-        // Horizontal dominant — per-side dominance check (vertical
-        // sides stay dark via the existing moved_across_boundary
-        // contract).
-        return [Position::Left, Position::Right]
-            .into_iter()
-            .find(|&pos| moved_across_boundary(prev_pos, curr_pos, displays, pos));
-    }
-    if ady > adx {
-        // Vertical dominant — symmetric: horizontal sides stay
-        // dark.
-        return [Position::Top, Position::Bottom]
-            .into_iter()
-            .find(|&pos| moved_across_boundary(prev_pos, curr_pos, displays, pos));
-    }
-
-    // Tied: motion gives no signal. Inspect geometric containment
-    // of `curr_pos` relative to the display that contained
-    // `prev_pos`.
     let containing = displays.iter().find(|d| is_within_dp_region(prev_pos, d))?;
     let crosses_left = curr_pos.0 < containing.left();
     let crosses_right = curr_pos.0 >= containing.right();
     let crosses_top = curr_pos.1 < containing.top();
     let crosses_bottom = curr_pos.1 >= containing.bottom();
-    let crossings = [
-        (Position::Left, crosses_left),
-        (Position::Right, crosses_right),
-        (Position::Top, crosses_top),
-        (Position::Bottom, crosses_bottom),
-    ];
-    let mut true_side = None;
+
+    let mut true_side: Option<Position> = None;
     let mut true_count = 0usize;
-    for (pos, crosses) in crossings {
+    let mut record = |pos: Position, crosses: bool| {
         if crosses {
             true_side = Some(pos);
             true_count += 1;
         }
+    };
+    record(Position::Left, crosses_left);
+    record(Position::Right, crosses_right);
+    record(Position::Top, crosses_top);
+    record(Position::Bottom, crosses_bottom);
+
+    if true_count != 1 {
+        // 0 edges (shouldn't happen post union-exit check) or
+        // corner exit (≥2 edges). Both ambiguous: do not fire.
+        return None;
     }
-    if true_count == 1 {
-        return true_side;
+    let pos = true_side?;
+
+    // Geometric attribution: `curr_pos` genuinely crossed this
+    // edge. Now require the motion direction to agree with the
+    // crossing — otherwise the motion vector points away from the
+    // geometric crossing and the user did not intend this edge.
+    let dx = curr_pos.0 - prev_pos.0;
+    let dy = curr_pos.1 - prev_pos.1;
+    match pos {
+        Position::Left => {
+            if dx < 0.0 {
+                Some(Position::Left)
+            } else {
+                None
+            }
+        }
+        Position::Right => {
+            if dx > 0.0 {
+                Some(Position::Right)
+            } else {
+                None
+            }
+        }
+        Position::Top => {
+            if dy < 0.0 {
+                Some(Position::Top)
+            } else {
+                None
+            }
+        }
+        Position::Bottom => {
+            if dy > 0.0 {
+                Some(Position::Bottom)
+            } else {
+                None
+            }
+        }
     }
-    // 0 edges (shouldn't happen since we already verified
-    // `in_display_region(curr)` is false) or ≥2 edges (tied corner
-    // exit) — both ambiguous, do not fire.
-    None
 }
 
 /// Return the first display in `displays` that contains `point`.
@@ -2219,26 +2150,31 @@ mod tests {
     }
 
     /// Belt-and-braces: a more strongly horizontal exit (|dx| > |dy|)
-    /// should correctly attribute to `Left`, NOT to `Bottom`. Pins
-    /// that the dominance check works in the *opposite* direction
-    /// too — i.e. when the cursor really is moving mostly leftward
-    /// through a corner exit, Left still wins.
+    /// where the geometric crossing is single-edge (only Bottom)
+    /// must fire Bottom — the geometric crossing wins over axis
+    /// dominance. v3 fired Left here because axis dominance always
+    /// won on `dx < 0` even when the cursor was past only Bottom
+    /// geometrically — that was the v3-residual bug (the user's
+    /// reported "鼠标撞到底但触发 Left"). v5 fires Bottom because
+    /// geometric crossing is the primary attribution and the
+    /// motion direction (`dy > 0`) agrees with the Bottom edge.
     ///
-    /// dx = -5, dy = +1 → |dx| > |dy|, so Left strictly dominates.
-    /// Bottom ALSO fires via the geometric fallback (curr.y == 1080
-    /// is past D1.bottom on the half-open convention), but
-    /// `entered_barrier`'s priority list `[Left, Right, Top,
-    /// Bottom]` picks Left first.
+    /// dx = -5, dy = +1 → |dx| > |dy| (horizontal dominant), but
+    /// curr.x = 95 > D1.left = 0 → NOT past Left. curr.y = 1080
+    /// = D1.bottom (half-open) → past Bottom. Single-edge Bottom
+    /// crossing with `dy > 0` → Bottom fires.
     #[test]
-    fn vertical_pair_d1_bottom_left_horizontal_dominant_fires_left() {
+    fn vertical_pair_d1_bottom_left_horizontal_dominant_fires_bottom() {
         let displays = user_vertical_pair_layout();
         let got = entered_barrier((100.0, 1079.0), (95.0, 1080.0), &displays);
         assert_eq!(
             got,
-            Some(Position::Left),
-            "expected Left when exiting D1's bottom-left corner with \
-             mostly-leftward motion (Bottom may also fire via geometric \
-             fallback but Left wins by priority), got {got:?}"
+            Some(Position::Bottom),
+            "expected Bottom when exiting D1's bottom edge with \
+             mostly-leftward motion — the geometric crossing is on \
+             D1.bottom (single edge), motion direction (dy>0) \
+             agrees with Bottom, so Bottom fires. v3 fired Left \
+             here (BUG). got {got:?}"
         );
     }
 
@@ -2500,10 +2436,13 @@ mod tests {
                     // other tests).
                     continue;
                 }
-                // Start the cursor 1–3 px from the left edge so
-                // any leftward dx makes curr.x negative.
-                let prev = (2.0, 1070.0);
-                let curr = (2.0 + dx, 1070.0 + dy);
+                // Pin prev.x far from D1.left so the horizontal drift
+                // can't accidentally push curr past D1.left, which
+                // would turn this into a corner exit and (under v5)
+                // return None. Single-edge Bottom crossing with
+                // dy > 0 must always fire Bottom.
+                let prev = (500.0, 1070.0);
+                let curr = (500.0 + dx, 1070.0 + dy);
                 // Sanity: curr must be past D1.bottom (1080) for
                 // this to be a real exit event.
                 assert!(
@@ -2511,12 +2450,19 @@ mod tests {
                     "test fixture out of range (curr.y={})",
                     curr.1
                 );
+                // Sanity: curr must NOT be past D1.left — this is a
+                // single-edge Bottom exit, not a corner.
+                assert!(
+                    curr.0 >= 0.0,
+                    "test fixture accidentally creates corner exit (curr.x={})",
+                    curr.0
+                );
                 let got = entered_barrier(prev, curr, &displays);
                 assert_eq!(
                     got,
                     Some(Position::Bottom),
-                    "vertical-dominant (dy={dy}, dx={dx}, prev.x=2) at \
-                     bottom-left must fire Bottom; got {got:?}"
+                    "vertical-dominant (dy={dy}, dx={dx}, prev.x=500) \
+                     at bottom (single-edge) must fire Bottom; got {got:?}"
                 );
             }
         }
@@ -2700,24 +2646,161 @@ mod tests {
         );
     }
 
-    /// Belt-and-braces: tied single-edge left exit (curr past only
-    /// D1.left). The cursor moves diagonally with |dx| == |dy| but
-    /// the curr happens to land inside the bottom half-open
-    /// (curr.y < 1080). Pins that v4's corner-exit ambiguity rule
-    /// does not bleed into single-edge cases.
+    /// Belt-and-braces: tied motion with `curr_pos` past no edge
+    /// of the containing display — i.e. a tied exit that lands
+    /// back inside the union under a different containment path
+    /// (e.g. `curr_pos` lands inside the OTHER display of the
+    /// pair). Pin: entered_barrier must return None — there's no
+    /// edge to attribute.
+    ///
+    /// prev=(10, 500), curr=(5, 505): dx=-5, dy=+5, tied. curr past
+    /// D1.left? 5 < 0? no. past D1.bottom? 505 >= 1080? no. past
+    /// D1.right? 505 >= 1920? no. past D1.top? 505 < 0? no. 0
+    /// edges crossed → None.
     #[test]
-    fn v4_tied_single_edge_left_fires_left() {
+    fn v4_tied_no_edge_crossed_returns_none() {
         let displays = user_vertical_pair_layout();
         let got = entered_barrier((10.0, 500.0), (5.0, 505.0), &displays);
-        // dx=-5, dy=+5 → tied. curr past D1.left (5 < 0? no, 5>0,
-        // so curr.x=5 is NOT past D1.left=0). curr past D1.top
-        // (505 < 0? no). curr past D1.bottom (505 >= 1080? no).
-        // curr past D1.right (505 >= 1920? no). So 0 edges crossed.
-        // entered_barrier must return None.
         assert_eq!(
             got, None,
             "tied motion with curr still inside D1 (no edge crossed) \
              must return None. got {got:?}"
+        );
+    }
+
+    // ----- v5 dominant corner exit — regression guards -------------------
+    //
+    // v4 fixed the TIED case (|dx| == |dy|) corner exit by returning
+    // None on multi-edge geometric crossings. v5 generalizes this
+    // to the DOMINANT case: regardless of axis dominance, when
+    // `curr_pos` is geometrically past 2+ edges of the containing
+    // display, return None (corner exit is ambiguous).
+    //
+    // macOS Quartz cursor clamp pins the cursor to union edges,
+    // producing exactly this kind of corner exit when the user
+    // pushes toward a corner and the hand drift / sensor noise
+    // produces a dominant-axis delta that nonetheless exits both
+    // adjacent edges. v3 fired Left via the priority list on the
+    // axis-dominant side; v4 still did this because it only added
+    // the corner-exit guard in the tied branch. v5 makes the guard
+    // universal.
+
+    /// horizontal_strong corner exit at bottom-left: prev in D1,
+    /// curr past both D1.left and D1.bottom. v3/v4 returned
+    /// `Some(Left)` (the v4 residual observed as handle=2
+    /// BeginPending on real device). v5 returns None.
+    #[test]
+    fn v5_horizontal_strong_corner_returns_none() {
+        let displays = user_vertical_pair_layout();
+        let got = entered_barrier((100.0, 1078.0), (-50.0, 1088.0), &displays);
+        assert_eq!(
+            got, None,
+            "horizontal_strong corner exit (|dx|=150 > |dy|=10) at \
+             bottom-left must NOT fire — curr is past both D1.left \
+             and D1.bottom, the corner exit is ambiguous. v3/v4 \
+             fired Left (BUG). v5 returns None. got {got:?}"
+        );
+    }
+
+    /// Sweep dominant corner exits: every (dx, dy) where |dx| > |dy|
+    /// AND curr past both D1.left and D1.bottom must return None
+    /// under v5. Documents that v5 closes the dominant-corner
+    /// residual for the full sweep of realistic motion sizes.
+    #[test]
+    fn v5_dominant_corner_grid_returns_none() {
+        let displays = user_vertical_pair_layout();
+        // dx must clear D1.left from prev.x = 100, i.e. |dx| > 100.
+        // dy clears D1.bottom (just barely — curr.y = 1080) when
+        // prev.y = 1080 - dy. Keep dy small to maintain
+        // |dx| > |dy|.
+        for dx in [-150.0_f64, -120.0] {
+            for dy in [0.5_f64, 1.0, 2.0, 5.0, 10.0, 20.0] {
+                if dx.abs() <= dy.abs() {
+                    continue;
+                }
+                let prev = (100.0, 1080.0 - dy);
+                let curr = (100.0 + dx, 1080.0);
+                assert!(curr.0 < 0.0, "curr.x={} must be past D1.left", curr.0);
+                assert!(curr.1 >= 1080.0, "curr.y={} must be past D1.bottom", curr.1);
+                let got = entered_barrier(prev, curr, &displays);
+                assert_eq!(
+                    got, None,
+                    "horizontal_strong ({dx}, {dy}) corner exit must \
+                     NOT fire under v5. got {got:?}"
+                );
+            }
+        }
+    }
+
+    /// End-to-end query_pure regression for the dominant-corner
+    /// residual. Active set contains only `Left @ D1.id`. v3/v4
+    /// returned the LEFT key (BUG); v5 returns None.
+    #[test]
+    fn v5_query_pure_dominant_corner_returns_none() {
+        let displays = vec![
+            DisplayBound::new(
+                DisplayRect::new(0.0, 0.0, 1920.0, 1080.0),
+                Some("macos:0000:0000::unknown-1".into()),
+            ),
+            DisplayBound::new(
+                DisplayRect::new(0.0, -1080.0, 1920.0, 1080.0),
+                Some("macos:0000:0000::unknown-2".into()),
+            ),
+        ];
+        let mut active = HashSet::new();
+        active.insert(BarrierKey {
+            pos: Position::Left,
+            monitor: Some("macos:0000:0000::unknown-1".into()),
+            offset: 0,
+            span: 10000,
+        });
+        let got = query_pure((100.0, 1078.0), (-50.0, 1088.0), &displays, &active);
+        assert_eq!(
+            got, None,
+            "horizontal_strong corner exit must NOT fire on \
+             query_pure under v5. v3/v4 returned the LEFT key (BUG, \
+             observed as handle=2 BeginPending on real device). \
+             got {got:?}"
+        );
+    }
+
+    /// Symmetric guard: vertical_strong corner exit at bottom-left.
+    /// prev in D1, curr past both D1.left and D1.bottom, but the
+    /// motion is dominantly vertical (|dy| > |dx|). v3 fired Bottom
+    /// because vertical_dominant darkens Left. v5 makes it None —
+    /// corner exit is still ambiguous regardless of axis dominance.
+    #[test]
+    fn v5_vertical_strong_corner_returns_none() {
+        let displays = user_vertical_pair_layout();
+        // prev in D1, curr past both D1.left and D1.bottom.
+        // delta = (-5, +50) → vertical_dominant.
+        let got = entered_barrier((2.0, 1030.0), (-3.0, 1080.0), &displays);
+        assert_eq!(
+            got, None,
+            "vertical_strong corner exit must NOT fire under v5. \
+             v3 fired Bottom (correct in user's mental model but \
+             v5 chooses the conservative None). got {got:?}"
+        );
+    }
+
+    /// Belt-and-braces: horizontal_dominant single-edge Bottom
+    /// exit (only D1.bottom crossed, motion dy>0) MUST still fire
+    /// Bottom under v5. Pins that v5 didn't over-correct into
+    /// "always None on union exit" — single-edge crossings with
+    /// direction-agreement still attribute correctly.
+    #[test]
+    fn v5_horizontal_dominant_single_edge_bottom_fires_bottom() {
+        let displays = user_vertical_pair_layout();
+        // prev = (500, 1079) inside D1, curr = (495, 1080).
+        // dx=-5, dy=+1 (horizontal_dominant). curr past only
+        // D1.bottom (curr.x=495 > D1.left=0). v5 fires Bottom.
+        let got = entered_barrier((500.0, 1079.0), (495.0, 1080.0), &displays);
+        assert_eq!(
+            got,
+            Some(Position::Bottom),
+            "horizontal_dominant single-edge Bottom exit must fire \
+             Bottom under v5 (motion direction dy>0 agrees with \
+             Bottom). got {got:?}"
         );
     }
 }
