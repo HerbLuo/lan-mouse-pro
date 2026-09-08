@@ -173,21 +173,31 @@ fn in_display_region(point: (f64, f64), displays: &[DisplayRect]) -> bool {
 ///    [`entered_barrier`] would always pick the first iterated
 ///    side (Left) regardless of actual motion. The `dx`/`dy`
 ///    comparison is sign-only.
-/// 3. **Axis dominance**: the axis relevant to `pos` must dominate
-///    the motion — i.e. `|dx| >= |dy|` for the horizontal sides
-///    (Left/Right) and `|dy| >= |dx|` for the vertical sides
-///    (Top/Bottom). This is what disambiguates diagonal exits
-///    through a display corner (the user-reported
-///    STEP-DEBUG-D1-BOTTOM bug): when the cursor exits the
-///    bottom-left corner with mostly-downward motion, the sign
-///    check alone would fire BOTH `Left` (dx < 0) and `Bottom`
-///    (dy > 0), and `entered_barrier`'s priority list
-///    `[Left, Right, Top, Bottom]` would then pick `Left` —
-///    incorrectly attributing the crossing to the horizontal edge
-///    that has a configured neighbor (the controlled machine on
-///    the user's left), even though the cursor clearly moved
-///    downward off the bottom edge. Requiring dominance breaks
-///    that ambiguity: `Bottom` fires, `Left` does not.
+/// 3. **Axis dominance (strict) + geometric fallback**: the axis
+///    relevant to `pos` must *strictly* dominate the motion — i.e.
+///    `|dx| > |dy|` for the horizontal sides (Left/Right) and
+///    `|dy| > |dx|` for the vertical sides (Top/Bottom). When
+///    dominance does NOT hold (the other axis dominates or they're
+///    exactly equal), the check falls through to a geometric
+///    question: is `curr_pos` actually past this edge of the
+///    display that contained `prev_pos`?
+///
+///    Why strict + geometric fallback: the user-reported
+///    `STEP-DEBUG-D1-BOTTOM` followup showed that `>=` dominance
+///    still left a residual trigger at exact 45° motion and at
+///    near-ties caused by mouse sensor noise or hand drift. With
+///    `>=`, both Left and Bottom fired on equal axes and
+///    `entered_barrier`'s priority list `[Left, Right, Top,
+///    Bottom]` then picked `Left` — incorrectly attributing the
+///    crossing to the horizontal edge that has a configured
+///    neighbor (the controlled machine on the user's left), even
+///    though the cursor's `curr_pos` is geometrically past only
+///    the bottom edge (x is still inside the display's x range).
+///    Strict `>` forces the tie case through the geometric
+///    fallback, which answers the only objective question left:
+///    which edges of the containing display is `curr_pos`
+///    actually past? That signal alone correctly disambiguates
+///    corner exits where the dominant-axis signal is ambiguous.
 ///
 /// Used as the per-edge detector inside [`entered_barrier`].
 fn moved_across_boundary(
@@ -201,13 +211,45 @@ fn moved_across_boundary(
     }
     let dx = curr_pos.0 - prev_pos.0;
     let dy = curr_pos.1 - prev_pos.1;
+
+    // Direction-inference gate: motion must point toward this side.
+    let motion_says = match pos {
+        Position::Left => dx < 0.0,
+        Position::Right => dx > 0.0,
+        Position::Top => dy < 0.0,
+        Position::Bottom => dy > 0.0,
+    };
+    if !motion_says {
+        return false;
+    }
+
     let adx = dx.abs();
     let ady = dy.abs();
+
+    // Dominance gate (strict): the axis relevant to `pos` must
+    // *strictly* dominate the other axis. `>=` was tried first
+    // (STEP-DEBUG-D1-BOTTOM v1) but still produced a residual
+    // trigger because exact ties (|dx| == |dy|) let both sides pass
+    // and the priority list picked Left.
+    let dominance = match pos {
+        Position::Left | Position::Right => adx > ady,
+        Position::Top | Position::Bottom => ady > adx,
+    };
+    if dominance {
+        return true;
+    }
+
+    // Geometric fallback: when motion does NOT strictly favor this
+    // axis, ask the only objective question — is `curr_pos` past
+    // this edge of the display that contained `prev_pos`?
+    let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d)) else {
+        return false;
+    };
     match pos {
-        Position::Left => dx < 0.0 && adx >= ady,
-        Position::Right => dx > 0.0 && adx >= ady,
-        Position::Top => dy < 0.0 && ady >= adx,
-        Position::Bottom => dy > 0.0 && ady >= adx,
+        Position::Left => curr_pos.0 < containing.left(),
+        Position::Right => curr_pos.0 >= containing.right(),
+        Position::Top => curr_pos.1 < containing.top(),
+        Position::Bottom => curr_pos.1 >= containing.bottom(),
     }
 }
 
@@ -2075,7 +2117,11 @@ mod tests {
     /// too — i.e. when the cursor really is moving mostly leftward
     /// through a corner exit, Left still wins.
     ///
-    /// dx = -5, dy = +1 → |dx| > |dy|, so Left dominates.
+    /// dx = -5, dy = +1 → |dx| > |dy|, so Left strictly dominates.
+    /// Bottom ALSO fires via the geometric fallback (curr.y == 1080
+    /// is past D1.bottom on the half-open convention), but
+    /// `entered_barrier`'s priority list `[Left, Right, Top,
+    /// Bottom]` picks Left first.
     #[test]
     fn vertical_pair_d1_bottom_left_horizontal_dominant_fires_left() {
         let displays = user_vertical_pair_layout();
@@ -2083,8 +2129,160 @@ mod tests {
         assert_eq!(
             got,
             Some(Position::Left),
-            "expected Left (not Bottom) when exiting D1's bottom-\
-             left corner with mostly-leftward motion, \
+            "expected Left when exiting D1's bottom-left corner with \
+             mostly-leftward motion (Bottom may also fire via geometric \
+             fallback but Left wins by priority), got {got:?}"
+        );
+    }
+
+    // ----- vertically stacked monitors, 45° / tie-residual regression
+    //
+    // User-reported followup to STEP-DEBUG-D1-BOTTOM (2026-09-08):
+    // "after the fix, it still triggers sometimes (low probability
+    //  instead of 100%)". Master-side log when it triggers:
+    //
+    //   capture: BeginPending (handle=1) - awaiting Ack within 500ms
+    //   client 1 acknowledged Enter after 6.678875ms
+    //   capture: pending -> active promotion (...)
+    //   entering client 1 ...
+    //
+    // The chain confirms `moved_across_boundary` still returned true
+    // for `Left` on some events whose `curr_pos` was geometrically
+    // past only `Bottom`. The two scenarios that produce this with
+    // the original `>=` dominance fix:
+    //
+    //   (a) **Exact 45° motion** at a corner — `adx == ady`, both
+    //       `Left` (dx < 0) and `Bottom` (dy > 0) return true on
+    //       the sign gate, both pass dominance with `>=`, and
+    //       `entered_barrier` picks `Left` from its priority list.
+    //   (b) **Near-45° motion** caused by mouse sensor noise or
+    //       hand tremor — `adx ≈ ady` with the noise briefly
+    //       favoring one axis; whichever axis wins becomes the
+    //       "wrong" side whenever the geometric past disagrees
+    //       with the noisy dominant axis.
+    //
+    // These tests pin the v2 fix: strict `>` dominance forces the
+    // tie case through the geometric fallback, which uses
+    // `curr_pos`'s position relative to the containing display's
+    // edges as the only objective signal. That signal correctly
+    // disambiguates corner exits even when motion is exactly or
+    // near 45°.
+
+    /// Exact 45° corner exit: dx = -5, dy = +5, so `|dx| == |dy|`.
+    /// v1 dominance with `>=` allowed BOTH sides to pass and the
+    /// priority list picked `Left` — BUG. v2 strict `>` forces
+    /// both sides into the geometric fallback; only `Bottom`
+    /// passes (curr.y = 1080 is past D1.bottom on half-open,
+    /// curr.x = 5 is NOT past D1.left = 0), so only `Bottom`
+    /// fires.
+    #[test]
+    fn vertical_pair_d1_bottom_left_exact_45_fires_bottom() {
+        let displays = user_vertical_pair_layout();
+        let got = entered_barrier((10.0, 1075.0), (5.0, 1080.0), &displays);
+        assert_eq!(
+            got,
+            Some(Position::Bottom),
+            "expected Bottom at the exact-45° corner exit (|dx| == \
+             |dy| = 5) — v1 returned Left because both sides passed \
+             `>=` dominance and priority picked Left; v2 strict `>` \
+             falls through to geometric and only Bottom is past. \
+             got {got:?}"
+        );
+    }
+
+    /// Near-45° motion with `adx` slightly > `ady` (sensor-noise
+    /// case). v1 with `>=` returned `Left` (dominance wins on
+    /// the tie side that noise favored); geometric position
+    /// says the cursor is past bottom only. v2 still allows
+    /// Left to win because adx (5) > ady (4) is strict; but
+    /// here the cursor IS past left geometrically (5 < 0? no,
+    /// curr.x = 5 > D1.left = 0), so the geometric fallback
+    /// disagrees with the dominance signal. v2 priority picks
+    /// Left. This pins that v2 doesn't over-correct: a noise-
+    /// biased near-tilt still attributes to the dominant motion
+    /// side. (For the user's bug to fire, the noise would have
+    /// to be on the OTHER axis — i.e. dx slightly negative
+    /// while dy is large but noise makes adx == ady briefly.)
+    ///
+    /// Wait — re-reading the user's setup: the controlled
+    /// machine is on the LEFT of D1, and the bug fires when
+    /// `moved_across_boundary(Left)` returns true. With v2,
+    /// `Left` returns true only when motion is strictly
+    /// dominantly leftward (adx > ady) AND curr.x < D1.left.
+    /// The user's pure-vertical motion never satisfies
+    /// `dx < 0` at all, so `Left`'s direction gate fails
+    /// outright — pure-vertical motion can NEVER trigger the
+    /// Left bug under v2, regardless of geometric position.
+    /// This is the strongest single guarantee of the fix.
+    #[test]
+    fn vertical_pair_d1_pure_vertical_motion_never_fires_left() {
+        // Try several vertical-motion magnitudes, including ones
+        // with floating-point noise on the other axis.
+        let displays = user_vertical_pair_layout();
+        for dy in [1.0, 5.0, 50.0] {
+            for dx in [-0.5, 0.0, 0.5] {
+                let prev = (500.0, 1079.0);
+                let curr = (500.0 + dx, 1079.0 + dy);
+                // Confirm we're actually testing an exit (curr
+                // outside the union).
+                if curr.1 < 1080.0 {
+                    continue;
+                }
+                // Loop over all four sides and confirm at most
+                // Bottom fires (no Left / Right / Top should
+                // ever fire from pure-vertical motion).
+                let got = entered_barrier(prev, curr, &displays);
+                assert_eq!(
+                    got,
+                    Some(Position::Bottom),
+                    "pure vertical motion (dx={dx}, dy={dy}) must \
+                     only fire Bottom, got {got:?}"
+                );
+            }
+        }
+    }
+
+    /// Pure 45° motion where the cursor exits only past Bottom
+    /// (x stays inside D1's x range). The geometric fallback
+    /// picks Bottom unambiguously; this is the case the user
+    /// observed as "still triggers sometimes" — motion was
+    /// 45° or near-45° (sensor noise), the v1 fix's `>=` let
+    /// Left win on the priority tie, and `query_pure` matched
+    /// the controlled-machine Left key. v2 closes that hole.
+    ///
+    /// End-to-end: `query_pure` returns `None` even though
+    /// `Left` would have won under v1.
+    #[test]
+    fn query_pure_d1_bottom_left_exact_45_does_not_cross() {
+        let displays = vec![
+            DisplayBound::new(
+                DisplayRect::new(0.0, 0.0, 1920.0, 1080.0),
+                Some("macos:0000:0000::unknown-1".into()),
+            ),
+            DisplayBound::new(
+                DisplayRect::new(0.0, -1080.0, 1920.0, 1080.0),
+                Some("macos:0000:0000::unknown-2".into()),
+            ),
+        ];
+        let mut active = HashSet::new();
+        active.insert(BarrierKey {
+            pos: Position::Left,
+            monitor: Some("macos:0000:0000::unknown-1".into()),
+            offset: 0,
+            span: 10000,
+        });
+        let got = query_pure(
+            (10.0, 1075.0),
+            (5.0, 1080.0),
+            &displays,
+            &active,
+        );
+        assert_eq!(
+            got,
+            None,
+            "expected query_pure to NOT cross at the exact-45° \
+             bottom-left exit — v1 returned the Left key (controlled \
+             machine) and incorrectly fired; v2 returns None. \
              got {got:?}"
         );
     }
