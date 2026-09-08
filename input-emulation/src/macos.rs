@@ -428,7 +428,7 @@ impl Emulation for MacOSEmulation {
                         // convention, so leave it alone.
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, -value, 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
-                            1 => (2, 0, value, 0),  // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
+                            1 => (2, 0, value, 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
                             _ => {
                                 log::warn!("invalid scroll event: {axis}, {value}");
                                 return Ok(());
@@ -457,7 +457,7 @@ impl Emulation for MacOSEmulation {
                         // so flip the sign on the way in.
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, -value / (120 / LINES_PER_STEP), 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
-                            1 => (2, 0, value / (120 / LINES_PER_STEP), 0),  // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
+                            1 => (2, 0, value / (120 / LINES_PER_STEP), 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
                             _ => {
                                 log::warn!("invalid scroll event: {axis}, {value}");
                                 return Ok(());

@@ -368,7 +368,9 @@ impl PeerSession {
     async fn send_outgoing_event(&self, event: ProtoEvent, addr: std::net::SocketAddr) {
         if let Some(tx) = self.outgoing_events.lock().await.as_ref() {
             if let Err(e) = tx.send((addr, event)) {
-                log::debug!("send_outgoing_event: outgoing_events has exited (forwarder gone): {e}");
+                log::debug!(
+                    "send_outgoing_event: outgoing_events has exited (forwarder gone): {e}"
+                );
             }
         }
     }
@@ -393,7 +395,7 @@ impl PeerSession {
         // same fixed-length `MAX_EVENT_SIZE` decoding path as the stream B
         // reader (`read_frame`). Datagrams carry their own length, but
         // decoding always goes through `ProtoEvent::try_from`.
-        let (buf, _len): ([u8; MAX_EVENT_SIZE], usize) = (*event).into();
+        let (buf, _len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
         self.send_datagram_or_stream_b(&buf).await
     }
 
@@ -501,7 +503,9 @@ impl PeerSession {
             // the reverse read capability is not needed.
             drop(recv);
             *g = Some(send);
-            log::debug!("send_stream_b: created and cached stream B (subsequent frames reuse the same one)");
+            log::debug!(
+                "send_stream_b: created and cached stream B (subsequent frames reuse the same one)"
+            );
         }
 
         // On write failure, reset the cache back to `None` so the next call
@@ -571,15 +575,21 @@ impl PeerSession {
         let result = match routed {
             Channel::Datagram => self.send_motion(event).await,
             Channel::StreamA => {
-                let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = (*event).into();
+                let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
                 self.send_stream_a(&buf[..len]).await
             }
             Channel::StreamB => {
-                let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = (*event).into();
+                let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
                 self.send_stream_b(&buf[..len]).await
             }
+            // PLAN-2 / M0a: StreamC is reserved for clipboard /
+            // file-transfer metadata. The send half is wired up in
+            // M0c STEP 0.5a (`cached_send_c`); until then, every
+            // StreamC event surfaces this error to callers — the
+            // `service::clipboard_dispatcher` (M1a+) is the intended
+            // caller and will gate on `hello_ok` separately.
             Channel::StreamC => Err(super::Error::HelloFailed(
-                "stream C is M2-only (clipboard metadata not in M1 ProtoEvent)".into(),
+                "stream C is M0c-only (clipboard metadata not yet wired up in M0a)".into(),
             )),
         };
         if matches!(event, ProtoEvent::Ack(_) | ProtoEvent::Leave(_)) {
@@ -792,14 +802,18 @@ impl PeerSession {
                 if !self.hello_ok.load(Ordering::Acquire) {
                     client_hello(&self).await?;
                 } else {
-                    log::debug!("peer.run(Client): hello_ok already set, skipping duplicate client_hello");
+                    log::debug!(
+                        "peer.run(Client): hello_ok already set, skipping duplicate client_hello"
+                    );
                 }
             }
             PeerRole::Server => {
                 if !self.hello_ok.load(Ordering::Acquire) {
                     server_hello(&self).await?;
                 } else {
-                    log::debug!("peer.run(Server): hello_ok already set, skipping duplicate server_hello");
+                    log::debug!(
+                        "peer.run(Server): hello_ok already set, skipping duplicate server_hello"
+                    );
                 }
             }
         }
@@ -1112,8 +1126,10 @@ mod tests {
                 MAX_EVENT_SIZE,
                 "send_motion filled the fixed-size buffer, peer should receive {MAX_EVENT_SIZE} bytes"
             );
-            let buf: [u8; MAX_EVENT_SIZE] =
-                datagram.as_ref().try_into().expect("datagram length should match");
+            let buf: [u8; MAX_EVENT_SIZE] = datagram
+                .as_ref()
+                .try_into()
+                .expect("datagram length should match");
             let decoded = ProtoEvent::try_from(buf).expect("datagram should decode as ProtoEvent");
             match decoded {
                 ProtoEvent::Input(input_event::Event::Pointer(
@@ -1145,7 +1161,7 @@ mod tests {
             client_cert[0].clone(),
             client_key,
             &pins_dir,
-                        std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
         )
         .await
         .expect("dial");
@@ -1228,7 +1244,7 @@ mod tests {
                 client_cert[0].clone(),
                 client_key,
                 &pins_dir,
-                            std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
             )
             .await
             .expect("dial");
@@ -1320,7 +1336,7 @@ mod tests {
                 client_cert[0].clone(),
                 client_key,
                 &pins_dir,
-                            std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
             )
             .await
             .expect("dial");
@@ -1330,7 +1346,10 @@ mod tests {
                 .await
                 .expect("client_hello timeout")
                 .expect("client_hello");
-            assert!(client_arc.hello_ok(), "hello_ok should be set after client_hello");
+            assert!(
+                client_arc.hello_ok(),
+                "hello_ok should be set after client_hello"
+            );
 
             let client_for_run = std::sync::Arc::clone(&client_arc);
             let run_task =
@@ -1434,7 +1453,7 @@ mod tests {
                 client_cert[0].clone(),
                 client_key,
                 &pins_dir,
-                            std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
             )
             .await
             .expect("dial");

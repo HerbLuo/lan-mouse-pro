@@ -71,10 +71,9 @@ pub(super) fn default_transport_config(idle_timeout: Duration) -> Arc<TransportC
     );
     let mut t = TransportConfig::default();
     t.keep_alive_interval(Some(KEEPALIVE));
-    t.max_idle_timeout(Some(
-        IdleTimeout::try_from(idle_timeout)
-            .expect("idle_timeout is far below the VarInt 2^30 ms upper bound (≈ 12.4 days)"),
-    ));
+    t.max_idle_timeout(Some(IdleTimeout::try_from(idle_timeout).expect(
+        "idle_timeout is far below the VarInt 2^30 ms upper bound (≈ 12.4 days)",
+    )));
     Arc::new(t)
 }
 
@@ -790,7 +789,9 @@ mod tests {
             quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client))
                 .expect("QuicClientConfig try_from");
         let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_client));
-        client_cfg.transport_config(super::default_transport_config(std::time::Duration::from_secs(5)));
+        client_cfg.transport_config(super::default_transport_config(
+            std::time::Duration::from_secs(5),
+        ));
 
         let client_ep =
             super::super::endpoint::endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())

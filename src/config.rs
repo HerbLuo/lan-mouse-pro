@@ -645,8 +645,12 @@ impl Config {
         WatchdogConfig {
             enabled: w.enabled.unwrap_or(defaults.enabled),
             ghost_active_check: w.ghost_active_check.unwrap_or(defaults.ghost_active_check),
-            crossing_storm_check: w.crossing_storm_check.unwrap_or(defaults.crossing_storm_check),
-            send_failures_check: w.send_failures_check.unwrap_or(defaults.send_failures_check),
+            crossing_storm_check: w
+                .crossing_storm_check
+                .unwrap_or(defaults.crossing_storm_check),
+            send_failures_check: w
+                .send_failures_check
+                .unwrap_or(defaults.send_failures_check),
             no_progress_check: w.no_progress_check.unwrap_or(defaults.no_progress_check),
             light_interval: w
                 .light_interval_ms
