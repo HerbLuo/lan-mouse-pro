@@ -74,6 +74,8 @@ rustls-pemfile.workspace = true
 rcgen = "0.13.1"
 sha2 = "0.10.8"
 notify = "8.2.0"
+# M0b STEP-0.2: HTTP/3-lite streaming uses `Bytes` for the body buffer.
+bytes = "1"
 
 # Web frontend. axum for HTTP/WS, rust-embed for baking the built Vue
 # bundle into the binary, open to launch the user's default browser
@@ -94,6 +96,10 @@ local-ip-address = "0.6"
 rcgen = "0.13"
 # rt-multi-thread: required by `local_set_test!` which runs under the multi_thread flavor
 tokio = { version = "1.32.0", features = ["rt-multi-thread", "time", "macros"] }
+# h3 spike (M0b STEP-0.2 Path 1) — see `examples/h3_pingpong.rs`.
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+rand = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
@@ -120,5 +126,5 @@ rdp_emulation = ["input-emulation/remote_desktop_portal"]
 name = "Lan Mouse"
 icon = ["target/icon.icns", "resources/de.feschber.LanMouse.svg"]
 identifier = "de.feschber.LanMouse"
-osx_info_plist_exts = ["build-aux/macos-lsui-element.plist"]
-resources = ["target/menubar-template.png"]
+osx_info_plist = "build-aux/macos-lsui-element.plist"
+osx_resources = "target/menubar-template.png"
