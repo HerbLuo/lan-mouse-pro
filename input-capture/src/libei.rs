@@ -78,18 +78,6 @@ pub struct LibeiInputCapture {
     monitors_tx: watch::Sender<Vec<MonitorInfo>>,
 }
 
-/// returns (start pos, end pos), inclusive
-fn pos_to_barrier(r: &Region, pos: Position) -> (i32, i32, i32, i32) {
-    let (x, y) = (r.x_offset(), r.y_offset());
-    let (w, h) = (r.width() as i32, r.height() as i32);
-    match pos {
-        Position::Left => (x, y, x, y + h - 1),
-        Position::Right => (x + w, y, x + w, y + h - 1),
-        Position::Top => (x, y, x + w - 1, y),
-        Position::Bottom => (x, y + h, x + w - 1, y + h),
-    }
-}
-
 /// Build the per-region tuple vec consumed by the pure
 /// [`select_barriers`]. Each tuple is `(width, height, x_offset,
 /// y_offset)` — matches the field order on ashpd's `Region` so

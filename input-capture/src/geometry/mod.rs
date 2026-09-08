@@ -210,10 +210,10 @@ pub fn display_containing(displays: &[DisplayRect], point: (f64, f64)) -> Option
 /// up the `monitor_id` that goes into the BarrierKey query.
 ///
 /// Returns `None` when the point falls outside every display (or the
-/// list is empty). Mirrors the "edge-seam goes to the left display"
-/// convention: `(1920.0, 540.0)` in a 2x1 horizontal pair belongs to
-/// the right display (idx 1), since the left display's right edge is
-/// exclusive.
+/// list is empty). Edge-seam goes to the right display (half-open:
+/// left/up inclusive, right/down exclusive): `(1920.0, 540.0)` in a
+/// 2x1 horizontal pair belongs to the right display (idx 1), since
+/// the left display's right edge is exclusive.
 pub fn display_containing_idx(displays: &[DisplayRect], point: (f64, f64)) -> Option<usize> {
     let (x, y) = point;
     displays
@@ -1094,16 +1094,13 @@ mod tests {
 
     /// C4a: prev at the seam `(1920.0, 540.0)` — under the
     /// half-open convention that point belongs to display_1 (idx 1)
-    /// because display_0's right edge is exclusive. Wait — actually
-    /// `display_0.right() = 1920.0` and the predicate is `x < right()`,
-    /// so `x == 1920.0` is NOT inside display_0; the point belongs
-    /// to display_1. Crossing top from that point queries with
-    /// `monitor: Some("macos:d1")`. Active contains d0's Top →
-    /// miss.
+    /// because display_0's right edge is exclusive (`x == 1920.0`
+    /// is NOT inside display_0). Crossing top from that point
+    /// queries with `monitor: Some("macos:d1")`. Active contains
+    /// d0's Top → miss.
     ///
-    /// The PLAN's C4 wording ("seam goes to d0") reflects an
-    /// alternative convention; this test pins the actual
-    /// implementation (seam → d1, the right-hand display).
+    /// Mirrors PLAN §3 STEP-3.4 C4: "prev 在接缝 → 归到 d1;
+    /// active 含 d0 → miss".
     #[test]
     fn crossed_pure_c4a_seam_top_queries_d1() {
         let displays = layout_2x1_bound();

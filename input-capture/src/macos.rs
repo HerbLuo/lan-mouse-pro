@@ -130,7 +130,7 @@ impl InputCaptureState {
         res.update_bounds()?;
         // Publish the initial monitor list so subscribers can read the
         // current state without waiting for the first reconfiguration.
-        let initial = enumerate_monitors(&res.displays);
+        let initial = enumerate_monitors();
         log::info!("initial monitors: {} monitor(s)", initial.len());
         for m in &initial {
             log::info!(
@@ -436,7 +436,7 @@ impl InputCaptureState {
                 // (the STEP-2.6 service layer) see the new list.
                 // Always run, even when the bounds refresh above
                 // failed — see the long-form comment above.
-                let monitors = enumerate_monitors(&self.displays);
+                let monitors = enumerate_monitors();
                 log::info!("monitors changed: {} monitor(s)", monitors.len());
                 for m in &monitors {
                     log::info!(
@@ -553,9 +553,15 @@ impl DisplayInfo {
 /// Quartz → IOKit walk. The bounds rectangle is then derived from
 /// the resulting `MonitorInfo.position/size` via [`build_display_bounds`]
 /// instead of doing a second `CGDisplay::bounds()` call.
-#[allow(dead_code)] // accepts `displays` for documentation/future use
-fn enumerate_monitors(displays: &[DisplayBound]) -> Vec<MonitorInfo> {
-    let _ = displays;
+/// Snapshot the current macOS monitor list. Always re-queries
+/// `CGDisplay::active_displays()` directly — the per-display
+/// bounds/metadata walk has been folded into
+/// [`enumerate_monitors_for_ids`] so both this public
+/// `Capture::monitors()` API and `update_bounds` share the same
+/// Quartz → IOKit walk. The bounds rectangle is then derived from
+/// the resulting `MonitorInfo.position/size` via [`build_display_bounds`]
+/// instead of doing a second `CGDisplay::bounds()` call.
+fn enumerate_monitors() -> Vec<MonitorInfo> {
     let Ok(active_ids) = CGDisplay::active_displays() else {
         log::warn!("enumerate_monitors: CGDisplay::active_displays failed");
         return Vec::new();
@@ -1570,7 +1576,7 @@ impl Capture for MacOSInputCapture {
         // based consumer that wants sub-second latency on
         // TCC-granted hosts; the polling path above is the
         // always-on, no-TCC-required baseline.
-        enumerate_monitors(&[])
+        enumerate_monitors()
     }
 }
 
@@ -1910,49 +1916,29 @@ mod tests {
     // affects barrier-tracking health; `enumerate_monitors()` is always
     // called.
     //
-    // This regression guard ensures `enumerate_monitors` reads the live
-    // OS state via `CGDisplay::active_displays()` directly and ignores
-    // its `displays` argument. That's the structural precondition for
-    // "DisplayReconfigured always pushes a fresh snapshot to
-    // monitors_tx, even when `update_bounds` left `self.displays`
-    // empty after a transient failure".
+    // This regression guard pins the structural precondition: the
+    // public `enumerate_monitors()` MUST read live Quartz state on
+    // every call (no caching of `self.displays`). If a future refactor
+    // makes the function consult `self.displays` instead of re-querying
+    // `CGDisplay::active_displays()`, the hot-plug bug would silently
+    // re-appear in production.
 
-    use crate::geometry::{DisplayBound, DisplayRect};
-
-    /// `enumerate_monitors` must re-query `CGDisplay::active_displays()`
-    /// directly and ignore the `displays` slice — the slice is kept
-    /// around for documentation / future-injection only. Two calls
-    /// with different slice contents MUST return the same live
-    /// snapshot. If a future refactor makes the function start
-    /// reading from the slice, this test fails and the hot-plug
-    /// bug would silently re-appear in production.
+    /// `enumerate_monitors` must read live Quartz state on every
+    /// call. Two back-to-back calls MUST return identical id lists
+    /// (deterministic read of the OS); the snapshot must also be
+    /// non-empty on real macOS hardware (the built-in display is
+    /// always present).
     #[test]
-    fn enumerate_monitors_ignores_displays_slice_and_returns_live_state() {
-        let from_empty = enumerate_monitors(&[]);
-        // A deliberately bogus slice: one entry with negative
-        // coordinates that could never be the actual OS-reported
-        // bounds on a real Mac. If `enumerate_monitors` ever
-        // started reading from this slice instead of the live
-        // Quartz enumeration, the returned list would diverge
-        // from `from_empty`.
-        let from_bogus = enumerate_monitors(&[DisplayBound::new(
-            DisplayRect::new(-987_654.0, -987_654.0, 1.0, 1.0),
-            None,
-        )]);
+    fn enumerate_monitors_returns_live_state() {
+        let snapshot_a = enumerate_monitors();
+        let snapshot_b = enumerate_monitors();
 
+        let ids_a: Vec<String> = snapshot_a.iter().map(|m| m.id.clone()).collect();
+        let ids_b: Vec<String> = snapshot_b.iter().map(|m| m.id.clone()).collect();
         assert_eq!(
-            from_empty.len(),
-            from_bogus.len(),
-            "enumerate_monitors must not depend on the `displays` slice \
-             (live `CGDisplay::active_displays()` counts must agree)"
-        );
-
-        let empty_ids: Vec<String> = from_empty.iter().map(|m| m.id.clone()).collect();
-        let bogus_ids: Vec<String> = from_bogus.iter().map(|m| m.id.clone()).collect();
-        assert_eq!(
-            empty_ids, bogus_ids,
-            "enumerate_monitors must return identical ids for identical \
-             live state, regardless of the `displays` slice content"
+            ids_a, ids_b,
+            "enumerate_monitors must return a stable live snapshot \
+             (live `CGDisplay::active_displays()` reads must agree)"
         );
 
         // Sanity: the live snapshot must be non-empty (the test
@@ -1960,7 +1946,7 @@ mod tests {
         // If this fires on a headless CI runner, the test setup
         // itself is wrong — not the production code.
         assert!(
-            !from_empty.is_empty(),
+            !snapshot_a.is_empty(),
             "live `CGDisplay::active_displays()` returned an empty \
              snapshot on macOS — test environment is not real hardware"
         );
