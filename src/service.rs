@@ -536,6 +536,29 @@ impl Service {
         });
         let keys = self.authorized_keys.read().expect("lock").clone();
         self.notify_frontend(FrontendEvent::AuthorizedUpdated(keys));
+        // STEP-M3-3.x: re-broadcast the latest monitor snapshot on
+        // every WS (re)connect. The seed `MonitorsChanged` from
+        // `CaptureTask::do_capture` (src/capture.rs:611) fires
+        // BEFORE any frontend is listening, so the broadcast in
+        // `frontend_listener.broadcast` finds zero subscribers and
+        // drops the event on the floor. Without this line the GUI
+        // dropdown stays at the lone "Any (back-compat)" option
+        // until the first hotplug tick from the 2s polling loop
+        // (`MONITOR_POLL_INTERVAL`) lands. Mirror the same defensive
+        // re-broadcast as `Enumerate` for clients — the source of
+        // truth is `self.last_monitors`, populated by the first
+        // `ICaptureEvent::MonitorsChanged` from the capture backend.
+        // `None` means the capture backend has not yet produced its
+        // seed snapshot (e.g. a still-loading platform monitor
+        // service on a slow boot); skip rather than fabricate an
+        // empty list, so the GUI keeps the existing "haven't
+        // received the first event yet" placeholder behavior
+        // (store/index.ts:62-64) instead of flashing an empty
+        // dropdown.
+        if let Some(monitors) = self.last_monitors.as_ref() {
+            let ipc_list = monitors.iter().map(geometry_to_ipc_monitor_info).collect();
+            self.notify_frontend(FrontendEvent::MonitorsChanged(ipc_list));
+        }
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
