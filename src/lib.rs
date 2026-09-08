@@ -8,6 +8,10 @@ mod dns;
 mod emulation;
 pub mod emulation_test;
 mod listen;
+// **PLAN-2 / M1a STEP-1a.1** — clipboard backend abstraction.
+// `mod` (not `pub mod`) until the dispatcher (STEP-1a.4) needs the
+// platform impls re-exported.
+pub(crate) mod clipboard;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_power;
 pub mod quic_transport;
