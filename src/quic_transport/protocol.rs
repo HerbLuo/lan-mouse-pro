@@ -181,6 +181,22 @@ pub fn route_input(cfg: &InputChannelConfig, event: &ProtoEvent) -> Channel {
         | ProtoEvent::Hello { .. }
         | ProtoEvent::Ping
         | ProtoEvent::Pong(_) => Channel::StreamA,
+
+        // (5) PLAN-2 / M0a — clipboard / file-transfer metadata —
+        // always StreamC. The StreamC reader is wired up in M0c
+        // STEP 0.5b; until then `send_input` returns
+        // `Err(HelloFailed("stream C is M2-only"))` for these
+        // variants. The match arm here ensures the routing table
+        // covers all `ProtoEvent` variants (no `_ => unreachable!()`
+        // needed), giving M0c a compile-time signal if a new variant
+        // is added without an explicit channel assignment.
+        ProtoEvent::ClipboardText(_)
+        | ProtoEvent::ClipboardImage(_)
+        | ProtoEvent::ClipboardFiles(_)
+        | ProtoEvent::FileTransferOffer(_)
+        | ProtoEvent::FileTransferResponse(_)
+        | ProtoEvent::FileTransferCancel(_)
+        | ProtoEvent::ClipboardRequest(_) => Channel::StreamC,
     }
 }
 
@@ -366,7 +382,13 @@ async fn write_hello_frame(
     send: &mut SendStream,
     event: &ProtoEvent,
 ) -> std::result::Result<(), Error> {
-    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = (*event).into();
+    // PLAN-2 / M0a: `ProtoEvent` is no longer `Copy` (the new
+    // clipboard / file-transfer variants carry `String` / `Vec<u8>`
+    // fields), but the existing call sites still feed it through the
+    // fixed-size `From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize)`.
+    // route_input ensures only fixed variants reach this path, so the
+    // `.clone()` is a memcpy of the small enum discriminant + body.
+    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
     send.write_u32(len as u32)
         .await
         .map_err(|e| Error::HelloFailed(format!("write Hello frame length: {e}")))?;
@@ -451,7 +473,13 @@ pub(crate) async fn write_frame<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = (*event).into();
+    // PLAN-2 / M0a: `ProtoEvent` is no longer `Copy` (the new
+    // clipboard / file-transfer variants carry `String` / `Vec<u8>`
+    // fields), but the existing call sites still feed it through the
+    // fixed-size `From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize)`.
+    // route_input ensures only fixed variants reach this path, so the
+    // `.clone()` is a memcpy of the small enum discriminant + body.
+    let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.clone().into();
     send.write_u32(len as u32)
         .await
         .map_err(|e| Error::HelloFailed(format!("write frame length: {e}")))?;
@@ -576,7 +604,9 @@ pub(crate) fn hello_watchdog(peer: std::sync::Arc<PeerSession>) {
     tokio::spawn(async move {
         tokio::time::sleep(HELLO_TIMEOUT).await;
         if !peer.hello_ok.load(Ordering::Acquire) {
-            log::warn!("hello watchdog: hello_ok not set within {HELLO_TIMEOUT:?}, proactively closing connection");
+            log::warn!(
+                "hello watchdog: hello_ok not set within {HELLO_TIMEOUT:?}, proactively closing connection"
+            );
             peer.conn
                 .close(VarInt::from(0u32), b"hello timeout (watchdog)");
         }
@@ -652,7 +682,7 @@ mod tests {
             client_cert_chain[0].clone(),
             client_key,
             &pins_dir,
-                        std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
         )
         .await
         .expect("dial");
@@ -735,7 +765,7 @@ mod tests {
                 client_cert_chain[0].clone(),
                 client_key,
                 &pins_dir,
-                            std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(5),
             )
             .await
             .expect("dial");
@@ -756,10 +786,15 @@ mod tests {
                         "HelloFailed message should contain 'wrong magic', actually: {msg}"
                     );
                 }
-                other => panic!("error should be Error::HelloFailed(wrong magic...), actually: {other:?}"),
+                other => panic!(
+                    "error should be Error::HelloFailed(wrong magic...), actually: {other:?}"
+                ),
             }
 
-            assert!(!client_session.hello_ok(), "hello_ok should remain false on failure path");
+            assert!(
+                !client_session.hello_ok(),
+                "hello_ok should remain false on failure path"
+            );
 
             drop(client_session);
             drop(client_ep);
@@ -803,7 +838,7 @@ mod tests {
             client_cert_chain[0].clone(),
             client_key,
             &pins_dir,
-                        std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
         )
         .await
         .expect("dial");
@@ -819,12 +854,20 @@ mod tests {
 
         match &result {
             crate::quic_transport::Error::HelloTimeout(d) => {
-                assert_eq!(*d, HELLO_TIMEOUT, "HelloTimeout should equal HELLO_TIMEOUT (3s)");
+                assert_eq!(
+                    *d, HELLO_TIMEOUT,
+                    "HelloTimeout should equal HELLO_TIMEOUT (3s)"
+                );
             }
-            other => panic!("error should be Error::HelloTimeout(HELLO_TIMEOUT), actually: {other:?}"),
+            other => {
+                panic!("error should be Error::HelloTimeout(HELLO_TIMEOUT), actually: {other:?}")
+            }
         }
 
-        assert!(!client_session.hello_ok(), "hello_ok should remain false on timeout path");
+        assert!(
+            !client_session.hello_ok(),
+            "hello_ok should remain false on timeout path"
+        );
 
         drop(client_session);
         drop(client_ep);

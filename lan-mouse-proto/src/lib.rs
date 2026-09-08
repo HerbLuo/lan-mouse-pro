@@ -7,10 +7,32 @@ use std::{
 };
 use thiserror::Error;
 
+mod codec;
+
+use crate::codec::{FixedCodec, VarCodec};
+
 /// defines the maximum size an encoded event can take up
 /// this is currently the pointer motion event
 /// type: u8, time: u32, dx: f64, dy: f64
 pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_of::<f64>();
+
+/// Maximum size of a single application-layer frame on StreamA / B / C.
+///
+/// **PLAN-2 / M0a** (codec dual-track): the fixed-size cap is
+/// [`MAX_EVENT_SIZE`] (21 bytes), but variable-length events (the new
+/// `ClipboardText` / `ClipboardImage` / `ClipboardFiles` /
+/// `FileTransferOffer` / `FileTransferResponse` / `FileTransferCancel` /
+/// `ClipboardRequest` variants — see PLAN §1 关键设计原则) need a larger
+/// frame for the inline body of `ClipboardText` (≤ 1 KiB per the
+/// inline-policy boundary). 16 KiB is generous for metadata frames and
+/// gives the DoS cap a concrete number without forcing a heap
+/// pre-allocation on every read.
+///
+/// **Wire-compat** (PLAN §0 评审 #1): the larger cap only applies to
+/// StreamC frames (which are dropped by old daemons' `streams.rs:291`);
+/// StreamA / StreamB frames remain bounded by `MAX_EVENT_SIZE` in
+/// practice (all hot-path variants fit).
+pub const MAX_FRAME_SIZE: usize = 16 * 1024;
 
 /// 8-byte protocol magic identifying a lan-mouse peer, carried in every
 /// [`ProtoEvent::Hello`]. The `Hello` is exchanged right after the QUIC
@@ -36,10 +58,19 @@ pub enum ProtocolError {
     /// position type does not exist
     #[error("invalid event id: `{0}`")]
     InvalidPosition(#[from] TryFromPrimitiveError<Position>),
+    /// frame body was truncated (var codec decode ran out of bytes,
+    /// or the input length prefix did not match the body length).
+    /// Distinct from `InvalidEventId` because it signals a
+    /// wire-format-level problem rather than an unknown variant.
+    #[error("frame body too short or truncated")]
+    FrameTooShort,
+    /// empty input (zero-length buffer) — no type byte to decode.
+    #[error("empty input (no type byte)")]
+    EmptyInput,
 }
 
 /// Position of a client
-#[derive(Clone, Copy, Debug, TryFromPrimitive, IntoPrimitive)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromPrimitive, IntoPrimitive)]
 #[repr(u8)]
 pub enum Position {
     Left,
@@ -60,8 +91,102 @@ impl Display for Position {
     }
 }
 
+/// A single file entry inside a `ClipboardFiles` payload.
+///
+/// PLAN-2 / M0a: `sha256` is `[u8; 32]` (fixed-size, easy to
+/// serialize, matches the existing wire convention for fingerprints /
+/// content hashes). `name` and `mime` are `String` (variable-length,
+/// length-prefixed on the wire by `VarCodec`).
+///
+/// **Wire-compat** (PLAN §0 评审 #1): FileEntry only travels on StreamC,
+/// which old daemons drop silently — no wire-compat concern with
+/// pre-M0a peers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileEntry {
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
+    pub sha256: [u8; 32],
+}
+
+/// Clipboard text payload — used by M1a / M1b for cross-device text
+/// sync.
+///
+/// `content_inline = Some(_)` for ≤ 1 KiB (carries the bytes inline);
+/// `None` for larger payloads (peer must HTTP/3 GET
+/// `/clipboard/text/{sha256}` to fetch).
+///
+/// `fingerprint` is the loop-avoidance tag (e.g. sha256 of the first 64
+/// bytes + length); `sha256` is the full content hash used by the
+/// HTTP/3 byte-pull endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardText {
+    pub fingerprint: [u8; 32],
+    pub sha256: [u8; 32],
+    pub size: u64,
+    pub content_inline: Option<Vec<u8>>,
+}
+
+/// Clipboard image metadata — used by M2a / M2b. Bytes always go
+/// through HTTP/3 GET `/clipboard/image/{sha256}`; `mime` selects the
+/// decode path (PNG / JPG / BMP / `application/x-dib`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardImage {
+    pub fingerprint: [u8; 32],
+    pub mime: String,
+    pub sha256: [u8; 32],
+    pub size: u64,
+}
+
+/// Clipboard files metadata — used by M3a. Carries one
+/// [`FileEntry`] per file in the OS clipboard selection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardFiles {
+    pub fingerprint: [u8; 32],
+    pub entries: Vec<FileEntry>,
+}
+
+/// File-transfer offer (sender → receiver) — used by M3a / M3b.
+/// Sent on StreamC as soon as the sender's
+/// `service::clipboard_dispatcher` detects file content; receiver
+/// responds with [`FileTransferResponse`] after user decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileTransferOffer {
+    pub sha256: [u8; 32],
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
+}
+
+/// File-transfer accept/reject (receiver → sender) — used by M3a /
+/// M3b. `accept = false` causes the sender to clean up
+/// `file_cache[{sha256}]` without further action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileTransferResponse {
+    pub sha256: [u8; 32],
+    pub accept: bool,
+}
+
+/// File-transfer cancel (sender → receiver) — used by M3a STEP 3a.5.
+/// Sent when the sender's clipboard is overwritten before the
+/// transfer completes; receiver stops its HTTP/3 stream and removes
+/// the `.partial` file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileTransferCancel {
+    pub sha256: [u8; 32],
+}
+
+/// Clipboard content request (receiver → sender) — used by M1b
+/// STEP 1b.1 to pull large text from the sender's `clipboard_cache`
+/// via HTTP/3 after receiving a metadata-only `ClipboardText`
+/// (size > 1 KiB, no inline).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardRequest {
+    pub sha256: [u8; 32],
+}
+
 /// main lan-mouse protocol event type
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ProtoEvent {
     /// notify a client that the cursor entered its region at the given position
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
@@ -95,6 +220,31 @@ pub enum ProtoEvent {
     /// recognize the event type silently skip it per the
     /// forward-compat handling in the receive loop.
     Hello { magic: [u8; 8], commit: [u8; 8] },
+    // === PLAN-2 / M0a — variable-length codec events (StreamC only) ===
+    //
+    // All seven variants below travel **only** on StreamC (per PLAN §0
+    // 评审 #1 wire-compat strategy). Old daemons drop `stream_bunch.c`
+    // silently (`streams.rs:291`); the new daemon never encodes these
+    // events on StreamA, so pre-0.4.0 peers cannot trigger
+    // `EventType::try_from(InvalidEventId)`断链.
+    //
+    // **Why `Clone, Debug` only** (no `Copy`): the inner payload
+    // structs carry `String` / `Vec<u8>` fields and are not bitwise
+    // copyable.
+    /// Clipboard text payload (see [`ClipboardText`]).
+    ClipboardText(ClipboardText),
+    /// Clipboard image metadata (see [`ClipboardImage`]).
+    ClipboardImage(ClipboardImage),
+    /// Clipboard files metadata (see [`ClipboardFiles`]).
+    ClipboardFiles(ClipboardFiles),
+    /// File-transfer offer (see [`FileTransferOffer`]).
+    FileTransferOffer(FileTransferOffer),
+    /// File-transfer accept/reject (see [`FileTransferResponse`]).
+    FileTransferResponse(FileTransferResponse),
+    /// File-transfer cancel (see [`FileTransferCancel`]).
+    FileTransferCancel(FileTransferCancel),
+    /// Clipboard content request (see [`ClipboardRequest`]).
+    ClipboardRequest(ClipboardRequest),
 }
 
 impl Display for ProtoEvent {
@@ -121,11 +271,68 @@ impl Display for ProtoEvent {
                     if valid { "PROTOCOL_MAGIC" } else { "foreign" }
                 )
             }
+            ProtoEvent::ClipboardText(ct) => write!(
+                f,
+                "ClipboardText(fp={}, sha={}, size={}, inline={})",
+                short_hex(&ct.fingerprint),
+                short_hex(&ct.sha256),
+                ct.size,
+                if ct.content_inline.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ),
+            ProtoEvent::ClipboardImage(ci) => write!(
+                f,
+                "ClipboardImage(fp={}, sha={}, size={}, mime={})",
+                short_hex(&ci.fingerprint),
+                short_hex(&ci.sha256),
+                ci.size,
+                ci.mime
+            ),
+            ProtoEvent::ClipboardFiles(cf) => write!(
+                f,
+                "ClipboardFiles(fp={}, entries={})",
+                short_hex(&cf.fingerprint),
+                cf.entries.len()
+            ),
+            ProtoEvent::FileTransferOffer(o) => write!(
+                f,
+                "FileTransferOffer(sha={}, name={}, size={}, mime={})",
+                short_hex(&o.sha256),
+                o.name,
+                o.size,
+                o.mime
+            ),
+            ProtoEvent::FileTransferResponse(r) => write!(
+                f,
+                "FileTransferResponse(sha={}, accept={})",
+                short_hex(&r.sha256),
+                r.accept
+            ),
+            ProtoEvent::FileTransferCancel(c) => {
+                write!(f, "FileTransferCancel(sha={})", short_hex(&c.sha256))
+            }
+            ProtoEvent::ClipboardRequest(r) => {
+                write!(f, "ClipboardRequest(sha={})", short_hex(&r.sha256))
+            }
         }
     }
 }
 
-#[derive(TryFromPrimitive, IntoPrimitive)]
+/// Compact hex prefix for `Display` (first 4 bytes = 8 hex chars).
+/// Used by `Display for ProtoEvent` so that log lines stay readable
+/// while still being grep-able for a specific fingerprint.
+fn short_hex(b: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(8);
+    for byte in &b[..4] {
+        s.push_str(&format!("{:02x}", byte));
+    }
+    s
+}
+
+#[derive(Debug, TryFromPrimitive, IntoPrimitive)]
 #[repr(u8)]
 pub enum EventType {
     PointerMotion,
@@ -140,6 +347,42 @@ pub enum EventType {
     Leave,
     Ack,
     Hello,
+    // === PLAN-2 / M0a — variable-length codec events (StreamC only) ===
+    ClipboardText,
+    ClipboardImage,
+    ClipboardFiles,
+    FileTransferOffer,
+    FileTransferResponse,
+    FileTransferCancel,
+    ClipboardRequest,
+}
+
+impl EventType {
+    /// Is this variant a **fixed-size** codec event (encoded into
+    /// `[u8; MAX_EVENT_SIZE]`)? Used by the top-level `From<ProtoEvent>
+    /// for Vec<u8>` / `TryFrom<&[u8]> for ProtoEvent` dispatchers to
+    /// pick the right codec path.
+    ///
+    /// **Invariant**: every variant listed here has a body that fits in
+    /// 20 bytes (MAX_EVENT_SIZE - 1 type byte); every variant NOT
+    /// listed uses the length-prefixed `VarCodec` and goes on StreamC.
+    pub fn is_fixed(&self) -> bool {
+        matches!(
+            self,
+            EventType::PointerMotion
+                | EventType::PointerButton
+                | EventType::PointerAxis
+                | EventType::PointerAxisValue120
+                | EventType::KeyboardKey
+                | EventType::KeyboardModifiers
+                | EventType::Ping
+                | EventType::Pong
+                | EventType::Enter
+                | EventType::Leave
+                | EventType::Ack
+                | EventType::Hello
+        )
+    }
 }
 
 impl ProtoEvent {
@@ -177,6 +420,13 @@ impl ProtoEvent {
             ProtoEvent::Leave(_) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
             ProtoEvent::Hello { .. } => EventType::Hello,
+            ProtoEvent::ClipboardText(_) => EventType::ClipboardText,
+            ProtoEvent::ClipboardImage(_) => EventType::ClipboardImage,
+            ProtoEvent::ClipboardFiles(_) => EventType::ClipboardFiles,
+            ProtoEvent::FileTransferOffer(_) => EventType::FileTransferOffer,
+            ProtoEvent::FileTransferResponse(_) => EventType::FileTransferResponse,
+            ProtoEvent::FileTransferCancel(_) => EventType::FileTransferCancel,
+            ProtoEvent::ClipboardRequest(_) => EventType::ClipboardRequest,
         }
     }
 }
@@ -248,6 +498,27 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 // peers.
                 Ok(Self::Hello { magic, commit })
             }
+            // === PLAN-2 / M0a — variable-length codec events ===
+            // These variants must NEVER appear in a
+            // `[u8; MAX_EVENT_SIZE]` buffer — they are encoded via
+            // `VarCodec` into a length-prefixed `Vec<u8>` and only
+            // reach `read_frame`'s var-codec dispatcher
+            // (`TryFrom<&[u8]> for ProtoEvent`). The `read_frame`
+            // DoS cap (`MAX_EVENT_SIZE`) prevents a malformed peer
+            // from delivering a var event with `len > MAX_EVENT_SIZE`
+            // to this fixed-size decoder.
+            EventType::ClipboardText
+            | EventType::ClipboardImage
+            | EventType::ClipboardFiles
+            | EventType::FileTransferOffer
+            | EventType::FileTransferResponse
+            | EventType::FileTransferCancel
+            | EventType::ClipboardRequest => {
+                unreachable!(
+                    "var-codec event delivered to fixed-size decoder; \
+                     read_frame dispatcher is buggy"
+                )
+            }
         }
     }
 }
@@ -262,51 +533,14 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
             let len = &mut len;
             encode_u8(buf, len, event.event_type() as u8);
             match event {
-                ProtoEvent::Input(event) => match event {
-                    InputEvent::Pointer(p) => match p {
-                        PointerEvent::Motion { time, dx, dy } => {
-                            encode_u32(buf, len, time);
-                            encode_f64(buf, len, dx);
-                            encode_f64(buf, len, dy);
-                        }
-                        PointerEvent::Button {
-                            time,
-                            button,
-                            state,
-                        } => {
-                            encode_u32(buf, len, time);
-                            encode_u32(buf, len, button);
-                            encode_u32(buf, len, state);
-                        }
-                        PointerEvent::Axis { time, axis, value } => {
-                            encode_u32(buf, len, time);
-                            encode_u8(buf, len, axis);
-                            encode_f64(buf, len, value);
-                        }
-                        PointerEvent::AxisDiscrete120 { axis, value } => {
-                            encode_u8(buf, len, axis);
-                            encode_i32(buf, len, value);
-                        }
-                    },
-                    InputEvent::Keyboard(k) => match k {
-                        KeyboardEvent::Key { time, key, state } => {
-                            encode_u32(buf, len, time);
-                            encode_u32(buf, len, key);
-                            encode_u8(buf, len, state);
-                        }
-                        KeyboardEvent::Modifiers {
-                            depressed,
-                            latched,
-                            locked,
-                            group,
-                        } => {
-                            encode_u32(buf, len, depressed);
-                            encode_u32(buf, len, latched);
-                            encode_u32(buf, len, locked);
-                            encode_u32(buf, len, group);
-                        }
-                    },
-                },
+                // PLAN-2 / M0a: the Input variant's body encoding goes
+                // through the `FixedCodec` trait (single source of
+                // truth for the byte-level encoding shared with the
+                // `From<ProtoEvent> for Vec<u8>` dispatcher).
+                ProtoEvent::Input(event) => {
+                    let body_len = <InputEvent as FixedCodec>::encode_fixed_body(&event, buf);
+                    *len += body_len;
+                }
                 ProtoEvent::Ping => {}
                 ProtoEvent::Pong(alive) => encode_u8(buf, len, alive as u8),
                 ProtoEvent::Enter(pos) => encode_u8(buf, len, pos as u8),
@@ -322,6 +556,27 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                     for b in commit.iter() {
                         encode_u8(buf, len, *b);
                     }
+                }
+                // === PLAN-2 / M0a — variable-length codec events ===
+                // These variants must NEVER be encoded via the
+                // fixed-size `(*event).into()` path — they are
+                // length-prefixed via `VarCodec` and travel only on
+                // StreamC. Callers that need to send a var event
+                // must use `Vec::<u8>::from(event)` instead. The
+                // route_input dispatcher ensures only fixed
+                // variants reach `send_input`'s `Channel::StreamA` /
+                // `Channel::StreamB` arms that use this From-impl.
+                v @ (ProtoEvent::ClipboardText(_)
+                | ProtoEvent::ClipboardImage(_)
+                | ProtoEvent::ClipboardFiles(_)
+                | ProtoEvent::FileTransferOffer(_)
+                | ProtoEvent::FileTransferResponse(_)
+                | ProtoEvent::FileTransferCancel(_)
+                | ProtoEvent::ClipboardRequest(_)) => {
+                    unreachable!(
+                        "var-codec event encoded via fixed-size buffer; \
+                         use Vec::<u8>::from(event) instead: {v}"
+                    )
                 }
             }
         }
@@ -363,8 +618,146 @@ macro_rules! encode_impl {
 
 encode_impl!(u8);
 encode_impl!(u32);
-encode_impl!(i32);
-encode_impl!(f64);
+// `encode_i32` / `encode_f64` removed (PLAN-2 / M0a: the InputEvent
+// body encoding is delegated to `FixedCodec::encode_fixed_body` in
+// `codec.rs`, which uses its own helpers). `decode_i32` / `decode_f64`
+// below are kept for the existing `TryFrom<[u8; MAX_EVENT_SIZE]>` decoder.
+
+// ============================================================================
+//  PLAN-2 / M0a — universal dispatcher (Vec<u8> / &[u8])
+// ============================================================================
+//
+// The fixed-size `From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize)`
+// hot path above is preserved for the existing call sites in
+// `quic_transport::session` / `quic_transport::protocol` (they only
+// ever feed it fixed-codec variants). For var-codec events
+// (`ClipboardText` / `ClipboardImage` / `ClipboardFiles` /
+// `FileTransferOffer` / `FileTransferResponse` / `FileTransferCancel` /
+// `ClipboardRequest`) we provide a `Vec<u8>`-based universal
+// dispatcher that allocates a vector per frame. StreamC traffic is
+// low-frequency (metadata only) so the allocation cost is negligible.
+
+impl From<ProtoEvent> for Vec<u8> {
+    fn from(event: ProtoEvent) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(event.event_type() as u8);
+        match event {
+            // === Fixed-codec variants ===
+            // Re-encode via the existing
+            // `From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize)`
+            // impl (single source of truth for the fixed encoding)
+            // and skip the type byte (already pushed above).
+            fixed @ (ProtoEvent::Input(_)
+            | ProtoEvent::Ping
+            | ProtoEvent::Pong(_)
+            | ProtoEvent::Enter(_)
+            | ProtoEvent::Leave(_)
+            | ProtoEvent::Ack(_)
+            | ProtoEvent::Hello { .. }) => {
+                let (arr, len) = <([u8; MAX_EVENT_SIZE], usize)>::from(fixed);
+                // arr[0] is the type byte (same as buf[0]); skip it.
+                debug_assert_eq!(arr[0], buf[0]);
+                buf.extend_from_slice(&arr[1..len]);
+            }
+            // === Var-codec variants ===
+            // Append the length-prefixed body via
+            // `VarCodec::encode_var_body`. The type byte was pushed
+            // above, so `encode_var_body` only writes the body.
+            ProtoEvent::ClipboardText(ct) => ct.encode_var_body(&mut buf),
+            ProtoEvent::ClipboardImage(ci) => ci.encode_var_body(&mut buf),
+            ProtoEvent::ClipboardFiles(cf) => cf.encode_var_body(&mut buf),
+            ProtoEvent::FileTransferOffer(o) => o.encode_var_body(&mut buf),
+            ProtoEvent::FileTransferResponse(r) => r.encode_var_body(&mut buf),
+            ProtoEvent::FileTransferCancel(c) => c.encode_var_body(&mut buf),
+            ProtoEvent::ClipboardRequest(r) => r.encode_var_body(&mut buf),
+        }
+        buf
+    }
+}
+
+/// Universal dispatcher for byte slices. Reads the type byte, then
+/// routes to the fixed-codec path (`TryFrom<[u8; MAX_EVENT_SIZE]>`)
+/// or the var-codec path (`VarCodec::decode_var_body`).
+///
+/// **Why a separate `TryFrom<&[u8]>` instead of just changing
+/// `read_frame`**: the existing fixed-size `TryFrom<[u8;
+/// MAX_EVENT_SIZE]>` is a public API used by `read_hello_frame` /
+/// `read_frame` / `listen.rs::server_accept_bi_task` /
+/// `listen.rs::server_datagram_reader_task`. Adding `TryFrom<&[u8]>`
+/// alongside lets the wire-level `read_frame` use a single API for
+/// both fixed and var frames (after M0a this dispatcher is the
+/// canonical entry point for the wire decoder).
+impl TryFrom<&[u8]> for ProtoEvent {
+    type Error = ProtocolError;
+
+    fn try_from(buf: &[u8]) -> Result<Self, Self::Error> {
+        if buf.is_empty() {
+            return Err(ProtocolError::EmptyInput);
+        }
+        let event_type = EventType::try_from(buf[0])?;
+        // Skip the type byte for the body slice.
+        let body = &buf[1..];
+        if event_type.is_fixed() {
+            // Reconstruct the full fixed-size buffer (type byte + body)
+            // and reuse the fixed decoder — single source of truth for
+            // the byte-level encoding. Trailing zeros are ignored by
+            // the fixed decoder (each variant reads only the bytes it
+            // needs). The reconstruction is critical because the
+            // existing `ProtoEvent::try_from([u8; MAX_EVENT_SIZE])`
+            // expects the type byte at `tmp[0]` (a 0 in `tmp[0]` would
+            // silently decode as `PointerMotion`).
+            let mut tmp = [0u8; MAX_EVENT_SIZE];
+            tmp[0] = buf[0];
+            let copy_len = body.len().min(MAX_EVENT_SIZE - 1);
+            tmp[1..1 + copy_len].copy_from_slice(&body[..copy_len]);
+            ProtoEvent::try_from(tmp)
+        } else {
+            // Var-codec dispatch. Each impl reads exactly its fields
+            // and leaves the cursor pointing at any remaining bytes;
+            // the trailing-bytes check below catches any extra garbage
+            // after the body.
+            let mut body_slice: &[u8] = body;
+            let result = match event_type {
+                EventType::ClipboardText => {
+                    ProtoEvent::ClipboardText(ClipboardText::decode_var_body(&mut body_slice)?)
+                }
+                EventType::ClipboardImage => {
+                    ProtoEvent::ClipboardImage(ClipboardImage::decode_var_body(&mut body_slice)?)
+                }
+                EventType::ClipboardFiles => {
+                    ProtoEvent::ClipboardFiles(ClipboardFiles::decode_var_body(&mut body_slice)?)
+                }
+                EventType::FileTransferOffer => ProtoEvent::FileTransferOffer(
+                    FileTransferOffer::decode_var_body(&mut body_slice)?,
+                ),
+                EventType::FileTransferResponse => ProtoEvent::FileTransferResponse(
+                    FileTransferResponse::decode_var_body(&mut body_slice)?,
+                ),
+                EventType::FileTransferCancel => ProtoEvent::FileTransferCancel(
+                    FileTransferCancel::decode_var_body(&mut body_slice)?,
+                ),
+                EventType::ClipboardRequest => ProtoEvent::ClipboardRequest(
+                    ClipboardRequest::decode_var_body(&mut body_slice)?,
+                ),
+                // Fixed variants are handled by the `is_fixed()` branch
+                // above; this arm is unreachable in practice.
+                _ => unreachable!(
+                    "is_fixed() returned false but event_type is fixed: {event_type:?}"
+                ),
+            };
+            // Top-level trailing-bytes check (defends against a
+            // peer that appends garbage after a complete body; the
+            // per-impl check was removed because container types
+            // like `FileEntry` decoded inside `Vec<FileEntry>` need
+            // to leave the cursor at the next-item boundary, not at
+            // a hard "empty" stop).
+            if !body_slice.is_empty() {
+                return Err(ProtocolError::FrameTooShort);
+            }
+            Ok(result)
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -451,5 +844,227 @@ mod tests {
             }
             other => panic!("ProtoEvent::hello returned non-Hello: {other}"),
         }
+    }
+
+    // === PLAN-2 / M0a — top-level dispatcher tests ====================
+
+    /// The fixed-codec `(*event).into()` hot path must still produce
+    /// the **exact same bytes** as the universal `Vec<u8>` dispatcher.
+    /// This is the critical wire-compat guarantee: a var-aware peer
+    /// receiving a fixed event via the universal dispatcher must
+    /// decode it identically to a fixed-only peer via `try_from`.
+    #[test]
+    fn fixed_event_bytes_match_universal_dispatcher() {
+        use input_event::Event as InputEvent;
+        let fixed_events = vec![
+            ProtoEvent::Ping,
+            ProtoEvent::Pong(true),
+            ProtoEvent::Enter(Position::Left),
+            ProtoEvent::Leave(42),
+            ProtoEvent::Ack(99),
+            ProtoEvent::Hello {
+                magic: PROTOCOL_MAGIC,
+                commit: *b"deadbeef",
+            },
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::Motion {
+                time: 1234,
+                dx: 1.5,
+                dy: -2.5,
+            })),
+            ProtoEvent::Input(InputEvent::Keyboard(KeyboardEvent::Modifiers {
+                depressed: 0x01,
+                latched: 0x02,
+                locked: 0,
+                group: 0,
+            })),
+        ];
+        for event in fixed_events {
+            let (fixed_arr, fixed_len) = <([u8; MAX_EVENT_SIZE], usize)>::from(event.clone());
+            let universal: Vec<u8> = Vec::from(event.clone());
+            assert_eq!(
+                &fixed_arr[..fixed_len],
+                &universal[..],
+                "fixed path and universal Vec<u8> path must produce identical bytes for {event}"
+            );
+        }
+    }
+
+    /// Top-level `TryFrom<&[u8]> for ProtoEvent`: a fixed event
+    /// round-trips through `From<ProtoEvent> for Vec<u8>` →
+    /// `TryFrom<&[u8]>`.
+    #[test]
+    fn fixed_event_dispatcher_round_trip() {
+        use input_event::Event as InputEvent;
+        let events = vec![
+            ProtoEvent::Ping,
+            ProtoEvent::Pong(false),
+            ProtoEvent::Enter(Position::Bottom),
+            ProtoEvent::Leave(7),
+            ProtoEvent::Ack(13),
+            ProtoEvent::hello(*b"cafebabe"),
+            ProtoEvent::Input(InputEvent::Pointer(PointerEvent::AxisDiscrete120 {
+                axis: 1,
+                value: -120,
+            })),
+        ];
+        for event in events {
+            let bytes: Vec<u8> = Vec::from(event.clone());
+            let decoded = ProtoEvent::try_from(bytes.as_slice())
+                .unwrap_or_else(|e| panic!("decode failed for {event}: {e}"));
+            // Display + Debug equality — simpler than full match
+            assert_eq!(
+                format!("{decoded:?}"),
+                format!("{event:?}"),
+                "round-trip mismatch for {event}"
+            );
+        }
+    }
+
+    /// Top-level dispatcher: a var event (ClipboardText with inline
+    /// payload) round-trips through the universal `Vec<u8>` path.
+    /// Pins the M0a acceptance criterion: var-codec events survive
+    /// `From<ProtoEvent> for Vec<u8>` → `TryFrom<&[u8]> for ProtoEvent`.
+    #[test]
+    fn clipboard_text_dispatcher_round_trip() {
+        let original = ProtoEvent::ClipboardText(ClipboardText {
+            fingerprint: [0xab; 32],
+            sha256: [0xcd; 32],
+            size: 11,
+            content_inline: Some(b"hello world".to_vec()),
+        });
+        let bytes: Vec<u8> = Vec::from(original.clone());
+        let decoded = ProtoEvent::try_from(bytes.as_slice()).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    /// Top-level dispatcher: `ClipboardFiles` with multiple entries
+    /// round-trips. Exercises the `read_vec_var` multi-item path
+    /// through the top-level dispatcher.
+    #[test]
+    fn clipboard_files_dispatcher_round_trip() {
+        let original = ProtoEvent::ClipboardFiles(ClipboardFiles {
+            fingerprint: [0x33; 32],
+            entries: vec![
+                FileEntry {
+                    name: "x.txt".to_string(),
+                    size: 100,
+                    mime: "text/plain".to_string(),
+                    sha256: [0x01; 32],
+                },
+                FileEntry {
+                    name: "y.png".to_string(),
+                    size: 999,
+                    mime: "image/png".to_string(),
+                    sha256: [0x02; 32],
+                },
+            ],
+        });
+        let bytes: Vec<u8> = Vec::from(original.clone());
+        let decoded = ProtoEvent::try_from(bytes.as_slice()).expect("decode");
+        assert_eq!(decoded, original);
+    }
+
+    /// Top-level dispatcher: all 5 remaining var variants round-trip.
+    #[test]
+    fn all_var_variants_dispatcher_round_trip() {
+        let cases = vec![
+            ProtoEvent::ClipboardImage(ClipboardImage {
+                fingerprint: [0x10; 32],
+                mime: "image/png".to_string(),
+                sha256: [0x20; 32],
+                size: 4096,
+            }),
+            ProtoEvent::FileTransferOffer(FileTransferOffer {
+                sha256: [0x99; 32],
+                name: "report.pdf".to_string(),
+                size: 1_234_567,
+                mime: "application/pdf".to_string(),
+            }),
+            ProtoEvent::FileTransferResponse(FileTransferResponse {
+                sha256: [0x42; 32],
+                accept: true,
+            }),
+            ProtoEvent::FileTransferResponse(FileTransferResponse {
+                sha256: [0x43; 32],
+                accept: false,
+            }),
+            ProtoEvent::FileTransferCancel(FileTransferCancel { sha256: [0xff; 32] }),
+            ProtoEvent::ClipboardRequest(ClipboardRequest { sha256: [0x55; 32] }),
+            // Also the no-inline ClipboardText
+            ProtoEvent::ClipboardText(ClipboardText {
+                fingerprint: [0xaa; 32],
+                sha256: [0xbb; 32],
+                size: 999,
+                content_inline: None,
+            }),
+        ];
+        for event in cases {
+            let bytes: Vec<u8> = Vec::from(event.clone());
+            let decoded = ProtoEvent::try_from(bytes.as_slice())
+                .unwrap_or_else(|e| panic!("decode failed for {event}: {e}"));
+            assert_eq!(decoded, event, "round-trip mismatch for {event}");
+        }
+    }
+
+    /// `TryFrom<&[u8]> for ProtoEvent` rejects empty input.
+    #[test]
+    fn empty_input_returns_error() {
+        let result = ProtoEvent::try_from([].as_slice());
+        assert!(matches!(result, Err(ProtocolError::EmptyInput)));
+    }
+
+    /// `TryFrom<&[u8]> for ProtoEvent` rejects an unknown event type
+    /// byte (delegates to `EventType::try_from`).
+    #[test]
+    fn unknown_event_type_returns_error() {
+        let result = ProtoEvent::try_from([0xffu8].as_slice());
+        assert!(matches!(result, Err(ProtocolError::InvalidEventId(_))));
+    }
+
+    /// The top-level dispatcher catches trailing garbage after a
+    /// complete var body (per-impl checks were removed for the
+    /// `Vec<FileEntry>` container case).
+    #[test]
+    fn dispatcher_catches_trailing_garbage() {
+        let original = ProtoEvent::ClipboardText(ClipboardText {
+            fingerprint: [0xab; 32],
+            sha256: [0xcd; 32],
+            size: 0,
+            content_inline: None,
+        });
+        let mut bytes: Vec<u8> = Vec::from(original);
+        bytes.push(0xff); // stray byte
+        let result = ProtoEvent::try_from(bytes.as_slice());
+        assert!(
+            matches!(result, Err(ProtocolError::FrameTooShort)),
+            "trailing garbage must be caught by the dispatcher, got: {result:?}"
+        );
+    }
+
+    /// `EventType::is_fixed` invariant: every old (M1) variant is
+    /// fixed; every new (M0a) variant is var. Pins the dispatch
+    /// contract.
+    #[test]
+    fn event_type_is_fixed_classification() {
+        assert!(EventType::PointerMotion.is_fixed());
+        assert!(EventType::PointerButton.is_fixed());
+        assert!(EventType::PointerAxis.is_fixed());
+        assert!(EventType::PointerAxisValue120.is_fixed());
+        assert!(EventType::KeyboardKey.is_fixed());
+        assert!(EventType::KeyboardModifiers.is_fixed());
+        assert!(EventType::Ping.is_fixed());
+        assert!(EventType::Pong.is_fixed());
+        assert!(EventType::Enter.is_fixed());
+        assert!(EventType::Leave.is_fixed());
+        assert!(EventType::Ack.is_fixed());
+        assert!(EventType::Hello.is_fixed());
+        // Var variants:
+        assert!(!EventType::ClipboardText.is_fixed());
+        assert!(!EventType::ClipboardImage.is_fixed());
+        assert!(!EventType::ClipboardFiles.is_fixed());
+        assert!(!EventType::FileTransferOffer.is_fixed());
+        assert!(!EventType::FileTransferResponse.is_fixed());
+        assert!(!EventType::FileTransferCancel.is_fixed());
+        assert!(!EventType::ClipboardRequest.is_fixed());
     }
 }
