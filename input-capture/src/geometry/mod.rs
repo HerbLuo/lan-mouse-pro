@@ -239,7 +239,8 @@ fn moved_across_boundary(
                 false
             } else {
                 // Tied. Use geometric.
-                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d)) else {
+                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d))
+                else {
                     return false;
                 };
                 geometric(containing)
@@ -251,7 +252,8 @@ fn moved_across_boundary(
             } else if vertical_strong {
                 false
             } else {
-                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d)) else {
+                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d))
+                else {
                     return false;
                 };
                 geometric(containing)
@@ -263,7 +265,8 @@ fn moved_across_boundary(
             } else if horizontal_strong {
                 false
             } else {
-                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d)) else {
+                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d))
+                else {
                     return false;
                 };
                 geometric(containing)
@@ -275,7 +278,8 @@ fn moved_across_boundary(
             } else if horizontal_strong {
                 false
             } else {
-                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d)) else {
+                let Some(containing) = displays.iter().find(|d| is_within_dp_region(prev_pos, d))
+                else {
                     return false;
                 };
                 geometric(containing)
@@ -289,19 +293,93 @@ fn moved_across_boundary(
 /// side". The result is `None` when the cursor stayed inside or
 /// jumped straight across the union (which physically shouldn't
 /// happen for normal mouse motion).
+///
+/// Detection contract (v4):
+/// 1. **Union exit**: `prev_pos` must be inside some display,
+///    `curr_pos` outside every display.
+/// 2. **Axis attribution**:
+///    - **Horizontal dominant** (`|dx| > |dy|`): fire `Left`/`Right`
+///      on the matching direction. Vertical sides stay dark.
+///    - **Vertical dominant** (`|dy| > |dx|`): fire `Top`/`Bottom`
+///      on the matching direction. Horizontal sides stay dark.
+///    - **Tied** (`|dx| == |dy|`): motion gives no signal. Inspect
+///      which edges of the **containing display** `curr_pos` is
+///      genuinely past (geometric check). If exactly one edge is
+///      past, fire that edge. If zero edges (e.g. `curr_pos` sits
+///      inside the union under a different containment rule), or
+///      two or more edges (the corner exit case), return `None` —
+///      corner exits in the tied axis are genuinely ambiguous
+///      between the two adjacent sides, and firing either picks
+///      wrong roughly half the time. Returning `None` keeps the
+///      cursor in the local machine until the user pushes far
+///      enough along a single axis for that axis to dominate.
+///
+/// Why return `None` on tied corner exits (v4 fix): v3 fell through
+/// to per-side geometric and let both adjacent sides pass on a
+/// tied corner exit. The priority list `[Left, Right, Top, Bottom]`
+/// then picked `Left` first, which still triggered the controlled-
+/// machine `Left` key on a corner exit the user intended as
+/// `Bottom` (the v3-residual bug reported after STEP-DEBUG-D1-
+/// BOTTOM v3). v4 makes the tied corner exit a hard "ambiguous —
+/// do not fire" case.
 pub fn entered_barrier(
     prev_pos: (f64, f64),
     curr_pos: (f64, f64),
     displays: &[DisplayRect],
 ) -> Option<Position> {
-    [
-        Position::Left,
-        Position::Right,
-        Position::Top,
-        Position::Bottom,
-    ]
-    .into_iter()
-    .find(|&pos| moved_across_boundary(prev_pos, curr_pos, displays, pos))
+    if !in_display_region(prev_pos, displays) || in_display_region(curr_pos, displays) {
+        return None;
+    }
+    let dx = curr_pos.0 - prev_pos.0;
+    let dy = curr_pos.1 - prev_pos.1;
+    let adx = dx.abs();
+    let ady = dy.abs();
+
+    if adx > ady {
+        // Horizontal dominant — per-side dominance check (vertical
+        // sides stay dark via the existing moved_across_boundary
+        // contract).
+        return [Position::Left, Position::Right]
+            .into_iter()
+            .find(|&pos| moved_across_boundary(prev_pos, curr_pos, displays, pos));
+    }
+    if ady > adx {
+        // Vertical dominant — symmetric: horizontal sides stay
+        // dark.
+        return [Position::Top, Position::Bottom]
+            .into_iter()
+            .find(|&pos| moved_across_boundary(prev_pos, curr_pos, displays, pos));
+    }
+
+    // Tied: motion gives no signal. Inspect geometric containment
+    // of `curr_pos` relative to the display that contained
+    // `prev_pos`.
+    let containing = displays.iter().find(|d| is_within_dp_region(prev_pos, d))?;
+    let crosses_left = curr_pos.0 < containing.left();
+    let crosses_right = curr_pos.0 >= containing.right();
+    let crosses_top = curr_pos.1 < containing.top();
+    let crosses_bottom = curr_pos.1 >= containing.bottom();
+    let crossings = [
+        (Position::Left, crosses_left),
+        (Position::Right, crosses_right),
+        (Position::Top, crosses_top),
+        (Position::Bottom, crosses_bottom),
+    ];
+    let mut true_side = None;
+    let mut true_count = 0usize;
+    for (pos, crosses) in crossings {
+        if crosses {
+            true_side = Some(pos);
+            true_count += 1;
+        }
+    }
+    if true_count == 1 {
+        return true_side;
+    }
+    // 0 edges (shouldn't happen since we already verified
+    // `in_display_region(curr)` is false) or ≥2 edges (tied corner
+    // exit) — both ambiguous, do not fire.
+    None
 }
 
 /// Return the first display in `displays` that contains `point`.
@@ -1982,7 +2060,7 @@ mod tests {
     /// origin (0, -1080). Both 1080p, same x range.
     fn user_vertical_pair_layout() -> Vec<DisplayRect> {
         vec![
-            DisplayRect::new(0.0, 0.0, 1920.0, 1080.0),    // D1 (bottom / primary)
+            DisplayRect::new(0.0, 0.0, 1920.0, 1080.0), // D1 (bottom / primary)
             DisplayRect::new(0.0, -1080.0, 1920.0, 1080.0), // D2 (top)
         ]
     }
@@ -2046,8 +2124,7 @@ mod tests {
         let displays = user_vertical_pair_layout();
         let got = entered_barrier((500.0, 1.0), (500.0, -1.0), &displays);
         assert_eq!(
-            got,
-            None,
+            got, None,
             "expected no barrier crossing when moving from D1 into \
              D2 along the y=0 seam, got {got:?}"
         );
@@ -2127,14 +2204,13 @@ mod tests {
             span: 10000,
         });
         let got = query_pure(
-            (100.0, 1075.0),  // prev: inside D1, near bottom-left
-            (99.0, 1081.0),   // curr: outside the union below-left
+            (100.0, 1075.0), // prev: inside D1, near bottom-left
+            (99.0, 1081.0),  // curr: outside the union below-left
             &displays,
             &active,
         );
         assert_eq!(
-            got,
-            None,
+            got, None,
             "expected query_pure to NOT cross when exiting D1's \
              bottom-left corner diagonally — pre-fix this returned \
              the Left key (controlled machine) and incorrectly \
@@ -2302,15 +2378,9 @@ mod tests {
             offset: 0,
             span: 10000,
         });
-        let got = query_pure(
-            (10.0, 1075.0),
-            (5.0, 1080.0),
-            &displays,
-            &active,
-        );
+        let got = query_pure((10.0, 1075.0), (5.0, 1080.0), &displays, &active);
         assert_eq!(
-            got,
-            None,
+            got, None,
             "expected query_pure to NOT cross at the exact-45° \
              bottom-left exit — v1 returned the Left key (controlled \
              machine) and incorrectly fired; v2 returns None. \
@@ -2401,8 +2471,7 @@ mod tests {
         });
         let got = query_pure((5.0, 1075.0), (2.0, 1082.0), &displays, &active);
         assert_eq!(
-            got,
-            None,
+            got, None,
             "vertical-dominant motion (ady=7 > adx=3) at bottom-left \
              corner must NOT cross — v2 returned the LEFT key and \
              triggered an incorrect crossing to the controlled machine. \
@@ -2439,7 +2508,8 @@ mod tests {
                 // this to be a real exit event.
                 assert!(
                     curr.1 >= 1080.0,
-                    "test fixture out of range (curr.y={})", curr.1
+                    "test fixture out of range (curr.y={})",
+                    curr.1
                 );
                 let got = entered_barrier(prev, curr, &displays);
                 assert_eq!(
@@ -2450,5 +2520,204 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ----- v4 tied corner exit — regression guards ----------------------
+    //
+    // v3 fixed vertical_strong and horizontal_strong corner exits by
+    // making the dominant axis dark for the other axis. The TIED
+    // case (|dx| == |dy|) still fell through to per-side geometric,
+    // where BOTH the horizontal side (curr.x < D1.left) AND the
+    // vertical side (curr.y >= D1.bottom) evaluated true. The
+    // priority list `[Left, Right, Top, Bottom]` then picked Left —
+    // which still triggered the controlled-machine Left key in
+    // query_pure (the residual the user reported after v3).
+    //
+    // macOS clamp behavior makes the residual observable in
+    // production: when the user pushes the cursor into the bottom-
+    // left corner of D1, Quartz pins location.x to D1.left (= 0)
+    // while location.y approaches D1.bottom (= 1080). At some
+    // MouseMoved event the hardware delta lands with |dx| ≈ |dy|
+    // (sensor noise / hand tremor near 45°), producing a curr_pos
+    // that exits the union on BOTH Left and Bottom. Under v3 this
+    // triggers the wrong-side crossing.
+    //
+    // v4 makes the tied corner exit a hard "ambiguous — do not fire"
+    // case: when |dx| == |dy| and `curr_pos` is geometrically past
+    // two or more edges of the containing display, entered_barrier
+    // returns None. The user pushes further along one axis, the
+    // dominant axis kicks in, and the correct side fires.
+
+    /// Exact tied 45° corner exit: |dx| == |dy| == 1, curr past both
+    /// D1.left and D1.bottom. v3 returned Some(Left) (BUG); v4
+    /// returns None because the corner exit is ambiguous between
+    /// Left and Bottom.
+    #[test]
+    fn v4_tied_corner_exact_45_returns_none() {
+        let displays = user_vertical_pair_layout();
+        let got = entered_barrier((0.0, 1079.0), (-1.0, 1080.0), &displays);
+        assert_eq!(
+            got, None,
+            "tied 45° corner exit (|dx|=|dy|=1) at bottom-left must \
+             NOT fire — curr is past both D1.left and D1.bottom, the \
+             exit is ambiguous between Left and Bottom, v4 returns \
+             None. got {got:?}"
+        );
+    }
+
+    /// Larger tied corner exit: |dx| == |dy| == 3.
+    #[test]
+    fn v4_tied_corner_3px_returns_none() {
+        let displays = user_vertical_pair_layout();
+        let got = entered_barrier((0.0, 1077.0), (-3.0, 1080.0), &displays);
+        assert_eq!(
+            got, None,
+            "tied 3px corner exit at bottom-left must NOT fire — \
+             ambiguous between Left and Bottom, v4 returns None. \
+             got {got:?}"
+        );
+    }
+
+    /// End-to-end `query_pure` regression for the v3 residual.
+    /// Active set contains only `Left @ D1.id`. v3 returned the
+    /// Left key (BUG). v4 returns None, so no controlled-machine
+    /// crossing fires.
+    #[test]
+    fn v4_query_pure_tied_corner_returns_none() {
+        let displays = vec![
+            DisplayBound::new(
+                DisplayRect::new(0.0, 0.0, 1920.0, 1080.0),
+                Some("macos:0000:0000::unknown-1".into()),
+            ),
+            DisplayBound::new(
+                DisplayRect::new(0.0, -1080.0, 1920.0, 1080.0),
+                Some("macos:0000:0000::unknown-2".into()),
+            ),
+        ];
+        let mut active = HashSet::new();
+        active.insert(BarrierKey {
+            pos: Position::Left,
+            monitor: Some("macos:0000:0000::unknown-1".into()),
+            offset: 0,
+            span: 10000,
+        });
+        let got = query_pure((0.0, 1077.0), (-3.0, 1080.0), &displays, &active);
+        assert_eq!(
+            got, None,
+            "query_pure on tied corner exit must NOT fire — the \
+             active set has only Left @ D1.id, but the motion is a \
+             tied-axis corner exit and is ambiguous. v3 fired the \
+             Left key here (BUG). got {got:?}"
+        );
+    }
+
+    /// Sweep tied-axis corner exits over a range of motion sizes.
+    /// Every (dx, dy) with |dx| == |dy| AND curr past both D1.left
+    /// and D1.bottom must return None under v4. This is the
+    /// strongest guard against the user's residual: any future
+    /// regression that re-introduces a priority-list pick in the
+    /// tied branch will fail at least one row of this grid.
+    #[test]
+    fn v4_tied_corner_grid_returns_none() {
+        let displays = user_vertical_pair_layout();
+        for motion in [1.0_f64, 2.0, 5.0, 10.0] {
+            let dx = -motion;
+            let dy = motion;
+            let prev = (0.0, 1080.0 - motion);
+            let curr = (0.0 + dx, 1080.0 - motion + dy);
+            assert!(curr.0 < 0.0, "curr.x must be past D1.left");
+            assert!(curr.1 >= 1080.0, "curr.y must be past D1.bottom");
+            let got = entered_barrier(prev, curr, &displays);
+            assert_eq!(
+                got, None,
+                "tied motion ({motion}px) at bottom-left must NOT \
+                 fire — v4 returns None on tied corner exits. \
+                 got {got:?}"
+            );
+        }
+    }
+
+    /// Symmetric guards for the other three corners, ensuring the
+    /// v4 corner-exit rule is symmetric across all 4 corners of the
+    /// containing display. Each fixture uses |dx| == |dy| AND curr
+    /// past both relevant edges.
+    #[test]
+    fn v4_tied_corner_all_four_corners_return_none() {
+        let displays = user_vertical_pair_layout();
+        // Bottom-left (D1: bottom = 1080, left = 0). prev=(0, 1079),
+        // curr=(-1, 1080): |dx|=|dy|=1, past both left and bottom.
+        assert_eq!(
+            entered_barrier((0.0, 1079.0), (-1.0, 1080.0), &displays),
+            None,
+            "bottom-left corner exit must NOT fire"
+        );
+        // Bottom-right (D1: bottom = 1080, right = 1920). prev=
+        // (1920, 1079), curr=(1921, 1080): |dx|=|dy|=1, past both
+        // right and bottom. Note D1.right = 1920 (exclusive), so
+        // curr.x = 1921 > 1920.
+        assert_eq!(
+            entered_barrier((1920.0, 1079.0), (1921.0, 1080.0), &displays),
+            None,
+            "bottom-right corner exit must NOT fire"
+        );
+        // Top-left of D2 (D2: top = -1080, left = 0). prev=
+        // (0, -1080), curr=(-1, -1081): |dx|=|dy|=1, past both
+        // left and top (D2.top = -1080, curr.y = -1081 < -1080).
+        // Note D2 is at y ∈ [-1080, 0).
+        assert_eq!(
+            entered_barrier((0.0, -1080.0), (-1.0, -1081.0), &displays),
+            None,
+            "top-left of D2 corner exit must NOT fire"
+        );
+        // Top-right of D2 (D2: top = -1080, right = 1920). prev=
+        // (1920, -1080), curr=(1921, -1081): |dx|=|dy|=1, past
+        // both right and top.
+        assert_eq!(
+            entered_barrier((1920.0, -1080.0), (1921.0, -1081.0), &displays),
+            None,
+            "top-right of D2 corner exit must NOT fire"
+        );
+    }
+
+    /// Belt-and-braces: tied single-edge exit (curr past only ONE
+    /// edge of the containing display) MUST still fire that edge.
+    /// Pins that v4 didn't over-correct — single-edge tied exits
+    /// retain their geometric attribution, only corner exits
+    /// (≥2 edges) became ambiguous.
+    ///
+    /// prev=(10, 1075) inside D1, curr=(5, 1080): curr past
+    /// D1.bottom only (curr.x=5 is NOT past D1.left=0). v3 fired
+    /// Bottom; v4 must also fire Bottom.
+    #[test]
+    fn v4_tied_single_edge_bottom_fires_bottom() {
+        let displays = user_vertical_pair_layout();
+        let got = entered_barrier((10.0, 1075.0), (5.0, 1080.0), &displays);
+        assert_eq!(
+            got,
+            Some(Position::Bottom),
+            "tied single-edge bottom exit must fire Bottom (curr past \
+             only D1.bottom). got {got:?}"
+        );
+    }
+
+    /// Belt-and-braces: tied single-edge left exit (curr past only
+    /// D1.left). The cursor moves diagonally with |dx| == |dy| but
+    /// the curr happens to land inside the bottom half-open
+    /// (curr.y < 1080). Pins that v4's corner-exit ambiguity rule
+    /// does not bleed into single-edge cases.
+    #[test]
+    fn v4_tied_single_edge_left_fires_left() {
+        let displays = user_vertical_pair_layout();
+        let got = entered_barrier((10.0, 500.0), (5.0, 505.0), &displays);
+        // dx=-5, dy=+5 → tied. curr past D1.left (5 < 0? no, 5>0,
+        // so curr.x=5 is NOT past D1.left=0). curr past D1.top
+        // (505 < 0? no). curr past D1.bottom (505 >= 1080? no).
+        // curr past D1.right (505 >= 1920? no). So 0 edges crossed.
+        // entered_barrier must return None.
+        assert_eq!(
+            got, None,
+            "tied motion with curr still inside D1 (no edge crossed) \
+             must return None. got {got:?}"
+        );
     }
 }
