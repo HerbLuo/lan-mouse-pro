@@ -98,9 +98,25 @@ pub(crate) struct LanMouseConnection {
     /// polled from `do_capture_session`'s `select!` without colliding
     /// with `self.conn.recv()`.
     peer_lost_tx: Sender<ClientHandle>,
+    /// **PLAN-2 / M1a STEP-1a.4** — sender for inbound clipboard
+    /// events. Cloned into every `connect_to_handle` call so the
+    /// resulting `PeerSession::clipboard_inbox` forwards
+    /// `StreamEvent::ClipboardMeta` from the per-peer stream C
+    /// reader to the service's clipboard dispatcher. Unbounded:
+    /// `read_stream_c_loop` runs in a hot loop and `send` is
+    /// non-blocking; the receiver lives on the service's main
+    /// loop (`Service::run`'s `select!` arm).
+    clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(std::net::SocketAddr, lan_mouse_proto::ProtoEvent)>,
 }
 
 impl LanMouseConnection {
+    /// **PLAN-2 / M1a STEP-1a.4** — `clipboard_inbound_tx` is the
+    /// sender for inbound clipboard events. See the field doc on
+    /// `LanMouseConnection::clipboard_inbound_tx` for the full
+    /// rationale. Constructed by `Service::new` and cloned into
+    /// every `connect_to_handle` / supervisor's redial so all
+    /// per-peer `set_clipboard_inbox` calls feed the same
+    /// service-side dispatcher.
     pub(crate) fn new(
         client_endpoint: Endpoint,
         cert_chain: Vec<CertificateDer<'static>>,
@@ -109,6 +125,7 @@ impl LanMouseConnection {
         client_manager: ClientManager,
         idle_timeout: std::time::Duration,
         peer_lost_tx: Sender<ClientHandle>,
+        clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(std::net::SocketAddr, lan_mouse_proto::ProtoEvent)>,
     ) -> Self {
         let (recv_tx, recv_rx) = channel();
         let quic_creds = Rc::new(QuicDialerCreds { cert_chain, key });
@@ -124,6 +141,7 @@ impl LanMouseConnection {
             retry_state: Default::default(),
             idle_timeout,
             peer_lost_tx,
+            clipboard_inbound_tx,
         }
     }
 
@@ -188,6 +206,7 @@ impl LanMouseConnection {
                 handle,
                 self.idle_timeout,
                 self.peer_lost_tx.clone(),
+                self.clipboard_inbound_tx.clone(),
             ));
         }
         Ok(())
@@ -316,6 +335,7 @@ impl LanMouseConnection {
                 handle,
                 self.idle_timeout,
                 self.peer_lost_tx.clone(),
+                self.clipboard_inbound_tx.clone(),
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
@@ -514,6 +534,16 @@ async fn connect_to_handle(
     // the receiver lives on `LanMouseConnection` and is consumed by
     // `capture.rs::do_capture_session` via [`LanMouseConnection::peer_lost`].
     peer_lost_tx: Sender<ClientHandle>,
+    /// **PLAN-2 / M1a STEP-1a.4** — sender for inbound clipboard
+    /// events. The successful-dial path calls
+    /// `peer.set_clipboard_inbox(Some(this.clone()))` so the
+    /// per-peer `read_stream_c_loop` (in
+    /// `quic_transport::streams`) can forward
+    /// `StreamEvent::ClipboardMeta` to the service's clipboard
+    /// dispatcher. The redial path (supervisor on peer death)
+    /// reuses the same sender so the new peer's inbox is
+    /// consistent with the old one's.
+    clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(std::net::SocketAddr, lan_mouse_proto::ProtoEvent)>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     let Some(ips_set) = client_manager.get_ips(handle) else {
@@ -694,6 +724,18 @@ async fn connect_to_handle(
     }
     peer.set_outgoing_events(Some(out_tx)).await;
 
+    // **PLAN-2 / M1a STEP-1a.4** — wire the inbound clipboard
+    // channel. `peer.run` reads var-codec frames off the peer's
+    // stream C and pushes them as
+    // `StreamEvent::ClipboardMeta(ProtoEvent)` to its
+    // `clipboard_inbox` (see `quic_transport::streams` +
+    // `quic_transport::session::send_clipboard_inbox`); the
+    // service's dispatcher consumes the receiver end and applies
+    // the event to the local OS clipboard. M1a only wires text;
+    // image / file variants are M2a / M3a (the dispatcher drops
+    // non-`ClipboardText` events for now).
+    peer.set_clipboard_inbox(Some(clipboard_inbound_tx.clone())).await;
+
     // Spawn the supervisor to take over the peer's lifecycle — when
     // `peer.run()` exits, it decides whether to trigger a RetryState reconnect.
     spawn_local(spawn_peer_supervisor(
@@ -711,6 +753,12 @@ async fn connect_to_handle(
         peer_lost_tx,
         recv_tx.clone(),
         last_pong_at,
+        // **M1a STEP-1a.4** — clipboard inbox sender.
+        // The supervisor's redial `connect_to_handle` reuses
+        // this clone so the new peer's stream C reader
+        // keeps pushing to the same service-side
+        // dispatcher.
+        clipboard_inbound_tx,
     ));
     Ok(())
 }
@@ -776,6 +824,14 @@ async fn spawn_peer_supervisor(
     // `connect_to_handle`. Read every [`PONG_HEALTH_TICK`] by the
     // watchdog below.
     last_pong_at: Rc<RefCell<Instant>>,
+    // **PLAN-2 / M1a STEP-1a.4** — sender for inbound clipboard
+    // events from the peer. The supervisor passes this clone to
+    // the redial `connect_to_handle` so the new peer's
+    // `set_clipboard_inbox` still points to the same service-side
+    // dispatcher. Without sharing, the redial would push to a
+    // throwaway channel and the dispatcher would never observe
+    // clipboard events on the new connection.
+    clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(std::net::SocketAddr, lan_mouse_proto::ProtoEvent)>,
 ) {
     log::info!("spawn_peer_supervisor: starting for handle {handle} addr {addr}");
 
@@ -886,6 +942,14 @@ async fn spawn_peer_supervisor(
                     handle,
                     idle_timeout,
                     peer_lost_tx.clone(),
+                    // **M1a STEP-1a.4** — the redial path
+                    // reuses the supervisor's existing
+                    // `clipboard_inbound_tx` clone so the
+                    // new peer's stream C reader pushes to
+                    // the same service-side dispatcher
+                    // receiver. Without this the redial
+                    // would push to a throwaway channel.
+                    clipboard_inbound_tx.clone(),
                 ));
             } else {
                 log::info!(

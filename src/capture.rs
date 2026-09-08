@@ -275,6 +275,24 @@ enum CaptureRequest {
     /// `conn.dial(handle)` → `connect_to_handle` is spawned in the
     /// background. See the docstring on `connect.rs::dial` for details.
     Dial(ClientHandle),
+    /// **PLAN-2 / M1a STEP-1a.4** — send a `ProtoEvent` to the
+    /// peer at `handle`. Routed via
+    /// [`crate::quic_transport::route_input`] so the same
+    /// `Channel` dispatch applies (clipboard / file events → StreamC,
+    /// input events → Datagram / StreamB, control events → StreamA).
+    /// The dispatcher (in `service::clipboard_dispatcher`) uses this
+    /// to push `ClipboardText` to every active peer with
+    /// `enable_clipboard_to = true`.
+    ///
+    /// **Fire-and-forget**: the caller's
+    /// `Capture::send_clipboard_text` is non-blocking. The actual
+    /// `conn.send(event, handle)` runs on the capture task; if the
+    /// peer is not connected the failure is logged at `warn` level
+    /// inside `CaptureTask` but the request itself returns
+    /// immediately. The dispatcher does not need to await per-peer
+    /// results because clipboard push is best-effort (a dropped
+    /// event on a flaky link is recovered on the user's next copy).
+    SendClip(ProtoEvent, ClientHandle),
 }
 
 impl Capture {
@@ -387,6 +405,23 @@ impl Capture {
     /// Silent no-op.
     pub(crate) fn dial(&self, handle: ClientHandle) {
         let _ = self.request_tx.send(CaptureRequest::Dial(handle));
+    }
+
+    /// **PLAN-2 / M1a STEP-1a.4** — push a `ProtoEvent` to the peer at
+    /// `handle`. Routes through
+    /// [`crate::quic_transport::route_input`] so clipboard events
+    /// automatically land on `Channel::StreamC` (handled by
+    /// `PeerSession::send_stream_c`).
+    ///
+    /// Fire-and-forget: the request is queued on `request_tx` and
+    /// `CaptureTask` calls `self.conn.send(event, handle).await`
+    /// off-thread. Failure modes (peer not connected, IO error) are
+    /// logged at `warn` level inside `CaptureTask`; the caller's
+    /// return value is `()` because the clipboard dispatcher does
+    /// not need per-peer ack semantics — clipboard push is
+    /// best-effort and the next user copy recovers the link.
+    pub(crate) fn send_event(&self, event: ProtoEvent, handle: ClientHandle) {
+        let _ = self.request_tx.send(CaptureRequest::SendClip(event, handle));
     }
 }
 
@@ -585,6 +620,22 @@ impl CaptureTask {
                         // conn.dial.
                         CaptureRequest::Dial(handle) => {
                             let _ = self.conn.dial(handle).await;
+                        }
+                        // **PLAN-2 / M1a STEP-1a.4** — outbound clipboard
+                        // push. `conn.send` looks up the active peer for
+                        // `handle` and calls `peer.send_input(&event,
+                        // &cfg)` which `route_input`s to `Channel::StreamC`
+                        // for `ClipboardText` → `send_stream_c`. A failed
+                        // send (peer not connected / stream closed) is
+                        // logged at `warn` but does not propagate back to
+                        // the dispatcher — the next user copy is the
+                        // natural retry point.
+                        CaptureRequest::SendClip(event, handle) => {
+                            if let Err(e) = self.conn.send(event.clone(), handle).await {
+                                log::warn!(
+                                    "capture: send_event to handle {handle} failed: {e}"
+                                );
+                            }
                         }
                     },
                     _ = self.cancellation_token.cancelled() => return,
@@ -912,6 +963,20 @@ impl CaptureTask {
                     // by connect.rs.
                     CaptureRequest::Dial(handle) => {
                         let _ = self.conn.dial(handle).await;
+                    }
+                    // **PLAN-2 / M1a STEP-1a.4** — outbound clipboard
+                    // push while `do_capture_session` is the active
+                    // branch. Symmetric with the restart-loop handler
+                    // above: route through `conn.send` which calls
+                    // `peer.send_input` and dispatches to StreamC for
+                    // `ClipboardText`. Failures are logged, not
+                    // surfaced.
+                    CaptureRequest::SendClip(event, handle) => {
+                        if let Err(e) = self.conn.send(event.clone(), handle).await {
+                            log::warn!(
+                                "capture: send_event to handle {handle} failed: {e}"
+                            );
+                        }
                     }
                 },
                 // Pending timeout tick: in the Pending state, if no Ack arrives

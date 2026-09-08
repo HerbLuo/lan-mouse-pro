@@ -74,9 +74,25 @@ enum EmulationRequest {
 }
 
 impl Emulation {
+    /// **PLAN-2 / M1a STEP-1a.4** — `clipboard_inbound_tx` is the
+    /// sender half of the inbound clipboard event channel. The
+    /// `ListenTask` (which already receives every
+    /// `ListenEvent::Msg { event, addr }` from the listen-side
+    /// supervisor) matches `ClipboardText` / `ClipboardImage` /
+    /// `ClipboardFiles` / `FileTransfer*` / `ClipboardRequest` and
+    /// pushes them through this sender so the service's clipboard
+    /// dispatcher can apply them to the local OS clipboard.
+    ///
+    /// `tokio::sync::mpsc` (not the `local_channel::mpsc` used for
+    /// the existing `EmulationEvent` channel) is the correct
+    /// primitive here: the dispatcher's `recv()` runs inside
+    /// `Service::run()`'s `select!` on the daemon's
+    /// `current_thread` runtime, and `tokio` channels are natively
+    /// `select!`-compatible.
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
+        clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(std::net::SocketAddr, lan_mouse_proto::ProtoEvent)>,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
         let (request_tx, request_rx) = channel();
@@ -87,6 +103,7 @@ impl Emulation {
             request_rx,
             event_tx,
             addr_to_fingerprint: HashMap::new(),
+            clipboard_inbound_tx,
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -143,6 +160,24 @@ struct ListenTask {
     /// here so it can forward it upward in `EmulationEvent::Entered`,
     /// associating the entered peer with its mTLS-verified identity.
     addr_to_fingerprint: HashMap<SocketAddr, String>,
+    /// **PLAN-2 / M1a STEP-1a.4** — sender for inbound clipboard /
+    /// file-transfer events decoded on the server-side
+    /// `server_stream_c_reader_task` (which pushes `ListenEvent::Msg
+    /// { event, addr }` for every var-codec frame). The clipboard
+    /// `match` arm forwards `ClipboardText` through this sender;
+    /// the service's dispatcher consumes the receiver in
+    /// `Service::run()` and applies the event to the local OS
+    /// clipboard (after the LRU loopback check).
+    ///
+    /// **Why `tokio::sync::mpsc` (not `local_channel::mpsc`)**: the
+    /// dispatcher's `recv()` lives inside `tokio::select!`, which
+    /// only supports the `tokio` flavor natively. The existing
+    /// `EmulationEvent` channel uses `local_channel` because the
+    /// service consumes it via `self.emulation.event()` (a custom
+    /// poll method) — not via `select!`. Cloning the `tokio`
+    /// sender into each per-listener `ListenTask` keeps the
+    /// dispatcher's `select!` integration simple.
+    clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(SocketAddr, lan_mouse_proto::ProtoEvent)>,
 }
 
 impl ListenTask {
@@ -202,6 +237,47 @@ impl ListenTask {
                                 // peer_commit field.
                                 self.listener.reply(addr, ProtoEvent::Hello { magic: PROTOCOL_MAGIC, commit: local_commit() }).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
+                            }
+                            // **PLAN-2 / M1a STEP-1a.4** — server-side
+                            // inbound clipboard. The
+                            // `server_stream_c_reader_task` (in
+                            // `listen.rs`) pushes every var-codec
+                            // frame as `ListenEvent::Msg { event, addr }`;
+                            // we forward `ClipboardText` here so the
+                            // service-level dispatcher can apply it
+                            // to the local OS clipboard.
+                            //
+                            // **M1a scope**: only `ClipboardText` is
+                            // wired (small text, ≤ 1 KiB inline).
+                            // `ClipboardImage` / `ClipboardFiles` /
+                            // `FileTransfer*` are M2a / M3a — they
+                            // stay dropped in the `_ => {}` arm below
+                            // until those milestones wire their
+                            // own inbound handlers.
+                            //
+                            // **Why a `tokio` channel (not the
+                            // existing `local_channel` for
+                            // `EmulationEvent`)**: the dispatcher's
+                            // `recv()` runs inside the service's
+                            // `tokio::select!`, which doesn't accept
+                            // `local_channel::mpsc::Receiver`. The
+                            // cross-task boundary is a 1-element
+                            // (`(SocketAddr, ProtoEvent)`) tuple;
+                            // a separate channel keeps the routing
+                            // surface explicit and avoids enums-of-events
+                            // for what is conceptually a different
+                            // subsystem (clipboard vs. emulation).
+                            ProtoEvent::ClipboardText(ct) => {
+                                if self
+                                    .clipboard_inbound_tx
+                                    .send((addr, ProtoEvent::ClipboardText(ct)))
+                                    .is_err()
+                                {
+                                    log::debug!(
+                                        "ListenTask: clipboard_inbound_tx closed (service gone), \
+                                         dropping inbound ClipboardText from {addr}"
+                                    );
+                                }
                             }
                             _ => {}
                         }

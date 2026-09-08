@@ -20,9 +20,14 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     sync::{Arc, RwLock},
+    time::Duration,
 };
 use thiserror::Error;
-use tokio::{process::Command, signal, sync::Notify};
+use tokio::{process::Command, signal, sync::mpsc as tokio_mpsc, sync::Notify};
+
+use crate::clipboard::{default_backend, ClipboardBackend, ClipboardError};
+use lan_mouse_proto::{ClipboardText, ProtoEvent};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Error)]
 pub enum ServiceError {
@@ -82,6 +87,119 @@ pub struct Service {
     /// `CaptureTask::do_capture`) is always treated as a "first
     /// observation" — no `BindingInvalid` is sent on startup.
     last_monitors: Option<Vec<GeometryMonitorInfo>>,
+    /// **PLAN-2 / M1a STEP-1a.4** — clipboard state. `None` when
+    /// the platform backend is unavailable
+    /// ([`ClipboardError::NotImplemented`] / `ToolMissing`); the
+    /// dispatch loop is skipped in that case. `Some(_)` means the
+    /// 500 ms tick is active and the service pushes inbound
+    /// `ClipboardText` events through this backend.
+    clipboard_backend: Option<Box<dyn ClipboardBackend>>,
+    /// **M1a STEP-1a.4** — LRU of recently-written fingerprints.
+    /// Loopback defence: a peer-pushed `ClipboardText` whose
+    /// `sha256` is in the LRU is treated as our own writeback and
+    /// dropped instead of re-applying it to the local clipboard.
+    /// Capacity 64 per PLAN §3 M1a "仅指纹比对防'收到本地写回内容'的最简回环".
+    /// **M1a known limitation**: under "copy 64 different things
+    /// in 60 s" pressure the LRU rolls and the same fingerprint
+    /// can come back through — at that point we re-apply a write
+    /// we did locally. M1b tightens the LRU to 128 + 60 s TTL +
+    /// explicit `cache.remove` on push (PLAN §1 评审 #3 2nd + #4
+    /// 3rd).
+    clipboard_lru: LruFingerprints,
+    /// **M1a STEP-1a.4** — last text observed by `current_text()`.
+    /// Avoids re-hashing on every tick when the clipboard is
+    /// quiescent. `None` until the first successful read; reset to
+    /// `None` after an inbound `set_text` so the next tick re-reads
+    /// and confirms the new value.
+    clipboard_last_text: Option<String>,
+    /// **M1a STEP-1a.4** — receiver for inbound clipboard events.
+    /// Senders live in two places:
+    /// - `Emulation::new` clones the sender into the
+    ///   `ListenTask` (server side — `server_stream_c_reader_task`
+    ///   pushes every var-codec frame as `ListenEvent::Msg`).
+    /// - `connect_to_handle` clones the sender into
+    ///   `peer.set_clipboard_inbox(...)` (client side — `peer.run`
+    ///   forwards every `StreamEvent::ClipboardMeta` here).
+    ///
+    /// Both paths funnel to this single receiver, consumed by the
+    /// `select!` arm in [`Service::run`].
+    clipboard_inbound_rx: tokio_mpsc::UnboundedReceiver<(SocketAddr, ProtoEvent)>,
+    /// **M1a STEP-1a.4** — sender cloned into
+    /// [`crate::emulation::Emulation::new`] and
+    /// [`crate::connect::connect_to_handle`]. The dispatcher's
+    /// inbound path is the only consumer of the receiver half.
+    /// Kept on the struct (rather than passed by value) so the
+    /// `Emulation` constructed in `Service::new` retains its
+    /// sender for the daemon's lifetime.
+    clipboard_inbound_tx: tokio_mpsc::UnboundedSender<(SocketAddr, ProtoEvent)>,
+    /// **M1a STEP-1a.4** — 500 ms tick for the clipboard poll
+    /// loop. `tokio::time::Interval` is `select!`-compatible so
+    /// the service's main loop drives the dispatch directly (no
+    /// separate task → no `Arc<Mutex<...>>` plumbing).
+    /// `Interval::tick` skips the first tick immediately; the
+    /// dispatch loop is `loop { _ = tick.tick() => ... }` so the
+    /// first dispatch happens at t≈500 ms, not t=0. This avoids
+    /// racing the daemon's startup handshake (which is also doing
+    /// `select!` work in the same task).
+    clipboard_tick: tokio::time::Interval,
+    /// **M1a STEP-1a.4** — last clipboard-sync timestamps for the
+    /// `FrontendEvent::ClipboardState` push. `None` until the
+    /// first sync (text / image / file). Updated on every
+    /// outbound push (local change) and every inbound apply
+    /// (peer change). `last_source` carries the peer hostname /
+    /// `SocketAddr` on inbound; `None` on local-origin.
+    last_text_ts_ms: Option<u64>,
+    last_image_ts_ms: Option<u64>,
+    last_file_ts_ms: Option<u64>,
+    /// **M1a STEP-1a.4** — peer `SocketAddr` (or local sentinel)
+    /// that most recently updated the clipboard. Used for the
+    /// `last_source` field of `FrontendEvent::ClipboardState`;
+    /// `None` means the most recent change originated locally.
+    last_clipboard_source: Option<SocketAddr>,
+}
+
+/// **PLAN-2 / M1a STEP-1a.4** — fixed-capacity LRU of SHA-256
+/// fingerprints, used by the clipboard dispatcher's loopback defence.
+///
+/// **Implementation**: `VecDeque<[u8; 32]>` with linear
+/// `contains`. Capacity 64 → `contains` is O(64) = ~64 byte
+/// comparisons per inbound event, which is well below the dispatch
+/// tick's 1-3 ms typical work. A `HashSet` would be asymptotically
+/// faster but adds allocation pressure and code surface; the
+/// `VecDeque` matches the M1a "minimum viable loopback defence"
+/// scope (PLAN §3 M1a "仅指纹比对防'收到本地写回内容'的最简回环").
+#[derive(Debug)]
+struct LruFingerprints {
+    capacity: usize,
+    items: VecDeque<[u8; 32]>,
+}
+
+impl LruFingerprints {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            items: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    fn contains(&self, fp: &[u8; 32]) -> bool {
+        self.items.contains(fp)
+    }
+
+    fn push(&mut self, fp: [u8; 32]) {
+        if self.items.len() >= self.capacity {
+            self.items.pop_front();
+        }
+        self.items.push_back(fp);
+    }
+
+    /// Test-only: drain the LRU. Used by the dispatcher unit tests
+    /// to assert "marked" vs "not marked" without exposing the
+    /// `VecDeque` to the test code.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.items.len()
+    }
 }
 
 #[derive(Debug)]
@@ -141,6 +259,17 @@ impl Service {
         // `connect.rs::pong_health_watchdog` for the producer side.
         let (peer_lost_tx, peer_lost_rx) = local_channel::mpsc::channel();
 
+        // **M1a STEP-1a.4** — clipboard inbound channel: sender is
+        // cloned into the listen-side `Emulation::ListenTask` (for
+        // server-pushed clipboard) and the connect-side
+        // `peer.set_clipboard_inbox` (for client-pushed clipboard).
+        // Both feed the same receiver consumed by `Service::run`'s
+        // `select!` arm. Constructed BEFORE `LanMouseConnection::new`
+        // because the conn's `dial` / `connect_to_handle` flow needs
+        // to clone the sender for every new peer.
+        let (clipboard_inbound_tx, clipboard_inbound_rx) =
+            tokio_mpsc::unbounded_channel::<(SocketAddr, ProtoEvent)>();
+
         let conn = LanMouseConnection::new(
             client_endpoint,
             cert_der.0.clone(),
@@ -149,6 +278,7 @@ impl Service {
             client_manager.clone(),
             quic_idle_timeout,
             peer_lost_tx,
+            clipboard_inbound_tx.clone(),
         );
 
         // input capture + emulation
@@ -162,8 +292,31 @@ impl Service {
             watchdog_config,
             peer_lost_rx,
         );
+
+        // Try to construct the platform clipboard backend. Failures
+        // (NotImplemented on platforms without a built file,
+        // ToolMissing when xclip / wl-paste / pbcopy are absent) are
+        // logged + the dispatch loop is skipped — the rest of the
+        // daemon stays alive.
+        let clipboard_backend = match default_backend() {
+            Ok(b) => {
+                log::info!("clipboard backend selected: {}", b.name());
+                Some(b)
+            }
+            Err(e) => {
+                log::warn!(
+                    "clipboard backend unavailable (clipboard sync disabled): {e}"
+                );
+                None
+            }
+        };
+
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener);
+        let emulation = Emulation::new(
+            emulation_backend,
+            listener,
+            clipboard_inbound_tx.clone(),
+        );
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
@@ -194,6 +347,24 @@ impl Service {
             // action fires until a second emission arrives with a
             // diff against this baseline.
             last_monitors: None,
+            // **M1a STEP-1a.4** — clipboard dispatch state.
+            // `clipboard_backend` is `Some` only when
+            // `default_backend()` succeeded; otherwise the dispatch
+            // tick + inbound arm in `Service::run` are no-ops.
+            // `clipboard_tick` is constructed unconditionally — the
+            // tick is `select!`-polled regardless, but the
+            // `clipboard_backend` guard short-circuits the
+            // no-backend case.
+            clipboard_backend,
+            clipboard_lru: LruFingerprints::new(64),
+            clipboard_last_text: None,
+            clipboard_inbound_rx,
+            clipboard_inbound_tx,
+            clipboard_tick: tokio::time::interval(Duration::from_millis(500)),
+            last_text_ts_ms: None,
+            last_image_ts_ms: None,
+            last_file_ts_ms: None,
+            last_clipboard_source: None,
         };
         Ok(service)
     }
@@ -219,6 +390,19 @@ impl Service {
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
+                // **M1a STEP-1a.4** — clipboard dispatch tick. Polls
+                // `clipboard_backend.current_text()` every 500 ms;
+                // on change → LRU + push to peers. Short-circuits
+                // when the backend is `None` (platform
+                // unsupported / tool missing).
+                _ = self.clipboard_tick.tick() => self.handle_clipboard_tick().await,
+                // **M1a STEP-1a.4** — inbound clipboard event from a
+                // peer. Server-side: `Emulation::ListenTask` pushes
+                // here. Client-side: `peer.set_clipboard_inbox` (set
+                // in `connect_to_handle`) pushes here.
+                Some(inbound) = self.clipboard_inbound_rx.recv() => {
+                    self.handle_clipboard_inbound(inbound);
+                }
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
         }
@@ -990,6 +1174,217 @@ impl Service {
             }
         });
     }
+
+    /// **PLAN-2 / M1a STEP-1a.4** — 500 ms tick handler.
+    ///
+    /// 1. Read the current clipboard text. `None` → no-op (clipboard
+    ///    holds non-text content, e.g. an image — skip this tick).
+    /// 2. Compare to `clipboard_last_text`. Equal → no-op.
+    /// 3. SHA-256 the text. If the hash is in the LRU → no-op
+    ///    (loopback defence: this hash was *we* who wrote it
+    ///    recently; pushing it again is wasted work).
+    /// 4. Mark LRU, update `last_text`, broadcast `ClipboardText` to
+    ///    every active peer with `enable_clipboard_to = true`,
+    ///    push `FrontendEvent::ClipboardState { last_source: None }`.
+    ///
+    /// **Why a 500 ms tick**: matches PLAN §3 M1a "macOS 实现
+    /// ... 500ms tick" / "Linux 500 ms tick" cadence. Fast enough
+    /// to feel instant to a user copying text; slow enough that the
+    /// backend read (1-3 ms for pbcopy / xclip / NSPasteboard) is
+    /// negligible.
+    ///
+    /// **Why we don't drop the read on a hash match**: the LRU
+    /// check happens *after* the read because the read is what
+    /// surfaces the new text — there's no way to detect "the
+    /// clipboard changed" without reading it. The hash check is
+    /// the *dedup* layer: it prevents re-broadcasting a value we
+    /// already broadcast this minute.
+    async fn handle_clipboard_tick(&mut self) {
+        let Some(backend) = self.clipboard_backend.as_mut() else {
+            return;
+        };
+        let new_text = match backend.current_text() {
+            Some(t) => t,
+            None => return,
+        };
+        if Some(&new_text) == self.clipboard_last_text.as_ref() {
+            return;
+        }
+        let sha = sha256_of(&new_text);
+        if self.clipboard_lru.contains(&sha) {
+            // Loopback — the LRU already holds this hash (e.g. we
+            // just applied an inbound `set_text` that wrote this
+            // value). Do not re-broadcast.
+            self.clipboard_last_text = Some(new_text);
+            return;
+        }
+        // New content — mark + broadcast.
+        self.clipboard_lru.push(sha);
+        self.clipboard_last_text = Some(new_text.clone());
+        let event = ProtoEvent::ClipboardText(ClipboardText {
+            fingerprint: sha,
+            sha256: sha,
+            size: new_text.len() as u64,
+            // **M1a inline-only**: ≤ 1 KiB carried inline. Larger
+            // payloads (M1b) would set `content_inline: None` and
+            // rely on the HTTP/3 GET path. The `if let Some(content)`
+            // is defensive: a clipboard value > 1 KiB would still be
+            // pushed inline, but the receiver's `route_input` would
+            // route the var-codec event to StreamC regardless of size.
+            content_inline: Some(new_text.into_bytes()),
+        });
+        self.broadcast_clipboard_event(event).await;
+        let now_ms = unix_now_ms();
+        self.last_text_ts_ms = Some(now_ms);
+        self.last_clipboard_source = None;
+        self.notify_frontend(FrontendEvent::ClipboardState {
+            last_text_ts: self.last_text_ts_ms,
+            last_image_ts: self.last_image_ts_ms,
+            last_file_ts: self.last_file_ts_ms,
+            last_source: None,
+        });
+    }
+
+    /// **PLAN-2 / M1a STEP-1a.4** — inbound `ClipboardText` from a
+    /// peer (server or client side, see the field doc on
+    /// `clipboard_inbound_rx`).
+    ///
+    /// Steps:
+    /// 1. Drop the event if the LRU already holds the fingerprint
+    ///    (loopback — we just wrote this content locally and a
+    ///    peer's echo made it back).
+    /// 2. Apply the inline bytes to the local OS clipboard via
+    ///    `backend.set_text` (or skip if the payload is
+    ///    `content_inline = None` — M1a only supports the inline
+    ///    path; M1b adds the HTTP/3 GET fallback).
+    /// 3. Mark LRU, update `last_text` (force re-read on the next
+    ///    tick so the broadcast loop sees the new value and
+    ///    de-dups).
+    /// 4. Notify the frontend with `last_source: Some(<addr>)` so
+    ///    the GUI can render the "clipboard was just changed by
+    ///    <peer>" amber highlight (PLAN §3 M4 STEP-4.4 preview).
+    fn handle_clipboard_inbound(&mut self, (addr, event): (SocketAddr, ProtoEvent)) {
+        let Some(backend) = self.clipboard_backend.as_mut() else {
+            return;
+        };
+        let ProtoEvent::ClipboardText(ct) = event else {
+            // Only text is wired in M1a. Image / Files / FileTransfer
+            // events flow through `clipboard_inbound_rx` once M2a /
+            // M3a wire their own inbound arms in the dispatcher.
+            return;
+        };
+        if self.clipboard_lru.contains(&ct.sha256) {
+            log::debug!(
+                "clipboard inbound: skipping loopback sha={}",
+                short_hex(&ct.sha256)
+            );
+            return;
+        }
+        let content = match &ct.content_inline {
+            Some(bytes) => bytes,
+            None => {
+                // M1a limitation: metadata-only (no inline) payloads
+                // can't be applied without the HTTP/3 GET path which
+                // is M1b. Log + skip; the receiver's clipboard
+                // remains on the pre-push value.
+                log::warn!(
+                    "clipboard inbound: sha={} has no inline payload (M1a only supports ≤ 1 KiB inline); skipping",
+                    short_hex(&ct.sha256)
+                );
+                return;
+            }
+        };
+        // Apply to the local OS clipboard. The text is UTF-8 by
+        // wire convention; if a peer sent non-UTF-8 bytes (corrupt
+        // / older daemon) the lossy replace keeps the daemon from
+        // panicking — the user will see replacement characters.
+        let text = String::from_utf8_lossy(content);
+        if let Err(e) = backend.set_text(&text) {
+            log::warn!("clipboard inbound: set_text failed: {e}");
+            return;
+        }
+        self.clipboard_lru.push(ct.sha256);
+        // Force the next tick to re-read so `last_text` updates to
+        // the freshly-written value; otherwise a stale `last_text`
+        // would suppress the change-detection that triggers
+        // `set_text` on the next inbound push with identical text
+        // (an edge case, but the dispatcher must be correct).
+        self.clipboard_last_text = None;
+        let now_ms = unix_now_ms();
+        self.last_text_ts_ms = Some(now_ms);
+        self.last_clipboard_source = Some(addr);
+        self.notify_frontend(FrontendEvent::ClipboardState {
+            last_text_ts: self.last_text_ts_ms,
+            last_image_ts: self.last_image_ts_ms,
+            last_file_ts: self.last_file_ts_ms,
+            last_source: Some(format!("{addr}")),
+        });
+        log::info!(
+            "clipboard inbound: applied {} bytes from {addr} (sha={})",
+            content.len(),
+            short_hex(&ct.sha256)
+        );
+    }
+
+    /// **PLAN-2 / M1a STEP-1a.4** — broadcast a clipboard event to
+    /// every active peer with `enable_clipboard_to = true`.
+    ///
+    /// Fire-and-forget: `Capture::send_event` queues the request on
+    /// the capture task's `request_tx`; the actual `conn.send`
+    /// happens off-thread. Per-peer send failures (peer
+    /// disconnected mid-tick) are logged at `warn` inside
+    /// `CaptureTask` but do not propagate here.
+    async fn broadcast_clipboard_event(&self, event: ProtoEvent) {
+        for (handle, cfg, state) in self.client_manager.get_client_states() {
+            if !cfg.enable_clipboard_to {
+                continue;
+            }
+            if !state.active {
+                continue;
+            }
+            if state.active_addr.is_none() {
+                continue;
+            }
+            self.capture.send_event(event.clone(), handle);
+        }
+    }
+}
+
+/// **PLAN-2 / M1a STEP-1a.4** — SHA-256 → `[u8; 32]` helper.
+/// The clipboard dispatcher's fingerprint is the SHA-256 of the
+/// text bytes (the same value the receiver uses as `ClipboardText
+/// ::sha256`). A truncated 8-byte "fingerprint" is a M1b
+/// optimisation; M1a uses the full hash.
+fn sha256_of(text: &str) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    let out = hasher.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&out);
+    arr
+}
+
+/// Compact hex prefix for log lines (first 4 bytes = 8 hex chars).
+fn short_hex(b: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(8);
+    for byte in &b[..4] {
+        s.push_str(&format!("{:02x}", byte));
+    }
+    s
+}
+
+/// **PLAN-2 / M1a STEP-1a.4** — milliseconds since the UNIX
+/// epoch. Used for the `last_text_ts` / `last_image_ts` /
+/// `last_file_ts` fields of `FrontendEvent::ClipboardState`.
+/// Returns `0` on clock-read failure (the dispatch loop will
+/// still publish a state event; the frontend treats 0 as "epoch"
+/// which is well-defined if unusual).
+fn unix_now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// **STEP-M2-2.6**: pure helper that turns an internal
