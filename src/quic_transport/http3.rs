@@ -707,24 +707,52 @@ impl Http3Client {
 // Server / client builder interfaces (PLAN §3 M0b STEP-0.2 产物)
 // ---------------------------------------------------------------------------
 
+/// Maximum concurrent in-flight HTTP/3-lite requests per peer.
+///
+/// Validated by STEP-VALIDATION-P2-M0b P2.2: an unbounded `tokio::spawn`
+/// per `accept_bi` lets a misbehaving peer open thousands of streams
+/// to exhaust memory. 32 is well above the documented M3a peak
+/// (1 file transfer + 1 clipboard-image pull + ~5 health-check retries
+/// from a typical GUI session) while still capping a malicious peer
+/// at a manageable backlog.
+const MAX_INFLIGHT_REQUESTS_PER_PEER: usize = 32;
+
 /// Build a server-side driver closure that accepts bidi streams on
 /// `conn`, dispatches each request through the router, and writes the
 /// response back.
 ///
 /// Each accepted stream runs in its own `tokio::spawn` task — the
 /// accept loop is non-blocking and continues to accept new streams
-/// while existing requests are still in flight.
+/// while existing requests are still in flight. The semaphore caps
+/// concurrent in-flight requests at [`MAX_INFLIGHT_REQUESTS_PER_PEER`];
+/// excess accepted streams still spawn the task but park on
+/// `semaphore.acquire().await` until a slot frees. New streams opened
+/// by the peer while we are saturated will queue at the QUIC layer
+/// (which has its own flow-control window); we never reject outright.
 pub fn build_server(
     router: Arc<Router>,
 ) -> impl Fn(Connection) -> futures::future::BoxFuture<'static, ()> + Send + Sync + Clone {
     move |conn: Connection| {
         let router = router.clone();
         Box::pin(async move {
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_REQUESTS_PER_PEER));
             loop {
                 match conn.accept_bi().await {
                     Ok((mut send, mut recv)) => {
                         let router = router.clone();
+                        let semaphore = semaphore.clone();
                         tokio::spawn(async move {
+                            // Acquire a slot before doing any work — this is
+                            // what bounds the in-flight count. The permit
+                            // is released when the task ends (drop semantics
+                            // of the RAII guard).
+                            let _permit = match semaphore.acquire_owned().await {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    // semaphore closed => server shutting down
+                                    return;
+                                }
+                            };
                             // Best-effort: surface protocol errors as a 400.
                             // Mid-stream cancellation or connection drop
                             // surfaces as `Err` we log-and-return.
