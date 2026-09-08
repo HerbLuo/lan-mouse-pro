@@ -86,11 +86,14 @@ impl StreamPair {
 /// keyboard config as well; see the implementation notes on
 /// `route_input`).
 ///
-/// **StreamC** — QUIC reliable bidi stream reserved for clipboard meta.
-/// Currently no events are routed to StreamC (every existing event maps
-/// to the first three variants); once M2 introduces
-/// `ProtoEvent::Clipboard` / `Input(ClipboardEvent)` an additional
-/// branch will be added.
+/// **StreamC** — QUIC reliable bidi stream reserved for clipboard
+/// metadata + file-transfer offers/cancels. Introduced by M0a (PLAN-2):
+/// `route_input` arm (5) routes all 7 new var-codec variants
+/// (`ClipboardText` / `ClipboardImage` / `ClipboardFiles` /
+/// `FileTransferOffer` / `FileTransferResponse` / `FileTransferCancel` /
+/// `ClipboardRequest`) to `Channel::StreamC`. The actual StreamC
+/// reader is wired up in M0c STEP-0.5b; until then `send_input` returns
+/// `Err(HelloFailed("stream C is M0c-only …"))`.
 ///
 /// **Derives**: `Debug / Clone / Copy / PartialEq / Eq`. `Copy` is sound
 /// because all four variants are zero-sized. `Hash` is intentionally
@@ -119,7 +122,7 @@ pub enum Channel {
 /// | `Input(Keyboard::Key)` | `Datagram` or `StreamB` | per `cfg.keyboard` |
 /// | `Input(Keyboard::Modifiers)` | `Datagram` or `StreamB` | per `cfg.keyboard` (**critical**: must share the channel with `Key` so the modifier bitmask and key events stay in sync) |
 /// | `Enter` / `Leave` / `Ack` / `Hello` / `Ping` / `Pong` | `StreamA` | **Always** — control flow |
-/// | (M2 scope, not yet emitted) `Clipboard` etc. | `StreamC` | added when M2 introduces the variant |
+/// | `ClipboardText` / `ClipboardImage` / `ClipboardFiles` / `FileTransferOffer` / `FileTransferResponse` / `FileTransferCancel` / `ClipboardRequest` (M0a) | `StreamC` | **Always** — clipboard meta + file-transfer (M0a var-codec; M0c wires reader) |
 ///
 /// **Why Motion / Axis / AxisDiscrete120 are always Datagram**: these
 /// high-frequency inputs should not pay the Stream retransmission cost
@@ -136,12 +139,13 @@ pub enum Channel {
 /// `mouse_button` and `keyboard`, so having Modifiers follow `keyboard`
 /// is the natural contract.
 ///
-/// **Why Channel::StreamC has no routing rule**: M1 does not introduce
-/// `ProtoEvent::Clipboard` / `Input(ClipboardEvent)`, and the upstream
-/// `ProtoEvent` enum does not contain those variants either. The match
-/// is exhaustive, so no `_ => unreachable!()` arm is required — every one
-/// of the current eight `ProtoEvent` variants is listed explicitly, and
-/// any M2 variant will produce a compile error reminding us to add the
+/// **Why Channel::StreamC routing was added in M0a**: PLAN-2 / M0a
+/// introduced 7 new var-codec variants (`ClipboardText` etc.) that are
+/// unsuitable for the fixed-size hot path and unfit for stream A
+/// (avoids `EventType::try_from(InvalidEventId)` on legacy daemons,
+/// per PLAN §0 评审 #1). The match in `route_input` is exhaustive on
+/// all 14 `ProtoEvent` variants, so adding a new variant in a future
+/// milestone will produce a compile error reminding us to add the
 /// missing arm.
 #[allow(dead_code)]
 pub fn route_input(cfg: &InputChannelConfig, event: &ProtoEvent) -> Channel {
