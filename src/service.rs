@@ -459,7 +459,17 @@ impl Service {
             ICaptureEvent::CaptureBegin(handle) => {
                 // we entered the capture zone for an incoming connection
                 // => notify it that its capture should be released
+                // [debug(temp):H1] reverse-Enter race diagnosis — log lookup
+                // result so we can see whether handle routes correctly and
+                // whether incoming_conn_info is populated when CaptureBegin
+                // arrives.
+                log::trace!(
+                    "debug(temp) CaptureBegin handle={handle} incoming_conn_info_keys={:?} lookup={:?}",
+                    self.incoming_conn_info.keys().collect::<Vec<_>>(),
+                    self.incoming_conn_info.get(&handle).map(|i| i.addr),
+                );
                 if let Some(incoming) = self.incoming_conn_info.get(&handle) {
+                    log::trace!("debug(temp) send_leave_event -> addr={}", incoming.addr);
                     self.emulation.send_leave_event(incoming.addr);
                 }
             }
@@ -571,6 +581,15 @@ impl Service {
         // defaults; M3+ will lift the field to come from the frontend.
         let key = crate::capture::to_capture_pos(pos);
         let key = input_capture::BarrierKey::from_pos(key);
+        // [debug(temp):H1] reverse-Enter race diagnosis — log at entry so we
+        // can correlate the handle we just minted with the CaptureBegin we
+        // expect to receive later (and verify there's no stale handle in
+        // incoming_conn_info / incoming_conns when Enter races).
+        log::trace!(
+            "debug(temp) add_incoming ENTRY addr={addr:?} pos={pos:?} new_handle={handle} \
+             incoming_conns_before={:?}",
+            self.incoming_conns,
+        );
         self.capture.create(handle, &key, CaptureType::EnterOnly);
         self.incoming_conns.insert(addr);
         self.incoming_conn_info.insert(
@@ -581,6 +600,8 @@ impl Service {
                 pos,
             },
         );
+        // [debug(temp):H1] post-insert — confirms handle/key were recorded.
+        log::trace!("debug(temp) add_incoming POST-INSERT handle={handle} key={key:?}");
     }
 
     fn update_incoming(&mut self, addr: SocketAddr, pos: Position, fingerprint: String) {

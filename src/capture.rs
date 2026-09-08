@@ -1594,6 +1594,13 @@ impl CaptureTask {
         self.state = State::Idle;
 
         log::info!("release_capture: calling capture.release() (OS-level release)");
+        // [debug(temp):H3] reverse-Enter race diagnosis — log so we can
+        // verify the release_capture -> Capture::release -> spawn_local ->
+        // ProducerEvent::Release chain fires for the reverse-Enter case.
+        log::trace!(
+            "debug(temp) capture task forwarding Release to producer (handle={:?})",
+            self.active_client
+        );
         let res = capture.release().await;
         log::info!(
             "release_capture: capture.release() returned (ok={})",

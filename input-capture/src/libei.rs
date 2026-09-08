@@ -761,6 +761,18 @@ async fn do_capture_session(
                     let activated = activated.ok_or(CaptureError::ActivationClosed)?;
                     log::debug!("activated: {activated:?}");
 
+                    // [debug(temp):H4] reverse-Enter race diagnosis — log
+                    // every Activated event's barrier_id and cursor_position
+                    // so we can see whether the libei barrier actually fires
+                    // for the reverse direction (and whether cursor_position
+                    // routes to the correct barrier in the UnknownBarrier
+                    // KDE-plasma fallback path).
+                    let activated_barrier_id = activated.barrier_id();
+                    let activated_cursor_pos = activated.cursor_position();
+                    log::trace!(
+                        "debug(temp) libei Begin barrier={activated_barrier_id:?} position={activated_cursor_pos:?}"
+                    );
+
                     // get barrier id from activation
                     let barrier_id = match activated.barrier_id() {
                         Some(ActivatedBarrier::Barrier(id)) => id,
