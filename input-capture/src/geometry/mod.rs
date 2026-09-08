@@ -421,10 +421,36 @@ fn query_pure(
         span: 10000,
     };
     if clients.contains(&key) {
-        Some(key)
-    } else {
-        None
+        return Some(key);
     }
+    // H1 legacy fallback (STEP-M3-3.4-FIXUP): when the specific
+    // `monitor: Some(...)` key misses but `clients` does carry a
+    // legacy `monitor: None` entry for the same `pos`, hit that.
+    //
+    // Rationale: every backend's `displays` production path
+    // (`build_display_bounds` on macOS, `update_display_regions`
+    // on Windows) fills `monitor_id` as `Some(...)` 100% of the
+    // time, so the PLAN §3 STEP-3.4 "display.monitor_id == None →
+    // legacy lookup" invariant never fires in production. The real
+    // legacy-config signal lives client-side: `ClientConfig.monitor
+    // == None` (the default for legacy configs / dropdown not yet
+    // picked). Without this fallback, a legacy client's barrier
+    // trigger silently disappears (100% edge miss) after M3.4.
+    //
+    // Guarded by `key.monitor.is_some()` so we never pay the
+    // second HashSet probe when the containing display itself has
+    // no monitor id (the pre-fix fast path already handles that
+    // case via the `clients.contains(&key)` hit above).
+    if key.monitor.is_some() {
+        let legacy_key = BarrierKey {
+            monitor: None,
+            ..key
+        };
+        if clients.contains(&legacy_key) {
+            return Some(legacy_key);
+        }
+    }
+    None
 }
 
 /// Detect a barrier crossing and look up the matching **active**
@@ -446,8 +472,18 @@ fn query_pure(
 ///   that contains it under the half-open convention (right display
 ///   for `(1920.0, 540.0)` in a 2x1 horizontal pair)
 /// - `prev` outside every display → `None` (no edge attribution)
-/// - `monitor_id == None` on the containing display → legacy
-///   "monitor-agnostic" lookup; matches keys with `monitor: None`
+/// - `monitor_id == None` on the containing display → fast path:
+///   the query key already has `monitor: None` so the lookup is
+///   identical to the legacy "monitor-agnostic" form (matches
+///   active keys with `monitor: None`)
+/// - specific-key miss + `monitor: None` entry in `clients` →
+///   legacy fallback (STEP-M3-3.4-FIXUP, H1). The query key was
+///   built with the containing display's `monitor_id` (which is
+///   `Some(...)` in production) and didn't match; if `clients`
+///   carries a legacy `monitor: None` entry for the same `pos`,
+///   return it. This restores pre-M3.4 behavior for clients
+///   whose `ClientConfig.monitor` is `None` (the default for
+///   legacy configs / dropdown not yet picked).
 ///
 /// `clients.contains(&key)` decides the final hit / miss. `offset`
 /// / `span` are not parameterized in this entry point — M4
@@ -987,13 +1023,14 @@ mod tests {
 
     // ----- crossed_pure 4x2 matrix (M3 STEP-3.4) -----------------------
     //
-    // The four-by-two matrix the PLAN calls out for STEP-3.4:
+    // The four-by-two matrix the PLAN calls out for STEP-3.4
+    // (C3 updated by STEP-M3-3.4-FIXUP for the H1 legacy fallback):
     //
     //   | prev_pos              | curr_pos              | active key(s)                             | expected     |
     //   |-----------------------|----------------------|--------------------------------------------|--------------|
     //   | C1: display_0 center  | top of union         | monitor: Some(d0.id), pos: Top           | hit (d0)     |
     //   | C2: display_1 center  | top of union         | monitor: Some(d1.id), pos: Top           | hit (d1)     |
-    //   | C3: display_0 center  | top of union         | monitor: None, pos: Top  + d1's Top key | miss          |
+    //   | C3: display_0 center  | top of union         | monitor: None, pos: Top  (legacy only)   | hit (legacy) |
     //   | C4a: seam (1920,540)  | top of union         | monitor: Some(d0.id), pos: Top           | hit (d0)     |
     //   | C4b: seam (1920,540)  | top of union         | monitor: Some(d1.id), pos: Top           | miss          |
     //   | C5: outside all       | top of union         | monitor: Some(d0.id), pos: Top           | miss          |
@@ -1070,13 +1107,28 @@ mod tests {
         );
     }
 
-    /// C3: prev in display_0 center, curr crosses the union's top.
-    /// Active contains ONLY `Top @ None` (the legacy key shape) →
-    /// query key carries `monitor: Some("macos:d0")` so the legacy
-    /// key doesn't match → miss.
+    /// C3 (post-H1 / STEP-M3-3.4-FIXUP): prev in display_0 center,
+    /// curr crosses the union's top. Active contains ONLY
+    /// `Top @ None` (the legacy client shape — typical of legacy
+    /// configs / dropdown not yet picked).
     ///
-    /// This is the canonical "M3 dropdown selects a specific
-    /// monitor; legacy Top-only client should NOT fire" case.
+    /// Pre-H1 this case returned `None` because `query_pure`
+    /// constructed a query key with `monitor: Some("macos:d0")`
+    /// that never matched the legacy `monitor: None` entry — the
+    /// 100% silent edge-miss bug STEP-DEBUG-M3-BARRIER-CHAIN
+    /// §3 H1 documents.
+    ///
+    /// Post-H1 the legacy fallback in `query_pure` probes
+    /// `monitor: None` after the specific-key miss and finds the
+    /// hit → returns the legacy key. This restores pre-M3.4
+    /// behavior for legacy-config clients.
+    ///
+    /// The test name's "misses" prefix is a STEP-3.4-era artifact
+    /// (when the fixture asserted the buggy behavior); kept for
+    /// backwards compat with the C1-C8 matrix indexing in this
+    /// module's docstring. Companion test
+    /// `query_pure_falls_back_to_legacy_when_active_has_monitor_none`
+    /// pins the same scenario at the private-helper level.
     #[test]
     fn crossed_pure_c3_display0_top_misses_legacy_active() {
         let displays = layout_2x1_bound();
@@ -1089,7 +1141,15 @@ mod tests {
             span: 10000,
         });
         let got = crossed_pure((500.0, 500.0), (500.0, -2.0), &displays, &active);
-        assert_eq!(got, None);
+        assert_eq!(
+            got,
+            Some(BarrierKey {
+                pos: Position::Top,
+                monitor: None,
+                offset: 0,
+                span: 10000,
+            })
+        );
     }
 
     /// C4a: prev at the seam `(1920.0, 540.0)` — under the
@@ -1283,6 +1343,69 @@ mod tests {
         );
     }
 
+    /// Production-realistic regression guard for the H1 legacy
+    /// fallback (STEP-M3-3.4-FIXUP / STEP-DEBUG-M3-BARRIER-CHAIN
+    /// §3 H1).
+    ///
+    /// Fixture matches what the per-OS backends actually produce:
+    /// - `displays` carries `Some(macos:d0)` / `Some(macos:d1)` —
+    ///   exactly what `build_display_bounds` (macOS) and
+    ///   `update_display_regions` (Windows) emit. The vacuous
+    ///   `crossed_pure_monitor_id_none_uses_legacy_key` test
+    ///   above uses `None` here, but no production backend ever
+    ///   produces a `monitor_id = None` DisplayBound.
+    /// - `active` contains only a legacy `monitor: None` entry —
+    ///   exactly what `ClientConfig.monitor = None` writes into
+    ///   the active set (the default for legacy configs / dropdown
+    ///   not yet picked).
+    ///
+    /// Pre-H1 this returned `None`: the query key
+    /// `{ pos: Top, monitor: Some("macos:d0"), ... }` never
+    /// matched the legacy `monitor: None` entry, so every legacy
+    /// client's barrier trigger silently disappeared (the 100%
+    /// edge-miss bug). Post-H1 the legacy fallback in `query_pure`
+    /// probes `monitor: None` and returns the legacy key.
+    ///
+    /// Calls `query_pure` directly (it's a private helper in this
+    /// module) so the fallback path is exercised even if the
+    /// public `crossed_pure` / `activation_pure` wrappers change.
+    /// The companion tests `crossed_pure_c3` and
+    /// `activation_pure_w3` pin the same behavior at the public
+    /// entry-point level.
+    #[test]
+    fn query_pure_falls_back_to_legacy_when_active_has_monitor_none() {
+        // Production-realistic fixture: both displays carry
+        // `Some(macos:...)` monitor_ids, just like
+        // `build_display_bounds` produces in production.
+        let displays = layout_2x1_bound();
+        let mut active = HashSet::new();
+        // Production-realistic client: legacy config, monitor not
+        // picked. This is the default `ClientConfig.monitor = None`
+        // path for users on a legacy config or who haven't yet
+        // selected a monitor in the dropdown.
+        active.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: None,
+            offset: 0,
+            span: 10000,
+        });
+        // Mouse moves from inside display_0 to past the union's
+        // top edge. Pre-H1 this returned `None`; post-H1 it must
+        // return the legacy key.
+        let got = query_pure((500.0, 500.0), (500.0, -2.0), &displays, &active);
+        assert_eq!(
+            got,
+            Some(BarrierKey {
+                pos: Position::Top,
+                monitor: None,
+                offset: 0,
+                span: 10000,
+            }),
+            "query_pure must fall back to legacy `monitor: None` key \
+             when specific_key misses but active has a legacy entry"
+        );
+    }
+
     // ----- activation_pure 4x2 matrix (M3 STEP-3.5) -------------------
     //
     // The Windows `check_client_activation` analog. Mirrors the
@@ -1293,11 +1416,13 @@ mod tests {
     // seam cases share the same code path and are already covered
     // by `crossed_pure_c6` / `c4a` / `c4b`).
     //
+    // W3 updated by STEP-M3-3.4-FIXUP for the H1 legacy fallback.
+    //
     //   | prev_pos              | curr_pos              | active key(s)                | expected     |
     //   |-----------------------|-----------------------|------------------------------|--------------|
     //   | W1: display_0 center  | top of union          | monitor: Some(d0.id), Top    | hit (d0)     |
     //   | W2: display_1 center  | top of union          | monitor: Some(d1.id), Top    | hit (d1)     |
-    //   | W3: display_0 center  | top of union          | monitor: None, Top           | miss         |
+    //   | W3: display_0 center  | top of union          | monitor: None, Top (legacy)  | hit (legacy) |
     //   | W4: display_0 right   | right of union        | monitor: Some(d0.id), Right  | hit (d0)     |
     //   | W5: outside all       | top of union          | monitor: Some(d0.id), Top    | miss         |
     //   | W6: display_0 center  | top of union          | monitor: None, Top + d0.Top  | hit (d0)     |
@@ -1371,12 +1496,17 @@ mod tests {
         );
     }
 
-    /// W3: prev in display_0 center, curr crosses the union's top.
-    /// Active contains ONLY `Top @ None` (the legacy key shape) →
-    /// query key carries `monitor: Some("windows:...")` so the
-    /// legacy key doesn't match → miss. This is the canonical
-    /// "M3 dropdown selects a specific monitor; legacy Top-only
-    /// client should NOT fire" case on Windows.
+    /// W3 (post-H1 / STEP-M3-3.4-FIXUP): mirror of
+    /// `crossed_pure_c3` for the Windows `activation_pure` path.
+    /// Clients contains ONLY `Top @ None` (legacy). Pre-H1 this
+    /// returned `None` because the Windows-side `query_pure`
+    /// constructed `monitor: Some("windows:...")` that never
+    /// matched the legacy entry. Post-H1 the legacy fallback hits
+    /// the `monitor: None` entry → returns the legacy key.
+    ///
+    /// Test name kept for matrix-index compat (`activation_pure_w1-w6`
+    /// in module docstring); the "misses" prefix is a STEP-3.5-era
+    /// artifact.
     #[test]
     fn activation_pure_w3_display0_top_misses_legacy_clients() {
         let displays = layout_2x1_bound_windows();
@@ -1389,7 +1519,15 @@ mod tests {
             span: 10000,
         });
         let got = activation_pure((500.0, 500.0), (500.0, -2.0), &displays, &clients);
-        assert_eq!(got, None);
+        assert_eq!(
+            got,
+            Some(BarrierKey {
+                pos: Position::Top,
+                monitor: None,
+                offset: 0,
+                span: 10000,
+            })
+        );
     }
 
     /// W4: 2x1 right-cross from display_0. prev inside d0, curr
