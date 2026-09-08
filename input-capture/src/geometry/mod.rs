@@ -385,7 +385,56 @@ impl BarrierKey {
     }
 }
 
-/// Detect a barrier crossing and look up the matching client key.
+/// Shared backend-side query: detect a barrier crossing, look up
+/// the `monitor_id` for the display that contained `prev_pos`, and
+/// probe `clients` for the resulting [`BarrierKey`].
+///
+/// This is the private helper both [`crossed_pure`] (macOS
+/// STEP-3.4) and [`activation_pure`] (Windows STEP-3.5) call into.
+/// Extracting the shared logic lets the two backends stay in lock-
+/// step on the half-open containment rule, the seam-attribution
+/// convention, and the `monitor_id == None` fallback — drift
+/// between them is the precise regression the PLAN §M3 §5 calls
+/// out as a "100% edge miss" bug.
+///
+/// `prev_pos` outside every display, or no barrier crossed, both
+/// yield `None`; the caller is responsible for the post-processing
+/// (e.g. deciding whether a hit should start a pending handshake
+/// or set the active client).
+fn query_pure(
+    prev_pos: (f64, f64),
+    curr_pos: (f64, f64),
+    displays: &[DisplayBound],
+    clients: &HashSet<BarrierKey>,
+) -> Option<BarrierKey> {
+    // Project to DisplayRect for the geometry primitives. The slice
+    // is small (one entry per attached monitor, typically 1-4) and
+    // the helper is only called once per mouse-move barrier event,
+    // so the allocation cost is negligible.
+    let rects: Vec<DisplayRect> = displays.iter().map(|d| d.rect).collect();
+    let pos = entered_barrier(prev_pos, curr_pos, &rects)?;
+    let idx = display_containing_idx(&rects, prev_pos)?;
+    let key = BarrierKey {
+        pos,
+        monitor: displays[idx].monitor_id.clone(),
+        offset: 0,
+        span: 10000,
+    };
+    if clients.contains(&key) {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+/// Detect a barrier crossing and look up the matching **active**
+/// client key.
+///
+/// macOS (`crossed`) is the only backend that re-uses this entry
+/// point in STEP-3.4 — the active client set and the registered
+/// client set are the same `HashSet` there. The function is named
+/// `crossed_pure` for symmetry with the historical event-tap side
+/// (`crossed` / `entered_barrier` / `clamp_to_display_bounds`).
 ///
 /// Combines the M0 [`entered_barrier`] position detector with the
 /// per-display [`monitor_id`] lookup so the returned key has the
@@ -400,33 +449,49 @@ impl BarrierKey {
 /// - `monitor_id == None` on the containing display → legacy
 ///   "monitor-agnostic" lookup; matches keys with `monitor: None`
 ///
-/// `active.contains(&key)` decides the final hit / miss. `offset` /
-/// `span` are not parameterized in this entry point — M4
+/// `clients.contains(&key)` decides the final hit / miss. `offset`
+/// / `span` are not parameterized in this entry point — M4
 /// `activation_pure` will add them.
 pub fn crossed_pure(
     prev_pos: (f64, f64),
     curr_pos: (f64, f64),
     displays: &[DisplayBound],
-    active: &HashSet<BarrierKey>,
+    clients: &HashSet<BarrierKey>,
 ) -> Option<BarrierKey> {
-    // Project to DisplayRect for the geometry primitives. The slice
-    // is small (one entry per attached monitor, typically 1-4) and
-    // crossed_pure is only called once per mouse-move barrier event,
-    // so the allocation cost is negligible.
-    let rects: Vec<DisplayRect> = displays.iter().map(|d| d.rect).collect();
-    let pos = entered_barrier(prev_pos, curr_pos, &rects)?;
-    let idx = display_containing_idx(&rects, prev_pos)?;
-    let key = BarrierKey {
-        pos,
-        monitor: displays[idx].monitor_id.clone(),
-        offset: 0,
-        span: 10000,
-    };
-    if active.contains(&key) {
-        Some(key)
-    } else {
-        None
-    }
+    query_pure(prev_pos, curr_pos, displays, clients)
+}
+
+/// Detect a barrier crossing and look up the matching **registered**
+/// client key (the Windows `check_client_activation` analog).
+///
+/// Windows holds two separate sets: `CLIENTS` (everything that has
+/// ever been created via `Capture::create`) and `ACTIVE_CLIENT` /
+/// `PENDING_CLIENT` (the currently-bound one). The
+/// pending-handshake flow runs [`cursor_within`] on its own code
+/// path, so this helper deliberately only owns the "is the user
+/// crossing a registered barrier" piece. The hit/miss decision is
+/// identical to macOS — same half-open containment rule, same seam
+/// attribution, same `monitor_id == None` legacy fallback — but
+/// the function lives alongside [`crossed_pure`] so a future
+/// refactor that wants to differentiate the two callers (e.g.
+/// macOS checking the `active` set vs. Windows checking the
+/// `clients` set) can change the semantics here without touching
+/// the other backend.
+///
+/// The 6-case `activation_pure_4x2` matrix in the `tests` module
+/// pins the Windows contract: `prev_pos` in display_0 / display_1 /
+/// outside × `monitor: Some("win:...")` / `None` in the registered
+/// set. Every case asserts the query `BarrierKey` carries the
+/// correct `monitor` field — i.e. NOT hard-coded `None` like the
+/// pre-3.5 `check_client_activation` did. The test is the
+/// regression guard for the Windows "100% edge miss" bug.
+pub fn activation_pure(
+    prev_pos: (f64, f64),
+    curr_pos: (f64, f64),
+    displays: &[DisplayBound],
+    clients: &HashSet<BarrierKey>,
+) -> Option<BarrierKey> {
+    query_pure(prev_pos, curr_pos, displays, clients)
 }
 
 #[cfg(test)]
@@ -1215,6 +1280,192 @@ mod tests {
             Some(BarrierKey {
                 pos: Position::Top,
                 monitor: None,
+                offset: 0,
+                span: 10000,
+            })
+        );
+    }
+
+    // ----- activation_pure 4x2 matrix (M3 STEP-3.5) -------------------
+    //
+    // The Windows `check_client_activation` analog. Mirrors the
+    // `crossed_pure` 4x2 matrix but uses `windows:` ids instead of
+    // `macos:` and a tighter 6-case selection (Windows only
+    // exercises prev_pos in display_0 / display_1 / outside ×
+    // active `monitor: Some / None`; the 2-display intra-set and
+    // seam cases share the same code path and are already covered
+    // by `crossed_pure_c6` / `c4a` / `c4b`).
+    //
+    //   | prev_pos              | curr_pos              | active key(s)                | expected     |
+    //   |-----------------------|-----------------------|------------------------------|--------------|
+    //   | W1: display_0 center  | top of union          | monitor: Some(d0.id), Top    | hit (d0)     |
+    //   | W2: display_1 center  | top of union          | monitor: Some(d1.id), Top    | hit (d1)     |
+    //   | W3: display_0 center  | top of union          | monitor: None, Top           | miss         |
+    //   | W4: display_0 right   | right of union        | monitor: Some(d0.id), Right  | hit (d0)     |
+    //   | W5: outside all       | top of union          | monitor: Some(d0.id), Top    | miss         |
+    //   | W6: display_0 center  | top of union          | monitor: None, Top + d0.Top  | hit (d0)     |
+    //
+    // Every case asserts the query `BarrierKey` carries the correct
+    // `monitor` field — i.e. NOT hard-coded `None` like the pre-3.5
+    // `check_client_activation` did. The test is the regression
+    // guard for the Windows "100% edge miss" bug.
+
+    /// 2x1 horizontal layout as `DisplayBound` with Windows-style
+    /// ids (`windows:…`). Returns the two displays with stable ids
+    /// `d0` (left) and `d1` (right).
+    fn layout_2x1_bound_windows() -> Vec<DisplayBound> {
+        vec![
+            DisplayBound::new(
+                DisplayRect::new(0.0, 0.0, 1920.0, 1080.0),
+                Some(r"windows:MONITOR\GSM5B23\{abc-123}".into()),
+            ),
+            DisplayBound::new(
+                DisplayRect::new(1920.0, 0.0, 1920.0, 1080.0),
+                Some(r"windows:MONITOR\GSM5B23\{def-456}".into()),
+            ),
+        ]
+    }
+
+    /// W1: prev in display_0 center, curr crosses the union's top.
+    /// Active contains `Top @ d0.id` → hit with that key.
+    #[test]
+    fn activation_pure_w1_display0_top_hit() {
+        let displays = layout_2x1_bound_windows();
+        let mut clients = HashSet::new();
+        clients.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: Some(r"windows:MONITOR\GSM5B23\{abc-123}".into()),
+            offset: 0,
+            span: 10000,
+        });
+        let got = activation_pure((500.0, 500.0), (500.0, -2.0), &displays, &clients);
+        assert_eq!(
+            got,
+            Some(BarrierKey {
+                pos: Position::Top,
+                monitor: Some(r"windows:MONITOR\GSM5B23\{abc-123}".into()),
+                offset: 0,
+                span: 10000,
+            })
+        );
+    }
+
+    /// W2: prev in display_1 center, curr crosses the union's top.
+    /// Active contains `Top @ d1.id` → hit with that key.
+    #[test]
+    fn activation_pure_w2_display1_top_hit() {
+        let displays = layout_2x1_bound_windows();
+        let mut clients = HashSet::new();
+        clients.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: Some(r"windows:MONITOR\GSM5B23\{def-456}".into()),
+            offset: 0,
+            span: 10000,
+        });
+        let got = activation_pure((2500.0, 500.0), (2500.0, -2.0), &displays, &clients);
+        assert_eq!(
+            got,
+            Some(BarrierKey {
+                pos: Position::Top,
+                monitor: Some(r"windows:MONITOR\GSM5B23\{def-456}".into()),
+                offset: 0,
+                span: 10000,
+            })
+        );
+    }
+
+    /// W3: prev in display_0 center, curr crosses the union's top.
+    /// Active contains ONLY `Top @ None` (the legacy key shape) →
+    /// query key carries `monitor: Some("windows:...")` so the
+    /// legacy key doesn't match → miss. This is the canonical
+    /// "M3 dropdown selects a specific monitor; legacy Top-only
+    /// client should NOT fire" case on Windows.
+    #[test]
+    fn activation_pure_w3_display0_top_misses_legacy_clients() {
+        let displays = layout_2x1_bound_windows();
+        let mut clients = HashSet::new();
+        // Legacy single-edge client (M3 not yet selected a monitor)
+        clients.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: None,
+            offset: 0,
+            span: 10000,
+        });
+        let got = activation_pure((500.0, 500.0), (500.0, -2.0), &displays, &clients);
+        assert_eq!(got, None);
+    }
+
+    /// W4: 2x1 right-cross from display_0. prev inside d0, curr
+    /// past the union's right edge. Active contains
+    /// `Right @ d0.id` → hit.
+    #[test]
+    fn activation_pure_w4_display0_right_hit() {
+        let displays = layout_2x1_bound_windows();
+        let mut clients = HashSet::new();
+        clients.insert(BarrierKey {
+            pos: Position::Right,
+            monitor: Some(r"windows:MONITOR\GSM5B23\{abc-123}".into()),
+            offset: 0,
+            span: 10000,
+        });
+        let got = activation_pure((1900.0, 500.0), (3841.0, 500.0), &displays, &clients);
+        assert_eq!(
+            got,
+            Some(BarrierKey {
+                pos: Position::Right,
+                monitor: Some(r"windows:MONITOR\GSM5B23\{abc-123}".into()),
+                offset: 0,
+                span: 10000,
+            })
+        );
+    }
+
+    /// W5: prev outside every display → entered_barrier returns
+    /// None → directly miss. Mirrors `crossed_pure_c5`.
+    #[test]
+    fn activation_pure_w5_off_screen_is_miss() {
+        let displays = layout_2x1_bound_windows();
+        let mut clients = HashSet::new();
+        clients.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: Some(r"windows:MONITOR\GSM5B23\{abc-123}".into()),
+            offset: 0,
+            span: 10000,
+        });
+        let got = activation_pure((-100.0, 500.0), (-100.0, -2.0), &displays, &clients);
+        assert_eq!(got, None);
+    }
+
+    /// W6: prev in display_0, curr crosses top. Active contains
+    /// BOTH `monitor: None` Top (legacy) and `d0.id` Top (M3). The
+    /// query is d0.Top, so only d0's key matches → hit with d0.
+    /// Pins that the `monitor: Some` key always beats the legacy
+    /// `monitor: None` key when both are present (the M3 dropdown
+    /// "I want this monitor specifically" intent wins).
+    #[test]
+    fn activation_pure_w6_display0_top_picks_d0_over_none() {
+        let displays = layout_2x1_bound_windows();
+        let mut clients = HashSet::new();
+        // Legacy single-edge client (M3 not yet selected a monitor)
+        clients.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: None,
+            offset: 0,
+            span: 10000,
+        });
+        // M3 dropdown picked d0 specifically.
+        clients.insert(BarrierKey {
+            pos: Position::Top,
+            monitor: Some(r"windows:MONITOR\GSM5B23\{abc-123}".into()),
+            offset: 0,
+            span: 10000,
+        });
+        let got = activation_pure((500.0, 500.0), (500.0, -2.0), &displays, &clients);
+        assert_eq!(
+            got,
+            Some(BarrierKey {
+                pos: Position::Top,
+                monitor: Some(r"windows:MONITOR\GSM5B23\{abc-123}".into()),
                 offset: 0,
                 span: 10000,
             })

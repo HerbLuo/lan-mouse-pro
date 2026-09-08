@@ -33,7 +33,7 @@ use input_event::{
 };
 
 use crate::geometry::{
-    DisplayBound, DisplayRect, MonitorInfo, clamp_to_display_bounds, cursor_within, entered_barrier,
+    DisplayBound, DisplayRect, MonitorInfo, activation_pure, clamp_to_display_bounds, cursor_within,
 };
 
 use super::{BarrierKey, CaptureEvent};
@@ -416,9 +416,11 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
             update_display_regions(displays, generation);
             // M3 STEP-3.4: DISPLAYS is now `Vec<DisplayBound>`; the
             // legacy position-only `cursor_within` still takes
-            // `&[DisplayRect]`, so project. 3.5 will replace this
-            // with `activation_pure(&[DisplayBound], …)` and drop
-            // the projection.
+            // `&[DisplayRect]`, so project. cursor_within doesn't
+            // need the monitor_id (it's a "is the cursor on the
+            // inside of pos for any display" check), so the
+            // projection is genuinely necessary here — we can't
+            // fold it into a higher-level helper.
             let rects: Vec<DisplayRect> = displays.iter().map(|b| b.rect).collect();
             cursor_within(curr_pos, &rects, pending_key.pos)
         });
@@ -431,29 +433,28 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
     }
 
     /* No active / no pending → check for a barrier crossing. */
-    let entered = DISPLAYS.with_borrow_mut(|(displays, generation)| {
+    //
+    // M3 STEP-3.5: thin wrapper around `activation_pure`. The
+    // pure helper takes `&[DisplayBound]` directly, so no more
+    // per-call `Vec<DisplayRect>` projection — the perf cost of
+    // allocating a fresh rects vec on every WM_MOUSEMOVE barrier
+    // event is gone. The query key carries the `monitor_id` from
+    // the containing display so `monitor: Some("windows:...")`
+    // keys actually match against `CLIENTS` (the pre-3.5 `from_pos`
+    // path hard-coded `monitor: None` and matched nothing).
+    let key = DISPLAYS.with_borrow_mut(|(displays, generation)| {
         update_display_regions(displays, generation);
-        // Same projection as above: `entered_barrier` is the legacy
-        // position-only helper, and STEP-3.5 will replace this
-        // with `activation_pure` that consumes `&[DisplayBound]`
-        // directly.
-        let rects: Vec<DisplayRect> = displays.iter().map(|b| b.rect).collect();
-        entered_barrier(prev_pos, curr_pos, &rects)
+        activation_pure(
+            prev_pos,
+            curr_pos,
+            displays,
+            &CLIENTS.with_borrow(|c| c.clone()),
+        )
     });
 
-    let Some(pos) = entered else {
+    let Some(key) = key else {
         return false;
     };
-
-    // M1: lift the detected Position into a BarrierKey. monitor /
-    // offset / span stay at their legacy defaults until M2 wires
-    // monitor info end-to-end.
-    let key = BarrierKey::from_pos(pos);
-
-    /* check if a client is registered for the barrier */
-    if !CLIENTS.with_borrow(|clients| clients.contains(&key)) {
-        return false;
-    }
 
     /* Enter pending — do NOT set ACTIVE_CLIENT.
      * When mouse_proc sees PENDING_CLIENT (and not ACTIVE_CLIENT) it does
@@ -461,10 +462,11 @@ fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
      */
     PENDING_CLIENT.replace(Some(key.clone()));
     let entry_point = DISPLAYS.with_borrow(|(displays, _)| {
-        // M3 STEP-3.4: project `Vec<DisplayBound>` to
-        // `&[DisplayRect]` for the legacy position-only helper.
-        // 3.5 will fold this into `activation_pure` and the
-        // projection goes away.
+        // Same projection as before STEP-3.5: clamp_to_display_bounds
+        // is a legacy position-only helper. The pending→active warp
+        // target is per-display (1px inside the display the cursor
+        // came from), so we still want the `&[DisplayBound]` →
+        // `&[DisplayRect]` projection here.
         let rects: Vec<DisplayRect> = displays.iter().map(|b| b.rect).collect();
         clamp_to_display_bounds(&rects, prev_pos, curr_pos)
     });

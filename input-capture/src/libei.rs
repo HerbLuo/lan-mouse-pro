@@ -90,6 +90,20 @@ fn pos_to_barrier(r: &Region, pos: Position) -> (i32, i32, i32, i32) {
     }
 }
 
+/// Build the per-region tuple vec consumed by the pure
+/// [`select_barriers`]. Each tuple is `(width, height, x_offset,
+/// y_offset)` — matches the field order on ashpd's `Region` so
+/// reading the call site is symmetric with the live portal call.
+///
+/// Used by [`update_barriers`] to project the live `Zones` handle
+/// into the fixture shape the pure helper accepts.
+fn regions_to_tuples(regions: &[Region]) -> Vec<(u32, u32, i32, i32)> {
+    regions
+        .iter()
+        .map(|r| (r.width(), r.height(), r.x_offset(), r.y_offset()))
+        .collect()
+}
+
 // ===== Monitor enumeration helpers (STEP-2.4) =====
 //
 // Pure functions that turn the libei portal's `Zones.regions()`
@@ -242,8 +256,38 @@ impl From<ICBarrier> for Barrier {
     }
 }
 
+/// Compute the barriers to feed into EIS `set_pointer_barriers` for
+/// the given `(width, height, x_offset, y_offset)` regions and
+/// clients.
+///
+/// Each client produces one `ICBarrier` per region (the portal
+/// does not support sub-region / sub-edge barriers — see
+/// PLAN §M4 STEP-4.5). The `(BarrierID → BarrierKey)` map mirrors
+/// the barrier list back to the client key so the
+/// `do_capture_session` activation-handshake path can map an
+/// incoming `Activated::barrier_id` back to the client.
+///
+/// **M3 STEP-3.5 refactor**: this used to take `&Zones` and
+/// iterate `zones.regions()` directly. The refactor splits the
+/// helper into a pure part (this function, takes a tuple vec
+/// fixture) and a thin wrapper (`update_barriers`, projects the
+/// live `Zones` into the tuple vec) so the regression test for
+/// "monitor field round-trips through select_barriers" can be
+/// driven with a hand-built tuple vec rather than requiring a
+/// live portal. libei's `Region` and `Zones` are both
+/// borrowed zvariant handles with no public constructor, so
+/// unit-testing through them was previously impossible.
+///
+/// **Sanity-tested contract**: each input client produces exactly
+/// one `ICBarrier` per region, and every entry in the resulting
+/// `key_for_barrier` map carries the *full* `BarrierKey` (including
+/// the `monitor` field) — i.e. we don't accidentally rebuild via
+/// `from_pos` and drop the monitor dimension the way the macOS /
+/// Windows backends did pre-3.4 / pre-3.5. libei is naturally
+/// immune to that bug because it hands the whole `active_clients`
+/// vec to EIS without a rebuild step; this test pins that behavior.
 fn select_barriers(
-    zones: &Zones,
+    regions: &[(u32, u32, i32, i32)],
     clients: &[BarrierKey],
     next_barrier_id: &mut NonZeroU32,
 ) -> (Vec<ICBarrier>, HashMap<BarrierID, BarrierKey>) {
@@ -251,20 +295,21 @@ fn select_barriers(
     let mut barriers: Vec<ICBarrier> = vec![];
 
     for key in clients {
-        let mut client_barriers = zones
-            .regions()
-            .iter()
-            .map(|r| {
-                let id = *next_barrier_id;
-                *next_barrier_id = next_barrier_id
-                    .checked_add(1)
-                    .expect("barrier id out of range");
-                let position = pos_to_barrier(r, key.pos);
-                key_for_barrier.insert(id, key.clone());
-                ICBarrier::new(id, position)
-            })
-            .collect();
-        barriers.append(&mut client_barriers);
+        for &(w, h, x, y) in regions {
+            let id = *next_barrier_id;
+            *next_barrier_id = next_barrier_id
+                .checked_add(1)
+                .expect("barrier id out of range");
+            let (w_i, h_i) = (w as i32, h as i32);
+            let position = match key.pos {
+                Position::Left => (x, y, x, y + h_i - 1),
+                Position::Right => (x + w_i, y, x + w_i, y + h_i - 1),
+                Position::Top => (x, y, x + w_i - 1, y),
+                Position::Bottom => (x, y + h_i, x + w_i - 1, y + h_i),
+            };
+            key_for_barrier.insert(id, key.clone());
+            barriers.push(ICBarrier::new(id, position));
+        }
     }
     (barriers, key_for_barrier)
 }
@@ -281,7 +326,13 @@ async fn update_barriers(
         .response()?;
     log::debug!("zones: {zones:?}");
 
-    let (barriers, id_map) = select_barriers(&zones, active_clients, next_barrier_id);
+    // STEP-3.5: project the live `Zones` handle into the pure
+    // tuple shape `select_barriers` accepts. The wrapper exists so
+    // unit tests can drive the barrier-selection logic without a
+    // live portal — `Region` / `Zones` are borrowed zvariant
+    // handles with no public constructor.
+    let regions = regions_to_tuples(zones.regions());
+    let (barriers, id_map) = select_barriers(&regions, active_clients, next_barrier_id);
     log::debug!("barriers: {barriers:?}");
     log::debug!("client for barrier id: {id_map:?}");
 
@@ -972,8 +1023,8 @@ impl Stream for LibeiInputCapture {
 #[cfg(test)]
 mod tests {
     use super::{
-        LibeiZoneInfo, build_monitor_info_list, build_stable_id, compute_scale, pick_primary,
-        publish_monitors_if_changed,
+        BarrierKey, LibeiZoneInfo, Position, build_monitor_info_list, build_stable_id,
+        compute_scale, pick_primary, publish_monitors_if_changed, select_barriers,
     };
     use crate::geometry::MonitorInfo;
 
@@ -1275,5 +1326,124 @@ mod tests {
             !rx.has_changed().unwrap(),
             "monitors_tx must not be notified on fetch error"
         );
+    }
+
+    // ===== STEP-3.5 libei barrier-selection regression test ========
+    //
+    // PLAN §M3 STEP-3.5 + §8 row "select_barriers_with_monitor_field":
+    //
+    //   regions = vec![(1920, 1080, 1920, 0)]   // 2x1 right screen
+    //   clients = vec![
+    //     BarrierKey { monitor: Some("region-1"), pos: Top, ... },
+    //     BarrierKey { monitor: None,            pos: Top, ... },
+    //   ]
+    //   => barriers.len() == 2
+    //      key_for_barrier map contains BOTH keys (monitor: Some AND None)
+    //
+    // libei is "naturally immune" to the M3 monitor-field bug — the
+    // backend hands the whole `active_clients` vec to EIS without
+    // rebuilding a query key — but pinning the behavior with an
+    // explicit test prevents a future refactor (e.g. an over-zealous
+    // `from_pos(key.pos)` normalization) from regressing the
+    // back-compat path that legacy `monitor: None` clients depend
+    // on.
+
+    /// 2x1 horizontal right-screen fixture: 1920x1080 at x=1920
+    /// (i.e. the right half of a 2x1 layout whose left screen sits
+    /// at x=0).
+    fn regions_2x1_right_screen() -> Vec<(u32, u32, i32, i32)> {
+        vec![(1920, 1080, 1920, 0)]
+    }
+
+    /// Sanity-test the new signature: full BarrierKey payloads
+    /// (including `monitor: Some(...)`) round-trip through
+    /// `select_barriers` into the `key_for_barrier` map. libei is
+    /// naturally immune to the M3 monitor-field bug; this test
+    /// pins the behavior so it stays that way.
+    #[test]
+    fn select_barriers_with_monitor_field() {
+        let regions = regions_2x1_right_screen();
+        let clients = vec![
+            BarrierKey {
+                pos: Position::Top,
+                monitor: Some("region-1".to_string()),
+                offset: 0,
+                span: 10000,
+            },
+            BarrierKey {
+                pos: Position::Top,
+                monitor: None,
+                offset: 0,
+                span: 10000,
+            },
+        ];
+        let mut next_id = NonZeroU32::new(1).expect("id must be non-zero");
+        let (barriers, key_for_barrier) = select_barriers(&regions, &clients, &mut next_id);
+
+        // 1 client × 1 region = 1 barrier per client; 2 clients → 2
+        // barriers total. libei does not currently produce
+        // sub-region barriers (PLAN §M4 STEP-4.5).
+        assert_eq!(
+            barriers.len(),
+            2,
+            "expected 2 barriers (one per client per region), got {barriers:?}"
+        );
+
+        // The id map MUST contain BOTH client keys with their full
+        // payloads (i.e. monitor fields preserved, not stripped).
+        // If a future refactor introduces a `from_pos(key.pos)`
+        // rebuild that drops the monitor field, this assertion fires.
+        let mapped_keys: Vec<BarrierKey> = key_for_barrier.values().cloned().collect();
+        assert!(
+            mapped_keys
+                .iter()
+                .any(|k| k.monitor.as_deref() == Some("region-1")),
+            "key_for_barrier must contain the monitor=Some(...) key; got {mapped_keys:?}"
+        );
+        assert!(
+            mapped_keys.iter().any(|k| k.monitor.is_none()),
+            "key_for_barrier must contain the monitor=None key (legacy back-compat); got {mapped_keys:?}"
+        );
+        assert_eq!(
+            mapped_keys.len(),
+            2,
+            "key_for_barrier map must have exactly 2 entries (one per client)"
+        );
+
+        // Belt-and-braces: barrier ids are unique, contiguous, and
+        // start at the seed.
+        let ids: Vec<u32> = barriers.iter().map(|b| b.barrier_id.get()).collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    /// Empty regions + non-empty clients → empty barriers (no
+    /// barriers to attach to). Pins the edge case so a future
+    /// refactor that adds a panic-on-empty or similar doesn't slip
+    /// in.
+    #[test]
+    fn select_barriers_empty_regions_yields_empty_barriers() {
+        let regions: Vec<(u32, u32, i32, i32)> = vec![];
+        let clients = vec![BarrierKey {
+            pos: Position::Top,
+            monitor: Some("region-1".to_string()),
+            offset: 0,
+            span: 10000,
+        }];
+        let mut next_id = NonZeroU32::new(1).expect("id must be non-zero");
+        let (barriers, key_for_barrier) = select_barriers(&regions, &clients, &mut next_id);
+        assert!(barriers.is_empty());
+        assert!(key_for_barrier.is_empty());
+    }
+
+    /// Empty clients + non-empty regions → empty barriers (no
+    /// active clients to attach). Mirror of the empty-regions case.
+    #[test]
+    fn select_barriers_empty_clients_yields_empty_barriers() {
+        let regions = regions_2x1_right_screen();
+        let clients: Vec<BarrierKey> = vec![];
+        let mut next_id = NonZeroU32::new(1).expect("id must be non-zero");
+        let (barriers, key_for_barrier) = select_barriers(&regions, &clients, &mut next_id);
+        assert!(barriers.is_empty());
+        assert!(key_for_barrier.is_empty());
     }
 }
