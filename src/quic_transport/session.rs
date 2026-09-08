@@ -32,7 +32,7 @@ type OutgoingEvent = (std::net::SocketAddr, ProtoEvent);
 type OutgoingEventSender = tokio_mpsc::UnboundedSender<OutgoingEvent>;
 
 use tokio::sync::{Mutex, mpsc as tokio_mpsc};
-use tokio::task::spawn_local;
+use tokio::task::{JoinHandle, spawn_local};
 
 use lan_mouse_ipc::InputChannelConfig;
 use lan_mouse_proto::ProtoEvent;
@@ -716,6 +716,41 @@ impl PeerSession {
     pub(crate) async fn set_stream_bunch(&self, bunch: StreamBunch) {
         let mut g = self.stream_bunch.lock().await;
         *g = Some(bunch);
+    }
+
+    /// Spawn the HTTP/3-lite server on this peer session's underlying
+    /// QUIC `Connection`. Returns the `JoinHandle` for testability / abort.
+    ///
+    /// **Server-side only**: the caller's responsibility to gate by
+    /// `PeerRole`. The client side should use
+    /// [`super::http3::Http3Client`] instead, which issues GETs against a
+    /// remote peer.
+    ///
+    /// **Why a separate method (not inside `peer.run`)**: the server-side
+    /// supervisor in `src/listen.rs::handle_quic_peer_supervisor`
+    /// does **not** call `peer.run(Server)` — it manages stream A + the
+    /// accept_bi loop directly. The client side does call
+    /// `peer.run(Client)` via `connect.rs::spawn_peer_supervisor`, but
+    /// server-side wiring happens through `listen.rs`, not through
+    /// `peer.run`. By exposing the http3 spawn as a method on
+    /// `PeerSession`, both `listen.rs` (today) and any future
+    /// unification that does call `peer.run(Server)` (later) share the
+    /// same code path.
+    ///
+    /// **Lifecycle**: the spawned task runs until the underlying
+    /// `Connection` closes (`accept_bi()` returns `Err`) or the runtime
+    /// shuts down. The JoinHandle lets the caller `abort()` for fast
+    /// teardown — `listen.rs` currently relies on `Connection` close
+    /// for graceful exit.
+    pub fn start_http3_server(
+        self: &Arc<Self>,
+        router: Arc<crate::quic_transport::http3::Router>,
+    ) -> JoinHandle<()> {
+        let conn = self.conn.clone();
+        spawn_local(async move {
+            let driver = crate::quic_transport::http3::build_server(router);
+            driver(conn).await;
+        })
     }
 
     /// `PeerSession` main loop.

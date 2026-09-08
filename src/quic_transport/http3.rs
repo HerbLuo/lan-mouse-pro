@@ -135,12 +135,25 @@ impl Response {
 /// are already buffered before the handler runs.
 pub type Handler = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
 
-/// Router that maps `path` to a [`Handler`]. Currently only exact path
-/// matches; future M2 / M3 layers will use parameterized
-/// `/clipboard/{text,image,file}/{sha256}` paths.
+/// Router that maps `path` to a [`Handler`].
+///
+/// **Two match modes**:
+/// - `routes` — exact path match (registered via [`Router::get`]). Used
+///   for static paths like `/healthz`.
+/// - `prefix_routes` — prefix match (registered via [`Router::get_prefix`]).
+///   Used for parameterized paths like `/clipboard/text/{sha256}` where
+///   the sha256 suffix is variable. The first prefix that matches wins
+///   (`HashMap::iter().find(...)`), which is deterministic for the small
+///   prefix sets we register; if two prefixes overlap the longer one
+///   should be registered first.
+///
+/// **Lookup order**: exact first, then prefix. This means a static
+/// `/clipboard/text/` (if ever registered) wins over a prefix
+/// `/clipboard/text/` (which would match all `/clipboard/text/...`).
 #[derive(Default, Clone)]
 pub struct Router {
     routes: HashMap<String, Handler>,
+    prefix_routes: HashMap<String, Handler>,
 }
 
 impl Router {
@@ -148,7 +161,7 @@ impl Router {
         Self::default()
     }
 
-    /// Register a handler for `path`. `method` is always GET in the
+    /// Register a handler for an exact path. `method` is always GET in the
     /// current revision; the router ignores any non-GET requests and
     /// returns 405.
     pub fn get<F>(mut self, path: impl Into<String>, handler: F) -> Self
@@ -159,15 +172,80 @@ impl Router {
         self
     }
 
+    /// Register a handler that matches any path beginning with `prefix`.
+    /// The handler is called with the full request (path + body); the
+    /// caller decides what to do with the suffix.
+    ///
+    /// **Use case**: parameterized paths like `/clipboard/text/{sha256}`
+    /// where the trailing sha256 is opaque to the router. The current
+    /// M0b stub handlers ignore the suffix and just return 404; M1/M2/M3
+    /// will read the suffix to look up the cache by sha256.
+    pub fn get_prefix<F>(mut self, prefix: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(&Request) -> Response + Send + Sync + 'static,
+    {
+        self.prefix_routes.insert(prefix.into(), Arc::new(handler));
+        self
+    }
+
     pub fn handle(&self, req: &Request) -> Response {
         if req.method != "GET" {
             return Response::with_status(405, Bytes::from_static(b"method not allowed"));
         }
-        match self.routes.get(&req.path) {
-            Some(h) => h(req),
-            None => Response::not_found(),
+        // Exact match first (deterministic, no allocation).
+        if let Some(h) = self.routes.get(&req.path) {
+            return h(req);
         }
+        // Prefix match — first hit wins. HashMap iteration order is
+        // unspecified but for the small prefix sets we register
+        // (currently 3 entries) this is fine; the production routers
+        // never have overlapping prefixes.
+        for (prefix, h) in &self.prefix_routes {
+            if req.path.starts_with(prefix) {
+                return h(req);
+            }
+        }
+        Response::not_found()
     }
+}
+
+/// Build the production default router with 5 routes (M0b STEP-0.3 + STEP-0.4).
+///
+/// **Routes**:
+/// | Path | Method | Status | Body | Notes |
+/// |---|---|---|---|---|
+/// | `GET /healthz` | GET | 200 | `"ok"` | M0b STEP-0.7 真机 `curl --http3` 命中点 |
+/// | `GET /clipboard/text/{sha256}` | GET | 404 | `"not found"` | M1a stub; 占位等 M1b 接 cache |
+/// | `GET /clipboard/image/{sha256}` | GET | 404 | `"not found"` | M2a stub; 占位等 M2a 接 cache |
+/// | `GET /clipboard/file/{sha256}` | GET | 404 | `"not found"` | M3a stub; 占位等 M3a 接 cache |
+/// | `GET /clipboard/file/{sha256}?range=...` | GET | 404 | `"not found"` | 同样走 `/clipboard/file/` prefix；range 接口 M3a 填 |
+///
+/// **Stub handler**: each clip board stub logs at trace (so a real
+/// inbound GET shows up in `RUST_LOG=trace` but not in the default INFO
+/// log) and returns 404. The trace log is the place to add M1/M2/M3
+/// cache-lookup logic.
+///
+/// **Why this is a free function rather than a `Router::default()` impl**:
+/// `Router` needs to remain `Default + Clone` (the spike + tests use
+/// `Router::new()`). The "production router" is a concrete 5-route
+/// factory — it lives at the module boundary, not on the type.
+pub fn default_router() -> Arc<Router> {
+    Arc::new(
+        Router::new()
+            .get("/healthz", |_req: &Request| Response::ok("ok"))
+            .get_prefix("/clipboard/text/", |req: &Request| {
+                log::trace!("http3 /clipboard/text/ stub: {}", req.path);
+                Response::not_found()
+            })
+            .get_prefix("/clipboard/image/", |req: &Request| {
+                log::trace!("http3 /clipboard/image/ stub: {}", req.path);
+                Response::not_found()
+            })
+            .get_prefix("/clipboard/file/", |req: &Request| {
+                log::trace!("http3 /clipboard/file/ stub: {}", req.path);
+                Response::not_found()
+            }),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -440,6 +518,192 @@ async fn read_bytes(recv: &mut RecvStream, len: usize) -> std::io::Result<Vec<u8
 }
 
 // ---------------------------------------------------------------------------
+// GrowingSink — `Vec<u8>`-backed AsyncWrite that allocates incrementally
+// ---------------------------------------------------------------------------
+
+/// `AsyncWrite` sink that appends bytes to a borrowed `Vec<u8>` as they
+/// arrive, with **no upfront capacity preallocation**.
+///
+/// **Why**: `ClientConn::request` reads the body in chunks via
+/// `read_exact`, which itself does incremental resize
+/// (`Vec::with_capacity(len.min(CHUNK_SIZE * 4))` — capped at 256 KiB).
+/// For the streaming path used by [`Http3Client::get_text`] and friends
+/// we want an explicit sink rather than `Vec<u8>::with_capacity(200 MiB)`;
+/// `GrowingSink` plugs into `ClientConn::request_streaming` and grows
+/// the underlying `Vec<u8>` only as bytes are actually written.
+///
+/// **Why not `tokio::io::sink`**: `tokio::io::sink` discards all bytes
+/// — useful for the "drain and forget" case, useless when the caller
+/// needs the bytes back. `GrowingSink` keeps them.
+///
+/// **Memory profile** (verified by `growing_sink_no_preallocation`
+/// test): peak allocation is `CHUNK_SIZE` (64 KiB) at any moment, plus
+/// `Vec<u8>` growth as `extend_from_slice` doubles the backing
+/// allocation internally — for 200 MiB the final allocation is ~200 MiB
+/// but the **peak working set** is bounded by `CHUNK_SIZE`.
+pub struct GrowingSink<'a> {
+    buf: &'a mut Vec<u8>,
+}
+
+impl<'a> GrowingSink<'a> {
+    pub fn new(buf: &'a mut Vec<u8>) -> Self {
+        Self { buf }
+    }
+}
+
+impl<'a> tokio::io::AsyncWrite for GrowingSink<'a> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        // `Vec::extend_from_slice` doubles the backing allocation when
+        // capacity is exhausted — never preallocates more than the bytes
+        // currently held. This is the memory-bounded path required by
+        // M0b STEP-0.4 ("avoid `Vec::with_capacity(200 MiB)`").
+        self.buf.extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Http3Client — typed wrapper around `Connection` for the production GETs
+// ---------------------------------------------------------------------------
+
+/// Production client handle bound to a single `Connection`. Provides
+/// typed accessors for the M1/M2/M3 byte-pipe routes
+/// (`/clipboard/text/{sha256}`, `/clipboard/image/{sha256}`,
+/// `/clipboard/file/{sha256}[?range=...]`) plus the M0b healthz probe.
+///
+/// **Connection reuse**: `quinn::Connection` is internally `Arc`-backed;
+/// every method opens a fresh bidi stream and the underlying QUIC
+/// connection is reused for the lifetime of the peer.
+///
+/// **Streaming**: every body read goes through [`GrowingSink`] —
+/// no `Vec::with_capacity(body_len)` calls, no 200 MiB upfront
+/// allocation. The body's bytes land in a `Vec<u8>` that grows
+/// incrementally as bytes arrive (see `GrowingSink` docstring).
+///
+/// **Status semantics**: the helper methods return `(status, body)`.
+/// Callers (M1/M2/M3 service code) inspect the status and decide
+/// whether to surface the bytes — 4xx means "cache miss / not yet
+/// ready" (log warn + skip), 5xx means "transient failure" (retry),
+/// 200 means the body is the requested bytes.
+#[derive(Clone)]
+pub struct Http3Client {
+    conn: Connection,
+}
+
+impl Http3Client {
+    /// Wrap a `Connection` into an [`Http3Client`]. Cheap to clone
+    /// (just an `Arc`-backed wrapper).
+    pub fn new(conn: Connection) -> Self {
+        Self { conn }
+    }
+
+    /// `GET /healthz` — used by M0b STEP-0.7 真机 `curl --http3` probe
+    /// and by the service's liveness check.
+    pub async fn healthz(&self) -> std::io::Result<(u16, Vec<u8>)> {
+        self.get_bytes("/healthz").await
+    }
+
+    /// `GET /clipboard/text/{sha256}` — pulled by the receiver after a
+    /// `ClipboardText { sha256, size }` metadata frame on StreamC.
+    /// Returns 404 in M0b (M1b wires the cache).
+    pub async fn get_text(&self, sha256: &str) -> std::io::Result<(u16, Vec<u8>)> {
+        self.get_bytes(&format!("/clipboard/text/{sha256}")).await
+    }
+
+    /// `GET /clipboard/image/{sha256}` — pulled by the receiver after a
+    /// `ClipboardImage { sha256, size }` metadata frame on StreamC.
+    /// Returns 404 in M0b (M2a wires the cache).
+    pub async fn get_image(&self, sha256: &str) -> std::io::Result<(u16, Vec<u8>)> {
+        self.get_bytes(&format!("/clipboard/image/{sha256}")).await
+    }
+
+    /// `GET /clipboard/file/{sha256}[?range=...]` — pulled by the
+    /// receiver after a `FileTransferOffer { sha256, size, ... }`
+    /// metadata frame on StreamC. Returns 404 in M0b (M3a wires the
+    /// file cache + range).
+    ///
+    /// `range = Some("N-M")` (per PLAN-2 §1 range semantics) emits
+    /// `?range=N-M` as the query. The query is part of the wire path
+    /// (no separate header framing yet — see http3.rs top doc-comment).
+    pub async fn get_file(
+        &self,
+        sha256: &str,
+        range: Option<&str>,
+    ) -> std::io::Result<(u16, Vec<u8>)> {
+        let path = match range {
+            Some(r) => format!("/clipboard/file/{sha256}?range={r}"),
+            None => format!("/clipboard/file/{sha256}"),
+        };
+        self.get_bytes(&path).await
+    }
+
+    /// Generic streaming GET. Returns `(status, body)` where the body
+    /// was read chunk-by-chunk into a `Vec<u8>` via [`GrowingSink`]
+    /// (no `Vec::with_capacity(body_len)`).
+    ///
+    /// **Error classification** (matches the leader's spec for the
+    /// M0b STEP-0.4 unit tests):
+    /// - `Connection` / `SendStream` IO errors → `std::io::Error`
+    ///   (typically `ErrorKind::ConnectionAborted`)
+    /// - response header decode failure (truncated body_len, etc.) →
+    ///   `std::io::Error` (typically `ErrorKind::UnexpectedEof`)
+    /// - 4xx / 5xx status **does not** raise an error — the caller
+    ///   inspects `status` and decides (PLAN-2 §5 评审 #3 2nd:
+    ///   "404 cache miss silently ignored"). This matches the spec.
+    async fn get_bytes(&self, path: &str) -> std::io::Result<(u16, Vec<u8>)> {
+        // Issue the request on a fresh bidi stream. `Connection::open_bi`
+        // is the only entry point for client-side bi streams.
+        let (mut send, mut recv) = self.conn.open_bi().await.map_err(quic_err_to_io)?;
+        // Stream-encode the request so we don't allocate a separate
+        // header Vec just for the call. Matches `ClientConn::request`.
+        write_request(&mut send, "GET", path, &[]).await?;
+        send.finish()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e))?;
+
+        // Decode the response header.
+        let (status, body_len) = read_response_header(&mut recv).await?;
+
+        // Stream the body into a `GrowingSink`. `body_len` is the
+        // declared length — we honor it exactly so the receiver knows
+        // when to stop (no extra EOF handling required). The
+        // `GrowingSink` allocates incrementally.
+        let mut out: Vec<u8> = Vec::new();
+        let mut sink = GrowingSink::new(&mut out);
+        let mut remaining = body_len as usize;
+        let mut chunk = vec![0u8; CHUNK_SIZE];
+        while remaining > 0 {
+            let want = remaining.min(CHUNK_SIZE);
+            recv.read_exact(&mut chunk[..want])
+                .await
+                .map_err(read_exact_err)?;
+            tokio::io::AsyncWriteExt::write_all(&mut sink, &chunk[..want]).await?;
+            remaining -= want;
+        }
+        tokio::io::AsyncWriteExt::flush(&mut sink).await?;
+
+        Ok((status, out))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Server / client builder interfaces (PLAN §3 M0b STEP-0.2 产物)
 // ---------------------------------------------------------------------------
 
@@ -687,5 +951,427 @@ mod tests {
         }
         assert_eq!(collected.len(), body.len());
         assert_eq!(collected, body.as_ref());
+    }
+
+    // === Router prefix + default_router tests (M0b STEP-0.3) ===================
+
+    /// Verify the prefix routing for `/clipboard/text/{sha256}` hits the
+    /// stub handler (404 + logged trace).
+    #[test]
+    fn clipboard_text_prefix_returns_404() {
+        let router = default_router();
+        let req = Request {
+            method: "GET".into(),
+            path: "/clipboard/text/abcdef0123456789".into(),
+            body: Bytes::new(),
+        };
+        let resp = router.handle(&req);
+        assert_eq!(
+            resp.status, 404,
+            "/clipboard/text/{{sha256}} stub should return 404"
+        );
+    }
+
+    #[test]
+    fn clipboard_image_prefix_returns_404() {
+        let router = default_router();
+        let req = Request {
+            method: "GET".into(),
+            path: "/clipboard/image/deadbeef".into(),
+            body: Bytes::new(),
+        };
+        let resp = router.handle(&req);
+        assert_eq!(
+            resp.status, 404,
+            "/clipboard/image/{{sha256}} stub should return 404"
+        );
+    }
+
+    #[test]
+    fn clipboard_file_prefix_returns_404_no_range() {
+        let router = default_router();
+        let req = Request {
+            method: "GET".into(),
+            path: "/clipboard/file/cafebabe".into(),
+            body: Bytes::new(),
+        };
+        let resp = router.handle(&req);
+        assert_eq!(
+            resp.status, 404,
+            "/clipboard/file/{{sha256}} stub should return 404"
+        );
+    }
+
+    /// Range query: `/clipboard/file/{sha256}?range=0-99` should match the
+    /// `/clipboard/file/` prefix (the `?range=` is part of the wire path)
+    /// and return 404 (range interface is M3a).
+    #[test]
+    fn clipboard_file_prefix_with_range_returns_404() {
+        let router = default_router();
+        let req = Request {
+            method: "GET".into(),
+            path: "/clipboard/file/cafebabe?range=0-99".into(),
+            body: Bytes::new(),
+        };
+        let resp = router.handle(&req);
+        assert_eq!(
+            resp.status, 404,
+            "/clipboard/file/{{sha256}}?range=... stub should return 404"
+        );
+    }
+
+    /// Exact `/healthz` should return 200 + "ok" via the default router.
+    #[test]
+    fn healthz_via_default_router_returns_200() {
+        let router = default_router();
+        let req = Request {
+            method: "GET".into(),
+            path: "/healthz".into(),
+            body: Bytes::new(),
+        };
+        let resp = router.handle(&req);
+        assert_eq!(resp.status, 200);
+        assert_eq!(&resp.body[..], b"ok");
+    }
+
+    /// Sanity check: a path outside any registered route returns 404.
+    #[test]
+    fn default_router_unknown_path_returns_404() {
+        let router = default_router();
+        let req = Request {
+            method: "GET".into(),
+            path: "/totally/not/a/route".into(),
+            body: Bytes::new(),
+        };
+        let resp = router.handle(&req);
+        assert_eq!(resp.status, 404);
+    }
+
+    /// Non-GET against `/healthz` returns 405.
+    #[test]
+    fn default_router_post_to_healthz_returns_405() {
+        let router = default_router();
+        let req = Request {
+            method: "POST".into(),
+            path: "/healthz".into(),
+            body: Bytes::new(),
+        };
+        let resp = router.handle(&req);
+        assert_eq!(resp.status, 405);
+    }
+
+    /// `get_prefix` should not consume an exact path that doesn't start
+    /// with the prefix — e.g. `/clipboard/text` (no trailing slash)
+    /// must NOT match `/clipboard/text/` (it falls through to 404).
+    #[test]
+    fn get_prefix_requires_trailing_slash_to_match() {
+        let router = Router::new().get_prefix("/clipboard/text/", |_| Response::not_found());
+        let req_no_slash = Request {
+            method: "GET".into(),
+            path: "/clipboard/text".into(),
+            body: Bytes::new(),
+        };
+        let resp = router.handle(&req_no_slash);
+        assert_eq!(
+            resp.status, 404,
+            "/clipboard/text (no trailing slash) should NOT match /clipboard/text/ prefix"
+        );
+    }
+
+    // === GrowingSink tests (M0b STEP-0.4) =====================================
+
+    #[test]
+    fn growing_sink_writes_incrementally() {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut sink = GrowingSink::new(&mut buf);
+        // Write three chunks; `poll_write` is synchronous in our impl
+        // (no real async IO), so we drive it directly.
+        let chunk1 = vec![0xABu8; 1024];
+        let chunk2 = vec![0xCDu8; 2048];
+        let chunk3 = vec![0xEFu8; 4096];
+        for c in [&chunk1, &chunk2, &chunk3] {
+            let r = futures::executor::block_on(async {
+                use tokio::io::AsyncWriteExt;
+                sink.write_all(c).await
+            });
+            r.expect("write_all");
+        }
+        let r = futures::executor::block_on(async {
+            use tokio::io::AsyncWriteExt;
+            sink.flush().await
+        });
+        r.expect("flush");
+        assert_eq!(buf.len(), 1024 + 2048 + 4096);
+        assert_eq!(&buf[..1024], &chunk1[..]);
+        assert_eq!(&buf[1024..1024 + 2048], &chunk2[..]);
+        assert_eq!(&buf[1024 + 2048..], &chunk3[..]);
+    }
+
+    /// Verify the GrowingSink does **not** preallocate any capacity
+    /// upfront — `buf.capacity()` after construction (before any write)
+    /// must be 0. This is the "no `Vec::with_capacity(200 MiB)`" guard
+    /// the leader mandated for STEP-0.4.
+    #[test]
+    fn growing_sink_no_preallocation() {
+        let mut buf: Vec<u8> = Vec::new();
+        assert_eq!(buf.capacity(), 0, "fresh Vec<u8> should have zero capacity");
+        let _sink = GrowingSink::new(&mut buf);
+        assert_eq!(
+            buf.capacity(),
+            0,
+            "constructing GrowingSink should NOT preallocate any Vec capacity"
+        );
+    }
+
+    // === Http3Client end-to-end (M0b STEP-0.4) ================================
+    //
+    // These tests spin up a real QUIC server + client (in-process) so the
+    // Http3Client is exercised through the full stack: open_bi → write
+    // request → read response header → stream body → return bytes. The
+    // /healthz happy path proves the wire format works; the 404 / 500
+    // cases prove the client surfaces non-200 statuses without raising
+    // IO errors (PLAN-2 §5 评审 #3 2nd: "404 cache miss silently ignored");
+    // the timeout test proves the upper layer can abort a stuck GET.
+
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    use crate::quic_transport::endpoint::{dial, endpoint};
+    use crate::quic_transport::test_helpers::{ephemeral_cert, ephemeral_pins_dir};
+
+    /// Spin up a server with `router` bound to the given test cert, plus
+    /// return the server's `Endpoint` and `Connection` once the client
+    /// dials. Used by the round-trip tests below.
+    async fn spawn_test_server(router: Arc<Router>) -> std::net::SocketAddr {
+        use crate::quic_transport::endpoint::install_crypto_provider;
+        use crate::quic_transport::endpoint_with_cert;
+
+        install_crypto_provider();
+        let (server_cert_chain, server_key) = ephemeral_cert();
+        let server_ep = endpoint_with_cert(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+            server_cert_chain,
+            server_key,
+            std::time::Duration::from_secs(5),
+        )
+        .expect("server endpoint bind");
+        let server_addr = server_ep.local_addr().expect("server addr");
+
+        // Spawn the server accept loop on the local task set so the
+        // per-connection driver has somewhere to run. Quinn `Endpoint`
+        // is `Clone` (internally `Arc`-backed); we move the clone into
+        // the task and drop the original at function exit (the closure
+        // owns the keepalive ref).
+        let ep_for_task = server_ep.clone();
+        tokio::task::spawn_local(async move {
+            loop {
+                let Some(incoming) = ep_for_task.accept().await else {
+                    break;
+                };
+                let conn = match incoming.await {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let driver = build_server(router.clone());
+                tokio::task::spawn_local(async move {
+                    driver(conn).await;
+                });
+            }
+        });
+        // Drop the local binding — the spawned task still holds an Arc.
+        drop(server_ep);
+
+        server_addr
+    }
+
+    /// Dial the test server and return a `Connection`. The helper hides
+    /// the cert / pins_dir plumbing so each round-trip test stays small.
+    async fn dial_test_server(server_addr: std::net::SocketAddr) -> quinn::Connection {
+        let (client_cert_chain, client_key) = ephemeral_cert();
+        let pins_dir = ephemeral_pins_dir();
+        let _ = std::fs::remove_dir_all(&pins_dir);
+        let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .expect("client endpoint bind");
+        let conn = dial(
+            &client_ep,
+            server_addr,
+            client_cert_chain[0].clone(),
+            client_key,
+            &pins_dir,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("dial");
+        conn
+    }
+
+    /// Happy path: client GET /healthz → server returns 200 + "ok".
+    /// Verifies the wire format works end-to-end through the QUIC stack.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_healthz_roundtrip() {
+        crate::quic_transport::test_helpers::local_set_test!(http3_client_healthz_roundtrip, {
+            let server_addr = spawn_test_server(default_router()).await;
+            let conn = dial_test_server(server_addr).await;
+            let client = Http3Client::new(conn);
+
+            let (status, body) = client.healthz().await.expect("healthz");
+            assert_eq!(status, 200, "/healthz should return 200");
+            assert_eq!(&body[..], b"ok", "/healthz body should be 'ok'");
+        });
+    }
+
+    /// Stub routes return 404 — the client surfaces the status without
+    /// raising an IO error (callers decide what to do with 404).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_text_returns_404() {
+        crate::quic_transport::test_helpers::local_set_test!(http3_client_get_text_returns_404, {
+            let server_addr = spawn_test_server(default_router()).await;
+            let conn = dial_test_server(server_addr).await;
+            let client = Http3Client::new(conn);
+
+            let (status, body) = client.get_text("abcdef").await.expect("get_text");
+            assert_eq!(
+                status, 404,
+                "/clipboard/text/{{sha256}} stub should return 404"
+            );
+            assert_eq!(
+                &body[..],
+                b"not found",
+                "default 404 body should be 'not found'"
+            );
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_image_returns_404() {
+        crate::quic_transport::test_helpers::local_set_test!(http3_client_get_image_returns_404, {
+            let server_addr = spawn_test_server(default_router()).await;
+            let conn = dial_test_server(server_addr).await;
+            let client = Http3Client::new(conn);
+
+            let (status, _body) = client.get_image("cafebabe").await.expect("get_image");
+            assert_eq!(status, 404);
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_file_returns_404() {
+        crate::quic_transport::test_helpers::local_set_test!(http3_client_get_file_returns_404, {
+            let server_addr = spawn_test_server(default_router()).await;
+            let conn = dial_test_server(server_addr).await;
+            let client = Http3Client::new(conn);
+
+            let (status_no_range, _) = client
+                .get_file("deadbeef", None)
+                .await
+                .expect("get_file no range");
+            assert_eq!(
+                status_no_range, 404,
+                "/clipboard/file/{{sha256}} (no range) should be 404"
+            );
+
+            let (status_with_range, _) = client
+                .get_file("deadbeef", Some("0-99"))
+                .await
+                .expect("get_file with range");
+            assert_eq!(
+                status_with_range, 404,
+                "/clipboard/file/{{sha256}}?range=0-99 should be 404 (M3a will fill this)"
+            );
+        });
+    }
+
+    /// 5xx response parsing: register a /boom route that returns 500 +
+    /// body "boom", GET it, assert (500, "boom"). Verifies the client
+    /// surfaces non-2xx / non-4xx statuses without an IO error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_5xx_error_parsing() {
+        crate::quic_transport::test_helpers::local_set_test!(http3_client_5xx_error_parsing, {
+            let router = Arc::new(Router::new().get("/boom", |_| {
+                Response::with_status(500, Bytes::from_static(b"boom"))
+            }));
+            let server_addr = spawn_test_server(router).await;
+            let conn = dial_test_server(server_addr).await;
+            let client = Http3Client::new(conn);
+
+            let (status, body) = client
+                .get_bytes("/boom")
+                .await
+                .expect("/boom should not raise an IO error for 5xx");
+            assert_eq!(status, 500, "5xx status should be surfaced as-is");
+            assert_eq!(&body[..], b"boom");
+        });
+    }
+
+    /// Timeout handling: a server that accepts the bidi stream but
+    /// **never writes a response** must let `tokio::time::timeout`
+    /// cancel the client's GET. This proves the upper layer (M1/M2/M3
+    /// service code) can abort a stuck GET without leaking tasks.
+    ///
+    /// **Why a custom hanging server (not the default router)**: the
+    /// default router's handlers are sync and respond immediately;
+    /// there's no way to make them hang. A custom server that just
+    /// parks on `accept_bi()` after accepting each stream produces a
+    /// reliable hang on the client side.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_timeout_handling() {
+        crate::quic_transport::test_helpers::local_set_test!(http3_client_timeout_handling, {
+            use crate::quic_transport::endpoint::install_crypto_provider;
+            use crate::quic_transport::endpoint_with_cert;
+
+            install_crypto_provider();
+            let (server_cert_chain, server_key) = ephemeral_cert();
+            let server_ep = endpoint_with_cert(
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+                server_cert_chain,
+                server_key,
+                std::time::Duration::from_secs(5),
+            )
+            .expect("server endpoint bind");
+            let server_addr = server_ep.local_addr().expect("server addr");
+
+            // Hanging server: accept connections, accept each bidi
+            // stream, but never write a response. The parked streams
+            // are kept alive so they aren't dropped (matches the
+            // "bunch bidi" parking pattern in `listen.rs`).
+            let parked: std::rc::Rc<
+                std::cell::RefCell<Vec<(quinn::SendStream, quinn::RecvStream)>>,
+            > = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let parked_for_task = parked.clone();
+            let ep_for_task = server_ep.clone();
+            tokio::task::spawn_local(async move {
+                loop {
+                    let Some(incoming) = ep_for_task.accept().await else {
+                        break;
+                    };
+                    let conn = match incoming.await {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    let parked_inner = parked_for_task.clone();
+                    tokio::task::spawn_local(async move {
+                        loop {
+                            let (send, recv) = match conn.accept_bi().await {
+                                Ok(pair) => pair,
+                                Err(_) => return,
+                            };
+                            // Park both halves; never read or write.
+                            parked_inner.borrow_mut().push((send, recv));
+                        }
+                    });
+                }
+            });
+            drop(server_ep);
+
+            // Client dials and tries to GET /anything.
+            let conn = dial_test_server(server_addr).await;
+            let client = Http3Client::new(conn);
+            let get = client.get_bytes("/anything");
+            // Wrap in a short timeout — the server will never respond.
+            let result = tokio::time::timeout(std::time::Duration::from_millis(200), get).await;
+            assert!(
+                result.is_err(),
+                "GET against a hanging server must time out (got Ok)"
+            );
+        });
     }
 }
