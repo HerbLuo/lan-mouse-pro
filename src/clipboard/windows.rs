@@ -292,17 +292,3 @@ mod tests {
         );
     }
 }
-
-// ============================================================================
-//  Unused-import silencer for the `err_to_string` helper on no-op paths
-// ============================================================================
-//
-// The `err_to_string` helper is only used in the `current_text`
-// `Some(Err)` branch which is unreachable in practice (the
-// `GlobalLock` failure path returns the `String` directly). Suppress
-// the resulting `unused` warning on the `err_to_string` fn so the
-// Windows build is warning-clean.
-#[allow(dead_code)]
-fn _force_keep_err_to_string() {
-    let _ = err_to_string;
-}
