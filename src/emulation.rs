@@ -1,12 +1,13 @@
 use crate::config::local_commit;
 use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
+use crate::quic_transport::PeerSession;
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
 use lan_mouse_proto::{PROTOCOL_MAGIC, Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     net::SocketAddr,
     rc::Rc,
@@ -22,6 +23,33 @@ pub(crate) struct Emulation {
     task: JoinHandle<()>,
     request_tx: Sender<EmulationRequest>,
     event_rx: Receiver<EmulationEvent>,
+    /// **M1a follow-up #2** — shared handle to the QUIC peer
+    /// registry that lives on [`LanMouseListener`]. Cloned from
+    /// the listener at construction time (see
+    /// [`LanMouseListener::quic_conns`]) so
+    /// [`Emulation::send_to_incoming`] can look up the
+    /// `Rc<PeerSession>` for an incoming peer by `SocketAddr` and
+    /// call `peer.send_input(&event, &cfg)` (which `route_input`s
+    /// `ClipboardText` to `Channel::StreamC`).
+    ///
+    /// **Why the registry lives on `Emulation` and not on `Service`**:
+    /// `Service` already routes outgoing-client clipboard pushes
+    /// through `Capture::send_event`, which is the right abstraction
+    /// for outgoing peers (handle → conn → peer). Incoming peers
+    /// have no `ClientHandle`, so the natural anchor is the listener
+    /// side — and `Emulation` is the `Service` field that already
+    /// owns the listener. `Service::broadcast_clipboard_event` then
+    /// calls `self.emulation.send_to_incoming(addr, event)` to push
+    /// to an incoming peer and `self.capture.send_event(event,
+    /// handle)` for outgoing clients, in two independent branches.
+    ///
+    /// **Concurrency**: `Rc<RefCell<…>>` is synchronous — the
+    /// `borrow()` is non-async and cannot conflict with the
+    /// listener's `accept_task` / `wake_task` (those run on
+    /// `spawn_local` and only borrow during their own await-free
+    /// critical sections). The actual send is `peer.send_input
+    /// (..).await`, which happens after the borrow drops.
+    quic_conns: Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>>,
 }
 
 pub(crate) enum EmulationEvent {
@@ -96,6 +124,10 @@ impl Emulation {
             std::net::SocketAddr,
             lan_mouse_proto::ProtoEvent,
         )>,
+        // **M1a follow-up #2** — cloned `Rc` handle to the
+        // listener's QUIC peer registry. See the field doc on
+        // [`Emulation::quic_conns`] for the rationale.
+        quic_conns: Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>>,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
         let (request_tx, request_rx) = channel();
@@ -113,6 +145,50 @@ impl Emulation {
             task,
             request_tx,
             event_rx,
+            quic_conns,
+        }
+    }
+
+    /// **M1a follow-up #2** — push a `ProtoEvent` (typically
+    /// `ClipboardText`) to a specific incoming peer via its cached
+    /// `Rc<PeerSession>`.
+    ///
+    /// Routes through `peer.send_input(&event, &cfg)` with the
+    /// default `InputChannelConfig`, which [`crate::quic_transport
+    /// ::route_input`] dispatches to `Channel::StreamC` for
+    /// `ClipboardText`. The receiver side
+    /// ([`crate::connect::connect_to_handle`]'s
+    /// `peer.set_clipboard_inbox`) already pushes every var-codec
+    /// frame on the inbound stream C through the same service-side
+    /// dispatcher as the server-pushed path.
+    ///
+    /// **Returns `Err`** when the peer is not currently registered
+    /// in `quic_conns`. This is the expected race between
+    /// `EmulationEvent::Disconnected { addr }` being processed by
+    /// the service's main loop and the dispatch loop's
+    /// `broadcast_clipboard_event` reading a stale snapshot of
+    /// `incoming_clipboard`. The caller logs + counts the skip
+    /// without dropping the rest of the broadcast.
+    pub(crate) async fn send_to_incoming(
+        &self,
+        addr: SocketAddr,
+        event: ProtoEvent,
+    ) -> Result<(), String> {
+        let peer = self.quic_conns.borrow().get(&addr).cloned();
+        match peer {
+            Some(peer) => {
+                use lan_mouse_ipc::InputChannelConfig;
+                match peer
+                    .send_input(&event, &InputChannelConfig::default())
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(format!("send_input to incoming peer {addr} failed: {e}")),
+                }
+            }
+            None => Err(format!(
+                "peer {addr} not in quic_conns (disconnected between Connected event and dispatch)"
+            )),
         }
     }
 

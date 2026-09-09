@@ -78,6 +78,36 @@ pub struct Service {
     incoming_conns: HashSet<SocketAddr>,
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
+    /// **M1a follow-up #2** — active incoming peer table used by
+    /// the clipboard dispatcher's `broadcast_clipboard_event` helper
+    /// to reach peers that have no outgoing-client entry (the slave
+    /// daemon's view of its incoming master). Keyed by
+    /// `SocketAddr` because that's how the QUIC peer registry
+    /// (`LanMouseListener::quic_conns`, accessed via
+    /// `Emulation::send_to_incoming`) identifies a peer.
+    ///
+    /// **Distinct from `incoming_conn_info`**: that map is keyed
+    /// by the `ClientHandle` assigned at `Enter` time and gates
+    /// the capture barrier; this map only tracks reachability +
+    /// per-peer clipboard opt-in, and is populated immediately on
+    /// `EmulationEvent::Connected` (before Enter). The two are
+    /// kept separate deliberately — clipboard reachability does
+    /// not depend on Enter (a peer can be QUIC-connected but never
+    /// have its cursor cross over, yet still need to receive text
+    /// copies made on this side).
+    ///
+    /// **Lifecycle**:
+    /// - `EmulationEvent::Connected { addr, fingerprint }` →
+    ///   `incoming_clipboard.insert(addr, IncomingClipboardState
+    ///   { fingerprint, enable_clipboard_to: true })`.
+    /// - `EmulationEvent::Disconnected { addr }` →
+    ///   `incoming_clipboard.remove(&addr)`.
+    /// The `Emulation` arm intentionally removes on every
+    /// `Disconnected` (not just transient ones) so a peer that
+    /// was permanently lost doesn't keep getting clipboard
+    /// pushes that fail at the `Emulation::send_to_incoming`
+    /// lookup.
+    incoming_clipboard: HashMap<SocketAddr, IncomingClipboardState>,
     next_trigger_handle: u64,
     /// **STEP-M2-2.6**: most recently observed monitor snapshot.
     /// Used by `reconcile_monitors_changed` to detect which
@@ -223,6 +253,36 @@ struct Incoming {
     pos: Position,
 }
 
+/// **M1a follow-up #2** — per-incoming-peer clipboard state.
+/// Currently only carries the mTLS fingerprint (for diagnostics /
+/// future authorization checks) and the per-peer
+/// `enable_clipboard_to` opt-in flag.
+///
+/// **`enable_clipboard_to` default is `true`** for incoming peers
+/// (MVP behaviour, matching the legacy outgoing-client default).
+/// GUI configuration of this flag for incoming peers is
+/// deliberately deferred — the existing
+/// `FrontendRequest::SetEnableClipboardTo(handle, enable)` only
+/// accepts outgoing `ClientHandle`s, and the incoming-peer table
+/// is keyed by `SocketAddr` (which the GUI doesn't currently
+/// expose as a stable identifier). A future milestone can lift
+/// this to a full per-peer config once the GUI learns to surface
+/// the inbound peer list.
+#[derive(Debug, Clone)]
+struct IncomingClipboardState {
+    /// mTLS fingerprint carried over from
+    /// `EmulationEvent::Connected` for diagnostics + future
+    /// authorization gating. Currently not read by the
+    /// dispatcher (`broadcast_clipboard_event` only consults
+    /// `enable_clipboard_to`); suppressed by the
+    /// `#[allow(dead_code)]` on the struct so the lint stays
+    /// quiet until a future milestone wires GUI-side per-peer
+    /// toggle for incoming peers.
+    #[allow(dead_code)]
+    fingerprint: String,
+    enable_clipboard_to: bool,
+}
+
 impl Service {
     pub async fn new(config: Config) -> Result<Self, ServiceError> {
         let client_manager = ClientManager::default();
@@ -335,7 +395,23 @@ impl Service {
         };
 
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener, clipboard_inbound_tx.clone());
+        // **M1a follow-up #2** — clone the QUIC peer registry
+        // (`Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>>`) from
+        // the listener so `Emulation::send_to_incoming` can push
+        // `ClipboardText` to peers that are reachable only on the
+        // listen side (i.e. the master's incoming peer from the
+        // slave's perspective). The slave's outgoing client list
+        // (`client_manager.get_client_states()`) does NOT contain
+        // the master — so `broadcast_clipboard_event` must merge the
+        // outgoing + incoming sets, otherwise copies made on the
+        // slave silently never reach the master.
+        let quic_conns_for_emulation = listener.quic_conns();
+        let emulation = Emulation::new(
+            emulation_backend,
+            listener,
+            clipboard_inbound_tx.clone(),
+            quic_conns_for_emulation,
+        );
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
@@ -359,6 +435,11 @@ impl Service {
             emulation_status: Default::default(),
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
+            // **M1a follow-up #2** — initially empty; populated
+            // by `handle_emulation_event`'s `Connected` arm and
+            // drained by `Disconnected`. See the field doc for
+            // why this is distinct from `incoming_conn_info`.
+            incoming_clipboard: Default::default(),
             next_trigger_handle: 0,
             // STEP-M2-2.6: `None` until the first `ICaptureEvent::
             // MonitorsChanged` from `CaptureTask::do_capture`. The
@@ -655,8 +736,26 @@ impl Service {
                 // and rebuilds) and when the user disables a
                 // client (deactivate_client runs on a different
                 // event flow and never reaches this handler).
+                //
+                // **M1a follow-up #2** — unlike the capture
+                // barrier (which is preserved across transient
+                // disconnects), the clipboard recipient entry is
+                // removed on every `Disconnected`. The QUIC peer
+                // registry (`LanMouseListener::quic_conns`) has
+                // already been drained by the supervisor's Drop
+                // guard by the time this event arrives, so any
+                // subsequent `Emulation::send_to_incoming(addr, …)`
+                // would fail with "peer not in quic_conns". Dropping
+                // the clipboard entry on disconnect keeps the
+                // dispatcher's "0 peers reached" log signal honest
+                // and avoids pushing to zombies during a long
+                // disconnect window. On the next `Connected` (the
+                // peer's supervisor redials) we re-insert with
+                // `enable_clipboard_to: true`.
+                let was_in_clipboard = self.incoming_clipboard.remove(&addr).is_some();
                 log::info!(
-                    "peer {addr} transiently disconnected — barrier preserved for fast recovery"
+                    "peer {addr} transiently disconnected — barrier preserved for fast recovery \
+                     (clipboard recipient entry removed: {was_in_clipboard})"
                 );
                 self.notify_frontend(FrontendEvent::IncomingDisconnected(addr));
             }
@@ -678,6 +777,25 @@ impl Service {
             }
             EmulationEvent::ReleaseNotify => self.capture.release(),
             EmulationEvent::Connected { addr, fingerprint } => {
+                // **M1a follow-up #2** — register the peer as a
+                // clipboard recipient immediately on connection
+                // (not on Enter). The dispatcher's
+                // `broadcast_clipboard_event` filters by
+                // `enable_clipboard_to`; defaulting to `true`
+                // matches the outgoing-client MVP behaviour. A
+                // second `Connected` for the same addr (e.g. on
+                // macOS wake force-close + reconnect) overwrites
+                // the prior entry — fingerprints are equal because
+                // the same mTLS cert authenticates both
+                // connections, and `enable_clipboard_to` resets to
+                // the same default value.
+                self.incoming_clipboard.insert(
+                    addr,
+                    IncomingClipboardState {
+                        fingerprint: fingerprint.clone(),
+                        enable_clipboard_to: true,
+                    },
+                );
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
             EmulationEvent::PeerHello { addr, commit } => {
@@ -1613,19 +1731,52 @@ impl Service {
     /// **PLAN-2 / M1a STEP-1a.4** — broadcast a clipboard event to
     /// every active peer with `enable_clipboard_to = true`.
     ///
-    /// Fire-and-forget: `Capture::send_event` queues the request on
-    /// the capture task's `request_tx`; the actual `conn.send`
-    /// happens off-thread. Per-peer send failures (peer
-    /// disconnected mid-tick) are logged at `warn` inside
-    /// `CaptureTask` but do not propagate here.
+    /// **M1a follow-up #2** — the broadcast targets **two disjoint
+    /// peer sets**, both of which must be reached:
+    ///
+    /// 1. **Outgoing clients** (`client_manager.get_client_states()`):
+    ///    the legacy path. Each outgoing client has a `ClientHandle`
+    ///    and is pushed via `Capture::send_event(event, handle)` →
+    ///    `CaptureTask` → `conn.send(event, handle)` →
+    ///    `peer.send_input` (StreamC). Skipped when `!active` or
+    ///    `state.active_addr.is_none()` (handshake incomplete).
+    ///
+    /// 2. **Incoming peers** (`incoming_clipboard`, populated by
+    ///    `EmulationEvent::Connected`): the slave-side master. Has
+    ///    no `ClientHandle` — pushed via
+    ///    `Emulation::send_to_incoming(addr, event)` →
+    ///    `peer.send_input` (StreamC) using the
+    ///    `LanMouseListener::quic_conns` registry. Skipped when
+    ///    `!enable_clipboard_to` or the peer is no longer in
+    ///    `quic_conns` (transient race with `Disconnected`).
+    ///
+    /// Without the second branch, copies made on a slave daemon
+    /// that runs incoming-only (the typical setup) never reach
+    /// the master: the master's `ClientHandle` is not in
+    /// `client_manager` on the slave, and `get_client_states()`
+    /// returns an empty list → `recipients == 0` → "clipboard
+    /// dispatched to 0 peers" with no `ClipboardText` ever sent.
+    /// Merging the two sets is the fix.
+    ///
+    /// Fire-and-forget: outgoing pushes go through `Capture::send_event`
+    /// (queues on the capture task's `request_tx`, the actual
+    /// `conn.send` happens off-thread). Incoming pushes go through
+    /// `Emulation::send_to_incoming` (directly awaits
+    /// `peer.send_input` on this task). Per-peer send failures
+    /// (peer disconnected mid-tick) are logged at `warn` inside
+    /// `CaptureTask` (outgoing) or returned as `Err` from
+    /// `send_to_incoming` (incoming) but do not propagate to the
+    /// dispatcher — both are best-effort and the user's next
+    /// copy is the natural retry point.
     async fn broadcast_clipboard_event(&self, event: ProtoEvent, recipients: &mut usize) {
+        // ── Branch 1: outgoing clients ─────────────────────────────
         let mut skipped_disabled = 0usize;
         let mut skipped_inactive = 0usize;
         let mut skipped_no_addr = 0usize;
         for (handle, cfg, state) in self.client_manager.get_client_states() {
             if !cfg.enable_clipboard_to {
                 log::info!(
-                    "clipboard broadcast: skipping peer handle={} (enable_clipboard_to=false)",
+                    "clipboard broadcast: skipping outgoing peer handle={} (enable_clipboard_to=false)",
                     handle
                 );
                 skipped_disabled += 1;
@@ -1633,7 +1784,7 @@ impl Service {
             }
             if !state.active {
                 log::info!(
-                    "clipboard broadcast: skipping peer handle={} (client not active yet)",
+                    "clipboard broadcast: skipping outgoing peer handle={} (client not active yet)",
                     handle
                 );
                 skipped_inactive += 1;
@@ -1641,14 +1792,14 @@ impl Service {
             }
             if state.active_addr.is_none() {
                 log::info!(
-                    "clipboard broadcast: skipping peer handle={} (no active_addr — handshake incomplete?)",
+                    "clipboard broadcast: skipping outgoing peer handle={} (no active_addr — handshake incomplete?)",
                     handle
                 );
                 skipped_no_addr += 1;
                 continue;
             }
             log::info!(
-                "clipboard broadcast: -> peer handle={} active_addr={:?}",
+                "clipboard broadcast: -> outgoing peer handle={} active_addr={:?}",
                 handle,
                 state.active_addr
             );
@@ -1657,10 +1808,74 @@ impl Service {
         }
         if skipped_disabled + skipped_inactive + skipped_no_addr > 0 {
             log::info!(
-                "clipboard broadcast gate summary: skipped disabled={} inactive={} no_addr={}",
+                "clipboard broadcast gate summary (outgoing): skipped disabled={} inactive={} no_addr={}",
                 skipped_disabled,
                 skipped_inactive,
                 skipped_no_addr
+            );
+        }
+
+        // ── Branch 2: incoming peers (M1a follow-up #2) ─────────────
+        //
+        // Snapshot the addresses first so a `Disconnected` event
+        // arriving mid-broadcast (which mutates
+        // `incoming_clipboard` via the `select!` arm) does not
+        // invalidate the iterator. The dispatcher's reads of
+        // `incoming_clipboard` are gated by the service's
+        // single-threaded `spawn_local` runtime, so there is no
+        // concurrent-mutation hazard at the language level — the
+        // snapshot is purely defensive against `select!` arm
+        // interleaving on the same task.
+        let incoming_snapshot: Vec<(SocketAddr, IncomingClipboardState)> = self
+            .incoming_clipboard
+            .iter()
+            .map(|(a, s)| (*a, s.clone()))
+            .collect();
+        let mut incoming_skipped_disabled = 0usize;
+        let mut incoming_skipped_unreachable = 0usize;
+        let mut incoming_send_failed = 0usize;
+        for (addr, state) in incoming_snapshot.iter() {
+            if !state.enable_clipboard_to {
+                log::info!(
+                    "clipboard broadcast: skipping incoming peer {addr} (enable_clipboard_to=false)"
+                );
+                incoming_skipped_disabled += 1;
+                continue;
+            }
+            log::info!("clipboard broadcast: -> incoming peer {addr}");
+            match self
+                .emulation
+                .send_to_incoming(*addr, event.clone())
+                .await
+            {
+                Ok(()) => {
+                    *recipients += 1;
+                }
+                Err(reason) if reason.contains("not in quic_conns") => {
+                    log::info!(
+                        "clipboard broadcast: incoming peer {addr} no longer in quic_conns \
+                         (race with Disconnected event; snapshot was stale); skipping"
+                    );
+                    incoming_skipped_unreachable += 1;
+                }
+                Err(reason) => {
+                    log::warn!(
+                        "clipboard broadcast: send to incoming peer {addr} failed: {reason}"
+                    );
+                    incoming_send_failed += 1;
+                }
+            }
+        }
+        if incoming_skipped_disabled
+            + incoming_skipped_unreachable
+            + incoming_send_failed
+            > 0
+        {
+            log::info!(
+                "clipboard broadcast gate summary (incoming): skipped disabled={} unreachable={} send_failed={}",
+                incoming_skipped_disabled,
+                incoming_skipped_unreachable,
+                incoming_send_failed
             );
         }
     }

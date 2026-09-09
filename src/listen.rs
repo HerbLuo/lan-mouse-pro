@@ -336,6 +336,31 @@ impl LanMouseListener {
         None
     }
 
+    /// **M1a follow-up #2** — accessor for the QUIC peer registry
+    /// (clones the inner `Rc`, returning a fresh handle that shares
+    /// the same backing storage). Used by
+    /// [`crate::service::Service`] to plumb the registry into
+    /// [`crate::emulation::Emulation`] so the clipboard
+    /// `broadcast_clipboard_event` helper can push `ClipboardText`
+    /// to **incoming** peers (which the outgoing-client path
+    /// `Capture::send_event` cannot reach because incoming peers
+    /// have no `ClientHandle`).
+    ///
+    /// **Why an accessor (not a `send_to_addr` method on the
+    /// listener)**: the `quic_conns` map is the only piece of
+    /// listener state the dispatcher needs, and exposing the full
+    /// `LanMouseListener` to `Emulation` would require wrapping it
+    /// in `Rc` (the listener owns `JoinHandle`s, which are `Clone`
+    /// but pulling one up to `Emulation` adds churn). Cloning the
+    /// inner `Rc<RefCell<…>>` keeps the surface narrow and avoids
+    /// a `Clone` impl on `LanMouseListener` that would otherwise
+    /// duplicate every field's `Rc`/`Sender`.
+    pub(crate) fn quic_conns(
+        &self,
+    ) -> Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>> {
+        self.quic_conns.clone()
+    }
+
     /// Force-closes the QUIC conn for `addr` using
     /// [`crate::quic_transport::session::WAKE_CLOSE_CODE`] so the peer takes
     /// its `RetryState` path via
