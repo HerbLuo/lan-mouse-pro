@@ -28,3 +28,12 @@
   - **main crate config 层**（`src/config.rs`）—— M3 改 `ClientConfig.monitor` 时一起处理（PLAN §M3 STEP-3.1）
 - **触发 fix 的建议时机**：QUIC idle timeout 调查 PR / PLAN-M2 启动前 / 任意后续 cleanup PR
 - **决策 STEP**：M1 / STEP-1.4
+
+### 当前工具链补充（2026-09-09）
+
+本机当前 Clippy 还会在同一批 pre-existing 代码上报告：
+
+- `src/service.rs:105-109`：`doc_lazy_continuation`（`incoming_clipboard` 生命周期列表）
+- `src/connect.rs:1692,1698`：`assertions_on_constants`
+
+这些位置均早于本次 M1b.1 改动，继续按本条永久忽略，留给独立 lint cleanup。
