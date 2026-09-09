@@ -285,13 +285,14 @@ pub fn default_backend() -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
     macos::MacOsPasteboard::new().map(|b| Box::new(b) as Box<dyn ClipboardBackend>)
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "linux")]
 pub fn default_backend() -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
-    // Linux + Windows impls land in STEP-1a.3. Until then the factory
-    // returns NotImplemented so the build is clean on every platform
-    // (CI matrix covers all three) and the operator sees a clear log
-    // line at daemon startup instead of a panic.
-    Err(ClipboardError::NotImplemented)
+    linux::LinuxClipboard::new().map(|b| Box::new(b) as Box<dyn ClipboardBackend>)
+}
+
+#[cfg(target_os = "windows")]
+pub fn default_backend() -> Result<Box<dyn ClipboardBackend>, ClipboardError> {
+    windows::WinClipboard::new().map(|b| Box::new(b) as Box<dyn ClipboardBackend>)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
