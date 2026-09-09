@@ -108,6 +108,23 @@ pub(crate) struct LanMouseConnection {
     /// loop (`Service::run`'s `select!` arm).
     clipboard_inbound_tx:
         tokio::sync::mpsc::UnboundedSender<(std::net::SocketAddr, lan_mouse_proto::ProtoEvent)>,
+    /// **M1a follow-up #1** — sender for "peer just transitioned to
+    /// active" notifications. Fires once per `connect_to_handle`
+    /// success path, immediately after `set_active_addr(handle, Some(
+    /// remote))`. The service-side receiver (`Service::run`'s
+    /// `select!` arm) reacts by reading the current local clipboard
+    /// and pushing it through `broadcast_clipboard_event`, recovering
+    /// copies the user made during the 5–35s dial window.
+    ///
+    /// **Why a dedicated channel** (not piggy-backed on
+    /// `clipboard_inbound_tx`): the two flows have different
+    /// semantics — `clipboard_inbound_tx` carries *bytes* from peer
+    /// to service, this one carries a *handle* from connect.rs to
+    /// service. Conflating them would force a discriminator field +
+    /// an enum payload, and the receivers don't share any code path.
+    /// Unbounded: the success path is once-per-dial, so backpressure
+    /// is never a concern.
+    clipboard_push_notify_tx: tokio::sync::mpsc::UnboundedSender<ClientHandle>,
 }
 
 impl LanMouseConnection {
@@ -118,6 +135,14 @@ impl LanMouseConnection {
     /// every `connect_to_handle` / supervisor's redial so all
     /// per-peer `set_clipboard_inbox` calls feed the same
     /// service-side dispatcher.
+    ///
+    /// **M1a follow-up #1** — `clipboard_push_notify_tx` is the
+    /// sender for "peer just became active" notifications. Fires
+    /// after the success path's `set_active_addr(handle, Some(addr))`
+    /// so the service dispatcher can recover copies made during
+    /// the dial window. See the field doc on
+    /// `LanMouseConnection::clipboard_push_notify_tx` for the full
+    /// rationale.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         client_endpoint: Endpoint,
@@ -131,6 +156,7 @@ impl LanMouseConnection {
             std::net::SocketAddr,
             lan_mouse_proto::ProtoEvent,
         )>,
+        clipboard_push_notify_tx: tokio::sync::mpsc::UnboundedSender<ClientHandle>,
     ) -> Self {
         let (recv_tx, recv_rx) = channel();
         let quic_creds = Rc::new(QuicDialerCreds { cert_chain, key });
@@ -147,6 +173,7 @@ impl LanMouseConnection {
             idle_timeout,
             peer_lost_tx,
             clipboard_inbound_tx,
+            clipboard_push_notify_tx,
         }
     }
 
@@ -212,6 +239,7 @@ impl LanMouseConnection {
                 self.idle_timeout,
                 self.peer_lost_tx.clone(),
                 self.clipboard_inbound_tx.clone(),
+                self.clipboard_push_notify_tx.clone(),
             ));
         }
         Ok(())
@@ -341,6 +369,7 @@ impl LanMouseConnection {
                 self.idle_timeout,
                 self.peer_lost_tx.clone(),
                 self.clipboard_inbound_tx.clone(),
+                self.clipboard_push_notify_tx.clone(),
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
@@ -552,6 +581,16 @@ async fn connect_to_handle(
         std::net::SocketAddr,
         lan_mouse_proto::ProtoEvent,
     )>,
+    // **M1a follow-up #1** — sender for "peer just became active"
+    // notifications. Fired immediately after
+    // `set_active_addr(handle, Some(remote))` so the service
+    // dispatcher can read the current local clipboard and push
+    // it through `broadcast_clipboard_event`, recovering copies
+    // the user made during the dial window. See the field doc on
+    // `LanMouseConnection::clipboard_push_notify_tx` for the
+    // rationale; this clone lives for the duration of the dial
+    // task and is consumed once at the success branch.
+    clipboard_push_notify_tx: tokio::sync::mpsc::UnboundedSender<ClientHandle>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     let Some(ips_set) = client_manager.get_ips(handle) else {
@@ -656,6 +695,39 @@ async fn connect_to_handle(
     // zero, mirroring the upstream `RetryState::on_success` "remove entry"
     // semantic).
     retry_state.borrow_mut().remove(&handle);
+
+    // **M1a follow-up #1** — notify the service dispatcher that this
+    // peer just transitioned `active_addr: None → Some(remote)`. The
+    // dispatcher reads the current local clipboard and pushes it
+    // through `broadcast_clipboard_event` so copies the user made
+    // during the dial window (5–35 s with backoff) reach the peer
+    // instead of being silently dropped by the `active_addr.is_none()`
+    // gate in the broadcast helper. The dispatcher's LRU check
+    // suppresses loopback if the inbound stream C also pushed the
+    // same content back.
+    //
+    // **Why after `set_active_addr` + `peers.insert`**: the
+    // dispatcher's `broadcast_clipboard_event` re-reads
+    // `state.active_addr` per peer and only dispatches when it's
+    // `Some` — so the notify must fire AFTER the addr is set, or the
+    // recovered push would itself be filtered by the same gate it's
+    // trying to bypass.
+    //
+    // **Why after `connecting.remove`**: ordering is otherwise
+    // immaterial, but grouping the three "success state" mutations
+    // together keeps the success branch readable. The send is
+    // non-blocking (UnboundedSender); a closed receiver (service
+    // shutting down) is silently dropped via `let _ =`.
+    if let Err(e) = clipboard_push_notify_tx.send(handle) {
+        // Service dispatcher is gone — likely the daemon is
+        // shutting down. Log at debug since it's an expected
+        // shutdown path; the supervisor's redial path will hit the
+        // same `send` failure on every reconnect and stay quiet.
+        log::debug!(
+            "clipboard push notify: service receiver dropped handle={handle} \
+             (daemon shutting down?): {e}"
+        );
+    }
 
     // Set up outgoing_events + spawn a forwarder task that forwards Ack /
     // Pong / Leave events read off stream A by the `peer.run` main loop into
@@ -768,6 +840,12 @@ async fn connect_to_handle(
         // keeps pushing to the same service-side
         // dispatcher.
         clipboard_inbound_tx,
+        // **M1a follow-up #1** — push-notify sender.
+        // The supervisor's redial `connect_to_handle` reuses
+        // this clone so the recovered clipboard push fires on
+        // every reconnect (initial dial + every supervisor redial),
+        // not just the first one.
+        clipboard_push_notify_tx,
     ));
     Ok(())
 }
@@ -844,6 +922,14 @@ async fn spawn_peer_supervisor(
         std::net::SocketAddr,
         lan_mouse_proto::ProtoEvent,
     )>,
+    // **M1a follow-up #1** — push-notify sender, forwarded to the
+    // redial `connect_to_handle` so every supervisor-triggered
+    // reconnect also notifies the service dispatcher. Without
+    // forwarding, only the initial dial would recover the dial-window
+    // copies; reconnects after a peer death would silently lose the
+    // user's clipboard activity that happened during the
+    // RetryState backoff window.
+    clipboard_push_notify_tx: tokio::sync::mpsc::UnboundedSender<ClientHandle>,
 ) {
     log::info!("spawn_peer_supervisor: starting for handle {handle} addr {addr}");
 
@@ -962,6 +1048,16 @@ async fn spawn_peer_supervisor(
                     // receiver. Without this the redial
                     // would push to a throwaway channel.
                     clipboard_inbound_tx.clone(),
+                    // **M1a follow-up #1** — push-notify
+                    // sender, forwarded to the redial
+                    // `connect_to_handle` so every
+                    // supervisor-triggered reconnect
+                    // (not just the initial dial) notifies
+                    // the service dispatcher. Without
+                    // this, copies made during a
+                    // RetryState backoff window following
+                    // a peer death would be lost.
+                    clipboard_push_notify_tx.clone(),
                 ));
             } else {
                 log::info!(

@@ -133,6 +133,18 @@ pub struct Service {
     /// sender for the daemon's lifetime.
     #[allow(dead_code)]
     clipboard_inbound_tx: tokio_mpsc::UnboundedSender<(SocketAddr, ProtoEvent)>,
+    /// **M1a follow-up #1** — receiver for "peer just became
+    /// active" notifications from
+    /// [`crate::connect::connect_to_handle`]. The sender clone
+    /// lives on `LanMouseConnection::clipboard_push_notify_tx`
+    /// and fires once per `set_active_addr(handle, Some(addr))`
+    /// success path. The dispatcher arm
+    /// (`handle_clipboard_recover_push`) reads the current local
+    /// clipboard and pushes it through `broadcast_clipboard_event`
+    /// to recover copies the user made during the 5–35 s dial
+    /// window — see BUGS.md "启动时未跨鼠标边界,复制文本无法传到
+    /// 被控端 (M1a follow-up #1)".
+    clipboard_push_notify_rx: tokio_mpsc::UnboundedReceiver<ClientHandle>,
     /// **M1a STEP-1a.4** — 500 ms tick for the clipboard poll
     /// loop. `tokio::time::Interval` is `select!`-compatible so
     /// the service's main loop drives the dispatch directly (no
@@ -272,6 +284,16 @@ impl Service {
         let (clipboard_inbound_tx, clipboard_inbound_rx) =
             tokio_mpsc::unbounded_channel::<(SocketAddr, ProtoEvent)>();
 
+        // **M1a follow-up #1** — "peer just became active"
+        // notification channel. Sender clone is moved into
+        // `LanMouseConnection` (and from there into every
+        // `connect_to_handle` task), receiver half lives on
+        // `Service` and is polled in `Service::run`'s `select!`
+        // arm. See the field doc on `clipboard_push_notify_rx`
+        // for the rationale.
+        let (clipboard_push_notify_tx, clipboard_push_notify_rx) =
+            tokio_mpsc::unbounded_channel::<ClientHandle>();
+
         let conn = LanMouseConnection::new(
             client_endpoint,
             cert_der.0.clone(),
@@ -281,6 +303,7 @@ impl Service {
             quic_idle_timeout,
             peer_lost_tx,
             clipboard_inbound_tx.clone(),
+            clipboard_push_notify_tx,
         );
 
         // input capture + emulation
@@ -356,6 +379,10 @@ impl Service {
             clipboard_last_text: None,
             clipboard_inbound_rx,
             clipboard_inbound_tx,
+            // **M1a follow-up #1** — push-notify receiver. The
+            // matching sender was moved into `LanMouseConnection`
+            // above. Polled in `Service::run`'s `select!` arm.
+            clipboard_push_notify_rx,
             clipboard_tick: tokio::time::interval(Duration::from_millis(500)),
             last_text_ts_ms: None,
             last_image_ts_ms: None,
@@ -398,6 +425,18 @@ impl Service {
                 // in `connect_to_handle`) pushes here.
                 Some(inbound) = self.clipboard_inbound_rx.recv() => {
                     self.handle_clipboard_inbound(inbound);
+                }
+                // **M1a follow-up #1** — peer just transitioned
+                // `active_addr: None → Some(addr)`. Read current
+                // local clipboard and push it through
+                // `broadcast_clipboard_event` to recover copies
+                // made during the dial window. The
+                // `broadcast_clipboard_event` gate
+                // (`active_addr.is_none()` filter) is now satisfied
+                // because the trigger fires *after*
+                // `set_active_addr` succeeds.
+                Some(handle) = self.clipboard_push_notify_rx.recv() => {
+                    self.handle_clipboard_recover_push(handle).await;
                 }
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -1248,7 +1287,11 @@ impl Service {
                 short_hex(&sha)
             );
         } else {
-            log::info!("clipboard dispatched to {} peer(s) (sha={})", recipients, short_hex(&sha));
+            log::info!(
+                "clipboard dispatched to {} peer(s) (sha={})",
+                recipients,
+                short_hex(&sha)
+            );
         }
         let now_ms = unix_now_ms();
         self.last_text_ts_ms = Some(now_ms);
@@ -1340,6 +1383,100 @@ impl Service {
             content.len(),
             short_hex(&ct.sha256)
         );
+    }
+
+    /// **PLAN-2 / M1a follow-up #1** — recover copies the user
+    /// made during the dial window.
+    ///
+    /// Triggered by `clipboard_push_notify_rx` whenever a peer's
+    /// `active_addr` transitions from `None → Some(addr)`. Reads
+    /// the current local clipboard once, runs the same LRU loopback
+    /// check as `handle_clipboard_tick`, and dispatches through the
+    /// shared `broadcast_clipboard_event` helper. Mirrors the tick
+    /// path closely so the GUI / state semantics match a "normal"
+    /// local-origin push (timestamp + `last_source = None`).
+    ///
+    /// **Why a separate method instead of calling
+    /// `handle_clipboard_tick`**: the tick path is gated by a 500 ms
+    /// `tokio::time::Interval` and would have to wait for the next
+    /// tick to fire — adding up to 500 ms of latency to a user copy
+    /// that already waited 5–35 s for the dial window to close.
+    /// Firing the push inline collapses the post-dial latency to
+    /// "next loop iteration + ~5 ms backend read".
+    ///
+    /// **Idempotency vs the tick**: if the tick also runs near the
+    /// same instant (the dispatcher's `clipboard_tick` is still
+    /// active), the second one to read the clipboard sees the
+    /// freshly-written LRU entry from the first push and skips —
+    /// net effect is exactly one outbound `ClipboardText`. The
+    /// `clipboard_last_text` write also short-circuits the tick's
+    /// change-detection for the same value.
+    ///
+    /// **No-op when backend unavailable**: same `clipboard_backend
+    /// .is_none()` guard as the tick path — the channel still
+    /// drains, just nothing is dispatched.
+    async fn handle_clipboard_recover_push(&mut self, handle: ClientHandle) {
+        let Some(backend) = self.clipboard_backend.as_mut() else {
+            return;
+        };
+        let new_text = match backend.current_text() {
+            Some(t) => t,
+            None => return,
+        };
+        let sha = sha256_of(&new_text);
+        if self.clipboard_lru.contains(&sha) {
+            // Loopback — same defensive check as the tick path.
+            // The most common cause: the inbound `clipboard_inbound`
+            // arm just wrote this hash to the LRU + applied the text
+            // to the local clipboard within the last ~64 ticks;
+            // pushing it again would be wasted work and could
+            // produce a visible "double copy" on the peer.
+            log::debug!(
+                "clipboard recover push: LRU loopback hit sha={} ({} bytes) \
+                 for handle={handle}, skipping",
+                short_hex(&sha),
+                new_text.len()
+            );
+            self.clipboard_last_text = Some(new_text);
+            return;
+        }
+        log::info!(
+            "clipboard recover push: peer handle={handle} just became active — \
+             pushing {} bytes (sha={})",
+            new_text.len(),
+            short_hex(&sha)
+        );
+        self.clipboard_lru.push(sha);
+        self.clipboard_last_text = Some(new_text.clone());
+        let event = ProtoEvent::ClipboardText(ClipboardText {
+            fingerprint: sha,
+            sha256: sha,
+            size: new_text.len() as u64,
+            content_inline: Some(new_text.into_bytes()),
+        });
+        let mut recipients = 0usize;
+        self.broadcast_clipboard_event(event, &mut recipients).await;
+        if recipients == 0 {
+            log::warn!(
+                "clipboard recover push: dispatched to 0 peers (sha={})",
+                short_hex(&sha)
+            );
+        } else {
+            log::info!(
+                "clipboard recover push: dispatched to {} peer(s) (sha={})",
+                recipients,
+                short_hex(&sha)
+            );
+        }
+        let now_ms = unix_now_ms();
+        self.last_text_ts_ms = Some(now_ms);
+        self.last_clipboard_source = None;
+        self.notify_frontend(FrontendEvent::ClipboardState {
+            last_text_ts: self.last_text_ts_ms,
+            last_image_ts: self.last_image_ts_ms,
+            last_file_ts: self.last_file_ts_ms,
+            last_source: None,
+        });
     }
 
     /// **PLAN-2 / M1a STEP-1a.4** — broadcast a clipboard event to
