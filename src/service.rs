@@ -1211,10 +1211,20 @@ impl Service {
             // Loopback — the LRU already holds this hash (e.g. we
             // just applied an inbound `set_text` that wrote this
             // value). Do not re-broadcast.
+            log::info!(
+                "clipboard tick: LRU loopback hit sha={} ({} bytes), skipping broadcast",
+                short_hex(&sha),
+                new_text.len()
+            );
             self.clipboard_last_text = Some(new_text);
             return;
         }
         // New content — mark + broadcast.
+        log::info!(
+            "clipboard change detected: {} bytes (sha={})",
+            new_text.len(),
+            short_hex(&sha)
+        );
         self.clipboard_lru.push(sha);
         self.clipboard_last_text = Some(new_text.clone());
         let event = ProtoEvent::ClipboardText(ClipboardText {
@@ -1229,7 +1239,17 @@ impl Service {
             // route the var-codec event to StreamC regardless of size.
             content_inline: Some(new_text.into_bytes()),
         });
-        self.broadcast_clipboard_event(event).await;
+        let mut recipients = 0usize;
+        self.broadcast_clipboard_event(event, &mut recipients).await;
+        if recipients == 0 {
+            log::warn!(
+                "clipboard dispatched to 0 peers (sha={}); peer gate filtered all clients — \
+                 check `enable_clipboard_to` in TOML and that the connection is active",
+                short_hex(&sha)
+            );
+        } else {
+            log::info!("clipboard dispatched to {} peer(s) (sha={})", recipients, short_hex(&sha));
+        }
         let now_ms = unix_now_ms();
         self.last_text_ts_ms = Some(now_ms);
         self.last_clipboard_source = None;
@@ -1330,18 +1350,50 @@ impl Service {
     /// happens off-thread. Per-peer send failures (peer
     /// disconnected mid-tick) are logged at `warn` inside
     /// `CaptureTask` but do not propagate here.
-    async fn broadcast_clipboard_event(&self, event: ProtoEvent) {
+    async fn broadcast_clipboard_event(&self, event: ProtoEvent, recipients: &mut usize) {
+        let mut skipped_disabled = 0usize;
+        let mut skipped_inactive = 0usize;
+        let mut skipped_no_addr = 0usize;
         for (handle, cfg, state) in self.client_manager.get_client_states() {
             if !cfg.enable_clipboard_to {
+                log::info!(
+                    "clipboard broadcast: skipping peer handle={} (enable_clipboard_to=false)",
+                    handle
+                );
+                skipped_disabled += 1;
                 continue;
             }
             if !state.active {
+                log::info!(
+                    "clipboard broadcast: skipping peer handle={} (client not active yet)",
+                    handle
+                );
+                skipped_inactive += 1;
                 continue;
             }
             if state.active_addr.is_none() {
+                log::info!(
+                    "clipboard broadcast: skipping peer handle={} (no active_addr — handshake incomplete?)",
+                    handle
+                );
+                skipped_no_addr += 1;
                 continue;
             }
+            log::info!(
+                "clipboard broadcast: -> peer handle={} active_addr={:?}",
+                handle,
+                state.active_addr
+            );
             self.capture.send_event(event.clone(), handle);
+            *recipients += 1;
+        }
+        if skipped_disabled + skipped_inactive + skipped_no_addr > 0 {
+            log::info!(
+                "clipboard broadcast gate summary: skipped disabled={} inactive={} no_addr={}",
+                skipped_disabled,
+                skipped_inactive,
+                skipped_no_addr
+            );
         }
     }
 }

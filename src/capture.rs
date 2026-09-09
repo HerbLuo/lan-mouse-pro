@@ -633,6 +633,9 @@ impl CaptureTask {
                         // the dispatcher — the next user copy is the
                         // natural retry point.
                         CaptureRequest::SendClip(event, handle) => {
+                            log::info!(
+                                "capture: SendClip -> handle {handle} (event={event:?})"
+                            );
                             if let Err(e) = self.conn.send(event.clone(), handle).await {
                                 log::warn!(
                                     "capture: send_event to handle {handle} failed: {e}"
@@ -974,6 +977,9 @@ impl CaptureTask {
                     // `ClipboardText`. Failures are logged, not
                     // surfaced.
                     CaptureRequest::SendClip(event, handle) => {
+                        log::info!(
+                            "capture: SendClip -> handle {handle} (event={event:?})"
+                        );
                         if let Err(e) = self.conn.send(event.clone(), handle).await {
                             log::warn!(
                                 "capture: send_event to handle {handle} failed: {e}"
