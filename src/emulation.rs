@@ -272,6 +272,18 @@ impl ListenTask {
                             // for what is conceptually a different
                             // subsystem (clipboard vs. emulation).
                             ProtoEvent::ClipboardText(ct) => {
+                                let sha_prefix: String = ct
+                                    .sha256
+                                    .iter()
+                                    .take(4)
+                                    .map(|b| format!("{b:02x}"))
+                                    .collect();
+                                log::info!(
+                                    "ListenTask: forwarding ClipboardText (sha={}…, {} bytes) from {from_addr} to dispatcher",
+                                    sha_prefix,
+                                    ct.content_inline.as_ref().map(|b| b.len()).unwrap_or(0),
+                                    from_addr = addr
+                                );
                                 if self
                                     .clipboard_inbound_tx
                                     .send((addr, ProtoEvent::ClipboardText(ct)))

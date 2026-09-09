@@ -902,9 +902,10 @@ async fn server_accept_bi_task(
         // opened via `PeerSession::send_stream_c`, NOT this
         // accepted bidi (each side opens its own bidi).
         if len as usize > lan_mouse_proto::MAX_EVENT_SIZE {
-            log::debug!(
-                "server accept_bi: stream C first frame length={len} (> MAX_EVENT_SIZE={}), dispatching to stream C reader",
-                lan_mouse_proto::MAX_EVENT_SIZE
+            log::info!(
+                "server accept_bi: stream C first frame length={len} (> MAX_EVENT_SIZE={}) from {from_addr}, dispatching to stream C reader",
+                lan_mouse_proto::MAX_EVENT_SIZE,
+                from_addr = addr
             );
             drop(send);
             spawn_local(server_stream_c_reader_task(recv, listen_tx.clone(), addr));
@@ -1017,7 +1018,7 @@ async fn server_stream_c_reader_task(
     loop {
         match quic_transport::read_stream_c_frame(&mut recv).await {
             Ok(event) => {
-                log::debug!("server stream C reader: from {addr}: {event}");
+                log::info!("server stream C reader: from {addr}: {event}");
                 if listen_tx.send(ListenEvent::Msg { event, addr }).is_err() {
                     log::debug!("server stream C reader: listen_tx closed, exiting");
                     return;
