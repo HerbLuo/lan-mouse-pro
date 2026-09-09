@@ -156,3 +156,30 @@
 - **Plan 偏差**：0 处功能性偏差（运行时行为完全正确；3 个 error 全部是 lint-level），但 1a.4 "0 new clippy" 的口径被突破 —— 文档记录为"1a.4 隐藏 3 个 lint error，1a.5 清理"
 - **解决 STEP**：M1a / STEP-1a.5
 
+---
+
+## #11 — Windows clipboard backend (`src/clipboard/windows.rs`) 在 Windows build 上无法编译（zig-cross 验证暴露 + 4 处修复）
+
+- **触发 STEP**：SUGGESTION #S-2（STEP-P2-M1a-1a.3 衍生）；2026-09-09 macOS 本地 `cargo-zigbuild --target x86_64-pc-windows-gnu` 验证暴露
+- **现象**：`cargo zigbuild --target x86_64-pc-windows-gnu -p lan-mouse --lib --all-targets --no-default-features` 报 4 处编译错误 + 3 处 warning：
+  1. **error[E0432] `windows_sys::Win32::Foundation::CloseClipboard` unresolved** — `CloseClipboard` 在 windows-sys 0.61 中位于 `Win32::System::DataExchange`，不是 `Win32::Foundation`。1a.3 leader 落地时按旧版 windows-sys 路径写错。
+  2. **error[E0308] mismatched types @ `src/clipboard/windows.rs:149`** — `let text = match result { Some(s) => s, None => return None };` 期望 `result: Option<String>`，但 `let result = unsafe { ... text }` 实际为 `String`（unsafe 块的尾表达式是 `text: String`，而非 `Option<String>`；块内的 `return Some(...)` 是从外层函数 return，不贡献块的值）。这是 M1a STEP-1a.3 leader 报告 §1.2 "Some(Ok) / Some(Err) shape" 注释与代码脱节的产物 —— 注释声称有 `Option<Result<String, String>>`，但实际重构时已展平为 `Option<String>`，match 没跟着改。
+  3. **error[E0308] mismatched types @ `src/clipboard/windows.rs:150`** — 同根因（`None` 模式在 `String` 上不合法）。
+  4. **warning: unused import `OsStringExt`** — `OsStringExt::encode_wide` 实际是 `OsStrExt` 上的方法；OsStrExt 已 import，OsStringExt 是冗余。
+  5. **warning: unused import `HWND`** — windows.rs 全文件未使用 `HWND`（仅 `HGLOBAL` 用于 handle）。
+  6. **warning: unused import `EmptyClipboard`** — set_text / current_text 均未调用 `EmptyClipboard`（"clear clipboard" 走 `SetClipboardData("")` 路径，未用 `EmptyClipboard` 单独 API）。
+  7. **warning: `Err_to_string` non_snake_case** — helper 函数命名违反 Rust 命名约定。
+- **根因**：1a.3 leader 落地 windows.rs 时**仅在 macOS 本机静态 review + 静态 cfg-gate 检查**，未跑 Windows 真机编译也未通过 CI 验证。windows.rs 是 `#[cfg(target_os = "windows")]` 守门，macOS 完全不编，所以 4 个 error + 3 个 warning 全部躲过本地 + M1a 1a.5 leader 复核（1a.5 clippy 检查 macOS host 也跳过 windows.rs）。GitHub Actions CI matrix 含 windows-latest job，但当前 main 分支无 recent push 触发；并且即使触发，`cargo build` 在 windows-latest 上也会立刻爆这 4 个 error —— 即 1a.3 落地后任何 CI run 都应已红。推测：M1a 1a.3 完成后 windows-latest job 没真正跑过 / 或 main 后续 commit 修了但未删 windows.rs 旧路径（看了 git log，1a.3 之后到 b92c750 之间 8 个 commit 全是 macOS-side 工作，windows-latest job 实际未触发）。
+- **解决方案**（本轮 leader 验证 + 修复）：
+  - `src/clipboard/windows.rs:51-55` — 修正 `CloseClipboard` import 位置：`Win32::Foundation::{CloseClipboard, ...}` → 拆分 `Win32::Foundation::{GetLastError, HGLOBAL}` + `Win32::System::DataExchange::{CloseClipboard, ...}`。同时移除 `HWND` / `EmptyClipboard` / `OsStringExt` 3 个 unused import。
+  - `src/clipboard/windows.rs:113-152` — 删掉 buggy 的 `match result { Some(s) => s, None => return None };`，直接把 unsafe 块的尾表达式 `text: String` 作为 `let text = unsafe { ... };` 的值。同时把 GlobalLock / UTF-16 decode 两条错误路径的 `return Some(Err_to_string(...))` 改为 `return None` —— 与 trait 契约 "platform read failed silently → None" 一致（之前 `Some(err_msg)` 会把 Win32 错误信息泄漏到 dispatcher 的 clipboard-text 通道作为"剪贴板内容"，是双 bug：编译错 + 语义错）。
+  - `src/clipboard/windows.rs:229-313` — `Err_to_string` 从 module-level 移到 `#[cfg(test)]`，重命名为 `err_to_string`（snake_case）。删除 `_force_keep_Err_to_string` workaround（不再需要 —— production code 已不用 `err_to_string`）。测试 `err_to_string_format_is_stable` 仍 pin 格式给未来 debug-log 用。
+- **预防措施**（AGENTS.md 待补 hard rule）：**任何 cfg-gated 平台模块落地后必须跑三平台编译验证**：
+  1. macOS host：`cargo build -p lan-mouse` + `cargo test -p lan-mouse --lib`（host 平台全编）
+  2. Linux cross：`cargo zigbuild --target x86_64-unknown-linux-gnu -p lan-mouse --lib --all-targets --no-default-features`（依赖 zig 0.14+，zig cross 替 cc-rs 编 ring/rcgen/zlib 的 C 链路；macOS 不需要 gcc cross-toolchain）
+  3. Windows cross：同上 + `--target x86_64-pc-windows-gnu`（zig 自带 lld 不支持 MSVC ABI，--gnu target 是 macOS 上唯一可验路径；MSVC target 留给 CI windows-latest job）
+  三平台全绿后才能写 `done` 报告。这与 FIXED #10 "leader-continued 后必须 fmt + clippy + test 三连" 同级硬约束 —— 但 #10 是 lint-level（错过只是 -D warnings 报错），#11 是 type-level（错过直接 E0308 / E0432 编不过，CI 红）。
+- **CI matrix 现状**：`.github/workflows/rust.yml` 已含 `ubuntu-latest` + `windows-latest` + `macos-latest` + `macos-15-intel` × `build` / `check` / `clippy` / `test` 4 job = 16 job。本机 zig-cross 验证后，windows.rs 在 windows-latest CI job 上也应绿（前提是 CI 真的跑了；如果 #11 修复 push 后 windows-latest job 还红，根因大概率是 input-capture/input-emulation 的 libei/layer-shell 在 Windows 上有 cfg-gated stub —— 那是 M1a scope 之外，留给 M1b+）。
+- **Plan 偏差**：1 处隐性偏差（windows.rs 未本地验证落地，是 1a.3 的隐性 scope gap；本轮就地把 gap 补上）。0 处功能性偏差（修复后 windows.rs 在 Windows + Linux 双 cross-compile + macOS native 均绿）。
+- **解决 STEP**：out-of-scope cleanup（M1a / STEP-P2-M1a-1a.3 follow-up；不在任何 PLAN STEP 内，仅响应 SUGGESTION #S-2 的本地验证诉求）
+
