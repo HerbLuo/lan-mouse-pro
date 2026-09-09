@@ -820,7 +820,7 @@ async fn connect_to_handle(
     // Spawn the supervisor to take over the peer's lifecycle — when
     // `peer.run()` exits, it decides whether to trigger a RetryState reconnect.
     spawn_local(spawn_peer_supervisor(
-        client_manager,
+        client_manager.clone(),
         peers.clone(),
         connecting.clone(),
         retry_state,
@@ -829,7 +829,7 @@ async fn connect_to_handle(
         pins_dir,
         handle,
         remote,
-        peer,
+        peer.clone(),
         quic_idle_timeout,
         peer_lost_tx,
         recv_tx.clone(),
@@ -839,7 +839,7 @@ async fn connect_to_handle(
         // this clone so the new peer's stream C reader
         // keeps pushing to the same service-side
         // dispatcher.
-        clipboard_inbound_tx,
+        clipboard_inbound_tx.clone(),
         // **M1a follow-up #1** — push-notify sender.
         // The supervisor's redial `connect_to_handle` reuses
         // this clone so the recovered clipboard push fires on
@@ -847,7 +847,281 @@ async fn connect_to_handle(
         // not just the first one.
         clipboard_push_notify_tx,
     ));
+
+    // **M1a follow-up #2 — client-side accept_bi loop**. Symmetric
+    // with `listen.rs::server_accept_bi_task`. Without this loop,
+    // a `send_stream_c` push from the peer (server side) opens a
+    // bidi that the client never dequeues — the bytes land in the
+    // accept queue and the slave's clipboard push never reaches the
+    // master. The bug surfaces as "被控端复制文本不能传到主控端" —
+    // `peer.send_input(ClipboardText)` returns Ok on the slave,
+    // `recipients == 1` is logged, but the master side never sees
+    // the frame.
+    //
+    // Spawned after the supervisor because both tasks read from
+    // `peer.connection()` independently; quinn's accept queue is
+    // shared so either task can drain bidis. The supervisor's
+    // `peer.run(PeerRole::Client)` doesn't accept_bi — its main
+    // loop only consumes stream A / B / C / datagram. See the
+    // `stream_c_clipboard_text_round_trip` test in
+    // `quic_transport::session.rs:1677+` for the comment that
+    // documents this asymmetry explicitly.
+    spawn_local(client_accept_bi_task(
+        peer,
+        client_manager,
+        recv_tx,
+        clipboard_inbound_tx,
+    ));
+
     Ok(())
+}
+
+/// **M1a follow-up #2** — client-side `accept_bi` loop. Symmetric
+/// with `listen.rs::server_accept_bi_task`, but for the *client*
+/// role.
+///
+/// **Background**: `PeerSession::send_stream_c` lazily
+/// `open_bi()`s a new bidi when its `cached_send_c` cache is
+/// empty. The server side dequeues those bidis via
+/// `listen.rs::server_accept_bi_task`. The client side had no
+/// equivalent — when the peer (server) opens a fresh bidi via
+/// `send_stream_c` to push a `ClipboardText` back to us, that
+/// bidi sits in the client's accept queue forever. The
+/// `stream_c_clipboard_text_round_trip` test in
+/// `quic_transport::session.rs:1677+` even calls this out:
+///
+/// > the server side needs an `accept_bi` loop to catch the lazy
+/// > stream C bidi opened by `send_stream_c` (... the production
+/// > listen.rs::server_accept_bi_task pattern). `peer.run`'s main
+/// > loop does not include this loop — it's added by the
+/// > production supervisor in `listen.rs`.
+///
+/// User-visible symptom: the slave daemon's clipboard push
+/// (`Service::broadcast_clipboard_event` → `Emulation::
+/// send_to_incoming` → `peer.send_input(ClipboardText)` → wire)
+/// succeeds on the slave side (`dispatched to 1 peer(s)`), but
+/// the master side never receives it because its accept_bi queue
+/// is unread. The master must accept the bidi, read the frame,
+/// forward it to `clipboard_inbound_tx`, and let the service
+/// dispatcher apply it to the local OS clipboard.
+///
+/// **Discriminator** (mirrors `server_accept_bi_task`): the first
+/// 4 bytes after `accept_bi` is a `[u32 BE len]` length prefix.
+/// `len > MAX_EVENT_SIZE` (21) → var-codec frame (ClipboardText
+/// / ClipboardImage / etc.) → stream C reader. `len ≤
+/// MAX_EVENT_SIZE` → fixed-codec stream B frame (defensive — the
+/// server doesn't normally push input events back, but we route
+/// them via `recv_tx` if it ever does). EOF on first read = bunch
+/// bidi (peer opened a bidi with no data — park both halves to
+/// avoid breaking the peer's writer).
+///
+/// **Lifecycle**: the task exits when `accept_bi` returns `Err`
+/// (connection closed by the peer / `conn.closed`). The
+/// supervisor's `peer.run` exiting at the same time races the
+/// task's exit; either one alone is enough — both leave the
+/// `peers` table clean via the supervisor's cleanup path.
+async fn client_accept_bi_task(
+    peer: Arc<PeerSession>,
+    client_manager: ClientManager,
+    recv_tx: Sender<(ClientHandle, lan_mouse_proto::ProtoEvent)>,
+    clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(
+        std::net::SocketAddr,
+        lan_mouse_proto::ProtoEvent,
+    )>,
+) {
+    let parked_streams: Rc<RefCell<Vec<(quinn::SendStream, quinn::RecvStream)>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    loop {
+        let (send, mut recv) = match peer.connection().accept_bi().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                log::info!("client accept_bi: exiting (conn closed): {e}");
+                return;
+            }
+        };
+        // Discriminator: try to read the first frame's length prefix.
+        use tokio::io::AsyncReadExt;
+        let len: u32 = match recv.read_u32().await {
+            Ok(n) => n,
+            Err(e) => {
+                // Bunch bidi: peer opened a bidi and never wrote.
+                // Park both halves so the peer's writer doesn't see
+                // a closed stream (matches the symmetric server-
+                // side parking in `listen.rs::server_accept_bi_task`).
+                log::debug!(
+                    "client accept_bi: accepted stream EOF'd immediately (bunch bidi), \
+                     parking send+recv: {e}"
+                );
+                parked_streams.borrow_mut().push((send, recv));
+                continue;
+            }
+        };
+        let remote = peer.connection().remote_address();
+        if len as usize > lan_mouse_proto::MAX_EVENT_SIZE {
+            // **Stream C**: read body inline, decode, forward to
+            // `clipboard_inbound_tx`, then spawn a reader for
+            // subsequent frames. Mirrors `listen.rs::
+            // server_accept_bi_task`'s stream C branch.
+            //
+            // **Why drop `send`**: the peer's stream C writer has
+            // its own send half on the OTHER end of this bidi (the
+            // bidi we just accepted). The peer's `cached_send_c`
+            // already holds the writer; dropping our `send` here
+            // just frees the unused local reference (and quinn
+            // keeps the bidi alive while the peer holds its writer
+            // and we hold our reader).
+            drop(send);
+            let mut body = vec![0u8; len as usize];
+            if let Err(e) = recv.read_exact(&mut body).await {
+                log::warn!(
+                    "client accept_bi: stream C first body read failed ({remote}, len={len}): {e}"
+                );
+                continue;
+            }
+            let event = match lan_mouse_proto::ProtoEvent::try_from(body.as_slice()) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!(
+                        "client accept_bi: stream C first frame decode failed ({remote}, len={len}): {e}"
+                    );
+                    continue;
+                }
+            };
+            log::info!("client accept_bi: stream C first frame from {remote}: {event}");
+            if let Err(e) = clipboard_inbound_tx.send((remote, event)) {
+                log::debug!("client accept_bi: clipboard_inbound_tx closed, exiting: {e}");
+                return;
+            }
+            spawn_local(client_stream_c_reader_task(
+                recv,
+                remote,
+                clipboard_inbound_tx.clone(),
+            ));
+        } else {
+            // **Stream B** (defensive): the master is the
+            // controller, so the slave doesn't normally push
+            // input events back — but if it does, route via
+            // `recv_tx` so `capture.rs` can act on Ack / Leave /
+            // Pong events.
+            //
+            // **Fixed-size body**: stream B frames are exactly
+            // `MAX_EVENT_SIZE` bytes (fixed-codec), unlike the
+            // var-codec stream C path above.
+            drop(send);
+            if len as usize != lan_mouse_proto::MAX_EVENT_SIZE {
+                log::warn!(
+                    "client accept_bi: stream B length {len} != MAX_EVENT_SIZE={} \
+                     (defensive stream B path; unexpected on the wire)",
+                    lan_mouse_proto::MAX_EVENT_SIZE
+                );
+                continue;
+            }
+            let mut body = vec![0u8; len as usize];
+            if let Err(e) = recv.read_exact(&mut body).await {
+                log::warn!(
+                    "client accept_bi: stream B body read failed ({remote}, len={len}): {e}"
+                );
+                continue;
+            }
+            let mut buf = [0u8; lan_mouse_proto::MAX_EVENT_SIZE];
+            buf.copy_from_slice(&body);
+            let event = match lan_mouse_proto::ProtoEvent::try_from(buf) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!(
+                        "client accept_bi: stream B first frame decode failed ({remote}): {e}"
+                    );
+                    continue;
+                }
+            };
+            log::debug!("client accept_bi: stream B first frame from {remote}: {event}");
+            if let Some(handle) = client_manager.get_client(remote) {
+                if let Err(e) = recv_tx.send((handle, event)) {
+                    log::debug!("client accept_bi: recv_tx.send failed, exiting: {e}");
+                    return;
+                }
+            } else {
+                log::warn!("client accept_bi: addr {remote} not in client_manager (dropping)");
+            }
+            spawn_local(client_stream_b_reader_task(
+                recv,
+                remote,
+                client_manager.clone(),
+                recv_tx.clone(),
+            ));
+        }
+    }
+}
+
+/// **M1a follow-up #2** — reader task for subsequent stream C frames
+/// on a bidi accepted by [`client_accept_bi_task`]. Spawned after
+/// the first frame is consumed inline, matching
+/// `listen.rs::server_stream_c_reader_task`'s lifecycle.
+async fn client_stream_c_reader_task(
+    mut recv: quinn::RecvStream,
+    remote: SocketAddr,
+    clipboard_inbound_tx: tokio::sync::mpsc::UnboundedSender<(
+        std::net::SocketAddr,
+        lan_mouse_proto::ProtoEvent,
+    )>,
+) {
+    loop {
+        match crate::quic_transport::read_stream_c_frame(&mut recv).await {
+            Ok(event) => {
+                log::info!("client stream C reader: from {remote}: {event}");
+                if let Err(e) = clipboard_inbound_tx.send((remote, event)) {
+                    log::debug!("client stream C reader: clipboard_inbound_tx closed: {e}");
+                    return;
+                }
+            }
+            Err(crate::quic_transport::Error::HelloFailed(msg))
+                if msg.starts_with("decode stream C frame") =>
+            {
+                log::warn!("client stream C reader: skip frame (decode error): {msg}");
+                continue;
+            }
+            Err(e) => {
+                log::info!("client stream C reader: stream ended ({remote}): {e}");
+                return;
+            }
+        }
+    }
+}
+
+/// **M1a follow-up #2** — reader task for subsequent stream B frames
+/// on a bidi accepted by [`client_accept_bi_task`]. Mirrors
+/// `listen.rs::server_stream_reader_task`.
+async fn client_stream_b_reader_task(
+    mut recv: quinn::RecvStream,
+    remote: SocketAddr,
+    client_manager: ClientManager,
+    recv_tx: Sender<(ClientHandle, lan_mouse_proto::ProtoEvent)>,
+) {
+    loop {
+        match crate::quic_transport::read_frame(&mut recv).await {
+            Ok(event) => {
+                log::debug!("client stream B reader: from {remote}: {event}");
+                if let Some(handle) = client_manager.get_client(remote) {
+                    if let Err(e) = recv_tx.send((handle, event)) {
+                        log::warn!("client stream B reader: recv_tx.send failed: {e}");
+                        return;
+                    }
+                } else {
+                    log::warn!("client stream B reader: addr {remote} not in client_manager");
+                }
+            }
+            Err(crate::quic_transport::Error::HelloFailed(msg))
+                if msg.starts_with("decode frame") =>
+            {
+                log::warn!("client stream B reader: skip frame: {msg}");
+                continue;
+            }
+            Err(e) => {
+                log::info!("client stream B reader: stream ended ({remote}): {e}");
+                return;
+            }
+        }
+    }
 }
 
 /// Peer lifecycle supervisor — decides whether to reconnect when a peer dies.
