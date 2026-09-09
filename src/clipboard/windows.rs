@@ -46,11 +46,11 @@
 #![cfg(target_os = "windows")]
 
 use std::ffi::OsString;
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::ffi::OsStrExt;
 
-use windows_sys::Win32::Foundation::{CloseClipboard, GetLastError, HGLOBAL, HWND};
+use windows_sys::Win32::Foundation::{GetLastError, HGLOBAL};
 use windows_sys::Win32::System::DataExchange::{
-    EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+    CloseClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 
@@ -110,12 +110,12 @@ impl ClipboardBackend for WinClipboard {
         // just above). `GlobalLock` returns a pointer to the first
         // byte; the memory is valid until `GlobalUnlock` /
         // `CloseClipboard`. We read up to the first NUL wide char.
-        let result = unsafe {
+        let text = unsafe {
             let ptr = GlobalLock(handle) as *const u16;
             if ptr.is_null() {
                 let err = GetLastError();
                 CloseClipboard();
-                return Some(Err_to_string("GlobalLock", err));
+                return Some(err_to_string("GlobalLock", err));
             }
             // Walk the wide-char buffer until NUL.
             let mut len = 0usize;
@@ -128,10 +128,10 @@ impl ClipboardBackend for WinClipboard {
             // (the BOM is not part of the visible text).
             let text = match String::from_utf16(slice) {
                 Ok(s) => s,
-                Err(e) => {
+                Err(_e) => {
                     GlobalUnlock(handle);
                     CloseClipboard();
-                    return Some(Err_to_string(
+                    return Some(err_to_string(
                         "from_utf16 (clipboard text is not valid UTF-16)",
                         0,
                     ));
@@ -141,14 +141,10 @@ impl ClipboardBackend for WinClipboard {
             CloseClipboard();
             text
         };
-        // `result` is now `Option<String>`: Some(Err_to_string(...)) is
-        // never actually produced (the helper is unused on the Ok
-        // path); the `Some(Ok)` / `Some(Err)` shape above was a
-        // workaround for borrow-checker ordering — flatten it.
-        let text = match result {
-            Some(s) => s,
-            None => return None,
-        };
+        // Error paths inside the unsafe block short-circuit via
+        // `return Some(err_to_string(...))`; reaching this point means
+        // the clipboard advertised `CF_UNICODETEXT` and the payload
+        // decoded cleanly. Cache + return.
         self.cached = Some(text.clone());
         Some(text)
     }
@@ -227,9 +223,9 @@ impl ClipboardBackend for WinClipboard {
 }
 
 /// Build a stable error string for a Win32 call. Used by the
-/// `Some(Err_to_string(...))` path in `current_text`; kept here so
+/// `Some(err_to_string(...))` path in `current_text`; kept here so
 /// the error wording is consistent across the read / write paths.
-fn Err_to_string(op: &str, err: u32) -> String {
+fn err_to_string(op: &str, err: u32) -> String {
     format!("{op} failed: GetLastError={err}")
 }
 
@@ -243,7 +239,7 @@ fn Err_to_string(op: &str, err: u32) -> String {
 // build — we cannot exercise the Win32 API locally.
 //
 // The tests pin the trait contract (`name()` / `can_clear()`) and
-// the basic safety invariants of the helpers (`Err_to_string`).
+// the basic safety invariants of the helpers (`err_to_string`).
 // Round-trip testing of `OpenClipboard` / `GetClipboardData` /
 // `SetClipboardData` is performed by the human verification matrix
 // in `tests/manual/clipboard-text.md` on a real Windows VM.
@@ -281,32 +277,32 @@ mod tests {
         assert_eq!(CF_UNICODETEXT, 13);
     }
 
-    /// `Err_to_string` produces a deterministic, parseable format
+    /// `err_to_string` produces a deterministic, parseable format
     /// (`"<op> failed: GetLastError=<code>"`). The dispatcher log
     /// grep relies on the exact prefix to recognise Win32 errors.
     #[test]
     fn err_to_string_format_is_stable() {
         assert_eq!(
-            Err_to_string("OpenClipboard", 5),
+            err_to_string("OpenClipboard", 5),
             "OpenClipboard failed: GetLastError=5"
         );
         assert_eq!(
-            Err_to_string("GlobalLock", 0),
+            err_to_string("GlobalLock", 0),
             "GlobalLock failed: GetLastError=0"
         );
     }
 }
 
 // ============================================================================
-//  Unused-import silencer for the `Err_to_string` helper on no-op paths
+//  Unused-import silencer for the `err_to_string` helper on no-op paths
 // ============================================================================
 //
-// The `Err_to_string` helper is only used in the `current_text`
+// The `err_to_string` helper is only used in the `current_text`
 // `Some(Err)` branch which is unreachable in practice (the
 // `GlobalLock` failure path returns the `String` directly). Suppress
-// the resulting `unused` warning on the `Err_to_string` fn so the
+// the resulting `unused` warning on the `err_to_string` fn so the
 // Windows build is warning-clean.
 #[allow(dead_code)]
-fn _force_keep_Err_to_string() {
-    let _ = Err_to_string;
+fn _force_keep_err_to_string() {
+    let _ = err_to_string;
 }
