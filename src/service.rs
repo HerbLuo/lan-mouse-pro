@@ -142,6 +142,12 @@ pub struct Service {
     /// `None` after an inbound `set_text` so the next tick re-reads
     /// and confirms the new value.
     clipboard_last_text: Option<String>,
+    /// Metadata-only clipboard text events waiting for the HTTP/3 pull
+    /// implemented in M1b.2. M1b.1 deliberately registers the SHA-256
+    /// without issuing a request. Only the latest hash is retained because
+    /// clipboard synchronization follows last-writer-wins semantics and an
+    /// older pending hash is stale once a newer notification arrives.
+    pending_clipboard_requests: HashMap<[u8; 32], ()>,
     /// **M1a STEP-1a.4** — receiver for inbound clipboard events.
     /// Senders live in two places:
     /// - `Emulation::new` clones the sender into the
@@ -458,6 +464,7 @@ impl Service {
             clipboard_backend,
             clipboard_lru: LruFingerprints::new(64),
             clipboard_last_text: None,
+            pending_clipboard_requests: Default::default(),
             clipboard_inbound_rx,
             clipboard_inbound_tx,
             // **M1a follow-up #1** — push-notify receiver. The
@@ -1462,7 +1469,7 @@ impl Service {
         });
     }
 
-    /// **PLAN-2 / M1a STEP-1a.4** — 500 ms tick handler.
+    /// Clipboard dispatcher 500 ms tick handler.
     ///
     /// 1. Read the current clipboard text. `None` → no-op (clipboard
     ///    holds non-text content, e.g. an image — skip this tick).
@@ -1470,9 +1477,9 @@ impl Service {
     /// 3. SHA-256 the text. If the hash is in the LRU → no-op
     ///    (loopback defence: this hash was *we* who wrote it
     ///    recently; pushing it again is wasted work).
-    /// 4. Mark LRU, update `last_text`, broadcast `ClipboardText` to
-    ///    every active peer with `enable_clipboard_to = true`,
-    ///    push `FrontendEvent::ClipboardState { last_source: None }`.
+    /// 4. Mark LRU, update `last_text`, and construct the canonical
+    ///    `ClipboardText` event. The protocol constructor keeps text up
+    ///    to 1 KiB inline and sends metadata only for larger text.
     ///
     /// **Why a 500 ms tick**: matches PLAN §3 M1a "macOS 实现
     /// ... 500ms tick" / "Linux 500 ms tick" cadence. Fast enough
@@ -1518,18 +1525,8 @@ impl Service {
         );
         self.clipboard_lru.push(sha);
         self.clipboard_last_text = Some(new_text.clone());
-        let event = ProtoEvent::ClipboardText(ClipboardText {
-            fingerprint: sha,
-            sha256: sha,
-            size: new_text.len() as u64,
-            // **M1a inline-only**: ≤ 1 KiB carried inline. Larger
-            // payloads (M1b) would set `content_inline: None` and
-            // rely on the HTTP/3 GET path. The `if let Some(content)`
-            // is defensive: a clipboard value > 1 KiB would still be
-            // pushed inline, but the receiver's `route_input` would
-            // route the var-codec event to StreamC regardless of size.
-            content_inline: Some(new_text.into_bytes()),
-        });
+        let event =
+            ProtoEvent::ClipboardText(ClipboardText::from_content(sha, sha, new_text.into_bytes()));
         let mut recipients = 0usize;
         self.broadcast_clipboard_event(event, &mut recipients).await;
         if recipients == 0 {
@@ -1556,28 +1553,13 @@ impl Service {
         });
     }
 
-    /// **PLAN-2 / M1a STEP-1a.4** — inbound `ClipboardText` from a
-    /// peer (server or client side, see the field doc on
-    /// `clipboard_inbound_rx`).
+    /// Clipboard inbound handler for `ClipboardText` from a peer (server or
+    /// client side, see the field doc on `clipboard_inbound_rx`).
     ///
-    /// Steps:
-    /// 1. Drop the event if the LRU already holds the fingerprint
-    ///    (loopback — we just wrote this content locally and a
-    ///    peer's echo made it back).
-    /// 2. Apply the inline bytes to the local OS clipboard via
-    ///    `backend.set_text` (or skip if the payload is
-    ///    `content_inline = None` — M1a only supports the inline
-    ///    path; M1b adds the HTTP/3 GET fallback).
-    /// 3. Mark LRU, update `last_text` (force re-read on the next
-    ///    tick so the broadcast loop sees the new value and
-    ///    de-dups).
-    /// 4. Notify the frontend with `last_source: Some(<addr>)` so
-    ///    the GUI can render the "clipboard was just changed by
-    ///    <peer>" amber highlight (PLAN §3 M4 STEP-4.4 preview).
+    /// Inline payloads are applied immediately. Metadata-only payloads are
+    /// registered in `pending_clipboard_requests` and intentionally stop
+    /// there; M1b.2 owns the `ClipboardRequest` / HTTP/3 pull path.
     fn handle_clipboard_inbound(&mut self, (addr, event): (SocketAddr, ProtoEvent)) {
-        let Some(backend) = self.clipboard_backend.as_mut() else {
-            return;
-        };
         let ProtoEvent::ClipboardText(ct) = event else {
             // Only text is wired in M1a. Image / Files / FileTransfer
             // events flow through `clipboard_inbound_rx` once M2a /
@@ -1591,19 +1573,19 @@ impl Service {
             );
             return;
         }
-        let content = match &ct.content_inline {
-            Some(bytes) => bytes,
-            None => {
-                // M1a limitation: metadata-only (no inline) payloads
-                // can't be applied without the HTTP/3 GET path which
-                // is M1b. Log + skip; the receiver's clipboard
-                // remains on the pre-push value.
-                log::warn!(
-                    "clipboard inbound: sha={} has no inline payload (M1a only supports ≤ 1 KiB inline); skipping",
-                    short_hex(&ct.sha256)
-                );
-                return;
-            }
+        let Some(content) = ct.content_inline.as_ref() else {
+            let newly_registered =
+                register_pending_clipboard_request(&mut self.pending_clipboard_requests, ct.sha256);
+            log::info!(
+                "clipboard inbound: registered metadata-only sha={} ({} bytes, new={}, HTTP/3 pull deferred to M1b.2)",
+                short_hex(&ct.sha256),
+                ct.size,
+                newly_registered
+            );
+            return;
+        };
+        let Some(backend) = self.clipboard_backend.as_mut() else {
+            return;
         };
         // Apply to the local OS clipboard. The text is UTF-8 by
         // wire convention; if a peer sent non-UTF-8 bytes (corrupt
@@ -1697,12 +1679,8 @@ impl Service {
         );
         self.clipboard_lru.push(sha);
         self.clipboard_last_text = Some(new_text.clone());
-        let event = ProtoEvent::ClipboardText(ClipboardText {
-            fingerprint: sha,
-            sha256: sha,
-            size: new_text.len() as u64,
-            content_inline: Some(new_text.into_bytes()),
-        });
+        let event =
+            ProtoEvent::ClipboardText(ClipboardText::from_content(sha, sha, new_text.into_bytes()));
         let mut recipients = 0usize;
         self.broadcast_clipboard_event(event, &mut recipients).await;
         if recipients == 0 {
@@ -1843,11 +1821,7 @@ impl Service {
                 continue;
             }
             log::info!("clipboard broadcast: -> incoming peer {addr}");
-            match self
-                .emulation
-                .send_to_incoming(*addr, event.clone())
-                .await
-            {
+            match self.emulation.send_to_incoming(*addr, event.clone()).await {
                 Ok(()) => {
                     *recipients += 1;
                 }
@@ -1866,11 +1840,7 @@ impl Service {
                 }
             }
         }
-        if incoming_skipped_disabled
-            + incoming_skipped_unreachable
-            + incoming_send_failed
-            > 0
-        {
+        if incoming_skipped_disabled + incoming_skipped_unreachable + incoming_send_failed > 0 {
             log::info!(
                 "clipboard broadcast gate summary (incoming): skipped disabled={} unreachable={} send_failed={}",
                 incoming_skipped_disabled,
@@ -1902,6 +1872,20 @@ fn short_hex(b: &[u8; 32]) -> String {
         s.push_str(&format!("{:02x}", byte));
     }
     s
+}
+
+/// Register a metadata-only clipboard text hash for the deferred HTTP/3
+/// pull. Returns `true` when `sha256` differs from the previously pending
+/// hash. Only the latest hash is kept because a newer clipboard notification
+/// supersedes an older one under last-writer-wins semantics.
+fn register_pending_clipboard_request(
+    pending: &mut HashMap<[u8; 32], ()>,
+    sha256: [u8; 32],
+) -> bool {
+    let newly_registered = !pending.contains_key(&sha256);
+    pending.clear();
+    pending.insert(sha256, ());
+    newly_registered
 }
 
 /// **PLAN-2 / M1a STEP-1a.4** — milliseconds since the UNIX
@@ -2084,6 +2068,29 @@ fn recover_monitors(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::register_pending_clipboard_request;
+    use std::collections::HashMap;
+
+    #[test]
+    fn metadata_only_text_registers_latest_pending_request_per_hash() {
+        let mut pending = HashMap::new();
+        let sha = [0x5A; 32];
+
+        assert!(register_pending_clipboard_request(&mut pending, sha));
+        assert!(!register_pending_clipboard_request(&mut pending, sha));
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key(&sha));
+
+        let other_sha = [0xA5; 32];
+        assert!(register_pending_clipboard_request(&mut pending, other_sha));
+        assert_eq!(pending.len(), 1);
+        assert!(!pending.contains_key(&sha));
+        assert!(pending.contains_key(&other_sha));
+    }
 }
 
 #[cfg(test)]

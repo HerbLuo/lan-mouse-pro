@@ -34,6 +34,12 @@ pub const MAX_EVENT_SIZE: usize = size_of::<u8>() + size_of::<u32>() + 2 * size_
 /// practice (all hot-path variants fit).
 pub const MAX_FRAME_SIZE: usize = 16 * 1024;
 
+/// Maximum size of a clipboard text body carried inline in a StreamC
+/// `ClipboardText` event. Larger values are represented by metadata only;
+/// the receiver records a pending request and a later milestone fetches the
+/// bytes through HTTP/3.
+pub const CLIPBOARD_TEXT_INLINE_LIMIT: usize = 1024;
+
 /// 8-byte protocol magic identifying a lan-mouse peer, carried in every
 /// [`ProtoEvent::Hello`]. The `Hello` is exchanged right after the QUIC
 /// mTLS handshake authenticates; a peer that fails to present this exact
@@ -125,6 +131,36 @@ pub struct ClipboardText {
     pub sha256: [u8; 32],
     pub size: u64,
     pub content_inline: Option<Vec<u8>>,
+}
+
+impl ClipboardText {
+    /// Build the canonical wire representation for clipboard text.
+    ///
+    /// The payload is kept inline only when its byte length is at most
+    /// [`CLIPBOARD_TEXT_INLINE_LIMIT`]. Larger payloads intentionally drop
+    /// the bytes here and retain only `sha256 + size`; the sender-side cache
+    /// and receiver-side HTTP/3 pull are wired in a later milestone. Keeping
+    /// this policy in one constructor prevents individual dispatch paths
+    /// from accidentally sending a large body inline.
+    pub fn from_content(fingerprint: [u8; 32], sha256: [u8; 32], content: Vec<u8>) -> Self {
+        let size = content.len() as u64;
+        let content_inline = if content.len() <= CLIPBOARD_TEXT_INLINE_LIMIT {
+            Some(content)
+        } else {
+            None
+        };
+        Self {
+            fingerprint,
+            sha256,
+            size,
+            content_inline,
+        }
+    }
+
+    /// Whether this event carries its content bytes inline.
+    pub fn is_inline(&self) -> bool {
+        self.content_inline.is_some()
+    }
 }
 
 /// Clipboard image metadata — used by M2a / M2b. Bytes always go
@@ -918,6 +954,61 @@ mod tests {
                 "round-trip mismatch for {event}"
             );
         }
+    }
+
+    /// The canonical constructor keeps the exact 1 KiB boundary inline,
+    /// while 1 KiB + 1 and larger payloads become metadata-only events.
+    /// This covers the four payload sizes used by the M1b dispatcher policy.
+    #[test]
+    fn clipboard_text_size_policy_uses_inline_only_at_or_below_limit() {
+        let cases = [
+            (CLIPBOARD_TEXT_INLINE_LIMIT, true),
+            (CLIPBOARD_TEXT_INLINE_LIMIT + 1, false),
+            (100 * 1024, false),
+            (1024 * 1024, false),
+        ];
+
+        for (size, expected_inline) in cases {
+            let content = vec![0xA5; size];
+            let event = ClipboardText::from_content([0x11; 32], [0x22; 32], content.clone());
+            assert_eq!(event.size, size as u64);
+            assert_eq!(event.is_inline(), expected_inline, "payload size: {size}");
+            if expected_inline {
+                assert_eq!(event.content_inline.as_deref(), Some(content.as_slice()));
+            } else {
+                assert!(event.content_inline.is_none(), "payload size: {size}");
+            }
+
+            let original = ProtoEvent::ClipboardText(event);
+            let encoded: Vec<u8> = original.clone().into();
+            let fixed_meta_len = 1 + 32 + 32 + size_of::<u64>() + 1;
+            let expected_len = if expected_inline {
+                fixed_meta_len + size_of::<u32>() + size
+            } else {
+                fixed_meta_len
+            };
+            assert_eq!(
+                encoded.len(),
+                expected_len,
+                "wire payload unexpectedly retained bytes for size: {size}"
+            );
+            let decoded = ProtoEvent::try_from(encoded.as_slice()).expect("decode clipboard text");
+            assert_eq!(
+                decoded, original,
+                "round-trip mismatch for payload size: {size}"
+            );
+        }
+    }
+
+    /// `ClipboardRequest` uses the var-codec dispatcher and preserves its
+    /// 32-byte SHA-256 key on the wire. The receiver-side service uses this
+    /// event in M1b.2 after registering a metadata-only text payload.
+    #[test]
+    fn clipboard_request_dispatcher_round_trip() {
+        let original = ProtoEvent::ClipboardRequest(ClipboardRequest { sha256: [0x5A; 32] });
+        let encoded: Vec<u8> = original.clone().into();
+        let decoded = ProtoEvent::try_from(encoded.as_slice()).expect("decode request");
+        assert_eq!(decoded, original);
     }
 
     /// Top-level dispatcher: a var event (ClipboardText with inline

@@ -1158,6 +1158,54 @@ mod tests {
         assert_eq!(route_input(&cfg, &pong()), Channel::StreamA);
     }
 
+    #[test]
+    fn route_input_all_clipboard_and_file_variants_to_stream_c() {
+        use lan_mouse_proto::{
+            ClipboardFiles, ClipboardImage, ClipboardRequest, ClipboardText, FileEntry,
+            FileTransferCancel, FileTransferOffer, FileTransferResponse,
+        };
+
+        let cfg = InputChannelConfig::default();
+        let events = [
+            ProtoEvent::ClipboardText(ClipboardText::from_content(
+                [0x01; 32],
+                [0x02; 32],
+                b"inline".to_vec(),
+            )),
+            ProtoEvent::ClipboardImage(ClipboardImage {
+                fingerprint: [0x03; 32],
+                mime: "image/png".into(),
+                sha256: [0x04; 32],
+                size: 0,
+            }),
+            ProtoEvent::ClipboardFiles(ClipboardFiles {
+                fingerprint: [0x05; 32],
+                entries: vec![FileEntry {
+                    name: "x".into(),
+                    size: 0,
+                    mime: "text/plain".into(),
+                    sha256: [0x06; 32],
+                }],
+            }),
+            ProtoEvent::FileTransferOffer(FileTransferOffer {
+                sha256: [0x07; 32],
+                name: "x".into(),
+                size: 0,
+                mime: "text/plain".into(),
+            }),
+            ProtoEvent::FileTransferResponse(FileTransferResponse {
+                sha256: [0x08; 32],
+                accept: true,
+            }),
+            ProtoEvent::FileTransferCancel(FileTransferCancel { sha256: [0x09; 32] }),
+            ProtoEvent::ClipboardRequest(ClipboardRequest { sha256: [0x0A; 32] }),
+        ];
+
+        for event in events {
+            assert_eq!(route_input(&cfg, &event), Channel::StreamC);
+        }
+    }
+
     // === StreamC wire codec (M0c STEP-0.5a + STEP-0.5b) =====================
 
     use super::{read_stream_c_frame, write_stream_c_frame};
