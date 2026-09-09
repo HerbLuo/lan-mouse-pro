@@ -910,6 +910,82 @@ impl Service {
         }
     }
 
+    /// **sleep-week-bug**: 屏幕睡眠 / monitor 暂时消失时,只销毁 capture
+    /// barrier,**不动** `s.active`、`peers[active_addr]`、`active_addr`。
+    ///
+    /// **为什么不直接 `deactivate_client`**:macOS 屏幕关闭(屏幕 dim /
+    /// 关屏)触发的 `CGDisplayReconfiguration` 回调会让 capture backend
+    /// 暂时上报 `monitor list = []`,然后屏幕唤醒后 `monitor list` 又
+    /// 恢复。如果走 `deactivate_client`,会把 `s.active` 设成 `false`,
+    /// 而 `s.active` 一旦为 `false` 既有的 `activate_client` 之外的任何
+    /// 路径都不会把它翻回来 —— 屏幕唤醒后用户就再也无法 capture 了
+    /// (`capture.create` 没被任何事件触发,`peers[addr]` 留着但前端仍
+    /// 显示客户端未激活)。
+    ///
+    /// **保留 QUIC 连接的意义**:detach 期间 `peers[active_addr]`、
+    /// `s.active_addr`、`ping_heartbeat_task`、`pong_health_watchdog`
+    /// 全部继续运行,所以被控端每 500ms 仍然能收到 Ping,它的
+    /// `last_response[addr]` 不会被 `> 1s` 触发超时而被 `close_with_wake_code`。
+    /// 屏幕唤醒后 monitor 恢复,Phase B 的 `reattach_capture` 直接重建
+    /// barrier,用户立即可以跨屏 —— 没有 reconnect 等待期。
+    ///
+    /// **为什么不需要 broadcast_state**:前端 `state.active` 没变(还是 `true`),
+    /// 只会清掉 `invalidReason` badge —— 这个 badge 由 Phase B 的
+    /// `reattach_capture` 调 `broadcast_client` 顺带清掉。
+    ///
+    /// **为什么这里仍要 `BindingInvalid`**:用户必须能在 GUI 上看到
+    /// "⚠ invalid" 提示,知道当前 monitor 不可用,避免他把鼠标移到屏幕边
+    /// 缘却发现没反应。
+    fn detach_capture(&mut self, handle: ClientHandle, reason: &str) {
+        log::info!("service: monitor-driven detach handle={handle} reason={reason:?}");
+        self.capture.destroy(handle);
+        self.notify_frontend(FrontendEvent::BindingInvalid(handle, reason.to_string()));
+    }
+
+    /// **sleep-week-bug**: 屏幕唤醒 / monitor 重新出现时,重建 capture
+    /// barrier 让用户立刻可以跨屏。
+    ///
+    /// **调用前置条件**:本方法只在 `recover_monitors` 返回非空 handle 时
+    /// 被调用,而 `recover_monitors` 只在 `(was_present=false, is_present=true)`
+    /// 时返回该 handle —— 也就是说,这个 handle **之前**一定经过 Phase A
+    /// 的 `detach_capture`,barrier **已经被 destroy 了**。所以这里直接
+    /// `create` 即可,**绝不**再调 `destroy`,否则
+    /// `input_capture::Capture::destroy` 会在 `id_map.remove(&id)` 拿到
+    /// `None` 时 `.expect("no barrier key for this handle")` panic
+    /// (现场日志:`thread 'main' panicked at input-capture/src/lib.rs:172:14`)。
+    ///
+    /// **为什么不调 `capture.dial(handle)`**:本方法的调用语境是"detached
+    /// 客户端的 monitor 恢复",此时 `peers[active_addr]` 通常仍有有效
+    /// entry(屏幕睡眠 < 30 min 时 QUIC idle_timeout 不会触发,slave
+    /// `last_response` 也不会超时)。调 `capture.dial` 会 `spawn_local` 一个
+    /// 新的 `connect_to_handle`,与仍存活的旧 peer 在 `peers[addr]` 上抢同
+    /// 一槽位(主分支 `1a111aa` 就是死在这里),而旧 supervisor 的
+    /// `peers.lock().await.remove(&addr)` 没有 `Arc::ptr_eq` 保护
+    /// (`f87ad44` 回退了 `299fb54`),新 peer 的 entry 会被旧 supervisor
+    /// 误删。
+    ///
+    /// **QUIC 连接已死的边界情况**:睡眠 > 30 min 时 QUIC idle_timeout 自
+    /// 然超时,master `should_retry_after_close(TimedOut)` 返回 true,既有的
+    /// supervisor redial 链路自动处理。屏幕唤醒后 `peers[addr]` 可能为空,
+    /// 但用户跨屏触发 `send()` 时会走 redial 路径(`active_addr` 仍是 `Some`)。
+    ///
+    /// **不调 `active = true`**:`s.active` 在 detach 期间**没被**改过
+    ///(detach 只动 barrier),所以这里也是 `true`。
+    fn reattach_capture(&mut self, handle: ClientHandle) {
+        let Some(key) = self.client_manager.get_key(handle) else {
+            return;
+        };
+        log::info!("service: monitor-driven reattach handle={handle} (monitor re-appeared)");
+        // 直接 create —— Phase A 的 `detach_capture` 已经把这个 handle 的
+        // barrier destroy 掉了;再 destroy 会 panic。barrier 的 id_map
+        // 此刻一定不含 `handle`,所以这里 `create` 一定不是重复创建。
+        self.capture.create(handle, &key, CaptureType::Default);
+        // broadcast 让前端的 invalidReason badge 消失(store/index.ts:248 写入,
+        // mergeClient 在下一个 State 事件里清掉)。注意这不是 State(active=false)
+        // 那种广播 —— `s.active` 一直是 `true`,只是清理 UX 标记。
+        self.broadcast_client(handle);
+    }
+
     fn activate_client(&mut self, handle: ClientHandle) {
         log::debug!("activating client {handle}");
 
@@ -1112,61 +1188,119 @@ impl Service {
         self.notify_frontend(event);
     }
 
-    /// **STEP-M2-2.6**: reconcile active clients against a new
-    /// monitor snapshot.
+    /// **STEP-M2-2.6 / sleep-week-bug**: reconcile all clients against a
+    /// new monitor snapshot.
     ///
-    /// For each currently active client, look at its
-    /// `BarrierKey.monitor` field (M1: always `None`, so this is
-    /// effectively a no-op today; M3+ will populate the field with
-    /// a user-chosen `MonitorId`) and compare against the new
-    /// monitor list:
+    /// **Three-phase state machine** for each `(handle, key)` pair:
     ///
-    /// * **Monitor gone**: `client_manager.deactivate_client(handle)`
-    ///   + `FrontendEvent::BindingInvalid(handle, reason)` so the
-    ///     GUI highlights the row (red border + tooltip) and pauses
-    ///     the toggle.
-    /// * **Monitor still present, geometry changed** (position /
-    ///   size / scale): `capture.destroy(old_key)` then
-    ///   `capture.create(new_key, handle)` via the standard
-    ///   `deactivate_client` → `activate_client` round-trip — same
-    ///   pattern as `update_pos`.
-    /// * **No change**: nothing.
+    /// | `(was_present, is_present)` | 分支                       | 动作                                                  |
+    /// |------------------------------|---------------------------|------------------------------------------------------|
+    /// | `(true, false)`              | **Phase A — detach**      | `detach_capture` (销毁 barrier,保持 `s.active=true`) |
+    /// | `(false, true)`              | **Phase B — recover**     | `reattach_capture` (重建 barrier,**不**触发新 dial)   |
+    /// | `(true, true)` + geometry Δ | **Phase C — recreate**    | `deactivate + activate` round-trip                    |
+    /// | `(true, true)` + same geom   | no-op                                                      |
+    /// | `(false, false)`             | no-op                                                      |
     ///
-    /// `last_monitors` is updated by `handle_capture_event` *before*
-    /// this is called; this method compares the new list against the
-    /// previous one.
+    /// **为什么是三相位而不是 `activate_client` 直接重激活**(主分支 `1a111aa`
+    /// 走的就是 activate_client 路径):
     ///
-    /// **Why the compare is two-list (old + new)**: the
-    /// `BarrierKey` itself doesn't carry geometry — it's
-    /// `(pos, monitor, offset, span)` with M2 offset/span at
-    /// defaults. Without an old-vs-new diff we'd never know whether
-    /// a barrier's "monitor" still maps to the same physical
-    /// rectangle, and the only signal that something changed is
-    /// "the geometry in the new list differs from the geometry in
-    /// the old list". The PLAN §M2 STEP-2.6 "exists but geometry
-    /// changed" branch hinges on this diff.
+    /// 1. `activate_client` → `capture.dial(handle)` → `spawn_local(connect_to_handle)`,
+    ///    会用同一 `peers[addr]` 槽位覆盖仍存活的旧 peer;旧 supervisor 的
+    ///    `peer.run()` 返回时 `peers.lock().await.remove(&addr)` 没有
+    ///    `Arc::ptr_eq` 保护(`f87ad44` 回退了 `299fb54`),新 peer 的 entry
+    ///    会被旧 supervisor 误删 → 链路永久死掉。
+    /// 2. `activate_client` 会调 `client_manager.activate_client` 检查 `s.active`
+    ///    并设成 `true`。我们 detach 期间没动 `s.active`,这里也无需再设。
+    /// 3. `activate_client` 会触发新 dial,与睡眠期间**仍活着的** QUIC 连接
+    ///    抢同一 peer entry。
+    ///
+    /// **Phase B 的 `reattach_capture` 只重建 barrier**:QUIC 连接若仍存活
+    /// 直接复用,若已死则由既有 supervisor redial 在用户首次 `send()` 时
+    /// 处理(详见 `reattach_capture` 的 docstring)。
+    ///
+    /// **为什么 snapshot 用 `registered_clients()` 而不是 `active_clients()`**:
+    /// Phase B 需要看到 detached 后(但 `s.active` 仍是 `true`)的 handle,
+    /// 而 `active_clients()` 在 detach 后仍包含它们 —— 但为了避免未来在
+    /// `detach_capture` 里也改 `s.active` 的歧义,我们显式用 `registered_clients()`
+    /// snapshot 全部 bindings(已 deactivated 的 `monitor=Some` 客户端也能被
+    /// 找到),Phase A/B 内部再用 `active_clients().contains(&handle)` 过滤。
+    ///
+    /// **M1 default (monitor = None)**:这些 binding 在 `reconcile_monitors` /
+    /// `recover_monitors` 里都被 `key.monitor.as_ref()` 检查跳过 —— 没有
+    /// `monitor` 字段的客户端从不进入 reconcile,既不会被 deactivate 也不
+    /// 需要 recover。
+    ///
+    /// `last_monitors` is updated by `handle_capture_event` *before* this is
+    /// called; this method compares the new list against the previous one.
     fn reconcile_monitors_changed(
         &mut self,
         new_monitors: &[GeometryMonitorInfo],
         old_monitors: &[GeometryMonitorInfo],
     ) {
-        // Snapshot active bindings first so the closures can mutably
-        // borrow `self.client_manager` / `self.capture` without
-        // conflicting with the iteration borrow.
+        // Snapshot **all** bindings (active ∪ inactive). We use
+        // `registered_clients()` rather than `active_clients()` so the
+        // snapshot includes any handle that has a monitor binding, even
+        // if a future refactor makes `detach_capture` also clear
+        // `s.active`. The pure helpers `reconcile_monitors` and
+        // `recover_monitors` filter by `key.monitor.is_some()`; Phase A
+        // and Phase B additionally filter by the active-client set
+        // before mutating.
+        let mut all_bindings: Vec<(ClientHandle, BarrierKey)> = Vec::new();
+        for handle in self.client_manager.registered_clients() {
+            if let Some(key) = self.client_manager.get_key(handle) {
+                all_bindings.push((handle, key));
+            }
+        }
+
+        // === Phase A: detach (monitor was present, now gone) ===
+        //
+        // Replaces the previous `deactivate_client` call. We intentionally
+        // do NOT change `s.active` — see the function docstring table
+        // and `detach_capture`'s docstring for the rationale.
+        let deactivations = reconcile_monitors(&all_bindings, new_monitors, old_monitors);
+        let active_set: std::collections::HashSet<ClientHandle> =
+            self.client_manager.active_clients().into_iter().collect();
+        for (handle, reason) in deactivations {
+            if !active_set.contains(&handle) {
+                // The user already deactivated it. Skip — no barrier to
+                // detach (it was destroyed by the user's deactivate),
+                // and re-detaching it would be a no-op that still
+                // surfaces a misleading "⚠ invalid" badge in the GUI.
+                continue;
+            }
+            self.detach_capture(handle, &reason);
+        }
+
+        // === Phase B: recover (monitor was gone, now back) ===
+        //
+        // New since sleep-week-bug. Reattaches the barrier for any active
+        // handle whose bound monitor reappeared. **Does not** call
+        // `capture.dial` — see function docstring.
+        let recoveries = recover_monitors(&all_bindings, new_monitors, old_monitors);
+        for handle in recoveries {
+            if !active_set.contains(&handle) {
+                // The user explicitly turned this client off while it
+                // was detached; do not silently reattach a barrier the
+                // user does not want.
+                continue;
+            }
+            // Idempotent — also handles the (rare) case where Phase A
+            // and Phase B both touch the same handle on the same
+            // MonitorsChanged tick (e.g. transient flicker).
+            self.reattach_capture(handle);
+        }
+
+        // === Phase C: geometry recreate (unchanged) ===
+        //
+        // Uses the active-only snapshot because Phase C is the legacy
+        // "monitor still there but its rectangle moved" path; an inactive
+        // client has no barrier to recreate.
         let mut active_bindings: Vec<(ClientHandle, BarrierKey)> = Vec::new();
         for handle in self.client_manager.active_clients() {
             if let Some(key) = self.client_manager.get_key(handle) {
                 active_bindings.push((handle, key));
             }
         }
-
-        let deactivations = reconcile_monitors(&active_bindings, new_monitors, old_monitors);
-        for (handle, reason) in deactivations {
-            log::info!("service: monitor-driven deactivate handle={handle} reason={reason:?}");
-            self.deactivate_client(handle);
-            self.notify_frontend(FrontendEvent::BindingInvalid(handle, reason));
-        }
-
         let recreations = recreate_monitors(&active_bindings, new_monitors, old_monitors);
         for (handle, _old_key, _new_key) in recreations {
             log::info!(
@@ -1680,6 +1814,63 @@ fn monitor_geometry_changed(a: &GeometryMonitorInfo, b: &GeometryMonitorInfo) ->
     a.position != b.position || a.size != b.size
 }
 
+/// **sleep-week-bug — Phase B pure helper**: given *all*
+/// `(handle, BarrierKey)` pairs (active ∪ inactive) and an old + new
+/// monitor snapshot, return the handles whose bound monitor is **back**:
+/// not present in `old_monitors` but present in `new_monitors`.
+///
+/// This completes the M2 set (`deactivate` + `recreate`):
+///
+/// | `(was_present, is_present)` | branch          |
+/// |------------------------------|-----------------|
+/// | `(true, false)`              | `reconcile_monitors` (Phase A — detach) |
+/// | `(false, true)`              | `recover_monitors` (here — Phase B)     |
+/// | `(true, true)`               | `recreate_monitors` (Phase C if geometry Δ, else no-op) |
+/// | `(false, false)`             | no-op                                    |
+///
+/// **Why a separate helper (not part of `reconcile_monitors`)**:
+/// `reconcile_monitors` only walks *active* bindings (legacy contract from
+/// STEP-M2-2.6); the recover signal needs to consider **inactive** handles
+/// too — a client that was detached in Phase A on a previous tick and is
+/// still `s.active=true` (because `detach_capture` deliberately doesn't
+/// clear `s.active`) must surface for reattach here. Splitting the
+/// helper keeps the pure-function surface clean and unit-testable, and
+/// matches the M2 split between "removal" and "geometry change" already
+/// in this module.
+///
+/// **Why iterate `all` instead of asking `ClientManager` for inactive-only**:
+/// `ClientManager` doesn't currently distinguish "user-deactivated" from
+/// "auto-deactivated-by-detach" — both have `s.active=false` (well,
+/// detach keeps `s.active=true`; user-deactivate sets it to `false`). The
+/// caller (`reconcile_monitors_changed`) gates the actual mutation on
+/// `active_clients().contains(&handle)`, so even if a *user-deactivated*
+/// handle's `monitor` came back, it won't be reattached. This helper
+/// just reports the *geometry* signal; activation gating is the caller's
+/// responsibility.
+///
+/// **`monitor = None` legacy clients**: skipped by the same `let Some(...) else continue`
+/// guard as `reconcile_monitors` — `None` bindings are never detached
+/// (Phase A returns no entry for them), so there's nothing to recover.
+fn recover_monitors(
+    all: &[(ClientHandle, BarrierKey)],
+    new_monitors: &[GeometryMonitorInfo],
+    old_monitors: &[GeometryMonitorInfo],
+) -> Vec<ClientHandle> {
+    let mut out = Vec::new();
+    for (handle, key) in all {
+        let Some(monitor_id) = key.monitor.as_ref() else {
+            // M1 default: no binding. Nothing to recover.
+            continue;
+        };
+        let was_present = old_monitors.iter().any(|m| m.id == *monitor_id);
+        let is_present = new_monitors.iter().any(|m| m.id == *monitor_id);
+        if !was_present && is_present {
+            out.push(*handle);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod reconcile_tests {
     //! Unit tests for the pure `reconcile_monitors` / `recreate_monitors`
@@ -1871,5 +2062,99 @@ mod reconcile_tests {
         assert_eq!(i.size, g.size);
         assert_eq!(i.primary, g.primary);
         assert_eq!(i.scale, g.scale);
+    }
+
+    // ===== sleep-week-bug Phase B — `recover_monitors` tests =====
+    //
+    // Mirror the M2-style structure of the tests above. The helper is a
+    // pure function over `(handle, key)` lists and old/new monitor
+    // snapshots, with no `ClientManager` dependency, so we can reuse
+    // `mk_monitor` / `binding` directly.
+
+    /// **Recovery case** (the M3 bug fix on main + sleep-week-bug's
+    /// single new code path): the `old` list does NOT contain the
+    /// bound monitor (it disappeared in a previous reconcile), the
+    /// `new` list DOES. The handle must be returned so the caller can
+    /// reattach it. This is the path that fires after macOS
+    /// sleep/wake: capture first reports `[]` (Phase A detaches),
+    /// the bound client stays `s.active=true` but has no barrier,
+    /// then capture reports the monitors again and Phase B
+    /// reattaches.
+    #[test]
+    fn recover_emits_handle_when_monitor_reappears() {
+        let new = vec![mk_monitor("DP-2", (0, 0), (1920, 1080))];
+        let old: Vec<GeometryMonitorInfo> = vec![];
+        // The handle's `s.active` is irrelevant to the pure helper.
+        // In production this snapshot is taken from
+        // `registered_clients()`, so the helper sees
+        // `(handle, key)` regardless of activation state.
+        let all = vec![binding(7, Some("DP-2"))];
+
+        let recovered = recover_monitors(&all, &new, &old);
+        assert_eq!(recovered, vec![7]);
+    }
+
+    /// **No recovery when monitor was always present**: a monitor
+    /// that survived both snapshots is not a recovery candidate —
+    /// it would only need a `recreate` if its geometry changed
+    /// (Phase C).
+    #[test]
+    fn recover_noop_when_monitor_was_present_in_both_lists() {
+        let monitors = vec![mk_monitor("DP-2", (0, 0), (1920, 1080))];
+        let all = vec![binding(0, Some("DP-2"))];
+        assert!(recover_monitors(&all, &monitors, &monitors).is_empty());
+    }
+
+    /// **No recovery when monitor is still missing**: if the bound
+    /// monitor is in neither `old` nor `new`, the client was
+    /// already detached by an earlier reconcile and remains so —
+    /// the helper must not falsely "recover" it.
+    #[test]
+    fn recover_noop_when_monitor_still_missing() {
+        let all = vec![binding(0, Some("DP-2"))];
+        let new: Vec<GeometryMonitorInfo> = vec![];
+        let old: Vec<GeometryMonitorInfo> = vec![];
+        assert!(recover_monitors(&all, &new, &old).is_empty());
+    }
+
+    /// **M1 default clients** (`monitor = None`) must never trigger
+    /// recovery, mirroring the `reconcile_monitors` invariant. Such
+    /// clients are never detached in Phase A either, so they don't
+    /// *need* recovery — but the guard is here to keep both helpers
+    /// symmetrical.
+    #[test]
+    fn recover_skips_default_key_monitor_none() {
+        let new = vec![mk_monitor("DP-2", (0, 0), (1920, 1080))];
+        let old: Vec<GeometryMonitorInfo> = vec![];
+        let all = vec![binding(0, None)];
+        assert!(recover_monitors(&all, &new, &old).is_empty());
+    }
+
+    /// **Mixed bindings**: only bound clients whose monitor
+    /// reappeared are recovered. Legacy (`monitor = None`) clients
+    /// are skipped; bound clients whose monitor stayed missing are
+    /// skipped; bound clients whose monitor is in `old` *and*
+    /// `new` are skipped (they'd be a recreate candidate, not a
+    /// recovery candidate — same as the existing
+    /// `reconcile_noop_when_monitor_list_unchanged` test above).
+    #[test]
+    fn recover_handles_mixed_default_and_bound_clients() {
+        let new = vec![
+            mk_monitor("DP-2", (0, 0), (1920, 1080)),
+            mk_monitor("DP-3", (1920, 0), (2560, 1440)),
+        ];
+        // DP-2 absent (will recover), DP-3 absent (must NOT recover),
+        // DP-4 present in both (must NOT recover — it never left).
+        let old = vec![mk_monitor("DP-3", (0, 0), (1920, 1080))];
+        let all = vec![
+            binding(0, None),         // legacy — skip
+            binding(1, Some("DP-2")), // reappeared — recover
+            binding(2, Some("DP-3")), // still missing — skip
+            binding(3, Some("DP-4")), // present in both — skip
+        ];
+
+        let mut recovered = recover_monitors(&all, &new, &old);
+        recovered.sort();
+        assert_eq!(recovered, vec![1]);
     }
 }
