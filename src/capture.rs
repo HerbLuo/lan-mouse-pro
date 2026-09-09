@@ -634,7 +634,7 @@ impl CaptureTask {
                         // natural retry point.
                         CaptureRequest::SendClip(event, handle) => {
                             log::info!(
-                                "capture: SendClip -> handle {handle} (event={event:?})"
+                                "capture: SendClip -> handle {handle} (event={event})"
                             );
                             if let Err(e) = self.conn.send(event.clone(), handle).await {
                                 log::warn!(
@@ -978,7 +978,7 @@ impl CaptureTask {
                     // surfaced.
                     CaptureRequest::SendClip(event, handle) => {
                         log::info!(
-                            "capture: SendClip -> handle {handle} (event={event:?})"
+                            "capture: SendClip -> handle {handle} (event={event})"
                         );
                         if let Err(e) = self.conn.send(event.clone(), handle).await {
                             log::warn!(
