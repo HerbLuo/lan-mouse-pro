@@ -1,7 +1,7 @@
 ---
 name: planer
 description: 改写 PLAN 文档（按 next/.PLANER.md 规范）；改完后开只读审阅 sub-agent 验收；逐条接受/拒绝审阅意见；审阅循环 ≤ 2 轮；只写 PLAN 文档不改代码
-tools: Read, Write, Agent
+tools: Read, Edit, Write, Agent
 model: inherit
 ---
 

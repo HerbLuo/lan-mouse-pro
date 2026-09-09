@@ -25,9 +25,9 @@
 - 输入通道模式 `InputChannelConfig` 已在 `PLAN-1` 中引入；本计划**不**改动
 
 **业务功能**
-- 剪贴板文本同步（含大小文本；fingerprint 防回环）
-- 剪贴板图片同步（PNG / JPG / BMP，SHA-256 校验）
-- 复制文件同步（HTTP/3 拉取 + SHA-256 + 询问 / 自动接收 + 源端取消）
+- 剪贴板文本同步（含大小文本；fingerprint 防回环）—— **双向：A→B 与 B→A 各跑一次才算通过**
+- 剪贴板图片同步（PNG / JPG / BMP，SHA-256 校验）—— **双向：A→B 与 B→A 各跑一次才算通过**
+- 复制文件同步（HTTP/3 拉取 + SHA-256 + 询问 / 自动接收 + 源端取消）—— **双向：A→B 与 B→A 各跑一次才算通过**
 
 **前端**
 - **ClipboardConfig 放 GeneralPanel**（daemon-global，评审 #4）：剪贴板监听是 daemon 全局（一个 OS 剪贴板喂所有 peer），接收目录也是全局 → `{ auto_accept_files, accept_dir, ignore_text, ignore_images, ignore_files }` 放 GeneralPanel
@@ -107,17 +107,19 @@
 | **M0a** — ProtoEvent codec 双轨化 | ~3 h | `cargo test -p lan-mouse-proto` 全绿；Input/Ping/Pong/Hello 旧路径零行为差异 | 待启动 |
 | **M0b** — HTTP/3 基础 | ~4.5 h | 真机 `curl --http3 https://<peer>/healthz` 200 | M0a |
 | **M0c** — StreamC 接通 + IPC 扩展 | ~4 h | StreamC reader 接通；GUI 看到 `ClipboardConfig` 字段；fmt/clippy/build 全绿 | M0b |
-| **M1a** — 剪贴板文本（小文本 ≤ 1 KiB） | ~6 h | 复制一段短文本 → 对端剪贴板出现 | M0c |
-| **M1b** — 剪贴板文本（大文本 + 防回环） | ~6 h | 复制 1 MiB 文本 → 对端粘贴成功；同端写回不再回环 | M1a |
-| **M2a** — 剪贴板图片 + macOS | ~6 h | macOS 复制截图 → 对端粘贴为 PNG / DIB 字节级一致 | M1b |
-| **M2b** — 剪贴板图片 + Windows / Linux | ~6 h | 三平台图片剪贴板端到端（macOS↔Windows 走 DIB） | M2a |
-| **M3a** — 复制文件 + HTTP/3 transfer | ~8 h | 复制 200 MiB 文件 → 对端落盘 SHA-256 一致 | M2b |
-| **M3b** — 文件接收 UI + 取消 + 中途拔网 | ~6 h | GUI 询问 / 自动接收；源端取消；拔网清晰报错 | M3a |
-| **M4** — GUI 集成 + 文档 | ~5 h | GeneralPanel 剪贴板状态、Toaster 通知、配置落盘 | M3b |
+| **M1a** — 剪贴板文本（小文本 ≤ 1 KiB） | ~6 h | 复制一段短文本 → 对端剪贴板出现；**双向端到端 (A↔B)** | M0c |
+| **M1b** — 剪贴板文本（大文本 + 防回环） | ~6 h | 复制 1 MiB 文本 → 对端粘贴成功；同端写回不再回环；**双向端到端 (A↔B)** | M1a |
+| **M2a** — 剪贴板图片 + macOS | ~6 h | macOS 复制截图 → 对端粘贴为 PNG / DIB 字节级一致；**双向端到端 (A↔B)** | M1b |
+| **M2b** — 剪贴板图片 + Windows / Linux | ~6 h | 三平台图片剪贴板端到端（macOS↔Windows 走 DIB）；**双向端到端 (A↔B)** | M2a |
+| **M3a** — 复制文件 + HTTP/3 transfer | ~8 h | 复制 200 MiB 文件 → 对端落盘 SHA-256 一致；**双向端到端 (A↔B)** | M2b |
+| **M3b** — 文件接收 UI + 取消 + 中途拔网 | ~6 h | GUI 询问 / 自动接收；源端取消；拔网清晰报错；**双向端到端 (A↔B)** | M3a |
+| **M4** — GUI 集成 + 文档 | ~5 h | GeneralPanel 剪贴板状态、Toaster 通知、配置落盘；**双向 GUI 验收 (A↔B 各跑一次)** | M3b |
 | **合计** | **~54.5 h** | | |
 
 > **STEP 时长门**：每 STEP 控制在人类实现 1.5 h（AI ~30 min）左右；超过 3 h 必拆。
 > **M3 已知范围扩大风险**：若 M3a 估时实际超 10 h，按"接收端落盘 + 200 MiB 性能"与"UI / 取消 / 拔网"二分拆为 M3a' / M3a''。
+>
+> **双向验收约定**：M1a / M1b / M2a / M2b / M3a / M3b / M4 **要求 A→B 与 B→A 各跑一次才算交付**。协议层 StreamC 是 bidi 的、两侧 daemon 镜像运行，理论上天然双向；但只测一侧会留下"反向静默失败"的隐性 bug（如最近 controlled→master 文本同步方向缺失）。测试矩阵（§8）的对应条目已显式拆为 (a) A→B 与 (b) B→A 两条。性能 / 拔网 / UI 验收同样在两方向各跑一次，分别记录结果。M0a / M0b / M0c 为协议 / 基础设施里程碑，不涉及端到端方向性，故 §2 主表对应行无"双向"标注。
 
 ## 3. 详细步骤
 
@@ -353,13 +355,13 @@
 | M0a | 3h | ProtoEvent 旧路径回归（Ping/Pong/Hello 兼容） | 待启动 |
 | M0b | 4.5h | 真机 h3 `curl --http3` 命中 /healthz | 待启动 |
 | M0c | 4h | StreamC reader 接通 + IPC ClipboardConfig 字段 | 待启动 |
-| M1a | 6h | 三平台小文本复制粘贴 | 待启动 |
-| M1b | 6h | 1 MiB 文本端到端 + 回环检测 | 待启动 |
-| M2a | 6h | macOS 4K 截图字节级一致 | 待启动 |
-| M2b | 6h | 三平台图片互传矩阵 | 待启动 |
-| M3a | 8h | 200 MiB 文件落盘 + SHA-256 + 取消 | 待启动 |
-| M3b | 6h | GUI 询问 + 拔网清晰报错 | 待启动 |
-| M4 | 5h | 三平台 GUI 端到端 + 文档同步 | 待启动 |
+| M1a | 6h | 三平台小文本复制粘贴 **（双向端到端 A↔B）** | 待启动 |
+| M1b | 6h | 1 MiB 文本端到端 + 回环检测 **（双向端到端 A↔B）** | 待启动 |
+| M2a | 6h | macOS 4K 截图字节级一致 **（双向端到端 A↔B）** | 待启动 |
+| M2b | 6h | 三平台图片互传矩阵 **（双向端到端 A↔B）** | 待启动 |
+| M3a | 8h | 200 MiB 文件落盘 + SHA-256 + 取消 **（双向端到端 A↔B）** | 待启动 |
+| M3b | 6h | GUI 询问 + 拔网清晰报错 **（双向端到端 A↔B）** | 待启动 |
+| M4 | 5h | 三平台 GUI 端到端 + 文档同步 **（双向 GUI 验收 A↔B 各跑一次）** | 待启动 |
 | **合计** | **~51 h** | | |
 
 > **校准系数**：与 `PLAN-1` 一致，30 min AI ≈ 1.5 h 人类。`image` crate 编译时间 + h3 crate 体积可能拉长 M2 / M0b/M0c，预留 ±20 % buffer。
@@ -474,10 +476,15 @@
 | 自动 | `service::clipboard_dispatcher` 小文本走 StreamC 派发单测 | 单测绿 | 1a.4 |
 | 自动 | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` | 无 diff / 无 warning | 1a.5 |
 | 自动 | 三平台编译通过 | CI matrix 全绿 | 1a.5 |
-| **人类** | macOS ↔ macOS 真机对：终端 `echo hello | pbcopy` → 对端 `pbpaste` 拿到 "hello" | 录屏 / 截图 | 1a.4 / 1a.5 |
-| **人类** | Windows ↔ Windows 真机对：PowerShell `Set-Clipboard -Value "hello"` → 对端 `Get-Clipboard` 拿到 "hello" | 截图 | 1a.3 / 1a.5 |
-| **人类** | Linux ↔ Linux 真机对：`xclip -selection clipboard` / `wl-paste` 互传 | 录屏 | 1a.3 / 1a.5 |
-| **人类** | macOS ↔ Windows / macOS ↔ Linux / Windows ↔ Linux 跨平台互传小文本 | 3 组真机各跑一次 | 1a.5 |
+| **人类** | macOS ↔ macOS 真机对：(a) A→B：A 端 `echo hello | pbcopy`，B 端 `pbpaste` 拿到 "hello" | 录屏 / 截图 | 1a.4 / 1a.5 |
+| **人类** | macOS ↔ macOS 真机对：(b) B→A：反过来同样拿（即上一行的反向，证明两侧 daemon 镜像运行） | 录屏 / 截图 | 1a.4 / 1a.5 |
+| **人类** | Windows ↔ Windows 真机对：(a) A→B：A 端 PowerShell `Set-Clipboard -Value "hello"`，B 端 `Get-Clipboard` 拿到 "hello" | 截图 | 1a.3 / 1a.5 |
+| **人类** | Windows ↔ Windows 真机对：(b) B→A：反过来同样拿 | 截图 | 1a.3 / 1a.5 |
+| **人类** | Linux ↔ Linux 真机对：(a) A→B：A 端 `xclip -selection clipboard -i < /tmp/x`（或 `wl-copy`），B 端 `xclip -o`（或 `wl-paste`）拿到 | 录屏 | 1a.3 / 1a.5 |
+| **人类** | Linux ↔ Linux 真机对：(b) B→A：反过来同样拿 | 录屏 | 1a.3 / 1a.5 |
+| **人类** | macOS ↔ Windows 跨平台：(a) A→B：macOS 端 pbcopy，Windows 端 Get-Clipboard；(b) B→A：Windows 端 Set-Clipboard，macOS 端 pbpaste | 各方向各一次 + 截图 | 1a.5 |
+| **人类** | macOS ↔ Linux 跨平台：(a) A→B + (b) B→A 同上 | 各方向各一次 + 录屏 | 1a.5 |
+| **人类** | Windows ↔ Linux 跨平台：(a) A→B + (b) B→A 同上 | 各方向各一次 + 录屏 | 1a.5 |
 
 ### M1b — 大文本 + 防回环
 
@@ -488,11 +495,12 @@
 | 自动 | HTTP/3 client `get_text` 单测（mock server） | 拿到正确字符串 | 1b.2 |
 | 自动 | 回环 LRU 单测：本地写 "abc" → 收到对端 "abc" → skip；TTL 过期后重新同步 | 单测绿 | 1b.3 |
 | 自动 | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` | 无 diff / 无 warning | 1b.4 |
-| **人类** | macOS ↔ macOS 1 MiB 文本：`head -c 1048576 /dev/urandom | base64 | pbcopy` → 对端 `pbpaste > /tmp/back.txt`；`diff` 为 0；`sha256sum` 一致 | diff 输出 + sha256 | 1b.1 / 1b.4 |
-| **人类** | Windows ↔ Windows 1 MiB 文本同上 | 同上 | 1b.4 |
-| **人类** | Linux ↔ Linux 1 MiB 文本同上 | 同上 | 1b.4 |
-| **人类** | 回环测试：本端 `pbcopy "x"` → 不应触发对端再推回（本端剪贴板不抖动） | 录屏看剪贴板历史 | 1b.3 / 1b.4 |
-| **人类** | 同内容重复复制（< 1 s 内 5 次）：只触发一次同步 | 日志 + UI 状态 | 1b.3 / 1b.4 |
+| **人类** | macOS ↔ macOS 1 MiB 文本：(a) A→B：A 端 `head -c 1048576 /dev/urandom | base64 | pbcopy`，B 端 `pbpaste > /tmp/back.txt`；`diff` 为 0；`sha256sum` 一致 | diff 输出 + sha256 | 1b.1 / 1b.4 |
+| **人类** | macOS ↔ macOS 1 MiB 文本：(b) B→A：反过来同样跑一次（验证两侧 daemon 都能作为 HTTP/3 server 暴露 `/clipboard/text/{sha256}`） | diff 输出 + sha256 | 1b.1 / 1b.4 |
+| **人类** | Windows ↔ Windows 1 MiB 文本：(a) A→B + (b) B→A 各跑一次 | 同上 | 1b.4 |
+| **人类** | Linux ↔ Linux 1 MiB 文本：(a) A→B + (b) B→A 各跑一次 | 同上 | 1b.4 |
+| **人类** | 回环测试：(a) A 端 `pbcopy "x"` → B 端不反向推回（B 端剪贴板不抖动）；(b) 反过来 B 端 `pbcopy "y"` → A 端不抖动 | 录屏看剪贴板历史（两个方向各录一段） | 1b.3 / 1b.4 |
+| **人类** | 同内容重复复制（< 1 s 内 5 次）：(a) A→B 方向 + (b) B→A 方向各跑一次，只触发一次同步 | 日志 + UI 状态 | 1b.3 / 1b.4 |
 
 ### M2a — 剪贴板图片 + macOS
 
@@ -505,9 +513,10 @@
 | 自动 | HTTP/3 server `/clipboard/image/{sha256}` 单测 | 200 + bytes | 2a.3 |
 | 自动 | 图片回环 LRU 单测（同 fingerprint skip） | 单测绿 | 2a.4 |
 | 自动 | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` | 无 diff / 无 warning | 2a.4 |
-| **人类** | macOS 真机：`screencapture -x -t png /tmp/4k.png`（4K）→ Finder 复制 / Cmd+C → 对端粘贴为 PNG 字节级一致 | `xxd | sha256sum` 对比 | 2a.2 / 2a.3 / 2a.4 |
-| **人类** | macOS 1080p JPG 截图同上 | 同上 | 2a.3 |
-| **人类** | 图片回环：复制 4K 截图后本端不抖动（不再触发对端重推） | 录屏 | 2a.4 |
+| **人类** | macOS ↔ macOS 真机 4K PNG：(a) A→B：A 端 `screencapture -x -t png /tmp/4k.png` → Cmd+C，B 端粘贴 → 字节级一致（`xxd | sha256sum` 对比） | sha256sum 输出 | 2a.2 / 2a.3 / 2a.4 |
+| **人类** | macOS ↔ macOS 真机 4K PNG：(b) B→A：反过来同样跑一次（验证 macOS daemon 同时作为 HTTP/3 server 暴露 `/clipboard/image/{sha256}` 也能拉回字节） | sha256sum 输出 | 2a.2 / 2a.3 / 2a.4 |
+| **人类** | macOS ↔ macOS 真机 1080p JPG：(a) A→B + (b) B→A 各跑一次 | 同上 | 2a.3 |
+| **人类** | 图片回环：(a) A→B 复制 4K 截图后 A 端不抖动 + (b) B→A 反向复制后 B 端不抖动 | 录屏（两个方向各录一段） | 2a.4 |
 
 ### M2b — 剪贴板图片 + Windows / Linux
 
@@ -518,10 +527,12 @@
 | 自动 | Wayland / X11 自动探测单测（`WAYLAND_DISPLAY` env / `DISPLAY` env） | 单测绿 | 2b.2 |
 | 自动 | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` | 无 diff / 无 warning | 2b.4 |
 | 自动 | 三平台编译通过 | CI matrix 全绿 | 2b.4 |
-| **人类** | Windows 真机：Snipping Tool 截 4K → 复制 → 对端（macOS）粘贴字节级一致（**走 CF_DIBV5 直传 + macOS DIB 解码，mime=application/x-dib**） | `xxd | sha256sum` | 2b.1 / 2b.3 |
-| **人类** | Windows 截 1080p JPG → 对端（macOS）粘贴字节级一致 | 同上 | 2b.3 |
-| **人类** | Linux 真机：GNOME / KDE 截图 → 对端（macOS / Windows）粘贴字节级一致 | 同上 | 2b.2 / 2b.3 |
-| **人类** | macOS ↔ Windows / macOS ↔ Linux / Windows ↔ Linux 三组互传 4K + 1080p JPG（共 6 组） | 6 组真机互测，**macOS↔Windows 走 DIB 字节级一致，其它组走 PNG** | 2b.3 |
+| **人类** | Windows → macOS 4K PNG（DIB 路径）：(a) A→B：Windows 端 Snipping Tool 截 4K → 复制，macOS 端粘贴字节级一致（**走 CF_DIBV5 直传 + macOS DIB 解码，mime=application/x-dib**） | `xxd | sha256sum` | 2b.1 / 2b.3 |
+| **人类** | Windows → macOS 4K PNG（DIB 路径）：(b) B→A：macOS 端复制 → Windows 端粘贴字节级一致 | sha256sum 输出 | 2b.1 / 2b.3 |
+| **人类** | Windows → macOS 1080p JPG：(a) A→B + (b) B→A 各跑一次 | 同上 | 2b.3 |
+| **人类** | Linux → macOS 截图：(a) A→B：Linux 端 GNOME / KDE 截图 → 复制，macOS 端粘贴字节级一致 + (b) B→A：反过来 | 同上 | 2b.2 / 2b.3 |
+| **人类** | Linux → Windows 截图：(a) A→B + (b) B→A 同上 | 同上 | 2b.2 / 2b.3 |
+| **人类** | macOS ↔ Windows / macOS ↔ Linux / Windows ↔ Linux 三组互传 4K + 1080p JPG（共 6 组，**每组双向（A→B 与 B→A 各跑一次），共 12 次真机测**） | 12 次真机互测，**macOS↔Windows 走 DIB 字节级一致，其它组走 PNG** | 2b.3 |
 
 ### M3a — 复制文件 + HTTP/3 transfer
 
@@ -535,10 +546,11 @@
 | 自动 | HTTP/3 client `get_file` 流式下载单测（不一次性分配 200 MiB） | 单测绿（profile 内存 < 50 MiB） | 3a.3 |
 | 自动 | `FileTransferCancel` 取消流程单测：源端 cancel → 接收端 1 s 内停止 + 清 .partial | 单测绿 | 3a.5 |
 | 自动 | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` | 无 diff / 无 warning | 3a.5 |
-| **人类** | macOS 真机：Finder 复制 200 MiB 随机文件 → 对端（macOS）落盘 `/tmp/received/` → `sha256sum` 一致 | sha256sum 输出 | 3a.2 / 3a.3 / 3a.5 |
-| **人类** | 200 MiB 传输 100 Mbps LAN < 30 s（计时） | 秒表 + 截图 | 3a.3 / 3a.5 |
-| **人类** | 源端复制文件后立即覆盖剪贴板 → 接收端不应下载（cancel 触发） | 日志 + 文件系统 | 3a.5 |
-| **人类** | 1 KiB / 1 MiB / 200 MiB 三种大小各跑一次 | 3 组真机 | 3a.1 / 3a.5 |
+| **人类** | macOS ↔ macOS 真机 200 MiB 文件：(a) A→B：A 端 Finder 复制 200 MiB 随机文件，B 端落盘 `/tmp/received/` → `sha256sum` 一致 | sha256sum 输出 | 3a.2 / 3a.3 / 3a.5 |
+| **人类** | macOS ↔ macOS 真机 200 MiB 文件：(b) B→A：反过来同样跑一次（验证两侧 daemon 都能作为 HTTP/3 server 暴露 `/clipboard/file/{sha256}` 流式拉取） | sha256sum 输出 | 3a.2 / 3a.3 / 3a.5 |
+| **人类** | 200 MiB 传输 100 Mbps LAN < 30 s（计时）：(a) A→B 方向 + (b) B→A 方向各计时一次 | 秒表 + 截图（两段） | 3a.3 / 3a.5 |
+| **人类** | 源端复制文件后立即覆盖剪贴板 → 接收端不应下载（cancel 触发）：(a) A→B 方向 cancel + (b) B→A 方向 cancel 各测一次 | 日志 + 文件系统 | 3a.5 |
+| **人类** | 1 KiB / 1 MiB / 200 MiB 三种大小各跑一次（**每种大小跑 A→B 与 B→A 两个方向**） | 3 种 × 2 方向 = 6 组真机 | 3a.1 / 3a.5 |
 
 ### M3b — 文件接收 UI + 取消 + 中途拔网
 
@@ -549,11 +561,13 @@
 | 自动 | 接收端询问流程单测：mock IPC 收到 `FileTransferRequest` → 等响应 → accept / reject | 单测绿 | 3b.2 |
 | 自动 | 拔网处理单测：mock HTTP/3 stream error → IPC 推 `FileTransferFailed` + 清 .partial | 单测绿 | 3b.3 |
 | 自动 | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` | 无 diff / 无 warning | 3b.4 |
-| **人类** | 三平台真机 GUI：复制 200 MiB 文件 → Toaster 弹通知 → Accept 落盘 + SHA-256 一致 | 录屏 + sha256sum | 3b.2 / 3b.4 |
-| **人类** | 复制 200 MiB 文件 → Toaster 弹通知 → Reject → 源端收到 cancel + 不再下载 | 日志 | 3b.2 |
-| **人类** | 复制 200 MiB 文件 → 接收中拔网线 / 关对端 Wi-Fi → 5 s 内 GUI 看到"传输失败：connection lost" | 录屏 + 错误信息 | 3b.3 / 3b.4 |
-| **人类** | 200 MiB 性能：100 Mbps **有线** LAN 实测 < 30 s | 秒表 | 3b.4 |
-| **人类** | 200 MiB 性能：Wi-Fi 实测 < 60 s（**评审 #5 3rd 双档**） | 秒表 | 3b.4 |
+| **人类** | macOS 真机 GUI Accept：(a) A→B：macOS A 端复制 200 MiB 文件 → macOS B 端 Toaster 弹通知 → 点 Accept 落盘 + SHA-256 一致；(b) B→A：反过来同样跑一次 | 录屏 + sha256sum（两个方向各录） | 3b.2 / 3b.4 |
+| **人类** | Windows 真机 GUI Accept：(a) A→B + (b) B→A 同上 | 同上 | 3b.2 / 3b.4 |
+| **人类** | Linux 真机 GUI Accept：(a) A→B + (b) B→A 同上 | 同上 | 3b.2 / 3b.4 |
+| **人类** | 复制 200 MiB 文件 → Toaster 弹通知 → Reject → 源端收到 cancel + 不再下载（**offer→response 天然单向，但需在 A→B 与 B→A 各跑一次以验证两侧 IPC 路径都通**） | 日志（两个方向各跑） | 3b.2 |
+| **人类** | 中途拔网：(a) A→B 方向：A 端发起 200 MiB 传输，B 端接收中拔网线 / 关 Wi-Fi → 5 s 内 B 端 GUI 看到"传输失败：connection lost"；(b) B→A 方向：反过来同样跑 | 录屏 + 错误信息（两个方向） | 3b.3 / 3b.4 |
+| **人类** | 200 MiB 性能：100 Mbps **有线** LAN 实测 < 30 s — (a) A→B + (b) B→A 各计时一次 | 秒表（两段） | 3b.4 |
+| **人类** | 200 MiB 性能：Wi-Fi 实测 < 60 s（**评审 #5 3rd 双档**） — (a) A→B + (b) B→A 各计时一次 | 秒表（两段） | 3b.4 |
 
 ### M4 — GUI 集成 + 文档
 
@@ -566,12 +580,12 @@
 | 自动 | `cd lan-mouse-vue && pnpm build` 产物 OK | 0 error | 4.5 |
 | 自动 | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` | 无 diff / 无 warning | 4.5 |
 | 自动 | 三平台编译通过 | CI matrix 全绿 | 4.5 |
-| **人类** | macOS 真机：浏览器打开 GUI（`pnpm dev`）→ ConnectionsPanel 改 `Auto-accept files` → 立即生效（config.toml 落盘） | 截图 + config.toml diff | 4.2 / 4.5 |
-| **人类** | Windows 真机：同上 | 同上 | 4.5 |
-| **人类** | Linux 真机：同上 | 同上 | 4.5 |
-| **人类** | GeneralPanel 剪贴板状态卡片：复制文本后 1 s 内 UI 显示最近时间 + 前 80 字符预览 | 录屏 | 4.4 |
-| **人类** | Toaster 文件传输通知：三平台各跑一次（accept + reject） | 录屏 | 4.3 / 4.5 |
-| **人类** | README.md / DOC.md 阅读一遍，确认"跨设备剪贴板"+"文件同步"章节描述准确 | 自审 | 4.5 |
+| **人类** | macOS 真机 GUI 配置：(a) A 端 ConnectionsPanel 改 `Auto-accept files` → 立即生效（config.toml 落盘）；(b) B 端同样改 → 两侧 `enable_clipboard_to` 各自独立 | 截图 + config.toml diff（两端各一份） | 4.2 / 4.5 |
+| **人类** | Windows 真机 GUI 配置：(a) + (b) 同上 | 同上 | 4.5 |
+| **人类** | Linux 真机 GUI 配置：(a) + (b) 同上 | 同上 | 4.5 |
+| **人类** | GeneralPanel 剪贴板状态卡片：(a) A→B 复制后 1 s 内 UI 显示最近时间 + 前 80 字符预览；(b) B→A 反向复制后同样显示 | 录屏（两个方向各录） | 4.4 |
+| **人类** | Toaster 文件传输通知：三平台各跑一次 accept + reject（**每平台双向 A→B / B→A 各跑一次 accept + reject**） | 录屏 | 4.3 / 4.5 |
+| **人类** | README.md / DOC.md 阅读一遍，确认"跨设备剪贴板"+"文件同步"章节**显式提到双向同步**承诺 | 自审 | 4.5 |
 
 ### 不可自动化 / 必须人为判断的项
 
