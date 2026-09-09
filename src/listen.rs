@@ -903,11 +903,44 @@ async fn server_accept_bi_task(
         // accepted bidi (each side opens its own bidi).
         if len as usize > lan_mouse_proto::MAX_EVENT_SIZE {
             log::info!(
-                "server accept_bi: stream C first frame length={len} (> MAX_EVENT_SIZE={}) from {from_addr}, dispatching to stream C reader",
+                "server accept_bi: stream C first frame length={len} (> MAX_EVENT_SIZE={}) from {from_addr}, reading inline + spawning stream C reader",
                 lan_mouse_proto::MAX_EVENT_SIZE,
                 from_addr = addr
             );
             drop(send);
+            // **BUG FIX**: the discriminator above already consumed the
+            // `[u32 BE len]` length prefix from `recv`. If we now spawn
+            // `server_stream_c_reader_task` directly, the reader's
+            // first `read_u32()` reads the **first 4 bytes of the body**
+            // as the next length prefix — off-by-4 corrupt decode.
+            //
+            // The Stream B path at lines ~919-948 sidesteps this by
+            // reading the first frame's body inline before spawning
+            // the reader task. Mirror that pattern here: read the first
+            // body inline, decode, push to `listen_tx`, then spawn the
+            // reader to handle SUBSEQUENT frames (whose first byte on
+            // the wire is the next `[u32 len]`).
+            let mut body = vec![0u8; len as usize];
+            if let Err(e) = recv.read_exact(&mut body).await {
+                log::warn!(
+                    "server accept_bi: stream C first body read failed ({addr}, len={len}): {e}"
+                );
+                continue;
+            }
+            let event = match lan_mouse_proto::ProtoEvent::try_from(body.as_slice()) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::warn!(
+                        "server accept_bi: stream C first frame decode failed ({addr}, len={len}): {e}"
+                    );
+                    continue;
+                }
+            };
+            log::info!("server accept_bi: stream C first frame from {addr}: {event}");
+            if listen_tx.send(ListenEvent::Msg { event, addr }).is_err() {
+                log::debug!("server accept_bi: listen_tx closed, exiting");
+                return;
+            }
             spawn_local(server_stream_c_reader_task(recv, listen_tx.clone(), addr));
             continue;
         }
