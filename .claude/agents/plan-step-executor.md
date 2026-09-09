@@ -14,7 +14,7 @@ model: inherit
 - **当前活跃 PLAN 由 Leader 传入**（每次调用都告诉你路径 + 当前 milestone 状态）
 - 项目根目录：`/Users/hb/Projects/@cloudself/lan-mouse-pro`（macOS + cargo）
 - 仓库约定：根目录 `AGENTS.md`（如有，覆盖 scope discipline / Rust idiom / Async pattern）
-- 注释中不要出现 PLAN STEP 字样
+- 注释中不要出现 PLAN-X STEP.. 字样
 
 ---
 
@@ -90,13 +90,13 @@ Grep: pattern="STEP-<X.Y>", path=<Leader 传入的 PLAN 路径>
 
 不通过则**不开工**，用结构化报告回给调用方：
 
-| 检查                 | 命令/动作                                                              | 期望                                                          |
-| -------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------- |
-| 产物对得上吗         | 对照 STEP "涉及文件 / 完成标志" 两段                                   | 文件/函数/常量/测试都列                                       |
-| 依赖对得上吗         | 检查本 STEP "依赖: <STEP-X.Y>" 列表都已归档为"通过"                    | 没找到的标 ⚠️                                                 |
-| 验收对得上吗         | `cargo build -p <crate>` / `cargo test` 可跑                           | 环境缺失 → 反问 Leader                                        |
-| **milestone 边界门** | grep 当前 STEP 描述是否触碰后续 milestone 范围（PLAN §0 Out of Scope） | 触碰 → 立即停止，反问 Leader                                  |
-| **时间预算门**       | 当前 STEP 估时是否 ≤ 30 min                                            | 超过 → 按"拆步"纪律立即拆步（仅 README 更新，不需 Leader 批） |
+| 检查                 | 命令/动作                                                              | 期望                         |
+| -------------------- | ---------------------------------------------------------------------- | ---------------------------- |
+| 产物对得上吗         | 对照 STEP "涉及文件 / 完成标志" 两段                                   | 文件/函数/常量/测试都列      |
+| 依赖对得上吗         | 检查本 STEP "依赖: <STEP-X.Y>" 列表都已归档为"通过"                    | 没找到的标 ⚠️                |
+| 验收对得上吗         | `cargo build -p <crate>` / `cargo test` 可跑                           | 环境缺失 → 反问 Leader       |
+| **milestone 边界门** | grep 当前 STEP 描述是否触碰后续 milestone 范围（PLAN §0 Out of Scope） | 触碰 → 立即停止，反问 Leader |
+| **时间预算门**       | 当前 STEP 估时是否 ≤ 60 min                                            | 超过 → 按"拆步"纪律立即拆步  |
 
 ---
 
