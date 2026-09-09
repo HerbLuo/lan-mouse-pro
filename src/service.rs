@@ -1509,7 +1509,7 @@ impl Service {
             // Loopback — the LRU already holds this hash (e.g. we
             // just applied an inbound `set_text` that wrote this
             // value). Do not re-broadcast.
-            log::info!(
+            log::debug!(
                 "clipboard tick: LRU loopback hit sha={} ({} bytes), skipping broadcast",
                 short_hex(&sha),
                 new_text.len()
@@ -1518,7 +1518,7 @@ impl Service {
             return;
         }
         // New content — mark + broadcast.
-        log::info!(
+        log::debug!(
             "clipboard change detected: {} bytes (sha={})",
             new_text.len(),
             short_hex(&sha)
@@ -1536,7 +1536,7 @@ impl Service {
                 short_hex(&sha)
             );
         } else {
-            log::info!(
+            log::debug!(
                 "clipboard dispatched to {} peer(s) (sha={})",
                 recipients,
                 short_hex(&sha)
@@ -1753,7 +1753,7 @@ impl Service {
         let mut skipped_no_addr = 0usize;
         for (handle, cfg, state) in self.client_manager.get_client_states() {
             if !cfg.enable_clipboard_to {
-                log::info!(
+                log::debug!(
                     "clipboard broadcast: skipping outgoing peer handle={} (enable_clipboard_to=false)",
                     handle
                 );
@@ -1761,7 +1761,7 @@ impl Service {
                 continue;
             }
             if !state.active {
-                log::info!(
+                log::debug!(
                     "clipboard broadcast: skipping outgoing peer handle={} (client not active yet)",
                     handle
                 );
@@ -1769,14 +1769,14 @@ impl Service {
                 continue;
             }
             if state.active_addr.is_none() {
-                log::info!(
+                log::debug!(
                     "clipboard broadcast: skipping outgoing peer handle={} (no active_addr — handshake incomplete?)",
                     handle
                 );
                 skipped_no_addr += 1;
                 continue;
             }
-            log::info!(
+            log::debug!(
                 "clipboard broadcast: -> outgoing peer handle={} active_addr={:?}",
                 handle,
                 state.active_addr
@@ -1785,7 +1785,7 @@ impl Service {
             *recipients += 1;
         }
         if skipped_disabled + skipped_inactive + skipped_no_addr > 0 {
-            log::info!(
+            log::debug!(
                 "clipboard broadcast gate summary (outgoing): skipped disabled={} inactive={} no_addr={}",
                 skipped_disabled,
                 skipped_inactive,
