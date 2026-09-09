@@ -1390,8 +1390,7 @@ impl Service {
     ///
     /// Triggered by `clipboard_push_notify_rx` whenever a peer's
     /// `active_addr` transitions from `None → Some(addr)`. Reads
-    /// the current local clipboard once, runs the same LRU loopback
-    /// check as `handle_clipboard_tick`, and dispatches through the
+    /// the current local clipboard once, dispatches through the
     /// shared `broadcast_clipboard_event` helper. Mirrors the tick
     /// path closely so the GUI / state semantics match a "normal"
     /// local-origin push (timestamp + `last_source = None`).
@@ -1404,13 +1403,23 @@ impl Service {
     /// Firing the push inline collapses the post-dial latency to
     /// "next loop iteration + ~5 ms backend read".
     ///
-    /// **Idempotency vs the tick**: if the tick also runs near the
-    /// same instant (the dispatcher's `clipboard_tick` is still
-    /// active), the second one to read the clipboard sees the
-    /// freshly-written LRU entry from the first push and skips —
-    /// net effect is exactly one outbound `ClipboardText`. The
-    /// `clipboard_last_text` write also short-circuits the tick's
-    /// change-detection for the same value.
+    /// **Why the LRU check is bypassed** (unlike the tick path):
+    /// the tick at `handle_clipboard_tick` writes the hash to the
+    /// LRU *before* `broadcast_clipboard_event`, even when the
+    /// broadcast is suppressed by the `active_addr.is_none()` gate
+    /// (`recipients == 0`). That "optimistic" LRU push is correct
+    /// for tick-vs-tick dedup, but it incorrectly suppresses THIS
+    /// push — the very push that's supposed to recover the copies
+    /// the tick couldn't deliver. The fix is to bypass the LRU
+    /// check here; the inbound arm's LRU check still applies
+    /// against the push we just made (so a peer's echo round-trip
+    /// is deduped correctly). Net effect: exactly one outbound
+    /// `ClipboardText` per `set_active_addr` transition.
+    ///
+    /// **Idempotency vs the tick**: even though we bypass the LRU
+    /// check, the `clipboard_last_text` write + the just-pushed LRU
+    /// entry still cause the next tick to dedup via either path —
+    /// net effect is exactly one outbound `ClipboardText`.
     ///
     /// **No-op when backend unavailable**: same `clipboard_backend
     /// .is_none()` guard as the tick path — the channel still
@@ -1424,22 +1433,10 @@ impl Service {
             None => return,
         };
         let sha = sha256_of(&new_text);
-        if self.clipboard_lru.contains(&sha) {
-            // Loopback — same defensive check as the tick path.
-            // The most common cause: the inbound `clipboard_inbound`
-            // arm just wrote this hash to the LRU + applied the text
-            // to the local clipboard within the last ~64 ticks;
-            // pushing it again would be wasted work and could
-            // produce a visible "double copy" on the peer.
-            log::debug!(
-                "clipboard recover push: LRU loopback hit sha={} ({} bytes) \
-                 for handle={handle}, skipping",
-                short_hex(&sha),
-                new_text.len()
-            );
-            self.clipboard_last_text = Some(new_text);
-            return;
-        }
+        // Intentionally **not** checking `clipboard_lru.contains(&sha)`
+        // here — see the docstring above for why the tick's
+        // pre-broadcast LRU push would otherwise suppress this
+        // recover push.
         log::info!(
             "clipboard recover push: peer handle={handle} just became active — \
              pushing {} bytes (sha={})",
