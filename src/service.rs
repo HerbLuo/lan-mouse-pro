@@ -1931,7 +1931,15 @@ impl Service {
             );
             return;
         };
-        let sha_hex = short_hex(&ct.sha256);
+        // **M1b follow-up** — must use the full 64-char hex sha256
+        // here, not `short_hex` (which truncates to 8 chars). The
+        // server's `/clipboard/text/` route handler validates the
+        // suffix is exactly 64 lowercase hex chars and returns 404
+        // for anything shorter. Using `short_hex` produced
+        // `/clipboard/text/43b20f97` (8 chars) which the source
+        // rejected as malformed even though the cache held the
+        // full 3261-byte body keyed by the full 32-byte sha256.
+        let sha_hex = full_hex(&ct.sha256);
         let client = Http3Client::new(conn);
         let result = client.get_text(&sha_hex).await;
         match result {
@@ -1940,7 +1948,7 @@ impl Service {
                     log::info!(
                         "clipboard inbound: pulled {} bytes from {addr} via HTTP/3 (sha={})",
                         body.len(),
-                        sha_hex
+                        short_hex(&ct.sha256)
                     );
                     self.apply_inbound_clipboard_text(&ct.sha256, &body, addr);
                 }
@@ -2360,6 +2368,21 @@ fn short_hex(b: &[u8; 32]) -> String {
     s
 }
 
+/// Full lowercase hex encoding of a 32-byte sha256 (64 chars).
+/// Used to construct the `/clipboard/text/{sha256}` URL path that
+/// the receiver's `Http3Client::get_text` issues and the
+/// source-side `clipboard_text_route` decodes. Must be the full
+/// 64-char form — the route handler rejects shorter suffixes as
+/// malformed. **Do not** substitute [`short_hex`] here: log lines
+/// use that for readability, but the wire path needs full fidelity.
+fn full_hex(b: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for byte in b.iter() {
+        s.push_str(&format!("{:02x}", byte));
+    }
+    s
+}
+
 /// Register a metadata-only clipboard text hash for the deferred HTTP/3
 /// pull. Returns `true` when `sha256` differs from the previously pending
 /// hash. Only the latest hash is kept because a newer clipboard notification
@@ -2373,6 +2396,51 @@ fn register_pending_clipboard_request(
     pending.clear();
     pending.insert(sha256, ());
     newly_registered
+}
+
+/// **M1b follow-up regression** — pins the full-hex contract for
+/// the URL path constructed in [`Service::handle_clipboard_inbound`].
+/// Previously the path used `short_hex` (8 chars), which the
+/// source-side route handler rejected as malformed (it requires
+/// exactly 64 lowercase hex chars). This test would catch a future
+/// refactor that re-substitutes `short_hex`.
+#[cfg(test)]
+mod hex_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn full_hex_emits_64_lowercase_chars() {
+        let sha = [0xAA; 32];
+        let hex = full_hex(&sha);
+        assert_eq!(hex.len(), 64, "full_hex must emit 64 chars");
+        assert_eq!(hex, "aa".repeat(32));
+    }
+
+    #[test]
+    fn short_hex_remains_8_chars_for_log_lines() {
+        let sha = [0xAA; 32];
+        let hex = short_hex(&sha);
+        assert_eq!(hex.len(), 8, "short_hex stays 8 chars for log readability");
+        assert_eq!(hex, "aaaaaaaa");
+    }
+
+    #[test]
+    fn full_hex_matches_receiver_path_expectations() {
+        // The path used in the bug report was
+        // `/clipboard/text/43b20f97` (8 chars, from short_hex).
+        // The source-side route handler requires 64 chars and
+        // returned 404 for any shorter suffix. With full_hex the
+        // path becomes
+        // `/clipboard/text/43b20f97...` (62 more chars) and
+        // matches what the source wrote to the cache.
+        let sha = [0x43, 0xb2, 0x0f, 0x97, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let hex = full_hex(&sha);
+        assert!(hex.starts_with("43b20f97"));
+        assert_eq!(hex.len(), 64);
+        assert_eq!(&hex[8..], &"00".repeat(28));
+    }
 }
 
 /// **M1b STEP-1b.2** — free-function form of
