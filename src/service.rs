@@ -2434,15 +2434,18 @@ impl Service {
     /// with the same sha256, echoing back to the peer).
     ///
     /// **MIME handling**: `ci.mime` is a wire string
-    /// (`"image/png"` for M2a; `"application/x-dib"` will join
-    /// in M2b). `Mime::from_label` maps known labels to the
+    /// (`"image/png"` for M2a; `"application/x-dib"` for M2b
+    /// STEP-2b.1). The DIB label routes through
+    /// [`crate::clipboard::Mime::is_dib_label`] to the dedicated
+    /// [`crate::clipboard::ClipboardBackend::set_dib_image`] path;
+    /// all other labels flow through `Mime::from_label` to the
     /// [`crate::clipboard::Mime`] enum used by
-    /// [`crate::clipboard::ClipboardBackend::set_image`]; unknown
+    /// [`crate::clipboard::ClipboardBackend::set_image`]. Unknown
     /// labels fall back to [`Mime::Png`] (the macOS backend
     /// already forces PNG regardless of the label). A failed
-    /// `set_image` is logged + return without bumping
-    /// `metrics.allow_count` (mirrors the text branch's "don't
-    /// inflate the metric on failure" contract).
+    /// `set_image` (or `set_dib_image`) is logged + return without
+    /// bumping `metrics.allow_count` (mirrors the text branch's
+    /// "don't inflate the metric on failure" contract).
     ///
     /// **No `clipboard_last_image` reset**: the text branch
     /// clears `clipboard_last_text` after a write so the next
@@ -2955,16 +2958,19 @@ fn evict_prev_outbound_clipboard_cache(
 /// used by [`evict_prev_outbound_clipboard_cache`]).
 ///
 /// **MIME handling**: the wire carries `mime` as a string
-/// (`"image/png"` for M2a; `"application/x-dib"` will join in
-/// M2b STEP-2b.1). [`Mime::from_label`] maps known labels to
-/// the [`Mime`] enum used by [`ClipboardBackend::set_image`].
-/// Unknown labels fall back to [`Mime::Png`] with a warn log —
-/// the macOS backend forces PNG regardless of the label (see
-/// `src/clipboard/macos.rs::set_image` docstring), and the
-/// Windows / Linux backends either match or are out of scope
-/// for M2a. Falling back to PNG keeps the daemon alive on
-/// unexpected wire labels instead of failing the inbound
-/// silently.
+/// (`"image/png"` for M2a; `"application/x-dib"` for M2b). The
+/// DIB label routes through [`crate::clipboard::Mime::is_dib_label`]
+/// to the dedicated [`ClipboardBackend::set_dib_image`] path (the
+/// [`Mime`] enum is intentionally left untouched per STEP-2b.1
+/// "不要触碰 Mime enum"). For all other labels,
+/// [`Mime::from_label`] maps the known PNG / JPEG / BMP labels to
+/// the [`Mime`] enum used by [`ClipboardBackend::set_image`];
+/// unknown labels fall back to [`Mime::Png`] with a warn log — the
+/// macOS backend forces PNG regardless of the label (see
+/// `src/clipboard/macos.rs::set_image` docstring), and the Windows
+/// / Linux backends either match or are out of scope for M2a.
+/// Falling back to PNG keeps the daemon alive on unexpected wire
+/// labels instead of failing the inbound silently.
 ///
 /// **Backend-unavailable case**: returns
 /// `Err(ClipboardError::Unsupported(...))` if no backend is
@@ -2983,6 +2989,16 @@ fn apply_inbound_image_bytes(
             "clipboard backend not available (inbound image apply)".into(),
         )
     })?;
+    // **M2b STEP-2b.1**: route raw DIB bytes
+    // (`application/x-dib`) through the dedicated
+    // [`ClipboardBackend::set_dib_image`] method rather than the
+    // generic PNG / JPEG / BMP [`Mime`]-based `set_image`. DIB
+    // does not map onto the [`Mime`] enum (PLAN §3 评审 #4 3rd —
+    // "不要触碰 Mime enum"), so we keep the routing predicate as a
+    // string equality check on the wire label.
+    if Mime::is_dib_label(mime) {
+        return backend.set_dib_image(bytes);
+    }
     let mime_enum = Mime::from_label(mime).unwrap_or_else(|| {
         log::warn!("clipboard inbound image: unknown mime label '{mime}'; defaulting to PNG");
         Mime::Png

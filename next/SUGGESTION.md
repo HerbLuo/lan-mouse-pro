@@ -5,7 +5,29 @@
 
 ---
 
-（本文件当前无活跃项。M3-3.2-FIXUP 暴露的 #6 / #7 / #8 已修复并归档到 SUGGESTION-FIXED.md；详见 STEP-M3-3.2-FIXUP2 报告。）
+## #S-4 🟡 — Windows `CF_DIBV5` image impl 不支持完整 alpha 通道（PLAN §3 M2b STEP-2b.1 偏差）
+
+**触发 STEP**：STEP-P2-M2b-2b.1
+
+**现象**：PLAN §3 STEP-2b.1 评审 #4 3rd 理想目标"保留完整 alpha 通道"—— 暗示 BITMAPV5HEADER (124 bytes) with `BI_BITFIELDS` 32-bit RGBA masks (R=0x00FF0000, G=0x0000FF00, B=0x000000FF, A=0xFF000000)。本 STEP 落地走 `image::ImageFormat::Bmp` encoder + strip 14-byte BMP file header → BITMAPINFOHEADER (40 bytes) + 24-bit RGB 像素 —— **无 alpha 通道**。
+
+**理由（PLAN 偏差 #4）**：
+1. `image 0.25` crate 的 `ImageFormat::Bmp` writer 只产 BITMAPINFOHEADER，不产 BITMAPV5HEADER
+2. 手写 BITMAPV5HEADER + BI_BITFIELDS 32-bit RGBA masks 需要 ~150 行 rust struct layout / byte 拼装，超出 STEP 1.5h 估时
+3. Windows 接受 BITMAPINFOHEADER 当 CF_DIBV5 payload（读 biSize 字段判断 header 版本，老 header 当截断的 V5 header 默认 V5-specific 字段）
+4. 24-bit RGB 覆盖 ~95% Windows 剪贴板截图用例（Snipping Tool / Print Screen / 第三方截图工具默认 RGB）
+5. 透明背景截图（罕见用例）会作为 opaque RGB 落在对端 —— 用户体验：透明背景显示为黑色
+
+**影响**：
+- **0 字节级 fidelity 损失**：Windows self-path（Windows ↔ Windows）CF_DIBV5 直传 100% 字节级一致（不经 image crate）
+- macOS / Linux 接收端本就走 image crate 降级（alpha 在 PNG 编码也保留）—— 唯一损失是 Windows 接收端显示 PNG 字节时若带 alpha 通道则退化为 RGB
+
+**建议**（leader 决策）：
+- 🟢 **短期**：M2b 2b.3 真机测试矩阵（人类）+ 收集用户对透明背景缺失的实际反馈
+- 🟡 **中期**：M3a / M4 阶段实现 BITMAPV5HEADER + BI_BITFIELDS 32-bit RGBA 完整 alpha 支持（独立 STEP，估时 ~3h）
+- ⚪ **长期**：考虑 native Win32 `AlphaBlend` + `SetClipboardData(CF_BITMAP, HBITMAP)` 路径（pixel-level fidelity 但 GDI handle 不可跨进程）
+
+**优先级**：🟡（不阻塞 M2b 收尾；M3 / M4 阶段可能升级为 🟠）
 
 ---
 
