@@ -146,17 +146,6 @@ pub struct Service {
     /// `None` after an inbound `set_text` so the next tick re-reads
     /// and confirms the new value.
     clipboard_last_text: Option<String>,
-    /// **M1b.1 STOP-GAP** — vestigial hash set kept for the
-    /// "metadata-only notification arrived but not yet pulled"
-    /// bookkeeping introduced in 1b.1. M1b.2 replaces the
-    /// notification-only behaviour with a direct HTTP/3 GET
-    /// (`Http3Client::get_text`), so the field is no longer
-    /// updated; it is kept here to preserve the 1b.1 struct shape
-    /// (the field's helper is exercised by an independent unit
-    /// test). Will be cleaned up in a future PR alongside the
-    /// helper — see `next/SUGGESTION.md`.
-    #[allow(dead_code)]
-    pending_clipboard_requests: HashMap<[u8; 32], ()>,
     /// **PLAN-2 / M1b STEP-1b.2** — content-addressed outbound
     /// clipboard text cache (sha256 → bytes). The dispatcher writes
     /// large (> 1 KiB) payloads here; the HTTP/3-lite server reads
@@ -741,7 +730,6 @@ impl Service {
             // (reviewer #4 3rd, was capacity 64 with no TTL in M1a).
             clipboard_lru: LruFingerprints::new(),
             clipboard_last_text: None,
-            pending_clipboard_requests: Default::default(),
             // **M1b STEP-1b.2** — shared with the listener so
             // per-peer HTTP/3 servers can read from the same store
             // the dispatcher writes to.
@@ -2383,21 +2371,6 @@ fn full_hex(b: &[u8; 32]) -> String {
     s
 }
 
-/// Register a metadata-only clipboard text hash for the deferred HTTP/3
-/// pull. Returns `true` when `sha256` differs from the previously pending
-/// hash. Only the latest hash is kept because a newer clipboard notification
-/// supersedes an older one under last-writer-wins semantics.
-#[cfg(test)]
-fn register_pending_clipboard_request(
-    pending: &mut HashMap<[u8; 32], ()>,
-    sha256: [u8; 32],
-) -> bool {
-    let newly_registered = !pending.contains_key(&sha256);
-    pending.clear();
-    pending.insert(sha256, ());
-    newly_registered
-}
-
 /// **M1b follow-up regression** — pins the full-hex contract for
 /// the URL path constructed in [`Service::handle_clipboard_inbound`].
 /// Previously the path used `short_hex` (8 chars), which the
@@ -2659,29 +2632,6 @@ fn recover_monitors(
         }
     }
     out
-}
-
-#[cfg(test)]
-mod clipboard_tests {
-    use super::register_pending_clipboard_request;
-    use std::collections::HashMap;
-
-    #[test]
-    fn metadata_only_text_registers_latest_pending_request_per_hash() {
-        let mut pending = HashMap::new();
-        let sha = [0x5A; 32];
-
-        assert!(register_pending_clipboard_request(&mut pending, sha));
-        assert!(!register_pending_clipboard_request(&mut pending, sha));
-        assert_eq!(pending.len(), 1);
-        assert!(pending.contains_key(&sha));
-
-        let other_sha = [0xA5; 32];
-        assert!(register_pending_clipboard_request(&mut pending, other_sha));
-        assert_eq!(pending.len(), 1);
-        assert!(!pending.contains_key(&sha));
-        assert!(pending.contains_key(&other_sha));
-    }
 }
 
 // ============================================================================

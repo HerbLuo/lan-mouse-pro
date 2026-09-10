@@ -5,6 +5,20 @@
 
 ---
 
+## #12 — M1b validator P2.1 dead code 清理（`pending_clipboard_requests` + `register_pending_clipboard_request`）
+
+- **触发 STEP**：M1b validator `next/STEP-VALIDATION-P2-M1b.md` §3 P2.1 / §6.1 第 1 项
+- **现象**：1b.1 (`8daaa1d`) 引入 `Service::pending_clipboard_requests: HashMap<[u8; 32], ()>` 字段 + `#[cfg(test)] fn register_pending_clipboard_request(...)` helper 作为 "metadata-only registered but not yet pulled" 的 stop-gap；1b.2 (`b65236a`) 取代语义为源端 `cache.remove(prev_sha)` + 接收端 HTTP/3 GET（`Http3Client::get_text`）后，4 处 dead code 加上 `#[allow(dead_code)]` 注解保留到本步。
+- **解决**：
+  - `src/service.rs:149-159` 字段 + doc-comment + `#[allow(dead_code)]` → 删
+  - `src/service.rs:744` `pending_clipboard_requests: Default::default(),` → 删
+  - `src/service.rs:2386-2399` `#[cfg(test)] fn register_pending_clipboard_request(...)` 函数 + doc-comment → 删
+  - `src/service.rs:2664-2685` `mod clipboard_tests` + `fn metadata_only_text_registers_latest_pending_request_per_hash`（含 3 次 helper 调用 + `use super::register_pending_clipboard_request;`） → 删
+  - `cargo test --workspace`：**339 passed / 0 failed / 3 ignored**（baseline 340 - 1 = 339，净删 1 个测试）；`cargo build --workspace`：0 error 0 warning；fmt / clippy baseline（4 + 14 pre-existing）维持不变。
+- **解决 STEP**：`next/STEP-P2-M1b-CLEANUP.md`
+
+---
+
 ## #3 — pre-existing QUIC smoke test flake `connection_survives_ten_seconds_of_silence`
 
 - **触发 STEP**：M1 / STEP-1.3（首次观察到；与本 STEP 无关）

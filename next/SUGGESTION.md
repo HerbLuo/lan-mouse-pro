@@ -52,8 +52,9 @@
 
 **触发 STEP**：STEP-P2-M1b-1b.4
 
-**现象**：`tests/clipboard_text_e2e.rs` 的 stub `active_eviction_concurrent_with_lookup_old_returns_miss` 想 `use lan_mouse::clipboard::cache::ClipboardCache;` → E0603 "module `clipboard` is private"。`src/lib.rs:14` 显式 `pub(crate) mod clipboard;`。Active eviction 契约 pin 在 `src/service.rs::register_pending_clipboard_request`（unit test 层，pub(crate) 满足），但 integration test 层无法触达。
+**现象**：`tests/clipboard_text_e2e.rs` 的 stub `active_eviction_concurrent_with_lookup_old_returns_miss` 想 `use lan_mouse::clipboard::cache::ClipboardCache;` → E0603 "module `clipboard` is private"。`src/lib.rs:14` 显式 `pub(crate) mod clipboard;`。Active eviction 契约 pin 在 `src/clipboard/cache.rs::tests::active_eviction_concurrent_with_lookup_old_returns_miss`（unit test 层，pub(crate) 满足），但 integration test 层无法触达。
 
-**建议**：M2a 阶段当 `clipboard::Backend` 需要暴露给 GUI Toaster 通知（PLAN §3 M4 STEP-4.4 GeneralPanel 卡片"剪贴板刚被 X 改了"提示）时顺手把 `pub(crate)` 升级为 `pub`；届时 un-stub `tests/clipboard_text_e2e.rs::active_eviction_concurrent_with_lookup_old_returns_miss` 并把 `src/service.rs::register_pending_clipboard_request` 的 body 搬过去。
+**建议**：M2a 阶段当 `clipboard::Backend` 需要暴露给 GUI Toaster 通知（PLAN §3 M4 STEP-4.4 GeneralPanel 卡片"剪贴板刚被 X 改了"提示）时顺手把 `pub(crate)` 升级为 `pub`；届时 un-stub `tests/clipboard_text_e2e.rs::active_eviction_concurrent_with_lookup_old_returns_miss` 并直接引用 `lan_mouse::clipboard::cache::ClipboardCache`。
+（**2026-09-10 修订**：M1b validator P2.1 cleanup 删除了原先提到的 `src/service.rs::register_pending_clipboard_request`（属于 1b.1 dead code，1b.2 取代后未清理）；active eviction 契约的真正 pin 位置一直是 `src/clipboard/cache.rs::tests::active_eviction_concurrent_with_lookup_old_returns_miss`。同步 un-stub 时一并修 P2.2 描述的 `tests/clipboard_text_e2e.rs:51 / :218 / :230` 三处 doc-comment 中的 stale 引用。）
 
 **优先级**：⚪（不阻塞 M1b；M2a / M4 阶段可能升级为 🟡）
