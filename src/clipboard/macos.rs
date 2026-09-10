@@ -363,6 +363,134 @@ impl ClipboardBackend for MacOsPasteboard {
         fresh
     }
 
+    /// **2026-09-10 screenshot-bug fix (master side)** — async
+    /// override that routes the CPU-heavy JPEG/TIFF → PNG
+    /// normalisation through `tokio::task::spawn_blocking`, freeing
+    /// the LocalSet thread for the 2–5 s the PNG encoder takes on
+    /// a full-screen screenshot.
+    ///
+    /// **Master-only impact**: this override only matters on the
+    /// master side where the dispatcher polls for outbound pushes.
+    /// The Windows / Linux receive path (`apply_inbound_clipboard_image`
+    /// calling `current_image`) doesn't need the `spawn_blocking`
+    /// path — Windows's `current_image` returns raw DIB bytes without
+    /// re-encoding and Linux shells out to `xclip`/`wl-paste` (already
+    /// a subprocess), so neither hits the heavy path.
+    ///
+    /// **Why this lives on the backend trait** (instead of a
+    /// service-side helper): the `Service::clipboard_poller` task
+    /// (`src/service.rs::run`) owns the backend. Calling
+    /// `current_image_async` from the poller routes the encode
+    /// through `spawn_blocking` automatically; the dispatcher
+    /// itself stays a thin orchestrator.
+    ///
+    /// **Cache-hit fast path is synchronous**: the cache lookup
+    /// + `bytes.clone()` for a 3–4 MB PNG is a single ~1 ms memcpy
+    /// that we don't push through the blocking pool on every
+    /// quiescent tick (the poller fires every 500 ms even when
+    /// nothing has changed). Only the cache-miss path spawns.
+    ///
+    /// **Three sync IPC reads before `spawn_blocking`** (PNG,
+    /// JPEG, TIFF pasteboard probes): each is a single
+    /// `NSPasteboard.dataForType:` call (~0.5–2 ms on the
+    /// LocalSet thread). These run *before* the heavy encode and
+    /// are cheap; we don't offload them because (a) they need
+    /// the `&mut self` borrow the spawn_blocking result has to
+    /// drop before re-acquiring for the cache write-back, and
+    /// (b) NSPasteboard must be touched from the main thread
+    /// (which the LocalSet is).
+    fn current_image_async<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<ImageBytes>> + Send + 'a>,
+    > {
+        // Cache hit: synchronous fast path. Clone the cached bytes
+        // BEFORE constructing the async block — `cached` borrows
+        // `self.image_cache`, which the returned future would carry
+        // for `'a`. Cloning frees `self` for the duration of the
+        // (trivial) await.
+        let pb = NSPasteboard::generalPasteboard();
+        let change_count = pb.changeCount();
+        if let Some(cached) = &self.image_cache {
+            if cached.change_count == change_count {
+                let bytes = cached.bytes.clone();
+                return Box::pin(async move { Some(bytes) });
+            }
+        }
+
+        // Cache miss: pull the three pasteboard byte buffers
+        // synchronously (cheap IPC), then run the encode on the
+        // blocking pool. The future then writes the result back to
+        // the cache *before* returning, so the very next tick hits
+        // the cache and short-circuits.
+        let png_bytes = read_pasteboard_bytes(&pb, NS_PASTEBOARD_TYPE_PNG);
+        let jpeg_bytes = read_pasteboard_bytes(&pb, NS_PASTEBOARD_TYPE_JPEG);
+        let tiff_bytes = read_pasteboard_bytes(&pb, NS_PASTEBOARD_TYPE_TIFF);
+
+        Box::pin(async move {
+            let fresh = tokio::task::spawn_blocking(
+                move || -> Option<ImageBytes> {
+                    // PNG passthrough — no CPU work.
+                    if let Some(bytes) = png_bytes {
+                        return Some(ImageBytes {
+                            mime: Mime::Png.mime_str().to_string(),
+                            data: bytes,
+                        });
+                    }
+                    // JPEG → PNG normalisation (the expensive path).
+                    if let Some(jpeg) = jpeg_bytes {
+                        if let Ok(png) = jpeg_to_png_normalized(&jpeg) {
+                            log::info!(
+                                "clipboard: JPEG→PNG normalized for cross-platform transfer \
+                                 ({} bytes → {} bytes)",
+                                jpeg.len(),
+                                png.len()
+                            );
+                            return Some(ImageBytes {
+                                mime: Mime::Png.mime_str().to_string(),
+                                data: png,
+                            });
+                        }
+                        log::warn!("clipboard: JPEG decode failed (will probe TIFF next)");
+                    }
+                    // TIFF → PNG normalisation.
+                    if let Some(tiff) = tiff_bytes {
+                        if let Ok(png) = tiff_to_png_normalized(&tiff) {
+                            log::info!(
+                                "clipboard: TIFF→PNG normalized for cross-platform transfer \
+                                 ({} bytes → {} bytes)",
+                                tiff.len(),
+                                png.len()
+                            );
+                            return Some(ImageBytes {
+                                mime: Mime::Png.mime_str().to_string(),
+                                data: png,
+                            });
+                        }
+                        log::warn!("clipboard: TIFF decode failed");
+                    }
+                    None
+                },
+            )
+            .await
+            .ok()
+            .flatten();
+
+            // Cache write-back. Re-borrow `self.image_cache` — the
+            // `await` above released the `&mut self` borrow that
+            // the async block held (Pin lifetime ends on await
+            // return), so this assignment is sound. Mirrors the
+            // sync `current_image`'s post-read cache behaviour.
+            if let Some(bytes) = fresh.as_ref() {
+                self.image_cache = Some(ImageCacheEntry {
+                    change_count,
+                    bytes: bytes.clone(),
+                });
+            }
+            fresh
+        })
+    }
+
     /// Write `bytes` to the clipboard as PNG.
     ///
     /// **`mime` is ignored** — the macOS backend writes PNG bytes

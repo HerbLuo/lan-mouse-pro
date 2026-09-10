@@ -26,7 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
-use tokio::{process::Command, signal, sync::Notify, sync::mpsc as tokio_mpsc};
+use tokio::{process::Command, signal, sync::Notify, sync::mpsc as tokio_mpsc, sync::oneshot};
 
 use crate::clipboard::{ClipboardBackend, Mime, default_backend};
 use crate::quic_transport::http3::Http3Client;
@@ -127,7 +127,28 @@ pub struct Service {
     /// dispatch loop is skipped in that case. `Some(_)` means the
     /// 500 ms tick is active and the service pushes inbound
     /// `ClipboardText` events through this backend.
+    ///
+    /// **2026-09-10 screenshot-bug fix**: ownership of this
+    /// backend is moved into the spawned `clipboard_poller` task
+    /// at the top of [`Self::run`]. The dispatcher in the main
+    /// task talks to the poller through [`Self::clipboard_backend_cmd`]
+    /// (the inbound side) + the `image_tx` / `text_tx` channels
+    /// (the outbound side). Inbound writes are the only path
+    /// that needs backend access from the main task; the polling
+    /// side is fully owned by the spawned task.
     clipboard_backend: Option<Box<dyn ClipboardBackend>>,
+    /// **2026-09-10 screenshot-bug fix** — mpsc sender for
+    /// `BackendCmd` requests to the [`clipboard_poller`] task
+    /// that owns [`Self::clipboard_backend`]. Inbound write
+    /// handlers ([`Self::apply_inbound_clipboard_text`] /
+    /// [`Self::apply_inbound_clipboard_image`]) and the
+    /// recover-push path ([`Self::handle_clipboard_recover_push`])
+    /// send `SetText` / `SetImage` / `SetDibImage` / `CurrentText`
+    /// / `CurrentImage` requests through this channel and await
+    /// a `oneshot` reply. `None` until [`Self::run`] sets it up;
+    /// in practice always `Some` for the lifetime of the main
+    /// `select!`.
+    clipboard_backend_cmd: Option<tokio_mpsc::UnboundedSender<BackendCmd>>,
     /// **M1a STEP-1a.4** — LRU of recently-written fingerprints.
     /// Loopback defence: a peer-pushed `ClipboardText` whose
     /// `sha256` is in the LRU is treated as our own writeback and
@@ -798,6 +819,16 @@ impl Service {
             // `clipboard_backend` guard short-circuits the
             // no-backend case.
             clipboard_backend,
+            // **2026-09-10 screenshot-bug fix** — populated by
+            // [`Self::run`] once the spawned `clipboard_poller`
+            // task is up. `None` until then; inbound handlers
+            // (`apply_inbound_clipboard_text` /
+            // `apply_inbound_clipboard_image` /
+            // `handle_clipboard_recover_push`) short-circuit on
+            // `None` so a Service that hasn't been driven through
+            // `run` yet (e.g. unit tests) is still safe to
+            // construct.
+            clipboard_backend_cmd: None,
             // **M1b STEP-1b.3** — capacity 128 + 60 s TTL
             // (reviewer #4 3rd, was capacity 64 with no TTL in M1a).
             clipboard_lru: LruFingerprints::new(),
@@ -856,6 +887,69 @@ impl Service {
             self.activate_client(handle);
         }
 
+        // **2026-09-10 screenshot-bug fix** — move the clipboard
+        // polling tick (and the heavy JPEG/TIFF → PNG encode it
+        // triggers on macOS) into a dedicated `spawn_local` task
+        // instead of running it as one arm of the main `select!`.
+        //
+        // Why this is necessary (root-cause recap, see
+        // [[lan-mouse-clipboard-screenshot-block]]):
+        //   `handle_clipboard_tick(&mut self)` holds an exclusive
+        //   `&mut self` borrow for the entire await chain. While
+        //   in flight, capture / emulation / frontend arms in the
+        //   main `select!` cannot be polled, so a 2–5 s PNG encode
+        //   starves the `Pong watchdog` → connection drops.
+        //   Putting the heavy work on a separate `spawn_local` task
+        //   keeps `&mut self` free on the main task during the
+        //   encode, so capture BeginPending events get processed
+        //   within their 500 ms window.
+        //
+        // Architecture:
+        //   - The spawned task (`clipboard_poller`) is the SOLE
+        //     owner of `clipboard_backend`. It runs the 500 ms tick
+        //     loop + serves inbound `BackendCmd` requests from the
+        //     main task (set_text / set_image / current_text /
+        //     current_image).
+        //   - The poller uses `backend.current_image_async()` which
+        //     routes the heavy encode through `spawn_blocking` on
+        //     macOS — important: spawn_blocking tasks are
+        //     sequential inside the poller (it awaits each one
+        //     before starting the next), so the previous failed
+        //     fix (`4313940`) that piled up concurrent encodes by
+        //     putting spawn_blocking inside a select! arm is not
+        //     repeated here.
+        //   - The main task consumes image / text results via two
+        //     unbounded channels (`image_rx`, `text_rx`) and
+        //     dispatches them through the existing `dispatch_image`
+        //     / `dispatch_text` paths (LRU dedup + cache insert +
+        //     broadcast).
+        //   - The main task sends backend write/read commands via
+        //     a third unbounded channel (`cmd_tx`); each command
+        //     carries a `oneshot` reply channel so the inbound
+        //     handler can `await` the result.
+        let (image_tx, mut image_rx) = tokio_mpsc::unbounded_channel::<crate::clipboard::ImageBytes>();
+        let (text_tx, mut text_rx) = tokio_mpsc::unbounded_channel::<String>();
+        let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<BackendCmd>();
+        // Stash the cmd sender on `self` so inbound write handlers
+        // (`apply_inbound_clipboard_text` / `apply_inbound_clipboard_image` /
+        // `handle_clipboard_recover_push`) can route `BackendCmd` requests
+        // to the spawned poller. Replacing the field here keeps the
+        // `Option<...>` shape so tests that don't drive `Service::run`
+        // can still construct a Service with no backend wired in.
+        self.clipboard_backend_cmd = Some(cmd_tx);
+        let clipboard_backend = self.clipboard_backend.take();
+        let clipboard_tick = std::mem::replace(
+            &mut self.clipboard_tick,
+            tokio::time::interval(Duration::from_millis(500)),
+        );
+        tokio::task::spawn_local(clipboard_poller(
+            clipboard_backend,
+            clipboard_tick,
+            image_tx,
+            text_tx,
+            cmd_rx,
+        ));
+
         loop {
             tokio::select! {
                 request = self.frontend_listener.next() => self.handle_frontend_request(request),
@@ -864,12 +958,15 @@ impl Service {
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
-                // **M1a STEP-1a.4** — clipboard dispatch tick. Polls
-                // `clipboard_backend.current_text()` every 500 ms;
-                // on change → LRU + push to peers. Short-circuits
-                // when the backend is `None` (platform
-                // unsupported / tool missing).
-                _ = self.clipboard_tick.tick() => self.handle_clipboard_tick().await,
+                // **2026-09-10 screenshot-bug fix (move #1)** — the
+                // clipboard dispatch tick no longer lives in this
+                // `select!`. See the long-form rationale above at
+                // the top of `Service::run`. The poller task sends
+                // ImageBytes / String results here; the dispatcher
+                // branches (`dispatch_image` / `dispatch_text`) are
+                // unchanged from the pre-move implementation.
+                Some(image) = image_rx.recv() => self.dispatch_image(image).await,
+                Some(text) = text_rx.recv() => self.dispatch_text(text).await,
                 // **M1a STEP-1a.4** — inbound clipboard event from a
                 // peer. Server-side: `Emulation::ListenTask` pushes
                 // here. Client-side: `peer.set_clipboard_inbox` (set
@@ -1883,25 +1980,20 @@ impl Service {
     /// keeps `current_image()` cheap on quiescent ticks — the
     /// image read is dominated by the sha256 hash (5-15 ms for
     /// a 4 K screenshot) which fits the 500 ms budget.
-    async fn handle_clipboard_tick(&mut self) {
-        let Some(backend) = self.clipboard_backend.as_mut() else {
-            return;
-        };
-        // Phase 1: image. Check first so macOS screenshot
-        // pasteboards (which advertise an empty string alongside
-        // the PNG) do not get masked by an empty-text short-circuit.
-        // `current_image()` is `&mut self` on the backend, so this
-        // borrow must end before the text branch can run.
-        if let Some(image) = backend.current_image() {
-            self.dispatch_image(image).await;
-            return;
-        }
-        // Phase 2: text. No image on the clipboard → fall through
-        // to the M1a / M1b text branch.
-        if let Some(new_text) = backend.current_text() {
-            self.dispatch_text(new_text).await;
-        }
-    }
+    ///
+    /// **Removed 2026-09-10 screenshot-bug fix**: the polling
+    /// tick used to live here as one arm of `Service::run`'s main
+    /// `select!`, holding `&mut self` for the entire await chain
+    /// and starving the Pong watchdog / capture BeginPending
+    /// during a 2–5 s PNG encode. The polling tick now lives in
+    /// the spawned [`clipboard_poller`] task (see [`Self::run`]),
+    /// which owns `clipboard_backend` and uses
+    /// [`crate::clipboard::ClipboardBackend::current_image_async`]
+    /// to route the heavy encode through `spawn_blocking`.
+    /// The main task's `select!` consumes the poller's results
+    /// via `image_rx` / `text_rx` and dispatches them through
+    /// [`Self::dispatch_image`] / [`Self::dispatch_text`]
+    /// directly.
 
     /// **M1a STEP-1a.4 + M1b STEP-1b.2 + M1b STEP-1b.3** —
     /// dispatcher branch for clipboard text.
@@ -2250,7 +2342,7 @@ impl Service {
         }
         // Inline fast-path: bytes are on the wire, just apply.
         if let Some(content) = ct.content_inline.as_ref() {
-            self.apply_inbound_clipboard_text(&ct.sha256, content, addr);
+            self.apply_inbound_clipboard_text(&ct.sha256, content, addr).await;
             return;
         }
         // Metadata-only slow-path: HTTP/3 GET against the source
@@ -2282,7 +2374,7 @@ impl Service {
                         body.len(),
                         short_hex(&ct.sha256)
                     );
-                    self.apply_inbound_clipboard_text(&ct.sha256, &body, addr);
+                    self.apply_inbound_clipboard_text(&ct.sha256, &body, addr).await;
                 }
                 _ => {
                     log::warn!(
@@ -2373,7 +2465,7 @@ impl Service {
                         short_hex(&ci.sha256),
                         ci.mime
                     );
-                    self.apply_inbound_clipboard_image(&ci.sha256, &body, &ci.mime, addr);
+                    self.apply_inbound_clipboard_image(&ci.sha256, &body, &ci.mime, addr).await;
                 }
                 _ => {
                     log::warn!(
@@ -2414,13 +2506,21 @@ impl Service {
     /// A failed `set_text` still leaves the LRU marked (we
     /// *intended* to write it); the cost is one harmless "skip"
     /// for the next inbound of the same fingerprint.
-    fn apply_inbound_clipboard_text(
+    ///
+    /// **2026-09-10 screenshot-bug fix** — now `async` because
+    /// the backend is owned by the spawned `clipboard_poller` and
+    /// `set_text` has to be requested through the `BackendCmd`
+    /// channel. The poller processes the request on the LocalSet
+    /// thread and returns the result via `oneshot`. The original
+    /// sync semantics (LRU mark → set_text → bookkeeping →
+    /// frontend notify) are unchanged.
+    async fn apply_inbound_clipboard_text(
         &mut self,
         sha256: &[u8; 32],
         bytes: &[u8],
         source: SocketAddr,
     ) {
-        let Some(backend) = self.clipboard_backend.as_mut() else {
+        let Some(cmd_tx) = self.clipboard_backend_cmd.as_ref() else {
             return;
         };
         // **M1b STEP-1b.3** — mark the loopback LRU BEFORE writing
@@ -2431,8 +2531,22 @@ impl Service {
         // wire convention; if a peer sent non-UTF-8 bytes (corrupt
         // / older daemon) the lossy replace keeps the daemon from
         // panicking — the user will see replacement characters.
-        let text = String::from_utf8_lossy(bytes);
-        if let Err(e) = backend.set_text(&text) {
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if cmd_tx.send(BackendCmd::SetText { text, reply: reply_tx }).is_err() {
+            // Poller is gone (daemon shutting down). Don't
+            // touch the LRU mark — leave it so the next daemon
+            // start doesn't re-broadcast this peer echo.
+            return;
+        }
+        let set_result = match reply_rx.await {
+            Ok(r) => r,
+            Err(_) => {
+                log::warn!("clipboard inbound: set_text reply channel closed");
+                return;
+            }
+        };
+        if let Err(e) = set_result {
             log::warn!("clipboard inbound: set_text failed: {e}");
             return;
         }
@@ -2519,19 +2633,66 @@ impl Service {
     /// tick re-reads the local backend; for image the dispatcher
     /// already short-circuits on `last_outbound_image_sha` match
     /// (STEP-2a.3), so an analogous "force re-read" isn't needed.
-    fn apply_inbound_clipboard_image(
+    ///
+    /// **2026-09-10 screenshot-bug fix** — now `async` because
+    /// the backend is owned by the spawned `clipboard_poller` and
+    /// both `set_image` / `set_dib_image` and the post-write
+    /// `current_image` re-read go through `BackendCmd` requests.
+    async fn apply_inbound_clipboard_image(
         &mut self,
         sha256: &[u8; 32],
         bytes: &[u8],
         mime: &str,
         source: SocketAddr,
     ) {
+        // Clone the cmd sender up front so we don't hold a
+        // borrow across the `&mut self` calls below (LRU
+        // mark + bookkeeping).
+        let Some(cmd_tx) = self.clipboard_backend_cmd.clone() else {
+            return;
+        };
         // Step 1: mark the image LRU BEFORE `set_image`. See the
         // function docstring for the window-defence ordering rationale.
         self.mark_local_image_write(*sha256);
         // Step 2: route the bytes through the platform backend.
-        // Unknown mime labels fall back to PNG (see `apply_inbound_image_bytes`).
-        if let Err(e) = apply_inbound_image_bytes(&mut self.clipboard_backend, bytes, mime) {
+        // Unknown mime labels fall back to PNG (see
+        // `apply_inbound_image_bytes`'s docstring for the
+        // routing predicate).
+        let is_dib = Mime::is_dib_label(mime);
+        let mime_enum = if is_dib {
+            None
+        } else {
+            Some(Mime::from_label(mime).unwrap_or_else(|| {
+                log::warn!("clipboard inbound image: unknown mime label '{mime}'; defaulting to PNG");
+                Mime::Png
+            }))
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let cmd = if is_dib {
+            BackendCmd::SetDibImage {
+                bytes: bytes.to_vec(),
+                reply: reply_tx,
+            }
+        } else {
+            BackendCmd::SetImage {
+                bytes: bytes.to_vec(),
+                mime: mime_enum.expect("non-DIB path always sets mime_enum"),
+                reply: reply_tx,
+            }
+        };
+        if cmd_tx.send(cmd).is_err() {
+            // Poller gone — daemon shutting down. Leave LRU
+            // mark in place so a future run doesn't echo.
+            return;
+        }
+        let set_result = match reply_rx.await {
+            Ok(r) => r,
+            Err(_) => {
+                log::warn!("clipboard inbound image: set_image reply channel closed");
+                return;
+            }
+        };
+        if let Err(e) = set_result {
             log::warn!("clipboard inbound image: set_image failed: {e}");
             return;
         }
@@ -2545,8 +2706,12 @@ impl Service {
         // would dispatch the just-applied DIB back to its
         // source. Marking the post-apply SHA closes that loop
         // even when the backend transcodes.
-        if let Some(backend) = self.clipboard_backend.as_mut() {
-            if let Some(written) = backend.current_image() {
+        let (cur_reply_tx, cur_reply_rx) = oneshot::channel();
+        if cmd_tx
+            .send(BackendCmd::CurrentImage { reply: cur_reply_tx })
+            .is_ok()
+        {
+            if let Ok(Some(written)) = cur_reply_rx.await {
                 let written_sha = sha256_of_bytes(&written.data);
                 if &written_sha != sha256 {
                     log::debug!(
@@ -2648,12 +2813,24 @@ impl Service {
     /// .is_none()` guard as the tick path — the channel still
     /// drains, just nothing is dispatched.
     async fn handle_clipboard_recover_push(&mut self, handle: ClientHandle) {
-        let Some(backend) = self.clipboard_backend.as_mut() else {
+        let Some(cmd_tx) = self.clipboard_backend_cmd.as_ref() else {
             return;
         };
-        let new_text = match backend.current_text() {
-            Some(t) => t,
-            None => return,
+        // **2026-09-10 screenshot-bug fix** — `current_text` is
+        // now routed through the `clipboard_poller` task via
+        // `BackendCmd::CurrentText`. Cheap on every backend
+        // (no PNG encode), but goes through the same channel
+        // as writes for consistency.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if cmd_tx
+            .send(BackendCmd::CurrentText { reply: reply_tx })
+            .is_err()
+        {
+            return;
+        }
+        let new_text = match reply_rx.await {
+            Ok(Some(t)) => t,
+            _ => return,
         };
         let sha = sha256_of(&new_text);
         // Intentionally **not** checking `clipboard_lru.contains(&sha)`
@@ -3071,6 +3248,17 @@ fn evict_prev_outbound_clipboard_cache(
 /// (`apply_inbound_clipboard_image`) logs warn and skips without
 /// incrementing the metrics allow counter — same "no inflate on
 /// failure" contract as the text branch.
+///
+/// **2026-09-10 screenshot-bug fix**: in production code the
+/// backend is owned by the spawned `clipboard_poller` task and
+/// the routing logic inlined into the
+/// `apply_inbound_clipboard_image` cmd-construction site. This
+/// helper now only exists for the unit tests in
+/// `image_inbound_tests` (which build a `RecordingBackend` /
+/// `DummyBackend` directly and exercise the mime-routing
+/// predicate in isolation from the rest of the service).
+#[cfg(test)]
+#[allow(dead_code)]
 fn apply_inbound_image_bytes(
     backend: &mut Option<Box<dyn ClipboardBackend>>,
     bytes: &[u8],
@@ -3110,6 +3298,174 @@ fn unix_now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+// ============================================================================
+//  Clipboard poller (2026-09-10 screenshot-bug fix — see Service::run for
+//  the long-form rationale)
+// ============================================================================
+
+/// Request to the clipboard poller task (`Service::run`'s spawned
+/// `clipboard_poller`). Each variant carries a `oneshot::Sender`
+/// reply so the inbound caller can `await` the result of an
+/// OS-clipboard write without holding the backend directly.
+///
+/// **Why a dedicated `BackendCmd` channel instead of sharing the
+/// backend via `Arc<Mutex<>>`**: the polling side routinely awaits
+/// `spawn_blocking` for 2–5 s during a full-screen JPEG→PNG encode,
+/// and any inbound write that grabs a std-Mutex lock during that
+/// window would block the entire LocalSet thread (deadlock-like).
+/// Routing writes through an mpsc channel keeps the backend mutex
+/// (which doesn't exist any more — the poller is the SOLE owner)
+/// out of the inbound path entirely.
+enum BackendCmd {
+    SetText {
+        text: String,
+        reply: tokio::sync::oneshot::Sender<Result<(), crate::clipboard::ClipboardError>>,
+    },
+    SetImage {
+        bytes: Vec<u8>,
+        mime: Mime,
+        reply: tokio::sync::oneshot::Sender<Result<(), crate::clipboard::ClipboardError>>,
+    },
+    SetDibImage {
+        bytes: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<(), crate::clipboard::ClipboardError>>,
+    },
+    CurrentText {
+        reply: tokio::sync::oneshot::Sender<Option<String>>,
+    },
+    CurrentImage {
+        reply: tokio::sync::oneshot::Sender<
+            Option<crate::clipboard::ImageBytes>,
+        >,
+    },
+}
+
+/// **2026-09-10 screenshot-bug fix** — dedicated spawned task
+/// that owns the OS clipboard backend and serves two distinct
+/// request streams:
+///
+/// 1. **Polling tick** (every 500 ms) — reads the local clipboard
+///    via `current_image_async` / `current_text` and forwards
+///    results to the main task's `image_tx` / `text_tx` channels.
+///    The dispatcher arms in the main `select!` consume from
+///    those channels and run the existing `dispatch_image` /
+///    `dispatch_text` helpers unchanged.
+/// 2. **Inbound backend cmds** (`cmd_rx`) — `set_text` /
+///    `set_image` / `set_dib_image` / `current_text` /
+///    `current_image`. Each carries a `oneshot` reply channel so
+///    the inbound caller can `await` the result.
+///
+/// **Lifecycle**: the task exits when the runtime drops, which
+/// happens when `Service::run` returns (CTRL+C). `cmd_tx` in
+/// `Service` is dropped at the same time, closing `cmd_rx`; the
+/// next `cmd_rx.recv()` returns `None`, the loop falls through,
+/// and the `image_tx` / `text_tx` channels are dropped on the way
+/// out.
+async fn clipboard_poller(
+    backend: Option<Box<dyn ClipboardBackend>>,
+    mut interval: tokio::time::Interval,
+    image_tx: tokio_mpsc::UnboundedSender<crate::clipboard::ImageBytes>,
+    text_tx: tokio_mpsc::UnboundedSender<String>,
+    mut cmd_rx: tokio_mpsc::UnboundedReceiver<BackendCmd>,
+) {
+    // **Backend-absent case**: no platform backend (e.g. running
+    // in a CI container without `xclip` / no macOS pasteboard
+    // binding). Still drain `cmd_rx` so inbound `apply_*` callers
+    // don't block forever waiting on a reply that will never
+    // arrive; just send `None` / `Err(Unsupported)` back.
+    let mut backend = match backend {
+        Some(b) => b,
+        None => {
+            log::debug!("clipboard poller: no backend configured; draining cmd_rx only");
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    BackendCmd::SetText { reply, .. } => {
+                        let _ = reply.send(Err(
+                            crate::clipboard::ClipboardError::Unsupported(
+                                "clipboard backend not configured".into(),
+                            ),
+                        ));
+                    }
+                    BackendCmd::SetImage { reply, .. }
+                    | BackendCmd::SetDibImage { reply, .. } => {
+                        let _ = reply.send(Err(
+                            crate::clipboard::ClipboardError::Unsupported(
+                                "clipboard backend not configured".into(),
+                            ),
+                        ));
+                    }
+                    BackendCmd::CurrentText { reply } => {
+                        let _ = reply.send(None);
+                    }
+                    BackendCmd::CurrentImage { reply } => {
+                        let _ = reply.send(None);
+                    }
+                }
+            }
+            return;
+        }
+    };
+    // Skip the immediate first tick — `tokio::time::interval`
+    // fires at t=0 by default; we don't want the very first
+    // poll to log anything before the daemon has been alive
+    // long enough for the user to have copied something.
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            // Bias toward the tick arm when both are ready so a
+            // burst of inbound cmds can't starve the polling tick.
+            biased;
+            _ = interval.tick() => {
+                // Phase 1: image. Check first so macOS screenshot
+                // pasteboards (which advertise an empty string
+                // alongside the PNG) do not get masked by an
+                // empty-text short-circuit. `current_image_async`
+                // routes the heavy encode through `spawn_blocking`
+                // on macOS — see the trait method docstring on
+                // `ClipboardBackend::current_image_async`.
+                match backend.current_image_async().await {
+                    Some(image) => {
+                        if image_tx.send(image).is_err() {
+                            // Main task is gone — daemon is
+                            // shutting down. Exit cleanly.
+                            return;
+                        }
+                        continue;
+                    }
+                    None => {}
+                }
+                // Phase 2: text. No image on the clipboard →
+                // fall through to the text branch.
+                if let Some(text) = backend.current_text() {
+                    if text_tx.send(text).is_err() {
+                        return;
+                    }
+                }
+            }
+            Some(cmd) = cmd_rx.recv() => {
+                match cmd {
+                    BackendCmd::SetText { text, reply } => {
+                        let _ = reply.send(backend.set_text(&text));
+                    }
+                    BackendCmd::SetImage { bytes, mime, reply } => {
+                        let _ = reply.send(backend.set_image(&bytes, mime));
+                    }
+                    BackendCmd::SetDibImage { bytes, reply } => {
+                        let _ = reply.send(backend.set_dib_image(&bytes));
+                    }
+                    BackendCmd::CurrentText { reply } => {
+                        let _ = reply.send(backend.current_text());
+                    }
+                    BackendCmd::CurrentImage { reply } => {
+                        let _ = reply.send(backend.current_image());
+                    }
+                }
+            }
+            else => return,
+        }
+    }
 }
 
 /// **STEP-M2-2.6**: pure helper that turns an internal
@@ -4236,10 +4592,11 @@ mod image_inbound_tests {
     //! the fetch → apply sequence is exercised by the end-to-end
     //! test matrix in PLAN §8 M2a (macOS 真机).
     use super::{
-        ClipboardBackend, IMAGE_LOOPBACK_CAPACITY, IMAGE_LOOPBACK_TTL, LruFingerprints, Mime,
-        apply_inbound_image_bytes,
+        BackendCmd, ClipboardBackend, IMAGE_LOOPBACK_CAPACITY, IMAGE_LOOPBACK_TTL,
+        LruFingerprints, Mime, apply_inbound_image_bytes, clipboard_poller,
     };
     use crate::clipboard::{ClipboardError, ImageBytes};
+    use tokio::sync::{mpsc as tokio_mpsc, oneshot};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -4712,6 +5069,142 @@ mod image_inbound_tests {
             mime: "image/png".to_string(),
             data: bytes,
         };
+    }
+
+    /// **2026-09-10 screenshot-bug fix — architecture pin**:
+    /// the `clipboard_poller` task drains `BackendCmd` requests
+    /// from `cmd_rx` and replies via `oneshot` channels even
+    /// when no backend is configured. This pins the "poller
+    /// always replies" contract so a future refactor that adds
+    /// (e.g.) a panic-on-no-backend short-circuit doesn't strand
+    /// inbound handlers waiting on a reply that never lands.
+    #[tokio::test(flavor = "current_thread")]
+    async fn clipboard_poller_no_backend_drains_cmds() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (image_tx, mut image_rx) =
+                    tokio_mpsc::unbounded_channel::<crate::clipboard::ImageBytes>();
+                let (text_tx, mut text_rx) = tokio_mpsc::unbounded_channel::<String>();
+                let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<BackendCmd>();
+                let interval = tokio::time::interval(Duration::from_millis(50));
+
+                // Backend absent — the poller should still
+                // respond to every cmd variant rather than
+                // parking on `cmd_rx.recv()` forever.
+                tokio::task::spawn_local(clipboard_poller(
+                    None,
+                    interval,
+                    image_tx,
+                    text_tx,
+                    cmd_rx,
+                ));
+
+                // SetText → Err(Unsupported) but the reply lands.
+                let (reply_tx, reply_rx) = oneshot::channel();
+                cmd_tx
+                    .send(BackendCmd::SetText {
+                        text: "hello".to_string(),
+                        reply: reply_tx,
+                    })
+                    .expect("cmd_tx alive");
+                let set_text_result = reply_rx.await.expect("reply arrives");
+                assert!(
+                    set_text_result.is_err(),
+                    "no-backend SetText must return Err"
+                );
+
+                // CurrentText → None.
+                let (reply_tx, reply_rx) = oneshot::channel();
+                cmd_tx
+                    .send(BackendCmd::CurrentText { reply: reply_tx })
+                    .expect("cmd_tx alive");
+                let current_text_result = reply_rx.await.expect("reply arrives");
+                assert_eq!(
+                    current_text_result, None,
+                    "no-backend CurrentText must return None"
+                );
+
+                // CurrentImage → None.
+                let (reply_tx, reply_rx) = oneshot::channel();
+                cmd_tx
+                    .send(BackendCmd::CurrentImage { reply: reply_tx })
+                    .expect("cmd_tx alive");
+                let current_image_result = reply_rx.await.expect("reply arrives");
+                assert_eq!(
+                    current_image_result, None,
+                    "no-backend CurrentImage must return None"
+                );
+
+                // The poller never sends image/text without a
+                // backend, so the receivers should stay empty
+                // for the lifetime of this test.
+                assert!(image_rx.try_recv().is_err());
+                assert!(text_rx.try_recv().is_err());
+
+                // Drop cmd_tx → cmd_rx returns None → poller
+                // exits cleanly.
+                drop(cmd_tx);
+            })
+            .await;
+    }
+
+    /// **2026-09-10 screenshot-bug fix — backend-roundtrip pin**:
+    /// when a `DummyBackend` is wired in, the poller correctly
+    /// forwards `SetText` (writes to backend) and `CurrentText`
+    /// (reads from backend) round-trips. This pins the basic
+    /// cmd-channel plumbing end-to-end before any platform-specific
+    /// overrides complicate the picture.
+    #[tokio::test(flavor = "current_thread")]
+    async fn clipboard_poller_dummy_backend_set_and_get_text() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let backend: Box<dyn ClipboardBackend> = Box::new(
+                    crate::clipboard::DummyBackend::with_text("initial"),
+                );
+                let (image_tx, _image_rx) =
+                    tokio_mpsc::unbounded_channel::<crate::clipboard::ImageBytes>();
+                let (text_tx, _text_rx) = tokio_mpsc::unbounded_channel::<String>();
+                let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<BackendCmd>();
+                let interval = tokio::time::interval(Duration::from_millis(50));
+
+                tokio::task::spawn_local(clipboard_poller(
+                    Some(backend),
+                    interval,
+                    image_tx,
+                    text_tx,
+                    cmd_rx,
+                ));
+
+                // Round-trip: set_text("from-cmd") then
+                // current_text() == Some("from-cmd").
+                let (reply_tx, reply_rx) = oneshot::channel();
+                cmd_tx
+                    .send(BackendCmd::SetText {
+                        text: "from-cmd".to_string(),
+                        reply: reply_tx,
+                    })
+                    .expect("cmd_tx alive");
+                reply_rx
+                    .await
+                    .expect("reply arrives")
+                    .expect("set_text ok on DummyBackend");
+
+                let (reply_tx, reply_rx) = oneshot::channel();
+                cmd_tx
+                    .send(BackendCmd::CurrentText { reply: reply_tx })
+                    .expect("cmd_tx alive");
+                let got = reply_rx.await.expect("reply arrives");
+                assert_eq!(
+                    got,
+                    Some("from-cmd".to_string()),
+                    "DummyBackend must return the text the poller just wrote"
+                );
+
+                drop(cmd_tx);
+            })
+            .await;
     }
 
     /// Tiny helper that mirrors `sha256_of_bytes` (free fn,

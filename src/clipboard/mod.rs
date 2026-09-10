@@ -411,6 +411,44 @@ pub trait ClipboardBackend: Send {
         None
     }
 
+    /// Async counterpart of [`Self::current_image`] that lets the
+    /// backend offload CPU-heavy work (e.g. JPEG/TIFF → PNG
+    /// normalisation on macOS, which can take 2–5 s on a 1920×1080
+    /// full-screen screenshot) onto `tokio::task::spawn_blocking`
+    /// without blocking the dispatcher's LocalSet executor.
+    ///
+    /// **Why this exists (2026-09-10 screenshot-bug fix)**:
+    /// `Service::run` runs all tokio tasks on a single-thread
+    /// `current_thread` runtime + `LocalSet`. When `current_image`
+    /// runs synchronously inside the dispatcher's `select!` arm,
+    /// the LocalSet thread is held by the PNG encoder for the
+    /// entire 2–5 s, starving every other tokio task
+    /// (Pong watchdog, peer.run stream A reads,
+    /// `ping_heartbeat_task`). The 1.5 s Pong watchdog fires
+    /// mid-encode and force-closes the QUIC connection.
+    ///
+    /// **Default impl wraps [`Self::current_image`]** so cheap
+    /// backends (Windows / Linux — return raw bytes without
+    /// re-encoding) satisfy the trait with zero thread-pool
+    /// overhead. macOS overrides to route the encode through
+    /// `spawn_blocking`.
+    ///
+    /// **Lifetime `'a`**: returned future borrows `&mut self`
+    /// (cache reads + write-back). The shape `Pin<Box<dyn Future
+    /// + Send + 'a>>` keeps `Box<dyn ClipboardBackend>` object-safe.
+    /// `'a` ties the future to `&mut self`'s lifetime; callers
+    /// must `await` it before the borrow ends.
+    fn current_image_async<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<ImageBytes>> + Send + 'a>,
+    > {
+        // Default: just wrap the sync impl. Cheap backends
+        // (Windows/Linux) hit this path verbatim — no
+        // thread-pool dispatch on every quiescent tick.
+        Box::pin(async move { self.current_image() })
+    }
+
     /// Replace the clipboard image with `bytes` (encoded as `mime`).
     ///
     /// The dispatcher passes raw PNG / JPEG / BMP bytes that match the
@@ -923,6 +961,40 @@ mod tests {
             backend.current_image(),
             None,
             "set_text must not be conflated with current_image"
+        );
+    }
+
+    /// `DummyBackend::current_image_async` must return the same value
+    /// as the sync `current_image` (default impl wraps it). This
+    /// pins the **2026-09-10 screenshot-bug fix** trait shape: the
+    /// default impl is the contract cheap backends rely on; a
+    /// future refactor that changes the default would silently
+    /// regress every Windows / Linux backend.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dummy_backend_current_image_async_default_matches_sync() {
+        let mut backend = DummyBackend::new();
+        let sync_result = backend.current_image();
+        let async_result = {
+            let fut = backend.current_image_async();
+            fut.await
+        };
+        assert_eq!(
+            sync_result, async_result,
+            "default current_image_async must wrap current_image verbatim"
+        );
+
+        // After set_text, both sync and async paths still return
+        // None (text doesn't accidentally surface as image).
+        backend.set_text("hi").expect("set_text ok");
+        let sync_after = backend.current_image();
+        let async_after = backend.current_image_async().await;
+        assert_eq!(
+            sync_after, async_after,
+            "sync and async must agree after a text write too"
+        );
+        assert!(
+            async_after.is_none(),
+            "DummyBackend (no image impl) must still return None after a text write"
         );
     }
 
