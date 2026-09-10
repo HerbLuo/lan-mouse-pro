@@ -942,13 +942,43 @@ impl Service {
             &mut self.clipboard_tick,
             tokio::time::interval(Duration::from_millis(500)),
         );
-        tokio::task::spawn_local(clipboard_poller(
+        // **2026-09-10 code-review follow-up** — wrap the spawned
+        // poller in a supervisor that catches panics. Without
+        // this wrapper, a panic inside `clipboard_poller` (e.g.
+        // an `image` crate decode bug on a malformed
+        // pasteboard, or an ObjC exception on a future objc2
+        // version surfacing as a Rust panic) would be silently
+        // swallowed by the LocalSet — `cmd_rx` would drain,
+        // every inbound `BackendCmd` send would silently fail,
+        // and clipboard sync would just stop working with zero
+        // operator-visible signal. The supervisor logs the
+        // panic and keeps the runtime alive so the rest of the
+        // daemon continues to function.
+        let poller_handle = tokio::task::spawn_local(clipboard_poller(
             clipboard_backend,
             clipboard_tick,
             image_tx,
             text_tx,
             cmd_rx,
         ));
+        tokio::task::spawn_local(async move {
+            match poller_handle.await {
+                Ok(()) => {
+                    // Poller exited normally (cmd_rx closed →
+                    // daemon shutting down). Nothing to log.
+                    log::debug!("clipboard poller exited normally");
+                }
+                Err(e) if e.is_panic() => {
+                    log::error!(
+                        "clipboard poller PANICKED — clipboard sync will not work \
+                         until the daemon restarts: {e:?}"
+                    );
+                }
+                Err(e) => {
+                    log::error!("clipboard poller join error: {e:?}");
+                }
+            }
+        });
 
         loop {
             tokio::select! {
@@ -2534,9 +2564,21 @@ impl Service {
         let text = String::from_utf8_lossy(bytes).into_owned();
         let (reply_tx, reply_rx) = oneshot::channel();
         if cmd_tx.send(BackendCmd::SetText { text, reply: reply_tx }).is_err() {
-            // Poller is gone (daemon shutting down). Don't
-            // touch the LRU mark — leave it so the next daemon
-            // start doesn't re-broadcast this peer echo.
+            // **2026-09-10 code-review follow-up** — surface the
+            // poller-gone condition. The LRU was marked before
+            // this point, so a panic'd poller leaves the
+            // clipboard unwritten *and* suppresses the peer's
+            // echo on the next daemon start (the LRU is empty
+            // after restart, but the previous daemon's LRU is
+            // gone anyway). The important thing is the operator
+            // sees this in logs — without the warn, clipboard
+            // sync could silently stop working for hours.
+            log::warn!(
+                "clipboard inbound: poller task is gone (panic or shutdown); \
+                 dropping inbound text push from {source} ({} bytes, sha={})",
+                bytes.len(),
+                short_hex(sha256)
+            );
             return;
         }
         let set_result = match reply_rx.await {
@@ -2681,8 +2723,15 @@ impl Service {
             }
         };
         if cmd_tx.send(cmd).is_err() {
-            // Poller gone — daemon shutting down. Leave LRU
-            // mark in place so a future run doesn't echo.
+            // **2026-09-10 code-review follow-up** — log the
+            // poller-gone condition. See the matching comment on
+            // `apply_inbound_clipboard_text` for the rationale.
+            log::warn!(
+                "clipboard inbound image: poller task is gone (panic or shutdown); \
+                 dropping inbound image push from {source} (sha={}, {} bytes, mime={mime})",
+                short_hex(sha256),
+                bytes.len()
+            );
             return;
         }
         let set_result = match reply_rx.await {
@@ -2709,21 +2758,38 @@ impl Service {
         let (cur_reply_tx, cur_reply_rx) = oneshot::channel();
         if cmd_tx
             .send(BackendCmd::CurrentImage { reply: cur_reply_tx })
-            .is_ok()
+            .is_err()
         {
-            if let Ok(Some(written)) = cur_reply_rx.await {
-                let written_sha = sha256_of_bytes(&written.data);
-                if &written_sha != sha256 {
-                    log::debug!(
-                        "clipboard inbound image: backend transcoded (inbound sha={} → \
-                         on-clipboard sha={}, mime={}); marking transcoded SHA in image LRU",
-                        short_hex(sha256),
-                        short_hex(&written_sha),
-                        written.mime
-                    );
-                }
-                self.mark_local_image_write(written_sha);
+            // **2026-09-10 code-review follow-up (Finding #3)** —
+            // the post-write re-read send failed. On Windows this
+            // is the only path that records the *post-transcode*
+            // SHA into the image LRU; without it, the next 500 ms
+            // tick would dispatch the freshly-written DIB back
+            // to its source (loopback echo). Bail out *before*
+            // `metrics.incr_allow` + the frontend notify so the
+            // dispatcher doesn't advertise a successful apply
+            // it couldn't fully verify.
+            log::warn!(
+                "clipboard inbound image: post-write CurrentImage cmd send failed \
+                 (poller gone); skipping allow-count + frontend notify for sha={} \
+                 ({} bytes, mime={mime})",
+                short_hex(sha256),
+                bytes.len()
+            );
+            return;
+        }
+        if let Ok(Some(written)) = cur_reply_rx.await {
+            let written_sha = sha256_of_bytes(&written.data);
+            if &written_sha != sha256 {
+                log::debug!(
+                    "clipboard inbound image: backend transcoded (inbound sha={} → \
+                     on-clipboard sha={}, mime={}); marking transcoded SHA in image LRU",
+                    short_hex(sha256),
+                    short_hex(&written_sha),
+                    written.mime
+                );
             }
+            self.mark_local_image_write(written_sha);
         }
         // Step 3: record the allow (mirrors the text branch's
         // "only on success" contract).
@@ -2826,6 +2892,14 @@ impl Service {
             .send(BackendCmd::CurrentText { reply: reply_tx })
             .is_err()
         {
+            // **2026-09-10 code-review follow-up** — log the
+            // poller-gone condition. The recover-push path is
+            // best-effort (drops the push if the poller is
+            // gone) but should not do so silently.
+            log::warn!(
+                "clipboard recover push: poller task is gone (panic or shutdown); \
+                 dropping push for handle={handle}"
+            );
             return;
         }
         let new_text = match reply_rx.await {
@@ -3459,7 +3533,19 @@ async fn clipboard_poller(
                         let _ = reply.send(backend.current_text());
                     }
                     BackendCmd::CurrentImage { reply } => {
-                        let _ = reply.send(backend.current_image());
+                        // **2026-09-10 screenshot-bug fix (round 2)** —
+                        // use the async variant. Calling `backend
+                        // .current_image()` (sync) here would re-run
+                        // JPEG/TIFF→PNG normalisation on the
+                        // LocalSet thread for 2–5 s and starve the
+                        // Pong watchdog — the exact failure mode the
+                        // a94c249 patch was built to eliminate. The
+                        // cmd arm must mirror the polling-tick arm's
+                        // off-thread encode path; otherwise the
+                        // post-write re-read in
+                        // `apply_inbound_clipboard_image` (Step 2.5)
+                        // reintroduces the bug on the *inbound* path.
+                        let _ = reply.send(backend.current_image_async().await);
                     }
                 }
             }
