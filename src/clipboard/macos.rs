@@ -77,6 +77,25 @@ const NS_PASTEBOARD_TYPE_PNG: &str = "public.png";
 /// re-encoded as PNG before being returned to the dispatcher.
 const NS_PASTEBOARD_TYPE_TIFF: &str = "public.tiff";
 
+/// `NSPasteboard` type identifier for JPEG payloads — used as a
+/// fallback when the producing app publishes a JPEG screenshot (the
+/// canonical case is `screencapture -c` after
+/// `defaults write com.apple.screencapture type jpg`: macOS places
+/// the JPEG bytes on the pasteboard under `public.jpeg` instead of
+/// `public.png`). Like TIFF, the JPEG bytes are decoded by the
+/// `image` crate and re-encoded as PNG before being returned to the
+/// dispatcher — the same "源端归一化" rationale as TIFF (PLAN §3
+/// 评审 #2 3rd): every receiver on every platform sees `image/png`
+/// bytes regardless of which macOS app produced the screenshot, so
+/// Windows / Linux backends that don't natively handle JPEG need no
+/// changes. JPEG re-encoding is lossy at the byte level (PNG
+/// compression is not a no-op; sha256 always changes), which is
+/// acceptable here because (a) the user explicitly chose JPG to save
+/// space, accepting the trade-off, and (b) the visual content is
+/// preserved exactly — the `image` crate decodes JPEG into RGBA
+/// pixels losslessly before re-encoding as PNG.
+const NS_PASTEBOARD_TYPE_JPEG: &str = "public.jpeg";
+
 /// **M3a STEP-3a.2** — `NSPasteboard` type identifier for
 /// file-selection payloads (Finder multi-select, single-file
 /// drag, etc.).
@@ -276,6 +295,18 @@ impl ClipboardBackend for MacOsPasteboard {
         }
         let pb = NSPasteboard::generalPasteboard();
         let png_type = NSString::from_str(NS_PASTEBOARD_TYPE_PNG);
+        // `NSPasteboard.clearContents()` is called first so any
+        // prior image representation (PNG / TIFF / JPEG / …) on
+        // the pasteboard is wiped. Although `setData(_:forType:)`
+        // documents itself as clearing other types, in practice
+        // macOS occasionally rejects the new write when the
+        // pasteboard still advertises conflicting representations
+        // — observed on the slave→master receive path where the
+        // local clipboard had a different format on entry (e.g.
+        // text from a previous recover push). Explicit
+        // `clearContents()` brings the pasteboard to a known-empty
+        // state before the new PNG lands.
+        let _ = pb.clearContents();
         // `NSData::with_bytes` copies the bytes into an NSData
         // owned by the autorelease pool; safe to call from any
         // thread once AppKit is initialised (which `new()` did).
@@ -350,6 +381,12 @@ impl ClipboardBackend for MacOsPasteboard {
         // `set_image`).
         let pb = NSPasteboard::generalPasteboard();
         let png_type = NSString::from_str(NS_PASTEBOARD_TYPE_PNG);
+        // **Explicit `clearContents()` before write** — see
+        // [`Self::set_image`] for the rationale. The receive
+        // path runs against a pasteboard that already has
+        // content (often text from the prior recover push);
+        // clearing first makes the PNG write deterministic.
+        let _ = pb.clearContents();
         let nsdata = NSData::with_bytes(&png_bytes);
         let ok = pb.setData_forType(Some(&nsdata), &png_type);
         if ok {
@@ -473,20 +510,106 @@ fn tiff_to_png_normalized(tiff: &[u8]) -> Result<Vec<u8>, ClipboardError> {
     Ok(out)
 }
 
-/// Read an image from `pb`, preferring PNG and falling back to TIFF
-/// (re-encoded as PNG). Returns `None` if neither type is present or
-/// if the only available type is a malformed TIFF.
+/// Decode JPEG bytes via the `image` crate and re-encode as PNG.
+///
+/// Mirror of [`tiff_to_png_normalized`] for the JPEG read fallback
+/// (`defaults write com.apple.screencapture type jpg`). JPEG bytes
+/// on `NSPasteboard` come from `screencapture` after the user
+/// switched the screenshot default; the `image` crate decodes them
+/// losslessly into RGBA pixels, then we re-encode as PNG so the
+/// rest of the daemon's pipeline (dispatcher, wire, receivers on
+/// Windows / Linux) only has to handle `image/png`.
+///
+/// **Why this re-encoding is acceptable** (per the rationale on
+/// `NS_PASTEBOARD_TYPE_JPEG`): the user explicitly chose JPG to
+/// save space; the round-trip is visually identical (JPEG → RGBA
+/// pixels → PNG is lossless in pixel space); only the byte stream
+/// changes (sha256 differs from the original JPEG bytes). This is
+/// the same trade-off already accepted for TIFF → PNG (PLAN §3
+/// 评审 #2 3rd).
+///
+/// **Returns** `Err(ClipboardError::Io)` with the underlying
+/// `image` crate error on decode or encode failure. The caller
+/// (`read_image_bytes_from_pasteboard`) logs a `warn!` and falls
+/// through to the TIFF probe rather than aborting the tick.
+fn jpeg_to_png_normalized(jpeg: &[u8]) -> Result<Vec<u8>, ClipboardError> {
+    let img = image::load_from_memory(jpeg)
+        .map_err(|e| ClipboardError::Io(format!("image::load_from_memory JPEG: {e}")))?;
+    let mut out = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut out);
+        img.write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|e| ClipboardError::Io(format!("image::write_to PNG: {e}")))?;
+    }
+    Ok(out)
+}
+
+/// Read an image from `pb`, preferring PNG and falling back to JPEG
+/// and then TIFF (both re-encoded as PNG). Returns `None` if none of
+/// the three types is present, or if the only available fallback type
+/// is malformed (warn-and-skip per the JPEG / TIFF branches).
+///
+/// **Probe order — PNG → JPEG → TIFF**:
+/// 1. **PNG** (preferred, byte-passthrough) — most macOS apps
+///    publish a PNG representation alongside any other image
+///    formats they offer, so this hits on the first try.
+/// 2. **JPEG** (re-encoded as PNG) — the canonical case is
+///    `screencapture -c` after
+///    `defaults write com.apple.screencapture type jpg`: macOS places
+///    the JPEG bytes on the pasteboard under `public.jpeg` instead
+///    of `public.png`. Placed before TIFF because the JPG screenshot
+///    default is the more commonly observed deviation from PNG.
+/// 3. **TIFF** (re-encoded as PNG) — Preview.app on a selected
+///    region, certain Quick Look exports, etc. (PLAN §3 评审 #2
+///    3rd). Kept as the last fallback for backward compatibility.
+///
+/// **All three branches return `image/png`** — even JPEG / TIFF
+/// inputs are re-encoded before reaching the dispatcher. This is
+/// the source-side normalisation decision (PLAN §3 评审 #2 3rd):
+/// every receiver on every platform only has to handle `image/png`,
+/// so Windows / Linux backends that don't natively handle JPEG need
+/// no changes.
 ///
 /// Called from `current_image` (one-shot read on each dispatcher
-/// tick); the TIFF→PNG normalisation + warn-on-bad-TIFF semantics
-/// are encapsulated here so the read path stays a single helper.
+/// tick); the JPEG → PNG and TIFF → PNG normalisation + warn-on-decode-failure
+/// semantics are encapsulated here so the read path stays a single
+/// helper.
 fn read_image_bytes_from_pasteboard(pb: &NSPasteboard) -> Option<ImageBytes> {
-    // Preferred: PNG (most apps provide it).
+    // Preferred: PNG (byte-passthrough — most apps provide it).
     if let Some(bytes) = read_pasteboard_bytes(pb, NS_PASTEBOARD_TYPE_PNG) {
         return Some(ImageBytes {
             mime: Mime::Png.mime_str().to_string(),
             data: bytes,
         });
+    }
+    // Fallback: JPEG (re-encoded as PNG). Triggered by
+    // `defaults write com.apple.screencapture type jpg` + a
+    // clipboard screenshot — without this probe, the JPEG
+    // would be silently dropped and the dispatcher's text
+    // branch would see the empty-string that `screencapture -c`
+    // advertises alongside the image (see the
+    // `current_text_on_image_only_pasteboard_returns_some_empty_string`
+    // pin test). On decode failure we fall through to the TIFF
+    // probe rather than aborting the tick — both fallbacks are
+    // best-effort.
+    if let Some(jpeg_bytes) = read_pasteboard_bytes(pb, NS_PASTEBOARD_TYPE_JPEG) {
+        match jpeg_to_png_normalized(&jpeg_bytes) {
+            Ok(png_bytes) => {
+                log::info!(
+                    "clipboard: JPEG→PNG normalized for cross-platform transfer \
+                     ({} bytes → {} bytes)",
+                    jpeg_bytes.len(),
+                    png_bytes.len()
+                );
+                return Some(ImageBytes {
+                    mime: Mime::Png.mime_str().to_string(),
+                    data: png_bytes,
+                });
+            }
+            Err(e) => {
+                log::warn!("clipboard: JPEG decode failed, falling through to TIFF probe: {e}");
+            }
+        }
     }
     // Fallback: TIFF (Preview.app on a selected region, certain
     // Quick Look exports, etc. — PLAN §3 评审 #2 3rd).
@@ -910,6 +1033,33 @@ mod tests {
         out
     }
 
+    /// Build a small but valid JPEG byte buffer for the
+    /// JPEG→PNG-normalisation test. Same 2×2 RGB gradient as the
+    /// TIFF fixture for parity — JPEG is a lossy format but with a
+    /// 2×2 solid-gradient source the decoded pixels are stable
+    /// across runs (no ringing / banding artefacts from natural
+    /// photos).
+    fn test_jpeg_bytes() -> Vec<u8> {
+        let img = image::RgbImage::from_fn(2, 2, |x, y| {
+            image::Rgb([(x * 100) as u8, (y * 100) as u8, 200])
+        });
+        let mut out = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut out);
+            img.write_to(&mut cursor, image::ImageFormat::Jpeg)
+                .expect("encode test jpeg");
+        }
+        // Sanity: JPEG magic prefix (FF D8 FF — see
+        // `clipboard::mime_from_magic`). Catches a future
+        // accidental swap to a different encoder.
+        assert_eq!(
+            &out[..3],
+            &[0xFF, 0xD8, 0xFF],
+            "test fixture must produce JPEG bytes (FF D8 FF magic)"
+        );
+        out
+    }
+
     /// RAII guard for image tests — saves the pasteboard's PNG + TIFF
     /// representations and restores them on drop. Image tests mutate
     /// the user's actual OS clipboard (via `NSPasteboard` directly,
@@ -926,6 +1076,12 @@ mod tests {
     struct ImageClipboardGuard {
         saved_png: Option<objc2::rc::Retained<NSData>>,
         saved_tiff: Option<objc2::rc::Retained<NSData>>,
+        /// **JPEG read-fallback regression**: the new
+        /// `current_image` JPEG branch reads from
+        /// `public.jpeg`, so the test guard must save / restore
+        /// it too — otherwise JPEG tests would clobber any
+        /// JPEG the user happened to have on their pasteboard.
+        saved_jpeg: Option<objc2::rc::Retained<NSData>>,
     }
 
     impl ImageClipboardGuard {
@@ -934,6 +1090,7 @@ mod tests {
             Self {
                 saved_png: pb.dataForType(&NSString::from_str(NS_PASTEBOARD_TYPE_PNG)),
                 saved_tiff: pb.dataForType(&NSString::from_str(NS_PASTEBOARD_TYPE_TIFF)),
+                saved_jpeg: pb.dataForType(&NSString::from_str(NS_PASTEBOARD_TYPE_JPEG)),
             }
         }
     }
@@ -943,12 +1100,16 @@ mod tests {
             let pb = NSPasteboard::generalPasteboard();
             let png_type = NSString::from_str(NS_PASTEBOARD_TYPE_PNG);
             let tiff_type = NSString::from_str(NS_PASTEBOARD_TYPE_TIFF);
+            let jpeg_type = NSString::from_str(NS_PASTEBOARD_TYPE_JPEG);
             let _ = pb.clearContents();
             if let Some(data) = self.saved_png.take() {
                 let _ = pb.setData_forType(Some(&data), &png_type);
             }
             if let Some(data) = self.saved_tiff.take() {
                 let _ = pb.setData_forType(Some(&data), &tiff_type);
+            }
+            if let Some(data) = self.saved_jpeg.take() {
+                let _ = pb.setData_forType(Some(&data), &jpeg_type);
             }
         }
     }
@@ -1130,6 +1291,151 @@ mod tests {
             decoded.height(),
             2,
             "TIFF→PNG normalisation must preserve height"
+        );
+    }
+
+    /// **JPEG→PNG normalisation** (the `defaults write
+    /// com.apple.screencapture type jpg` bug fix): when only
+    /// `public.jpeg` is on the pasteboard — the canonical state
+    /// after a screenshot under the JPG default — `current_image`
+    /// must re-encode the JPEG bytes to PNG (via the `image`
+    /// crate) and label the returned `ImageBytes` as `"image/png"`.
+    /// This is the regression test for the bug where the JPEG
+    /// screenshot was silently dropped because
+    /// `read_image_bytes_from_pasteboard` only probed `public.png`
+    /// and `public.tiff`.
+    ///
+    /// **What we assert**:
+    /// - `current_image()` returns `Some(...)` (the old bug was
+    ///   `None`).
+    /// - The returned `mime` is `"image/png"` (not `"image/jpeg"`
+    ///   — the JPEG bytes were re-encoded for cross-platform
+    ///   normalisation, matching the TIFF branch's contract).
+    /// - The returned `data` starts with the PNG magic.
+    /// - `image::load_from_memory(&data)` round-trips back to
+    ///   the 2×2 dimensions we started with (visual equivalence
+    ///   — sha256 will differ from the original JPEG bytes,
+    ///   which is the accepted trade-off).
+    ///
+    /// **Sanity-check for the `ImageClipboardGuard` JPEG field**:
+    /// the guard saves + restores `public.jpeg` since the
+    /// JPEG fixture is written there; without the new field,
+    /// this test would clobber any JPEG the user happened to
+    /// have on their pasteboard.
+    #[test]
+    fn current_image_normalizes_jpeg_to_png() {
+        let _lock = lock_for_test();
+        let mut backend = MacOsPasteboard::new().expect("new");
+        let _guard = ImageClipboardGuard::new();
+
+        let jpeg = test_jpeg_bytes();
+        write_pasteboard_bytes(NS_PASTEBOARD_TYPE_JPEG, &jpeg);
+
+        let normalised = backend
+            .current_image()
+            .expect("current_image must return Some after writing JPEG to pasteboard \
+                     (regression: the bug dropped the image and returned None)");
+        assert_eq!(
+            normalised.mime, "image/png",
+            "JPEG input must be normalised to image/png (PLAN §3 评审 #2 3rd — same contract as TIFF)"
+        );
+        // PNG magic check — proves the bytes are actually PNG,
+        // not the original JPEG labelled `image/png`.
+        assert_eq!(
+            &normalised.data[..8],
+            &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+            "normalised bytes must start with the PNG magic"
+        );
+        // Round-trip via the `image` crate to confirm the
+        // dimensions match the 2×2 fixture. The actual pixel
+        // values may differ slightly from the original JPEG
+        // (JPEG is lossy, but the `image` crate decodes it into
+        // RGBA pixels losslessly — any difference would be a
+        // re-encode bug, not a JPEG artefact).
+        let decoded =
+            image::load_from_memory(&normalised.data).expect("normalised PNG must be decodable");
+        assert_eq!(
+            decoded.width(),
+            2,
+            "JPEG→PNG normalisation must preserve width"
+        );
+        assert_eq!(
+            decoded.height(),
+            2,
+            "JPEG→PNG normalisation must preserve height"
+        );
+        // The bytes are NOT byte-identical to the input JPEG
+        // (sha256 differs) — that's the lossy re-encode
+        // trade-off, by design. We don't assert the exact
+        // delta here; the magic + dimension checks above are
+        // the strict contract.
+        assert_ne!(
+            normalised.data, jpeg,
+            "JPEG→PNG re-encode changes the byte stream (PNG compression is not a no-op); \
+             visual equivalence is preserved by the `image` crate's lossless RGBA decode"
+        );
+    }
+
+    /// **Probe order — PNG wins over JPEG when both are present**
+    /// (regression test for the JPEG-fallback priority).
+    /// Some macOS apps publish both `public.png` and
+    /// `public.jpeg` representations of the same paste
+    /// (PNG is byte-passthrough, JPEG is the original
+    /// compressed stream). The PNG probe must short-circuit
+    /// so we never re-encode unnecessarily.
+    ///
+    /// **Setup**: write a PNG, then write a JPEG to the
+    /// pasteboard (the second `write_pasteboard_bytes` does NOT
+    /// clear the PNG — `NSPasteboard` accumulates
+    /// representations). `current_image` must return the PNG
+    /// bytes verbatim.
+    #[test]
+    fn current_image_prefers_png_over_jpeg_when_both_present() {
+        let _lock = lock_for_test();
+        let mut backend = MacOsPasteboard::new().expect("new");
+        let _guard = ImageClipboardGuard::new();
+
+        let png = test_png_bytes();
+        let jpeg = test_jpeg_bytes();
+        // Order matters: write PNG first, then JPEG. The
+        // `write_pasteboard_bytes` helper calls `clearContents()`
+        // before writing, so the second call would clobber the
+        // first — instead, write JPEG directly via NSPasteboard
+        // to keep the PNG representation.
+        let pb = NSPasteboard::generalPasteboard();
+        let _ = pb.clearContents();
+        let png_type = NSString::from_str(NS_PASTEBOARD_TYPE_PNG);
+        let jpeg_type = NSString::from_str(NS_PASTEBOARD_TYPE_JPEG);
+        let png_nsdata = NSData::with_bytes(&png);
+        let jpeg_nsdata = NSData::with_bytes(&jpeg);
+        assert!(
+            pb.setData_forType(Some(&png_nsdata), &png_type),
+            "test setup: write PNG must succeed"
+        );
+        assert!(
+            pb.setData_forType(Some(&jpeg_nsdata), &jpeg_type),
+            "test setup: write JPEG must succeed (without clobbering PNG)"
+        );
+        // Sanity: both representations are now on the pasteboard.
+        assert!(
+            pb.dataForType(&png_type).is_some(),
+            "test setup: PNG must still be readable after JPEG write"
+        );
+        assert!(
+            pb.dataForType(&jpeg_type).is_some(),
+            "test setup: JPEG must be readable"
+        );
+
+        let result = backend
+            .current_image()
+            .expect("current_image must return Some when both PNG and JPEG are present");
+        assert_eq!(
+            result.mime, "image/png",
+            "PNG probe must short-circuit before the JPEG fallback"
+        );
+        assert_eq!(
+            result.data, png,
+            "PNG probe must return the PNG bytes verbatim (no re-encode when PNG is present)"
         );
     }
 

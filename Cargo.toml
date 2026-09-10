@@ -142,12 +142,17 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-app-kit = "0.3"
 # `image` features: PNG (write) + TIFF (read fallback) + BMP (read
-# for DIB fallback in `dib_to_png_via_image_crate`, M2b STEP-2b.1).
+# for DIB fallback in `dib_to_png_via_image_crate`, M2b STEP-2b.1)
+# + JPEG (read fallback for `defaults write com.apple.screencapture
+# type jpg` screenshots — the `screencapture` tool places JPEG bytes
+# on `NSPasteboard` under `public.jpeg`, and we re-encode them as
+# PNG before broadcasting; see
+# `src/clipboard/macos.rs::jpeg_to_png_normalized`).
 # Default features include many formats we don't need; explicit
 # feature list keeps the dep tree minimal. See
 # `src/clipboard/macos.rs::tiff_to_png_normalized` and
 # `src/clipboard/macos.rs::dib_to_png_via_image_crate`.
-image = { version = "0.25", default-features = false, features = ["png", "tiff", "bmp"] }
+image = { version = "0.25", default-features = false, features = ["png", "tiff", "bmp", "jpeg"] }
 
 [features]
 default = [
