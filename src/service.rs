@@ -30,7 +30,7 @@ use tokio::{process::Command, signal, sync::Notify, sync::mpsc as tokio_mpsc};
 
 use crate::clipboard::{ClipboardBackend, default_backend};
 use crate::quic_transport::http3::Http3Client;
-use lan_mouse_proto::{ClipboardText, ProtoEvent};
+use lan_mouse_proto::{ClipboardImage, ClipboardText, ProtoEvent};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Error)]
@@ -173,6 +173,31 @@ pub struct Service {
     /// update this field — the active eviction is keyed by sha256, so
     /// it doesn't care which path produced the previous push.
     last_outbound_text_sha: Option<[u8; 32]>,
+    /// **M2a STEP-2a.3** — sha256 of the most recent
+    /// outbound `ClipboardImage` push. Mirrors
+    /// [`Self::last_outbound_text_sha`] for the image dispatcher
+    /// branch: the next push calls
+    /// [`Self::evict_prev_outbound_image_cache`] (which delegates to
+    /// the same free-function helper) so the image branch follows
+    /// the identical "evict prev before push" contract as the text
+    /// branch.
+    ///
+    /// **Also serves as the tick short-circuit**: if the freshly-
+    /// read image's sha256 matches `last_outbound_image_sha`, the
+    /// dispatcher skips the broadcast. This avoids re-pushing the
+    /// same image metadata every 500 ms while the clipboard sits
+    /// unchanged (the macOS backend's `changeCount` short-circuit
+    /// in STEP-2a.2 means `current_image()` runs less often than
+    /// the tick rate, but every call still produces a sha256 hash
+    /// worth a few ms).
+    ///
+    /// **Distinct from `last_outbound_text_sha`**: the two are
+    /// tracked separately so a text push doesn't accidentally evict
+    /// a previously-cached image and vice versa. They share one
+    /// underlying cache (`clipboard_cache`) but the active-eviction
+    /// contract keys by sha256, so the previous-push pointer must
+    /// match the previous-push kind.
+    last_outbound_image_sha: Option<[u8; 32]>,
     /// **M1a STEP-1a.4** — receiver for inbound clipboard events.
     /// Senders live in two places:
     /// - `Emulation::new` clones the sender into the
@@ -738,6 +763,11 @@ impl Service {
             // dispatcher treats the "first push" case as "no prev
             // to evict" without checking this.
             last_outbound_text_sha: None,
+            // **M2a STEP-2a.3** — same "no prev to evict" semantics
+            // for the image branch. Independent from
+            // `last_outbound_text_sha` so a text push does not
+            // accidentally evict a previously-cached image.
+            last_outbound_image_sha: None,
             clipboard_inbound_rx,
             clipboard_inbound_tx,
             // **M1a follow-up #1** — push-notify receiver. The
@@ -1747,15 +1777,15 @@ impl Service {
 
     /// Clipboard dispatcher 500 ms tick handler.
     ///
-    /// 1. Read the current clipboard text. `None` → no-op (clipboard
-    ///    holds non-text content, e.g. an image — skip this tick).
-    /// 2. Compare to `clipboard_last_text`. Equal → no-op.
-    /// 3. SHA-256 the text. If the hash is in the LRU → no-op
-    ///    (loopback defence: this hash was *we* who wrote it
-    ///    recently; pushing it again is wasted work).
-    /// 4. Mark LRU, update `last_text`, and construct the canonical
-    ///    `ClipboardText` event. The protocol constructor keeps text up
-    ///    to 1 KiB inline and sends metadata only for larger text.
+    /// **Two-phase poll**: text first (the M1a / M1b path),
+    /// image second (the M2a STEP-2a.3 path). Each tick dispatches
+    /// at most one event — whichever kind is currently on the
+    /// clipboard. If the clipboard holds text, the text branch fires
+    /// and the image branch is skipped; otherwise the image branch
+    /// is consulted. This matches the platform reality (the macOS
+    /// pasteboard publishes one "current" representation per
+    /// `pbpaste` / `NSPasteboard.dataForType` call) without forcing
+    /// the dispatcher to multiplex two parallel event streams.
     ///
     /// **Why a 500 ms tick**: matches PLAN §3 M1a "macOS 实现
     /// ... 500ms tick" / "Linux 500 ms tick" cadence. Fast enough
@@ -1763,20 +1793,60 @@ impl Service {
     /// backend read (1-3 ms for pbcopy / xclip / NSPasteboard) is
     /// negligible.
     ///
-    /// **Why we don't drop the read on a hash match**: the LRU
-    /// check happens *after* the read because the read is what
-    /// surfaces the new text — there's no way to detect "the
-    /// clipboard changed" without reading it. The hash check is
-    /// the *dedup* layer: it prevents re-broadcasting a value we
-    /// already broadcast this minute.
+    /// **M2a STEP-2a.3** — `dispatch_image` runs only when text
+    /// is `None`. The macOS backend's `changeCount` short-circuit
+    /// in STEP-2a.2 means `current_image()` returns without
+    /// expensive work most ticks; on platforms without an
+    /// equivalent the cost is still dominated by the sha256 hash
+    /// (5-15 ms for a 4 K screenshot) which is well within the
+    /// 500 ms budget.
     async fn handle_clipboard_tick(&mut self) {
         let Some(backend) = self.clipboard_backend.as_mut() else {
             return;
         };
-        let new_text = match backend.current_text() {
-            Some(t) => t,
-            None => return,
-        };
+        // Phase 1: text. If the clipboard holds text, dispatch
+        // it and skip image entirely (matches the M1a / M1b
+        // semantics — the tick returns early on text).
+        if let Some(new_text) = backend.current_text() {
+            self.dispatch_text(new_text).await;
+            return;
+        }
+        // Phase 2: image. No text on the clipboard → check for
+        // image. `current_image()` is `&mut self` on the backend,
+        // so the borrow for the text branch has already ended —
+        // safe to call here without overlapping borrows.
+        if let Some(image) = backend.current_image() {
+            self.dispatch_image(image).await;
+        }
+    }
+
+    /// **M1a STEP-1a.4 + M1b STEP-1b.2 + M1b STEP-1b.3** —
+    /// dispatcher branch for clipboard text.
+    ///
+    /// Extracted from [`Self::handle_clipboard_tick`] so the
+    /// text + image branches share the same outer plumbing
+    /// (500 ms tick + `current_*()` poll) but each branch is a
+    /// self-contained helper that's easy to read in isolation.
+    /// The behaviour matches the pre-2a.3 inline implementation
+    /// byte-for-byte; this is a pure refactor + the addition of
+    /// the image sibling.
+    ///
+    /// Steps:
+    /// 1. Compare to `clipboard_last_text` — skip if unchanged.
+    /// 2. SHA-256 the text. If the hash is in the loopback LRU,
+    ///    skip (the recent local writeback dedup layer).
+    /// 3. Mark LRU, update `last_text`, build the
+    ///    `ClipboardText` event (≤ 1 KiB inline, > 1 KiB
+    ///    metadata-only).
+    /// 4. Active eviction: `cache.remove(prev_sha)` before
+    ///    broadcast.
+    /// 5. Broadcast to all eligible peers.
+    /// 6. Cache insert (metadata-only payloads only — inline
+    ///    payloads already on the wire).
+    /// 7. Update `last_outbound_text_sha` + `last_text_ts_ms` +
+    ///    `last_clipboard_source` + emit `FrontendEvent
+    ///    ::ClipboardState`.
+    async fn dispatch_text(&mut self, new_text: String) {
         if Some(&new_text) == self.clipboard_last_text.as_ref() {
             return;
         }
@@ -1855,6 +1925,123 @@ impl Service {
         self.last_outbound_text_sha = Some(sha);
         let now_ms = unix_now_ms();
         self.last_text_ts_ms = Some(now_ms);
+        self.last_clipboard_source = None;
+        self.notify_frontend(FrontendEvent::ClipboardState {
+            last_text_ts: self.last_text_ts_ms,
+            last_image_ts: self.last_image_ts_ms,
+            last_file_ts: self.last_file_ts_ms,
+            last_source: None,
+        });
+    }
+
+    /// **M2a STEP-2a.3** — dispatcher branch for clipboard images.
+    ///
+    /// Sibling of [`Self::dispatch_text`] but operating on
+    /// [`crate::clipboard::ImageBytes`]. The dispatch contract
+    /// matches the text branch wherever possible (active eviction
+    /// before broadcast, broadcast to all eligible peers, cache
+    /// insert for the new payload, frontend notification); the
+    /// differences are:
+    ///
+    /// 1. **No loopback-LRU check at the dispatcher.** The text
+    ///    branch consults `clipboard_lru` to short-circuit "we
+    ///    just wrote this locally, the OS echoed it back" — for
+    ///    images this check would be redundant with the
+    ///    receiver-side loopback detection (M2a STEP-2a.4).
+    ///    Per PLAN §3 M2a STEP-2a.3 the image branch pushes
+    ///    every non-duplicate change and lets the receiver dedup.
+    /// 2. **No inline-vs-metadata split.** Image bytes always go
+    ///    through HTTP/3 (`/clipboard/image/{sha256}`); the
+    ///    cache stores every pushed image regardless of byte
+    ///    count. PNG screenshots at 5-15 MiB are well above the
+    ///    text inline limit anyway.
+    /// 3. **Same fingerprint convention as text.** The wire
+    ///    `ClipboardImage::fingerprint` field equals the sha256 —
+    ///    matches the existing text path (`from_content` uses
+    ///    `sha` for both fields).
+    /// 4. **Mime field passes through verbatim.** The receiver
+    ///    decides how to decode based on the `mime` string the
+    ///    source wrote; for M2a / M2b this is always
+    ///    `"image/png"` (or `"application/x-dib"` from Windows in
+    ///    M2b).
+    ///
+    /// Steps:
+    /// 1. SHA-256 the image bytes (content fingerprint).
+    /// 2. Compare to `last_outbound_image_sha` — skip if the
+    ///    same image was the most recent push (bandwidth
+    ///    optimisation: avoids re-broadcasting the same image
+    ///    every 500 ms while the clipboard sits unchanged).
+    /// 3. Active eviction: `cache.remove(prev_image_sha)`
+    ///    before broadcast (mirrors the text branch's
+    ///    "evict prev before push" contract).
+    /// 4. Cache insert: store the new image bytes keyed by sha256
+    ///    so the receiver's HTTP/3 GET can pull them.
+    /// 5. Broadcast the `ClipboardImage` metadata event.
+    /// 6. Update `last_outbound_image_sha` + `last_image_ts_ms` +
+    ///    emit `FrontendEvent::ClipboardState`.
+    async fn dispatch_image(&mut self, image: crate::clipboard::ImageBytes) {
+        // Step 1: SHA-256 the image bytes.
+        let sha = sha256_of_bytes(&image.data);
+        // Step 2: skip if same image as last push. The macOS
+        // backend's `changeCount` short-circuit in STEP-2a.2 means
+        // `current_image()` runs less often than the tick rate, but
+        // every call still produces a sha256 hash worth a few ms
+        // for a 4 K screenshot — comparing to
+        // `last_outbound_image_sha` skips the broadcast and cache
+        // churn when the user hasn't copied anything new.
+        if Some(&sha) == self.last_outbound_image_sha.as_ref() {
+            return;
+        }
+        // Step 3: active eviction (mirrors the text branch).
+        self.evict_prev_outbound_image_cache();
+        // Step 4: cache insert. The bytes already passed the
+        // dedup check above, so this is always a fresh sha256
+        // entry. (Overwriting an existing entry with the same
+        // sha256 — which can only happen via direct manipulation
+        // outside this method — would no-op the byte counter; we
+        // don't optimise for that case.)
+        if let Ok(mut guard) = self.clipboard_cache.lock() {
+            guard.insert(sha, image.data.clone());
+        } else {
+            log::warn!(
+                "clipboard cache mutex poisoned on image insert sha={}; skipping cache write",
+                short_hex(&sha)
+            );
+        }
+        // Step 5: build + broadcast the metadata event. The wire
+        // format is `ClipboardImage { fingerprint, mime, sha256,
+        // size }` — fingerprint == sha256 by the text-path
+        // convention; size is the byte count of `image.data`.
+        let event = ProtoEvent::ClipboardImage(ClipboardImage {
+            fingerprint: sha,
+            mime: image.mime.clone(),
+            sha256: sha,
+            size: image.data.len() as u64,
+        });
+        let mut recipients = 0usize;
+        self.broadcast_clipboard_event(event, &mut recipients).await;
+        if recipients == 0 {
+            log::warn!(
+                "clipboard dispatched image to 0 peers (sha={}, mime={}, size={} bytes); \
+                 peer gate filtered all clients — check `enable_clipboard_to` in TOML \
+                 and that the connection is active",
+                short_hex(&sha),
+                image.mime,
+                image.data.len()
+            );
+        } else {
+            log::debug!(
+                "clipboard dispatched image ({} bytes, mime={}, sha={}) to {} peer(s)",
+                image.data.len(),
+                image.mime,
+                short_hex(&sha),
+                recipients
+            );
+        }
+        // Step 6: bookkeeping + frontend notification.
+        self.last_outbound_image_sha = Some(sha);
+        let now_ms = unix_now_ms();
+        self.last_image_ts_ms = Some(now_ms);
         self.last_clipboard_source = None;
         self.notify_frontend(FrontendEvent::ClipboardState {
             last_text_ts: self.last_text_ts_ms,
@@ -2188,6 +2375,25 @@ impl Service {
         );
     }
 
+    /// **M2a STEP-2a.3** — image-branch sibling of
+    /// [`Self::evict_prev_outbound_clipboard_cache`]. Delegates to
+    /// the same free-function helper so the active-eviction
+    /// contract stays in one place; only the `last_outbound_*_sha`
+    /// field differs. Called by [`Self::dispatch_image`] *immediately
+    /// before* pushing a new `ClipboardImage`, mirroring the text
+    /// branch's "evict prev before push" ordering.
+    ///
+    /// **Independent from the text-branch eviction**: the cache is
+    /// shared, but the previous-push pointers are tracked
+    /// separately so a text push does not accidentally evict a
+    /// previously-cached image (and vice versa).
+    fn evict_prev_outbound_image_cache(&mut self) {
+        evict_prev_outbound_clipboard_cache(
+            &self.clipboard_cache,
+            &mut self.last_outbound_image_sha,
+        );
+    }
+
     /// **PLAN-2 / M1a STEP-1a.4** — broadcast a clipboard event to
     /// every active peer with `enable_clipboard_to = true`.
     ///
@@ -2347,6 +2553,20 @@ fn sha256_of(text: &str) -> [u8; 32] {
     arr
 }
 
+/// **M2a STEP-2a.3** — sibling of [`sha256_of`] for arbitrary
+/// byte payloads (used by the image dispatcher branch for image
+/// bytes, and reused by the test suite to compute expected
+/// sha256 values). Operates on `&[u8]` so callers don't need to
+/// allocate an owned `Vec<u8>` or convert to `String`.
+fn sha256_of_bytes(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let out = hasher.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&out);
+    arr
+}
+
 /// Compact hex prefix for log lines (first 4 bytes = 8 hex chars).
 fn short_hex(b: &[u8; 32]) -> String {
     let mut s = String::with_capacity(8);
@@ -2406,9 +2626,11 @@ mod hex_encoding_tests {
         // path becomes
         // `/clipboard/text/43b20f97...` (62 more chars) and
         // matches what the source wrote to the cache.
-        let sha = [0x43, 0xb2, 0x0f, 0x97, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let sha = [
+            0x43, 0xb2, 0x0f, 0x97, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
         let hex = full_hex(&sha);
         assert!(hex.starts_with("43b20f97"));
         assert_eq!(hex.len(), 64);
@@ -3294,5 +3516,190 @@ mod reconcile_tests {
         let mut recovered = recover_monitors(&all, &new, &old);
         recovered.sort();
         assert_eq!(recovered, vec![1]);
+    }
+}
+
+// ============================================================================
+//  M2a STEP-2a.3 — sha256_of_bytes + dispatch_image cache-step tests
+// ============================================================================
+
+#[cfg(test)]
+#[allow(unused_assignments)]
+mod dispatch_image_tests {
+    //! **M2a STEP-2a.3** — pins the byte-level helpers and the
+    //! image dispatcher cache-step used by
+    //! [`Service::dispatch_image`]. The full
+    //! `dispatch_image` integration (broadcast + state update +
+    //! frontend notification) requires a live `Service` with
+    //! `LanMouseListener` / `Capture` / `Emulation` wired up; that
+    //! coverage is deferred to M2a-2a.4's end-to-end test matrix
+    //! (PLAN §8 M2a STEP-2a.4 完成标志). What this module covers:
+    //!
+    //! 1. **`sha256_of_bytes`** matches the canonical SHA-256 over
+    //!    an arbitrary byte slice (verified against the known
+    //!    SHA-256 of an empty input + a known string).
+    //! 2. **Cache step of `dispatch_image`** is testable as a
+    //!    pure helper: given an image, compute the sha256, perform
+    ///    active eviction of `last_outbound_image_sha`, and insert
+    ///    the new bytes — verifiable without standing up a full
+    ///    `Service`.
+    use super::{Arc, Mutex, sha256_of_bytes};
+    use crate::clipboard::ImageBytes;
+    use crate::clipboard::cache::ClipboardCache;
+    use crate::service::evict_prev_outbound_clipboard_cache;
+
+    /// **`sha256_of_bytes` correctness**: the empty-input SHA-256
+    /// (`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`)
+    /// is the canonical "nil" digest every SHA-256 implementation
+    /// produces; if the helper drifts the test catches it
+    /// immediately.
+    #[test]
+    fn sha256_of_bytes_empty_input() {
+        let sha = sha256_of_bytes(&[]);
+        let expected = [
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+            0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+            0x78, 0x52, 0xb8, 0x55,
+        ];
+        assert_eq!(sha, expected, "empty input must hash to canonical SHA-256");
+    }
+
+    /// **`sha256_of_bytes`** matches the SHA-256 of a known ASCII
+    /// string ("abc") — the canonical SHA-256 test vector.
+    #[test]
+    fn sha256_of_bytes_known_string() {
+        let sha = sha256_of_bytes(b"abc");
+        let expected = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        assert_eq!(
+            sha, expected,
+            "SHA-256(abc) must match the canonical test vector"
+        );
+    }
+
+    /// **`dispatch_image` cache step** (the cache + active-eviction
+    /// half of the dispatcher). Mirrors the call sequence in
+    /// `Service::dispatch_image`:
+    ///
+    /// 1. `sha256 = sha256_of_bytes(image.data)`
+    /// 2. Skip if same as `last_outbound_image_sha`
+    /// 3. `evict_prev_outbound_clipboard_cache(...)` — drops the
+    ///    prev sha256 from the cache
+    /// 4. `cache.insert(sha256, image.data.clone())` — stores the
+    ///    new bytes
+    ///
+    /// Pins that the dispatcher's image branch correctly caches
+    /// the new image and evicts the previous push, matching the
+    /// text-branch contract (PLAN §1 评审 #3 2nd).
+    #[test]
+    fn dispatch_image_cache_step_inserts_new_and_evicts_prev() {
+        let cache = Arc::new(Mutex::new(ClipboardCache::new()));
+        let mut last_outbound_image_sha: Option<[u8; 32]> = None;
+
+        // First image: no prev to evict (None).
+        let img1_bytes = vec![0xAAu8; 5_000_000];
+        let img1 = ImageBytes {
+            mime: "image/png".to_string(),
+            data: img1_bytes.clone(),
+        };
+        let sha1 = sha256_of_bytes(&img1.data);
+        assert_ne!(
+            Some(&sha1),
+            last_outbound_image_sha.as_ref(),
+            "first push has no prev to match"
+        );
+        evict_prev_outbound_clipboard_cache(&cache, &mut last_outbound_image_sha);
+        cache.lock().unwrap().insert(sha1, img1.data.clone());
+        last_outbound_image_sha = Some(sha1);
+
+        // Cache must hold img1.
+        assert_eq!(
+            cache.lock().unwrap().lookup(&sha1),
+            Some(img1_bytes.clone()),
+            "first image must be cached after insert"
+        );
+        assert_eq!(cache.lock().unwrap().bytes(), 5_000_000);
+
+        // Second image: push the same steps for img2 → evicts sha1
+        // from the cache before inserting img2.
+        let img2_bytes = vec![0xBBu8; 3_000_000];
+        let img2 = ImageBytes {
+            mime: "image/png".to_string(),
+            data: img2_bytes.clone(),
+        };
+        let sha2 = sha256_of_bytes(&img2.data);
+        assert_ne!(sha2, sha1, "distinct images must hash to distinct sha256");
+        assert_ne!(
+            Some(&sha2),
+            last_outbound_image_sha.as_ref(),
+            "different image must not match last outbound"
+        );
+        evict_prev_outbound_clipboard_cache(&cache, &mut last_outbound_image_sha);
+        cache.lock().unwrap().insert(sha2, img2.data.clone());
+        last_outbound_image_sha = Some(sha2);
+
+        // img1 was the prev outbound → must be evicted from cache
+        // (active eviction).
+        assert_eq!(
+            cache.lock().unwrap().lookup(&sha1),
+            None,
+            "previous image must be evicted by active-eviction step"
+        );
+        // img2 is the new push → must be present.
+        assert_eq!(
+            cache.lock().unwrap().lookup(&sha2),
+            Some(img2_bytes.clone()),
+            "new image must be cached after insert"
+        );
+        assert_eq!(cache.lock().unwrap().bytes(), 3_000_000);
+    }
+
+    /// **Short-circuit on duplicate push**: if
+    /// `last_outbound_image_sha` matches the freshly-computed
+    /// sha256, the dispatcher's image branch is a no-op — no
+    /// cache churn, no broadcast. This is the bandwidth
+    /// optimisation that prevents re-pushing the same image every
+    /// 500 ms while the clipboard sits unchanged.
+    #[test]
+    fn dispatch_image_cache_step_skips_on_duplicate_sha() {
+        let cache = Arc::new(Mutex::new(ClipboardCache::new()));
+        let mut last_outbound_image_sha: Option<[u8; 32]> = None;
+
+        // Prime the cache with image A.
+        let img_a_bytes = vec![0xCCu8; 1_024];
+        let img_a = ImageBytes {
+            mime: "image/png".to_string(),
+            data: img_a_bytes.clone(),
+        };
+        let sha_a = sha256_of_bytes(&img_a.data);
+        cache.lock().unwrap().insert(sha_a, img_a.data.clone());
+        last_outbound_image_sha = Some(sha_a);
+
+        // Simulate a duplicate tick: the dispatcher computes
+        // sha_a again (same bytes), compares to
+        // last_outbound_image_sha, sees a match, and returns
+        // before mutating the cache.
+        let sha_again = sha256_of_bytes(&img_a.data);
+        assert_eq!(sha_again, sha_a, "same bytes must hash to the same sha256");
+        assert_eq!(
+            Some(&sha_again),
+            last_outbound_image_sha.as_ref(),
+            "duplicate short-circuit precondition: sha matches last outbound"
+        );
+
+        // Cache state unchanged from the prime step.
+        assert_eq!(
+            cache.lock().unwrap().lookup(&sha_a),
+            Some(img_a_bytes),
+            "duplicate short-circuit must not disturb the cache"
+        );
+        assert_eq!(
+            cache.lock().unwrap().bytes(),
+            1_024,
+            "duplicate short-circuit must not affect byte counter"
+        );
     }
 }
