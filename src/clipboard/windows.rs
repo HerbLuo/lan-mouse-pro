@@ -58,10 +58,11 @@
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
+use std::path::PathBuf;
 
 use windows_sys::Win32::Foundation::{GetLastError, HGLOBAL};
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+    CloseClipboard, DragQueryFileW, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalFree, GlobalLock, GlobalUnlock,
@@ -85,6 +86,15 @@ const CF_DIBV5_U32: u32 = CF_DIBV5 as u32;
 /// a top-level constant. Value 13 is stable since Windows 95 / NT
 /// 3.51 and has not changed since.
 const CF_UNICODETEXT: u32 = 13;
+
+/// **M3a STEP-3a.2** — `CF_HDROP` constant — the Win32 clipboard
+/// format for "file drop" (a `DROPFILES` struct + double-NUL
+/// terminated list of absolute file paths). Value 15 is stable
+/// since Windows 95 / NT 3.51 and has not changed since.
+///
+/// We cast to `u32` for the same reason as `CF_DIBV5_U32` above
+/// — `GetClipboardData` / `DragQueryFileW` take `u32` parameters.
+const CF_HDROP_U32: u32 = 15;
 
 /// Windows clipboard backend. Wraps the Win32 `OpenClipboard` /
 /// `GetClipboardData` / `SetClipboardData` API.
@@ -459,6 +469,94 @@ impl ClipboardBackend for WinClipboard {
             CloseClipboard();
         }
         Ok(())
+    }
+
+    // === M3a STEP-3a.2 — file method ===
+
+    /// Read the OS clipboard's current file selection via
+    /// `CF_HDROP` (the Win32 "file drop" clipboard format).
+    ///
+    /// `CF_HDROP` is a `DROPFILES` struct followed by a
+    /// double-NUL-terminated list of absolute file paths in
+    /// UTF-16 LE. The dispatcher calls `DragQueryFileW` to
+    /// enumerate the entries.
+    ///
+    /// **No deduplication**: a multi-select paste that
+    /// includes the same path twice yields the same `PathBuf`
+    /// twice (the receiver's `collect_files` then dedupes
+    /// via `PartialEq` on `FileEntry`).
+    ///
+    /// **Why we use the typed `DragQueryFileW` Rust binding**:
+    /// the Win32 API takes a `HDROP` handle (cast from the
+    /// `HGLOBAL` returned by `GetClipboardData`) and returns
+    /// each path via a `&mut [u16]` buffer + `wchars` size.
+    /// The Rust binding (windows-sys 0.61) wraps the call
+    /// with the right type signatures.
+    fn current_files(&mut self) -> Option<Vec<PathBuf>> {
+        if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
+            return None;
+        }
+        let handle = unsafe { GetClipboardData(CF_HDROP_U32) } as HGLOBAL;
+        if handle.is_null() {
+            unsafe {
+                CloseClipboard();
+            }
+            return None;
+        }
+        // SAFETY: `handle` is a valid `HDROP` (`HGLOBAL`) for the
+        // duration of the `OpenClipboard` window. We do NOT
+        // `GlobalLock` it because `DragQueryFileW` expects a raw
+        // `HDROP` handle (it locks internally). Casting
+        // `HGLOBAL → HDROP` is bit-equivalent on Windows.
+        let hdrop = handle as windows_sys::Win32::System::Ole::HDROP;
+        // SAFETY: `DragQueryFileW` with `UINT uFile = 0xFFFFFFFF`
+        // returns the file count. NULL-terminated file paths in
+        // wide-char UTF-16.
+        let count = unsafe { DragQueryFileW(hdrop, 0xFFFFFFFFu32, std::ptr::null_mut(), 0) }
+            as usize;
+        if count == 0 {
+            unsafe {
+                CloseClipboard();
+            }
+            return None;
+        }
+        let mut paths = Vec::with_capacity(count);
+        for i in 0..count {
+            // SAFETY: query buffer size first; `DragQueryFileW`
+            // returns the required wchar count (excluding the
+            // terminating NUL). Allocate one extra wchar for the
+            // NUL.
+            let wchars_needed =
+                unsafe { DragQueryFileW(hdrop, i as u32, std::ptr::null_mut(), 0) } as usize;
+            if wchars_needed == 0 {
+                continue;
+            }
+            let mut buf = vec![0u16; wchars_needed + 1];
+            // SAFETY: `DragQueryFileW` writes `wchars_needed`
+            // wchars + a trailing NUL into `buf`. The function
+            // returns the wchar count written (excluding the
+            // NUL) — we ignore it here because `wchars_needed`
+            // already encoded the length.
+            let written = unsafe {
+                DragQueryFileW(hdrop, i as u32, buf.as_mut_ptr(), buf.len() as u32)
+            };
+            if written == 0 {
+                continue;
+            }
+            // Convert UTF-16 → `OsString` → `PathBuf`. The wide
+            // path is absolute (Win32 `CF_HDROP` always carries
+            // absolute paths — verified against the Win32 docs).
+            let os_string = OsString::from_wide(&buf[..written as usize]);
+            paths.push(PathBuf::from(os_string));
+        }
+        unsafe {
+            CloseClipboard();
+        }
+        if paths.is_empty() {
+            None
+        } else {
+            Some(paths)
+        }
     }
 }
 

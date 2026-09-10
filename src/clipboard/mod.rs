@@ -80,6 +80,8 @@ pub mod file_meta;
 #[allow(unused_imports)]
 pub use file_meta::FileEntry;
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 /// Backend-specific error for clipboard operations.
@@ -489,6 +491,60 @@ pub trait ClipboardBackend: Send {
     fn watch_image(&mut self) -> futures::stream::BoxStream<'static, ImageChange> {
         Box::pin(futures::stream::empty())
     }
+
+    // === M3a STEP-3a.2 — file methods (default impls) ===
+
+    /// Read the OS clipboard's current file selection (if any).
+    ///
+    /// Returns:
+    /// - `Some(paths)` if the clipboard holds one or more file
+    ///   references. The dispatcher's outbound branch feeds this
+    ///   into `collect_files` to project to [`crate::clipboard::FileEntry`]
+    ///   metadata.
+    /// - `None` if the clipboard holds no file references (text,
+    ///   image, …) **or** if the backend does not yet implement
+    ///   file reads.
+    ///
+    /// **Default returns `None`** — the M3a platform impls
+    /// (`MacOsPasteboard`, `WinClipboard`, `LinuxClipboard`) override
+    /// this with the platform-specific read path. The default lets
+    /// existing image-only / text-only backends satisfy the trait
+    /// without churn.
+    ///
+    /// **Duplicates**: backends that deduplicate (e.g. macOS's
+    /// `NSFilenamesPboardType` returns a flat list without dups) need
+    /// no extra filtering. Backends that may yield duplicates
+    /// (Windows `CF_HDROP` can list the same path twice if the user
+    /// selected it twice) should deduplicate before returning.
+    fn current_files(&mut self) -> Option<Vec<PathBuf>> {
+        None
+    }
+
+    /// Stream of file-selection changes emitted by the backend
+    /// (M3a+).
+    ///
+    /// **Default returns an empty stream** — the polling dispatcher
+    /// uses [`Self::current_files`] on its 500 ms tick and does not
+    /// subscribe to this stream for backends that lack a native
+    /// watcher (every platform's file change is detected by polling
+    /// the same `current_files` method; no platform has a native
+    /// file-change notification API). macOS may override this later
+    /// to wrap `NSPasteboardDidChangeNotification`; for now every
+    /// implementation inherits the empty default.
+    fn watch_files(&mut self) -> futures::stream::BoxStream<'static, Vec<PathBuf>> {
+        Box::pin(futures::stream::empty())
+    }
+}
+
+/// **M3a STEP-3a.2** — file-selection change event.
+///
+/// Mirrors the [`ImageChange`] pattern used by the image dispatcher.
+/// The paths are exactly what [`ClipboardBackend::current_files`]
+/// returns; the dispatcher feeds them through `collect_files` +
+/// `file_cache` insertion + `ClipboardFiles` broadcast.
+#[derive(Clone, Debug)]
+pub struct FilesChange {
+    pub paths: Vec<PathBuf>,
 }
 
 // ============================================================================

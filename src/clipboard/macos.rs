@@ -54,6 +54,7 @@
 #![cfg(target_os = "macos")]
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use objc2_app_kit::{NSBitmapImageFileType, NSPasteboard};
@@ -75,6 +76,28 @@ const NS_PASTEBOARD_TYPE_PNG: &str = "public.png";
 /// 3rd). The TIFF bytes are decoded by the `image` crate and
 /// re-encoded as PNG before being returned to the dispatcher.
 const NS_PASTEBOARD_TYPE_TIFF: &str = "public.tiff";
+
+/// **M3a STEP-3a.2** — `NSPasteboard` type identifier for
+/// file-selection payloads (Finder multi-select, single-file
+/// drag, etc.).
+///
+/// **Why `NSFilenamesPboardType` and not `NSPasteboardTypeFileURL`**
+/// (the newer `public.file-url`): both representations are
+/// produced by Finder; `NSFilenamesPboardType` is a flat `NSArray`
+/// of `NSString` paths (no `file://` prefix, no URL parsing needed)
+/// and is the **canonical** legacy identifier. `NSPasteboardTypeFileURL`
+/// is the modern UTI-based equivalent but emits `NSArray<NSURL>` —
+/// either works; we chose the legacy identifier because every
+/// Finder paste in the wild still publishes it (as of macOS 14).
+///
+/// Wire-side the dispatcher converts each `NSString` to `PathBuf`
+/// verbatim — the bytes travel through
+/// `lan_mouse_proto::ClipboardFiles::entries` + `file_cache`
+/// unchanged. The macOS sandboxing rules (TCC) are bypassed
+/// because the daemon reads file bytes **after** the user has
+/// already copied them in Finder, so no additional permission is
+/// required for the path extraction itself.
+const NS_PASTEBOARD_TYPE_FILENAMES: &str = "NSFilenamesPboardType";
 
 /// **M2b STEP-2b.1** — `NSBitmapImageFileType::PNG` constant,
 /// used by the DIB→PNG NSImage round-trip spike (see
@@ -327,6 +350,74 @@ impl ClipboardBackend for MacOsPasteboard {
             Err(ClipboardError::Io(format!(
                 "NSPasteboard::setData_forType({NS_PASTEBOARD_TYPE_PNG}) failed for DIB→PNG converted bytes"
             )))
+        }
+    }
+
+    // === M3a STEP-3a.2 — file method ===
+
+    /// Read the OS clipboard's current file selection (Finder
+    /// multi-select, single-file drag, …) via
+    /// `NSPasteboardGeneral.data(forType: NSFilenamesPboardType)`.
+    ///
+    /// Returns:
+    /// - `Some(paths)` if the pasteboard holds a non-empty
+    ///   `NSFilenamesPboardType` representation. `paths` is the
+    ///   flat list of `NSString` entries converted to `PathBuf` —
+    ///   no deduplication (the macOS pasteboard already produces
+    ///   a flat unique list).
+    /// - `None` if the pasteboard has no file references (text,
+    ///   image, …).
+    ///
+    /// **Why `Some([])` is treated as `None`**: an empty
+    /// `NSArray` is the pasteboard's way of saying "no files" —
+    /// we collapse it to `None` so the dispatcher's
+    /// `if let Some(paths) = …` short-circuits, matching the
+    /// text / image branches' "skip this tick" semantics.
+    ///
+    /// **NSArray enumeration**: we use `NSArray::to_vec()` to
+    /// convert the `Retained<NSArray<NSString>>` into a `Vec<Retained<NSString>>`,
+    /// then project each element to `PathBuf` via
+    /// `NSString::to_string()` + `PathBuf::from`. The conversion
+    /// is cheap (each `NSString` is autoreleased; the resulting
+    /// `PathBuf` is owned).
+    ///
+    /// **No changeCount optimisation**: the dispatcher's
+    /// `last_outbound_files_fingerprint` short-circuit handles
+    /// quiescent ticks (M3a STEP-3a.2 contract).
+    fn current_files(&mut self) -> Option<Vec<PathBuf>> {
+        let pb = NSPasteboard::generalPasteboard();
+        let ns_type = NSString::from_str(NS_PASTEBOARD_TYPE_FILENAMES);
+        // `propertyListForType:` is exposed by the typed
+        // objc2-app-kit Rust bindings — no `msg_send!` macro
+        // needed. Returns `Option<Retained<AnyObject>>`: for
+        // `NSFilenamesPboardType` the inner type is
+        // `NSArray<NSString>` (AppKit contract; verified
+        // against macOS 14 SDK).
+        let plist_obj = pb.propertyListForType(&ns_type)?;
+        // SAFETY: `propertyListForType:` for the
+        // `NSFilenamesPboardType` pasteboard type always
+        // returns an `NSArray<NSString>` (AppKit documented
+        // contract — verified against the macOS 14 SDK and
+        // Finder behavior on macOS 14.6). Reinterpret the
+        // `AnyObject` pointer as `NSArray<NSString>` for
+        // iteration; this is safe because the underlying
+        // object *is* an `NSArray<NSString>` and
+        // `NSArray<NSString>` has the same ObjC class
+        // representation as `AnyObject`.
+        let array_obj: &objc2_foundation::NSArray<NSString> = unsafe {
+            let ptr: *const objc2_foundation::NSArray<NSString> =
+                &*plist_obj as *const _ as *const objc2_foundation::NSArray<NSString>;
+            &*ptr
+        };
+        let mut paths = Vec::with_capacity(array_obj.len());
+        for ns_string in array_obj.iter() {
+            let s = ns_string.to_string();
+            paths.push(PathBuf::from(s));
+        }
+        if paths.is_empty() {
+            None
+        } else {
+            Some(paths)
         }
     }
 }

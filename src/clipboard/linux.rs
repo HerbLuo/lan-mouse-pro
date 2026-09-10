@@ -51,6 +51,7 @@
 #![cfg(target_os = "linux")]
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use super::{ClipboardBackend, ClipboardError, ImageBytes, Mime};
@@ -358,6 +359,68 @@ impl ClipboardBackend for LinuxClipboard {
         let png_bytes = dib_to_png_via_image_crate(bytes)?;
         self.set_image(&png_bytes, Mime::Png)
     }
+
+    // === M3a STEP-3a.2 — file method ===
+
+    /// Read the OS clipboard's current file selection via
+    /// `text/uri-list` — the standard MIME type for file references
+    /// on both X11 and Wayland.
+    ///
+    /// **X11**: `xclip -selection clipboard -t text/uri-list -o`
+    /// (the `-t` flag is the same flag used by `current_image`'s
+    /// `image/png` call — it tells xclip to dump only the
+    /// `text/uri-list` representation).
+    ///
+    /// **Wayland**: `wl-paste --type text/uri-list` (also the
+    /// standard MIME flag pattern).
+    ///
+    /// Both tools exit non-zero when the clipboard does not hold
+    /// the requested type (e.g. it holds text / image only). We
+    /// surface that exit-non-zero as `None` to mirror the
+    /// `current_text` / `current_image` "no change this tick"
+    /// semantics.
+    ///
+    /// **URI-list format** (RFC 2483): one URI per line, separated
+    /// by CRLF or LF. Comments start with `#`. Each URI is
+    /// either a `file:///path/to/file` URL (local file) or a
+    /// non-file scheme (`http://`, `ftp://`, …). We extract
+    /// local-file URIs only (`file://` prefix) and convert each
+    /// to a `PathBuf` via `urlencoding`-free percent-decoding
+    /// (most filesystem paths don't need percent-decoding; we
+    /// fall back to the raw string if the parse fails).
+    ///
+    /// **No file-write path on Linux**: M3a only needs the
+    /// **read** path; `set_files` is out of scope (PLAN §3
+    /// M3a STEP-3a.2 / 3a.3 boundary).
+    fn current_files(&mut self) -> Option<Vec<PathBuf>> {
+        let output = match self.tool {
+            Tool::WlPaste => Command::new("wl-paste")
+                .args(["--type", "text/uri-list"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+                .ok()?,
+            Tool::Xclip => Command::new("xclip")
+                .args([
+                    "-selection",
+                    "clipboard",
+                    "-t",
+                    "text/uri-list",
+                    "-o",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+                .ok()?,
+        };
+        if !output.status.success() {
+            return None;
+        }
+        if output.stdout.is_empty() {
+            return None;
+        }
+        Some(parse_uri_list(&output.stdout))
+    }
 }
 
 impl LinuxClipboard {
@@ -386,7 +449,124 @@ impl LinuxClipboard {
 /// exercise it directly without needing to mock `xclip` / `wl-copy`
 /// subprocess invocations.
 ///
-/// **Decode path**: `image::load_from_memory` accepts BMP files
+// ============================================================================
+//  M3a STEP-3a.2 — URI list parser
+// ============================================================================
+
+/// **M3a STEP-3a.2** — parse a `text/uri-list` byte stream (RFC 2483)
+/// into a `Vec<PathBuf>` of local file paths.
+///
+/// **Format** (RFC 2483 §3): one URI per line, separated by CRLF
+/// (preferred) or LF. Comments start with `#` (drop entire line).
+/// URIs may use any URI scheme; we keep only `file://` URIs and
+/// drop the rest silently (a non-file URI in the file clipboard
+/// is meaningless for our transfer).
+///
+/// **Percent-decoding**: `file:///path/with%20space/file` →
+/// `/path/with space/file`. The percent-decoding is RFC 3986 §2.4
+/// compliant — `%XX` where `XX` is two uppercase / lowercase hex
+/// digits. We do NOT add a `url` crate dep for this; the path
+/// space is small and a 10-line decoder avoids pulling in a new
+/// transitive dep just for `text/uri-list` parsing.
+///
+/// **Empty / comment-only lists**: returns `Vec::new()` (the
+/// dispatcher's "empty list" short-circuit will treat it as no
+/// files — but a non-`None` `Some(vec![])` distinguishes "non-empty
+/// `current_files` that had no parseable entries" from "the
+/// clipboard does not advertise `text/uri-list` at all" — the
+/// latter returns `None` from `current_files` directly).
+fn parse_uri_list(bytes: &[u8]) -> Vec<PathBuf> {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for raw_line in text.split(|c| c == '\n' || c == '\r') {
+        // Strip trailing CR (split on \r\n yields the \n side
+        // with a trailing \r we may have missed).
+        let line = raw_line.trim_end_matches('\r').trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(path) = file_uri_to_path(line) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Convert a single `file://` URI to a `PathBuf`. Returns `None`
+/// for non-`file://` URIs (caller skips) or malformed inputs.
+///
+/// **Why we accept both `file:///abs/path` and `file://hostname/abs/path`**:
+/// RFC 8089 §3 allows both forms. The host part is normally empty
+/// for local files (`file:///abs/path`); we treat it as empty
+/// regardless and concatenate the path part as-is. On Linux this
+/// matches what `gvfs` / `xdg-open` produce.
+fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    const PREFIX: &str = "file://";
+    let rest = uri.strip_prefix(PREFIX)?;
+    // `file://hostname/path` — skip the hostname if non-empty.
+    // The hostname is everything up to the next '/'.
+    let path_str = if let Some(slash_pos) = rest.find('/') {
+        let hostname = &rest[..slash_pos];
+        if !hostname.is_empty() {
+            // Non-empty hostname; for local files this would be
+            // `localhost` — strip it. For non-local (rare on
+            // Linux clipboard), bail.
+            if hostname != "localhost" {
+                return None;
+            }
+        }
+        &rest[slash_pos + 1..]
+    } else {
+        // No path component at all.
+        return None;
+    };
+    // Percent-decode in place. We don't allocate a String for the
+    // common case (no percent sequences).
+    if !path_str.contains('%') {
+        return Some(PathBuf::from(path_str));
+    }
+    let decoded = percent_decode(path_str);
+    Some(PathBuf::from(decoded))
+}
+
+/// Minimal RFC 3986 percent-decoder. `%XX` → byte 0xXX. Invalid
+/// escapes (non-hex trailing chars or single `%`) are passed
+/// through verbatim — never panics, never errors.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+// ============================================================================
+//  DIB→PNG helper (M2b STEP-2b.2)
+// ============================================================================
+
+/// **M2b STEP-2b.2** — `image`-crate based DIB → PNG conversion.
 /// (14-byte file header + DIB) directly. Raw DIB payloads from
 /// Windows `CF_DIBV5` (no 14-byte file header) may also decode if
 /// the leading `biSize` field is structured for the BMP codec
@@ -662,5 +842,78 @@ mod tests {
     #[test]
     fn image_crate_bmp_format_is_available() {
         let _format: image::ImageFormat = image::ImageFormat::Bmp;
+    }
+
+    // === M3a STEP-3a.2 — URI list parser tests ===
+
+    /// `parse_uri_list` decodes the canonical RFC 2483 form:
+    /// `file:///abs/path` per line, CRLF separated.
+    #[test]
+    fn parse_uri_list_decodes_simple_file_uri() {
+        let input = b"file:///tmp/a.bin\r\nfile:///tmp/b.bin\r\n";
+        let paths = parse_uri_list(input);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].to_str().unwrap(), "/tmp/a.bin");
+        assert_eq!(paths[1].to_str().unwrap(), "/tmp/b.bin");
+    }
+
+    /// LF-only separator (some xclip builds emit LF instead of
+    /// CRLF). Both should work.
+    #[test]
+    fn parse_uri_list_accepts_lf_separator() {
+        let input = b"file:///tmp/a.bin\nfile:///tmp/b.bin\n";
+        let paths = parse_uri_list(input);
+        assert_eq!(paths.len(), 2);
+    }
+
+    /// RFC 2483 §3 comment lines (start with `#`) are skipped.
+    #[test]
+    fn parse_uri_list_skips_comment_lines() {
+        let input = b"# this is a comment\nfile:///tmp/a.bin\n";
+        let paths = parse_uri_list(input);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].to_str().unwrap(), "/tmp/a.bin");
+    }
+
+    /// Non-`file://` URIs (e.g. `http://`) are silently skipped.
+    /// The Linux clipboard sometimes advertises a few non-file
+    /// types when the user copies a mixed selection.
+    #[test]
+    fn parse_uri_list_skips_non_file_uris() {
+        let input = b"http://example.com/\nfile:///tmp/a.bin\nftp://server/x\n";
+        let paths = parse_uri_list(input);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].to_str().unwrap(), "/tmp/a.bin");
+    }
+
+    /// Percent-decoding: `%20` → space, `%2F` → `/`. A
+    /// `file:///tmp/path%20with%20space` URI becomes
+    /// `/tmp/path with space`.
+    #[test]
+    fn parse_uri_list_percent_decodes_paths() {
+        let input = b"file:///tmp/path%20with%20space\n";
+        let paths = parse_uri_list(input);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].to_str().unwrap(), "/tmp/path with space");
+    }
+
+    /// `file://localhost/abs/path` is equivalent to
+    /// `file:///abs/path` (RFC 8089 §3). Both forms are accepted.
+    #[test]
+    fn parse_uri_list_accepts_localhost_hostname() {
+        let input = b"file://localhost/tmp/a.bin\n";
+        let paths = parse_uri_list(input);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].to_str().unwrap(), "/tmp/a.bin");
+    }
+
+    /// Empty / comment-only input returns an empty vec (NOT
+    /// `None` — the dispatcher distinguishes "no file entries
+    /// parsed" from "no text/uri-list representation").
+    #[test]
+    fn parse_uri_list_empty_or_comments_returns_empty_vec() {
+        assert!(parse_uri_list(b"").is_empty());
+        assert!(parse_uri_list(b"# only comment\n").is_empty());
+        assert!(parse_uri_list(b"\n\n\n").is_empty());
     }
 }
