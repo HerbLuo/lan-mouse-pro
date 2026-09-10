@@ -52,7 +52,7 @@
 
 ---
 
-### 全屏截图后鼠标卡顿 / 连接被强制关闭（2026-09-10，未解决）
+### 全屏截图后鼠标卡顿且无法粘贴
 
 **现状（用户实测确认）**：
 
@@ -138,6 +138,7 @@ a353255  revert(commit 0d5cd3f): drop RGBA→24-bit BI_RGB collapse + regression
 **日志样本**（2026-09-10，用户实测）：
 
 master：
+
 ```
 14:32:23Z clipboard: JPEG→PNG normalized for cross-platform transfer (127751 bytes → 391350 bytes)
 14:32:23Z clipboard dispatched image to 0 peers (sha=9a12bddc, mime=image/png, size=391350 bytes)
@@ -154,6 +155,7 @@ master：
 ```
 
 slave（时钟快约 2 秒）：
+
 ```
 14:32:39Z service: clipboard inbound: applied 0 bytes from 10.2.1.15:62687 (sha=e3b0c442)
 14:32:43Z capture: EnterOnly trigger on 9223372036854775808 (event=BeginPending) — forwarding to service as CaptureBegin
@@ -183,7 +185,7 @@ slave（时钟快约 2 秒）：
 
 **当前最有可能的几个候选根因**（按概率排序，待用 trace 日志区分）：
 
-- **C1：粘贴目标读的不是 CF_DIBV5/CF_DIB**——某些 Windows 应用（老版本 Office / 部分截图工具 / WPS / 部分 IM）只读 `CF_BITMAP`（GDI handle）或不读 CF_*v5。如果应用方是这一类，"applied" 日志跟 paste 失败就不矛盾。
+- **C1：粘贴目标读的不是 CF_DIBV5/CF_DIB**——某些 Windows 应用（老版本 Office / 部分截图工具 / WPS / 部分 IM）只读 `CF_BITMAP`（GDI handle）或不读 CF\_\*v5。如果应用方是这一类，"applied" 日志跟 paste 失败就不矛盾。
 - **C2：DIB 字节格式跟应用期望不匹配**——RGBA PNG → `image` crate 32-bit BMP → BI_BITFIELDS 压缩 + bit-shift bug（0d5cd3f revert 后的已知遗留问题，见 `clipboard/windows.rs:639-645` 的"Known limitation"段）。如果两次截图 alpha 状态不同（第一次有 alpha、第二次无），可以解释"第一次失败第二次成功"。
 - **C3：被控端有剪贴板管理器**（Ditto / ClipboardMaster 等）抢走 lan-mouse 写入的 DIB、换成自家格式。用户实际粘贴时读到的是管理器重写过的内容，第一次跨越因为 cache 还没预热、第二次就稳定了。
 
@@ -191,7 +193,7 @@ slave（时钟快约 2 秒）：
 
 **下一步诊断需要**（用户复现时给出）：
 
-1. **paste 目标应用**（记事本 / Paint / 微信 / QQ / 浏览器 / 截图工具 / WPS / 其他）。不同的目标读不同的 CF_* 格式，能直接锁定 C1。
+1. **paste 目标应用**（记事本 / Paint / 微信 / QQ / 浏览器 / 截图工具 / WPS / 其他）。不同的目标读不同的 CF\_\* 格式，能直接锁定 C1。
 2. **`RUST_LOG=lan_mouse::clipboard=trace` 完整 slave 日志**（含"applied"前后 2 秒），特别是：
    - step 2.5 那条 debug 日志 `clipboard inbound image: backend transcoded (inbound sha=… → on-clipboard sha=…, mime=…)` 有没有打 → 能确认 re-read 是否成功
    - 紧接的 tick 有没有再打 `clipboard dispatched image (X bytes) to N peer(s)` → 能确认 echo 是否在发生
@@ -223,6 +225,7 @@ slave 还没启动），然后 slave 连上，master 会 push **0字节空文本
 被复制的图片完全没被传过去。
 
 复现路径：
+
 1. master 启动，复制一张截图（slave 未启动）
 2. 启动 slave，连接成功
 3. master 日志看到 `clipboard recover push: pushing 0 bytes (sha=e3b0c442)`
@@ -235,6 +238,7 @@ slave 还没启动），然后 slave 连上，master 会 push **0字节空文本
 pasteboard 时也走 image 分支（不要被"pbpaste 返回空串"误导走文本路径）。
 
 **当前代码状态**：
+
 - ✅ `dispatch_image` 完整（`service.rs:2075-2176`）—— LRU / last_outbound_image_sha /
   cache insert / FrontendEvent 都已具备
 - ❌ `handle_clipboard_recover_push` 只调 `current_text`，没调 `current_image`
