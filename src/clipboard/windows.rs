@@ -67,7 +67,7 @@ use windows_sys::Win32::System::DataExchange::{
 use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
 };
-use windows_sys::Win32::System::Ole::CF_DIBV5;
+use windows_sys::Win32::System::Ole::{CF_DIB, CF_DIBV5};
 use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
 
 use super::{ClipboardBackend, ClipboardError, ImageBytes, MIME_DIB, Mime};
@@ -82,6 +82,23 @@ use super::{ClipboardBackend, ClipboardError, ImageBytes, MIME_DIB, Mime};
 /// `CF_DIBV5 as u32`. The constant value (`17`) is stable since
 /// Windows 95 / NT 3.51 and has not changed since.
 const CF_DIBV5_U32: u32 = CF_DIBV5 as u32;
+
+/// **`CF_DIB` cast to `u32`**: the legacy `BITMAPINFO`-based
+/// DIB clipboard format (= `8`). We write **both** `CF_DIB`
+/// and `CF_DIBV5` for inbound image bytes — `CF_DIBV5` alone
+/// is sufficient for every modern Windows app (Paint, Word,
+/// browsers), but the WeChat desktop client on Windows reads
+/// only `CF_DIB` and silently drops `CF_DIBV5`-only clipboards
+/// (verified 2026-09-10 against the user's WeChat setup:
+/// clipboard history shows the image, Paint pastes correctly,
+/// but WeChat's paste does nothing). The same DIB bytes (a
+/// `BITMAPINFOHEADER` + pixel block) are valid for both formats
+/// — Windows accepts a `BITMAPINFOHEADER` as a truncated V5
+/// header for `CF_DIBV5`, and as a complete header for
+/// `CF_DIB` — so a second `SetClipboardData` call with the
+/// same bytes is enough; no transcoding is required. The
+/// constant value (`8`) is stable since Windows 95 / NT 3.51.
+const CF_DIB_U32: u32 = CF_DIB as u32;
 
 /// `CF_UNICODETEXT` constant — not exposed by `windows-sys` 0.61 as
 /// a top-level constant. Value 13 is stable since Windows 95 / NT
@@ -452,55 +469,34 @@ impl ClipboardBackend for WinClipboard {
                 "EmptyClipboard (set_dib_image) failed: GetLastError={err}"
             )));
         }
-        let byte_len = bytes.len();
-        // SAFETY: `GlobalAlloc` allocates movable memory (the
-        // clipboard prefers moveable handles — the OS may
-        // relocate them to compact the heap). Returns NULL on
-        // failure; we surface `Io` with `GetLastError` for
-        // diagnosability.
-        let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) } as HGLOBAL;
-        if handle.is_null() {
-            let err = unsafe { GetLastError() };
+        // SAFETY: see `set_text` for the leak-on-failure
+        // rationale — a 32-byte leak on the rare `SetClipboardData`
+        // failure is harmless. We write **both** `CF_DIBV5` and
+        // `CF_DIB` — same DIB bytes for each — so apps that read
+        // either format find the image. See [`CF_DIB_U32`] for the
+        // WeChat-specific rationale (verified 2026-09-10).
+        //
+        // The two handles are independent because `SetClipboardData`
+        // transfers ownership of each `HGLOBAL` to the OS — sharing
+        // one handle between the two formats would leave the second
+        // `SetClipboardData` reading freed memory (the OS frees the
+        // handle from the first call as soon as the clipboard is
+        // closed).
+        match alloc_dib_handle_and_set(bytes, CF_DIBV5_U32) {
+            Ok(()) => {}
+            Err(e) => {
+                unsafe {
+                    CloseClipboard();
+                }
+                return Err(e);
+            }
+        }
+        if let Err(e) = alloc_dib_handle_and_set(bytes, CF_DIB_U32) {
             unsafe {
                 CloseClipboard();
             }
-            return Err(ClipboardError::Io(format!(
-                "GlobalAlloc({byte_len} bytes, set_dib_image) failed: GetLastError={err}"
-            )));
+            return Err(e);
         }
-        // SAFETY: `handle` is a valid `HGLOBAL` (just allocated).
-        // `GlobalLock` returns NULL on failure. Copy the DIB
-        // payload verbatim into the locked region.
-        let write_ok = unsafe {
-            let dst = GlobalLock(handle) as *mut u8;
-            if dst.is_null() {
-                let err = GetLastError();
-                log::error!(
-                    "windows clipboard GlobalLock failed for set_dib_image: GetLastError={err}"
-                );
-                CloseClipboard();
-                // Free the HGLOBAL we allocated above — GlobalLock
-                // failure must not leak the multi-MB DIB handle (M2b
-                // validator P1.2). OS cleanup at process exit is too
-                // late for a daemon loop.
-                let _ = GlobalFree(handle);
-                return Err(ClipboardError::Io(format!(
-                    "GlobalLock (set_dib_image) failed: GetLastError={err}"
-                )));
-            }
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, byte_len);
-            GlobalUnlock(handle);
-            true
-        };
-        if !write_ok {
-            return Err(ClipboardError::Io(
-                "GlobalLock (set_dib_image) returned NULL".into(),
-            ));
-        }
-        // SAFETY: see `set_text` for the leak-on-failure
-        // rationale — a 32-byte leak on the rare `SetClipboardData`
-        // failure is harmless.
-        let _ = unsafe { SetClipboardData(CF_DIBV5_U32, handle as _) };
         unsafe {
             CloseClipboard();
         }
@@ -671,6 +667,90 @@ fn encode_png_to_dib(png_bytes: &[u8]) -> Result<Vec<u8>, ClipboardError> {
     Ok(bmp_file[14..].to_vec())
 }
 
+/// Allocate a fresh `HGLOBAL`, copy `bytes` into it, and hand it
+/// to the clipboard under `format`. Used by [`WinClipboard::set_dib_image`]
+/// to publish the same DIB under both `CF_DIBV5` (modern readers)
+/// and `CF_DIB` (legacy readers — most notably the WeChat desktop
+/// client, which silently ignores `CF_DIBV5`-only clipboards).
+///
+/// **Why a separate `HGLOBAL` per format**: `SetClipboardData`
+/// transfers ownership of the handle to the OS; once the clipboard
+/// is closed, the OS is free to free the handle. Passing the same
+/// handle to a second `SetClipboardData` would either fail
+/// outright (the handle has been invalidated) or, worse, succeed
+/// and then point at freed memory on the next read. Two
+/// independent allocations avoid that entirely.
+///
+/// **Allocation discipline** mirrors the pre-existing
+/// `set_dib_image` inline path — `GlobalAlloc(GMEM_MOVEABLE)` +
+/// `GlobalLock` + `copy_nonoverlapping` + `GlobalUnlock` +
+/// `SetClipboardData`. The clipboard is assumed to already be
+/// open and emptied by the caller; this helper does **not**
+/// open / close the clipboard itself, so the caller can compose
+/// several `alloc_dib_handle_and_set` calls under a single
+/// `OpenClipboard` + `EmptyClipboard` + `CloseClipboard`
+/// sequence.
+///
+/// **Caller is responsible for `CloseClipboard` on error**: if
+/// `GlobalAlloc` or `GlobalLock` fails, this helper returns
+/// `Err` with the clipboard still open — the caller must call
+/// `CloseClipboard` to release the lock before propagating the
+/// error. On `Ok`, the caller still owns the close because we
+/// never close it ourselves.
+fn alloc_dib_handle_and_set(bytes: &[u8], format: u32) -> Result<(), ClipboardError> {
+    let byte_len = bytes.len();
+    // SAFETY: `GlobalAlloc` allocates movable memory (the
+    // clipboard prefers moveable handles — the OS may
+    // relocate them to compact the heap). Returns NULL on
+    // failure; we surface `Io` with `GetLastError` for
+    // diagnosability.
+    let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) } as HGLOBAL;
+    if handle.is_null() {
+        let err = unsafe { GetLastError() };
+        return Err(ClipboardError::Io(format!(
+            "GlobalAlloc({byte_len} bytes, alloc_dib_handle_and_set format={format}) \
+             failed: GetLastError={err}"
+        )));
+    }
+    // SAFETY: `handle` is a valid `HGLOBAL` (just allocated).
+    // `GlobalLock` returns NULL on failure. Copy the DIB
+    // payload verbatim into the locked region.
+    let write_ok = unsafe {
+        let dst = GlobalLock(handle) as *mut u8;
+        if dst.is_null() {
+            let err = GetLastError();
+            log::error!(
+                "windows clipboard GlobalLock failed for alloc_dib_handle_and_set \
+                 format={format}: GetLastError={err}"
+            );
+            // Free the HGLOBAL we allocated above — GlobalLock
+            // failure must not leak the multi-MB DIB handle (M2b
+            // validator P1.2). OS cleanup at process exit is too
+            // late for a daemon loop.
+            let _ = GlobalFree(handle);
+            return Err(ClipboardError::Io(format!(
+                "GlobalLock (alloc_dib_handle_and_set format={format}) failed: \
+                 GetLastError={err}"
+            )));
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, byte_len);
+        GlobalUnlock(handle);
+        true
+    };
+    if !write_ok {
+        return Err(ClipboardError::Io(format!(
+            "GlobalLock (alloc_dib_handle_and_set format={format}) returned NULL"
+        )));
+    }
+    // SAFETY: ownership of `handle` transfers to the OS on the
+    // successful `SetClipboardData` return. We ignore the return
+    // value (NULL on failure) — see `set_text` for the
+    // leak-on-failure rationale (a ~32-byte header leak on the
+    // rare failure path is harmless).
+    let _ = unsafe { SetClipboardData(format, handle as _) };
+    Ok(())
+}
+
 // ============================================================================
 //  Tests
 // ============================================================================
@@ -717,6 +797,17 @@ mod tests {
     #[test]
     fn cf_unicodetext_constant_is_stable() {
         assert_eq!(CF_UNICODETEXT, 13);
+    }
+
+    /// **`CF_DIB = 8` is a stable Win32 constant**, also pinned so a
+    /// future windows-sys bump that re-exports the constant does not
+    /// accidentally change our value. The legacy `BITMAPINFO`-based
+    /// DIB format is what we publish alongside `CF_DIBV5` so the
+    /// WeChat desktop client (which reads only `CF_DIB` and
+    /// silently drops `CF_DIBV5`-only clipboards) sees the image.
+    #[test]
+    fn cf_dib_constant_is_stable() {
+        assert_eq!(CF_DIB_U32, 8);
     }
 
     /// `err_to_string` produces a deterministic, parseable format
