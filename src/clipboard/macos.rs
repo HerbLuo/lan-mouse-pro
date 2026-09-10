@@ -134,9 +134,57 @@ const NS_BITMAP_IMAGE_FILE_TYPE_PNG: NSBitmapImageFileType = NSBitmapImageFileTy
 /// future log statements can correlate "I just wrote X" with "X was
 /// already there before I wrote it" without a second subprocess
 /// call.
+///
+/// The `image_cache` field stores the last-normalised image bytes
+/// alongside the `NSPasteboard.changeCount()` value they were
+/// observed at. The dispatcher polls `current_image()` every 500 ms;
+/// without this cache the macOS backend would re-read the pasteboard
+/// (cheap) **and re-run the TIFF/JPEG → PNG normalisation** (expensive
+/// — a 4 MB TIFF decode + PNG re-encode is ~50-200 ms of pure CPU,
+/// and a noisy `clipboard: TIFF→PNG normalized` log line on every
+/// tick) even when the pasteboard hasn't changed. `changeCount` is
+/// the standard `NSPasteboard` monotonic counter that increments on
+/// every pasteboard write by any process (verified across macOS 12
+/// → 14); a stable `changeCount` across two ticks guarantees the
+/// pasteboard contents are byte-identical, so the cached normalised
+/// bytes are still authoritative.
 #[derive(Debug)]
 pub struct MacOsPasteboard {
     cached: Option<String>,
+    image_cache: Option<ImageCacheEntry>,
+}
+
+/// **Single-entry image cache** used by
+/// [`MacOsPasteboard::current_image`] to short-circuit the
+/// TIFF/JPEG → PNG normalisation on quiescent dispatcher ticks.
+///
+/// The cache holds **one** entry (not an LRU) because the daemon's
+/// clipboard loop is single-stream: the dispatcher observes one
+/// pasteboard state at a time, so a second cache slot would never
+/// be reached before being overwritten by the next state change.
+/// A single-entry cache also keeps the struct trivial to reason
+/// about — no eviction policy, no capacity tuning, no `Mutex` (the
+/// dispatcher owns the only `&mut self` reference).
+#[derive(Debug, Clone)]
+struct ImageCacheEntry {
+    /// `NSPasteboard.changeCount()` at the moment the cached bytes
+    /// were produced. `current_image` short-circuits when the
+    /// pasteboard's current `changeCount` matches this value,
+    /// which means "no other process has written to the pasteboard
+    /// since we last read it" — the cached bytes are byte-identical
+    /// to what a fresh read would return.
+    ///
+    /// Stored as `isize` (not `usize`) because that is what
+    /// `NSPasteboard.changeCount()` returns in `objc2-app-kit`;
+    /// a signed counter is harmless for our equality check (a
+    /// negative value is a system bug, not a real state).
+    change_count: isize,
+    /// The normalised `ImageBytes` (PNG-mime) — what
+    /// `current_image` returned last tick. The dispatcher compares
+    /// the bytes' SHA to its own `last_outbound_image_sha` /
+    /// image LRU, which is where the "no re-dispatch" decision
+    /// ultimately lives.
+    bytes: ImageBytes,
 }
 
 impl MacOsPasteboard {
@@ -171,7 +219,10 @@ impl MacOsPasteboard {
         // AppKit is missing the macOS build itself would not have
         // produced a binary, so the linker guarantees presence.
         let _ = NSPasteboard::generalPasteboard();
-        Ok(Self { cached: None })
+        Ok(Self {
+            cached: None,
+            image_cache: None,
+        })
     }
 }
 
@@ -260,16 +311,56 @@ impl ClipboardBackend for MacOsPasteboard {
     /// originating as TIFF on macOS round-trips lossily as PNG —
     /// that is the explicit PLAN §3 评审 #2 3rd decision).
     ///
-    /// **No changeCount optimisation here**: this method always
-    /// reads. The dispatcher (M2a STEP-2a.3) compares the freshly-read
-    /// bytes' fingerprint to the last-broadcast fingerprint to decide
-    /// whether to push — same pattern as the text path. Optimising the
-    /// quiescent-tick skip via `NSPasteboard.changeCount()` would
-    /// change the trait's "Some(bytes) means there is an image, None
-    /// means there is not" semantics, so it stays out of this method.
+    /// **changeCount short-circuit** (M2b follow-up, 2026-09-10):
+    /// the dispatcher polls this every 500 ms; without the cache
+    /// the backend re-reads the pasteboard (cheap) **and re-runs
+    /// the TIFF / JPEG → PNG normalisation** (expensive) on every
+    /// tick, even when the pasteboard hasn't changed — producing a
+    /// noisy `clipboard: TIFF→PNG normalized` / `JPEG→PNG
+    /// normalized` log line ~2× per second during normal use.
+    ///
+    /// `NSPasteboard.changeCount()` is the standard monotonic
+    /// counter that increments on every pasteboard write by any
+    /// process; a stable value across two ticks guarantees the
+    /// pasteboard contents are byte-identical (the OS doesn't
+    /// reuse the counter without a write). We compare against the
+    /// cached `change_count` and return the cached normalised
+    /// `ImageBytes` verbatim on a hit.
+    ///
+    /// **Trait semantics preserved**: `Some(bytes)` still means
+    /// "there is an image on the clipboard" — `changeCount` only
+    /// gates *which* `Some(bytes)` we return (cached vs freshly
+    /// normalised), not *whether* we return one. The dispatcher's
+    /// SHA comparison against `last_outbound_image_sha` / the
+    /// image LRU is unaffected.
+    ///
+    /// **When the cache misses** (first call, `changeCount`
+    /// changed, or the cached entry was invalidated by a local
+    /// `set_image` / `set_dib_image` write that bumped
+    /// `changeCount` to a new value): we re-read the pasteboard
+    /// and re-normalise, then store the result keyed by the new
+    /// `changeCount` so the next quiescent tick hits.
     fn current_image(&mut self) -> Option<ImageBytes> {
         let pb = NSPasteboard::generalPasteboard();
-        read_image_bytes_from_pasteboard(&pb)
+        let change_count = pb.changeCount();
+        if let Some(cached) = &self.image_cache {
+            if cached.change_count == change_count {
+                return Some(cached.bytes.clone());
+            }
+        }
+        let fresh = read_image_bytes_from_pasteboard(&pb);
+        // Only cache a hit — caching a `None` ("no image on
+        // pasteboard") would mask the case where the user just
+        // copied an image but `changeCount` hasn't ticked yet
+        // (shouldn't happen, but the cost of re-reading is tiny
+        // and the bug-class is annoying).
+        if let Some(bytes) = fresh.as_ref() {
+            self.image_cache = Some(ImageCacheEntry {
+                change_count,
+                bytes: bytes.clone(),
+            });
+        }
+        fresh
     }
 
     /// Write `bytes` to the clipboard as PNG.
@@ -312,6 +403,13 @@ impl ClipboardBackend for MacOsPasteboard {
         // thread once AppKit is initialised (which `new()` did).
         let nsdata = NSData::with_bytes(bytes);
         let ok = pb.setData_forType(Some(&nsdata), &png_type);
+        // **Invalidate the image cache** (M2b follow-up, 2026-09-10):
+        // we just bumped `NSPasteboard.changeCount()`, so any cached
+        // entry from before this write is now stale. Dropping the
+        // cache here forces the next `current_image()` call to
+        // re-read + re-normalise from the new pasteboard state; the
+        // subsequent quiescent tick will then re-populate it.
+        self.image_cache = None;
         if ok {
             Ok(())
         } else {
@@ -389,6 +487,11 @@ impl ClipboardBackend for MacOsPasteboard {
         let _ = pb.clearContents();
         let nsdata = NSData::with_bytes(&png_bytes);
         let ok = pb.setData_forType(Some(&nsdata), &png_type);
+        // **Invalidate the image cache** — same rationale as
+        // [`Self::set_image`]. `clearContents()` + `setData_forType`
+        // bumped `NSPasteboard.changeCount()`, so the cached entry
+        // (if any) is now stale.
+        self.image_cache = None;
         if ok {
             Ok(())
         } else {
@@ -1516,6 +1619,220 @@ mod tests {
             read_back, jpeg_bytes,
             "macOS backend writes bytes verbatim under .png regardless of `mime`"
         );
+    }
+
+    // === changeCount cache (M2b follow-up, 2026-09-10) ===
+
+    /// **`current_image` populates the changeCount cache on the
+    /// first read** so the second quiescent-tick read can return
+    /// the cached normalised bytes without re-running
+    /// `image::load_from_memory` + `image::write_to(Png)` (the
+    /// expensive TIFF/JPEG → PNG normalisation step that was
+    /// spamming the log ~2× per second before this fix).
+    #[test]
+    fn current_image_populates_change_count_cache() {
+        let _lock = lock_for_test();
+        let mut backend = MacOsPasteboard::new().expect("new");
+        let _guard = ImageClipboardGuard::new();
+
+        // Pre-condition: cache starts empty.
+        assert!(
+            backend.image_cache.is_none(),
+            "fresh backend must have an empty image_cache"
+        );
+
+        // Write a JPEG and read once — the JPEG fallback will fire
+        // (no PNG on the pasteboard), `jpeg_to_png_normalized`
+        // will run, and the result lands in the cache.
+        write_pasteboard_bytes(NS_PASTEBOARD_TYPE_JPEG, &test_jpeg_bytes());
+        let first_read = backend
+            .current_image()
+            .expect("current_image returns Some for JPEG-only pasteboard");
+        assert_eq!(first_read.mime, "image/png", "JPEG must normalise to image/png");
+
+        // Post-condition: the cache is now populated for the
+        // current `changeCount()`.
+        let pb = NSPasteboard::generalPasteboard();
+        let cc_after_first = pb.changeCount();
+        assert!(
+            backend.image_cache.is_some(),
+            "image_cache must be populated after the first read"
+        );
+        let cached_entry = backend
+            .image_cache
+            .as_ref()
+            .expect("just checked is_some; cache must hold an entry");
+        assert_eq!(
+            cached_entry.change_count, cc_after_first,
+            "cache entry's change_count must match the live NSPasteboard.changeCount()"
+        );
+        assert_eq!(
+            cached_entry.bytes.data, first_read.data,
+            "cache entry's bytes must match what the first call returned"
+        );
+    }
+
+    /// **`current_image` short-circuits on a stable `changeCount`**
+    /// — the second back-to-back call returns the cached bytes
+    /// without re-running the JPEG / TIFF normalisation. We verify
+    /// this by mutating the cached entry's bytes in place: if the
+    /// short-circuit fires, the second call returns the mutated
+    /// bytes; if the short-circuit is broken, the second call
+    /// re-normalises and returns fresh bytes (which would equal
+    /// `first.data`, not the mutated value).
+    #[test]
+    fn current_image_short_circuits_on_stable_change_count() {
+        let _lock = lock_for_test();
+        let mut backend = MacOsPasteboard::new().expect("new");
+        let _guard = ImageClipboardGuard::new();
+
+        write_pasteboard_bytes(NS_PASTEBOARD_TYPE_JPEG, &test_jpeg_bytes());
+        let first = backend
+            .current_image()
+            .expect("current_image returns Some for JPEG-only pasteboard");
+        // First call populates the cache; mutate it to a sentinel.
+        let cached = backend
+            .image_cache
+            .as_mut()
+            .expect("cache must be populated after the first read");
+        cached.bytes = ImageBytes {
+            mime: "image/png".into(),
+            data: b"SENTINEL-CACHE-HIT".to_vec(),
+        };
+
+        let second = backend
+            .current_image()
+            .expect("current_image must still return Some on a cache hit");
+
+        assert_eq!(
+            second.data, b"SENTINEL-CACHE-HIT",
+            "second current_image on a stable changeCount must return the cached bytes; \
+             a re-normalised JPEG would not equal this sentinel (cache short-circuit regressed)"
+        );
+        // Also: the cache entry must be untouched (same sentinel).
+        let cached_after = backend
+            .image_cache
+            .as_ref()
+            .expect("cache must still be populated after the second read");
+        assert_eq!(cached_after.bytes.data, b"SENTINEL-CACHE-HIT");
+    }
+
+    /// **`set_image` invalidates the cache** — the local write
+    /// bumps `NSPasteboard.changeCount()`, so any cached entry
+    /// from before the write is now stale. Without this
+    /// invalidation the next `current_image` call would return the
+    /// pre-write bytes instead of the freshly-written ones.
+    #[test]
+    fn set_image_invalidates_change_count_cache() {
+        let _lock = lock_for_test();
+        let mut backend = MacOsPasteboard::new().expect("new");
+        let _guard = ImageClipboardGuard::new();
+
+        // Seed the cache with a JPEG read.
+        write_pasteboard_bytes(NS_PASTEBOARD_TYPE_JPEG, &test_jpeg_bytes());
+        let _ = backend
+            .current_image()
+            .expect("current_image returns Some for JPEG-only pasteboard");
+        assert!(
+            backend.image_cache.is_some(),
+            "cache must be populated before set_image"
+        );
+
+        // Local write — bumps changeCount.
+        let new_png = test_png_bytes();
+        backend
+            .set_image(&new_png, Mime::Png)
+            .expect("set_image must succeed");
+
+        assert!(
+            backend.image_cache.is_none(),
+            "set_image must drop the image_cache so the next current_image re-reads"
+        );
+
+        // And the next current_image must return the freshly-written
+        // PNG bytes (passthrough, not a JPEG→PNG re-encode).
+        let after_write = backend
+            .current_image()
+            .expect("current_image returns Some after set_image(PNG)");
+        assert_eq!(
+            after_write.data, new_png,
+            "current_image must reflect the freshly-written PNG (cache was invalidated)"
+        );
+        assert_eq!(
+            after_write.mime, "image/png",
+            "PNG passthrough must keep image/png mime"
+        );
+    }
+
+    /// **`set_dib_image` invalidates the cache** — same rationale
+    /// as the `set_image` test above. The receive path
+    /// (`apply_inbound_clipboard_image` on Windows ↔
+    /// `set_dib_image` here on macOS) writes a fresh PNG, so the
+    /// cache from any previous outbound dispatch must be dropped.
+    #[test]
+    fn set_dib_image_invalidates_change_count_cache() {
+        let _lock = lock_for_test();
+        let mut backend = MacOsPasteboard::new().expect("new");
+        let _guard = ImageClipboardGuard::new();
+
+        write_pasteboard_bytes(NS_PASTEBOARD_TYPE_JPEG, &test_jpeg_bytes());
+        let _ = backend.current_image().expect("first read populates cache");
+        assert!(
+            backend.image_cache.is_some(),
+            "cache must be populated before set_dib_image"
+        );
+
+        // Build a minimal valid DIB (BITMAPINFOHEADER for a 4×2
+        // 24-bit BMP). The set_dib_image path runs the same DIB→
+        // PNG conversion + `setData_forType` as a real inbound
+        // image, so the cache invalidation we test here is the
+        // same one the wire path triggers.
+        let dib = build_minimal_dib_for_tests();
+        backend
+            .set_dib_image(&dib)
+            .expect("set_dib_image must succeed on a minimal DIB");
+
+        assert!(
+            backend.image_cache.is_none(),
+            "set_dib_image must drop the image_cache (changeCount bumped)"
+        );
+    }
+
+    /// Build a tiny but valid 24-bit DIB payload (4×2 RGB) for
+    /// the `set_dib_image` cache-invalidation tests. Mirrors what
+    /// `prepend_bmp_file_header` produces minus the 14-byte file
+    /// header — i.e. a bare `BITMAPINFOHEADER` + pixel rows.
+    fn build_minimal_dib_for_tests() -> Vec<u8> {
+        // BITMAPINFOHEADER = 40 bytes (little-endian on Windows).
+        let mut dib = Vec::with_capacity(40 + 4 * 2 * 3);
+        // biSize
+        dib.extend_from_slice(&40u32.to_le_bytes());
+        // biWidth
+        dib.extend_from_slice(&4i32.to_le_bytes());
+        // biHeight
+        dib.extend_from_slice(&2i32.to_le_bytes());
+        // biPlanes
+        dib.extend_from_slice(&1u16.to_le_bytes());
+        // biBitCount (24 = RGB)
+        dib.extend_from_slice(&24u16.to_le_bytes());
+        // biCompression (0 = BI_RGB)
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        // biSizeImage
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        // biXPelsPerMeter
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        // biYPelsPerMeter
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        // biClrUsed
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        // biClrImportant
+        dib.extend_from_slice(&0u32.to_le_bytes());
+        // Pixel data: 4×2 rows of BGR triplets (rows already
+        // 4-byte aligned: 4 × 3 = 12 bytes per row, no padding).
+        for _ in 0..(4 * 2) {
+            dib.extend_from_slice(&[0x80, 0x80, 0x80]);
+        }
+        dib
     }
 
     // === M2b STEP-2b.1 — DIB spike + set_dib_image fallback ===

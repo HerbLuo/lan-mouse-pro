@@ -568,9 +568,15 @@ impl PeerSession {
             // wire is symmetric so the server-side reader accepts
             // any bidi we open; we only write to this one.
             drop(recv);
+            // **Stream priority — PRIORITY_META**: see `PRIORITY_*`
+            // constants for the rationale. Clipboard metadata frames
+            // are tiny (≤ a few hundred bytes) but the receiver
+            // needs them promptly to issue the HTTP/3 GET for the
+            // body — bulk HTTP/3 response data must not starve them.
+            set_stream_priority(&send, PRIORITY_META);
             *g = Some(send);
             log::debug!(
-                "send_stream_c: created and cached stream C (subsequent frames reuse the same one)"
+                "send_stream_c: created and cached stream C (priority={PRIORITY_META}, subsequent frames reuse the same one)"
             );
         }
 
@@ -623,9 +629,15 @@ impl PeerSession {
             // Drop the recv half — stream B is one-way (we write, peer reads);
             // the reverse read capability is not needed.
             drop(recv);
+            // **Stream priority — PRIORITY_INPUT**: see `PRIORITY_*`
+            // constants for the rationale. Set BEFORE the first write so
+            // Quinn's scheduler honors it (per quinn 0.11 docs, "changing
+            // the priority of a stream with pending data may only take
+            // effect after that data has been transmitted").
+            set_stream_priority(&send, PRIORITY_INPUT);
             *g = Some(send);
             log::debug!(
-                "send_stream_b: created and cached stream B (subsequent frames reuse the same one)"
+                "send_stream_b: created and cached stream B (priority={PRIORITY_INPUT}, subsequent frames reuse the same one)"
             );
         }
 
@@ -1256,6 +1268,79 @@ impl PeerSession {
 /// to prevent any caller from bypassing the cap with a "stale larger value".
 const MAX_SAFE_DATAGRAM: usize = 1162;
 
+// === Stream priority levels ============================================
+//
+// Quinn's `SendStream::set_priority(i32)` lets streams on the same QUIC
+// connection be ranked for sending order. Higher = sent first. Default is
+// 0. Critical for isolating bulk clipboard image transfers (multi-MB HTTP/3
+// responses) from low-latency control frames (Ping / Pong / Ack / Enter /
+// Leave).
+//
+// **Why this matters (screenshot bug, 2026-09-10)**: when the user takes a
+// ~3.3 MB screenshot on the master, the master serves the image body via
+// HTTP/3 over the same QUIC connection as Stream A (control plane). Without
+// priorities, small control frames on Stream A compete at the same priority
+// level as the bulk HTTP/3 bytes — under sustained load (cwnd full, kernel
+// UDP send buffer saturated) the Ping→Pong round-trip can exceed the
+// 1.5 s Pong watchdog threshold, force-closing the connection and forcing
+// the user to wait for reconnect before the mouse can cross over to the
+// controlled side again. Setting Stream A to the highest priority ensures
+// control frames are scheduled first, regardless of concurrent bulk
+// traffic.
+//
+// **Levels**:
+// - `PRIORITY_CONTROL` (+100) — Stream A (Ping / Pong / Ack / Enter / Leave /
+//   Hello). The heartbeat / capture-release protocol relies on this stream
+//   being responsive; even a few hundred ms of head-of-line delay triggers
+//   the Pong watchdog.
+// - `PRIORITY_INPUT` (+50) — Stream B (mouse buttons / keyboard keys /
+//   modifiers). High-frequency and latency-sensitive, but missing one frame
+//   is far less catastrophic than missing a Pong (the user just sees a
+//   skipped click / keystroke; no disconnect).
+// - `PRIORITY_META` (+50) — Stream C (clipboard metadata: ClipboardText /
+//   ClipboardImage / etc.). Tiny frames (≤ a few hundred bytes even for
+//   large file offers) but the receiver needs them promptly to issue the
+//   HTTP/3 GET for the body — so don't let bulk HTTP/3 response data
+//   starve them.
+// - `PRIORITY_BULK` (-100) — HTTP/3 image body response (large clipboard
+//   payloads served from `clipboard_cache`). Lower than default so that
+//   control / input / metadata streams get scheduled first whenever
+//   there's a backlog. Small HTTP/3 text responses share this level
+//   (negligible impact — they're small enough to drain in one packet).
+//
+// **Quinn caveat**: per the quinn 0.11 docs, "Changing the priority of a
+// stream with pending data may only take effect after that data has been
+// transmitted." We always set priority BEFORE the first write on a
+// stream, so this caveat doesn't apply in practice.
+pub(crate) const PRIORITY_CONTROL: i32 = 100;
+pub(crate) const PRIORITY_INPUT: i32 = 50;
+pub(crate) const PRIORITY_META: i32 = 50;
+pub(crate) const PRIORITY_BULK: i32 = -100;
+
+/// Best-effort wrapper around `quinn::SendStream::set_priority`.
+///
+/// `set_priority` returns `Result<(), ClosedStream>` — a stream that has
+/// already been closed cannot have its priority changed. We swallow the
+/// error and log at debug because:
+/// 1. The call has no observable side effect on already-closed streams —
+///    their data is gone, and we never intend to write more to them.
+/// 2. The caller (e.g. `send_stream_b`, `send_stream_c`, the `accept_bi`
+///    HTTP/3 branches) has no useful fallback when `set_priority` fails —
+///    the stream's data will just go out at Quinn's default priority.
+///
+/// Used by both [`PeerSession`] methods (which set priorities on cached
+/// streams during handshake / lazy-open) and by the `accept_bi` HTTP/3
+/// branches in `connect.rs` / `listen.rs` (which set priorities on the
+/// response stream before `handle_http3_stream` writes the bulk body).
+pub(crate) fn set_stream_priority(send: &quinn::SendStream, priority: i32) {
+    if let Err(e) = send.set_priority(priority) {
+        log::debug!(
+            "set_stream_priority: set_priority({priority}) on stream returned {e} \
+             (stream already closed; falling back to default priority 0)"
+        );
+    }
+}
+
 // Silence the unused-import warning on `Ordering`. `client_hello` /
 // `server_hello` (defined in `super::protocol`) use
 // `self.hello_ok.store(..., Ordering::Release)`, but this file does not
@@ -1877,5 +1962,384 @@ mod tests {
     #[allow(dead_code)]
     fn _unused() {
         let _ = key_event();
+    }
+
+    /// Regression test for the 2026-09-10 screenshot bug: a multi-MB
+    /// clipboard image transferred over HTTP/3 on the same QUIC
+    /// connection as Stream A (control plane) used to starve the
+    /// Ping/Pong round-trip past the 1.5 s Pong watchdog threshold,
+    /// force-closing the connection and freezing the mouse for
+    /// several seconds while the user waited for reconnect.
+    ///
+    /// **Fix**: pin Stream A (control) to `PRIORITY_CONTROL` (highest),
+    /// and pin the HTTP/3 response stream to `PRIORITY_BULK` (lowest).
+    /// Quinn's per-stream priority scheduler then puts Pong / Ack /
+    /// Enter / Leave frames ahead of any bulk HTTP/3 body bytes,
+    /// regardless of how saturated the connection's cwnd or kernel
+    /// UDP send buffer is.
+    ///
+    /// **What this test pins**: after `client_hello` / `server_hello`
+    /// completes, `cached_send_a` must report
+    /// `priority() == PRIORITY_CONTROL` on **both** sides — otherwise
+    /// the Pong the controlled side sends back to the master can be
+    /// queued behind whatever bulk transfer the master is writing,
+    /// re-introducing the bug.
+    ///
+    /// **Why we test the cached stream directly**: querying
+    /// `priority()` is the only observable side effect of
+    /// `set_stream_priority` that's both deterministic (not timing-
+    /// dependent) and unambiguous. An integration test that simulates
+    /// a concurrent bulk transfer + Ping/Pong round-trip would be
+    /// flaky on slow CI runners and would also need to mock the
+    /// cwnd-saturation conditions that are the actual cause of the
+    /// bug (impractical without a network simulator).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_priority_pinned_after_hello() {
+        use std::sync::Arc;
+        local_set_test!(stream_priority_pinned_after_hello, {
+            use crate::quic_transport::endpoint::install_crypto_provider;
+            install_crypto_provider();
+
+            let (server_cert, server_key) = ephemeral_cert();
+            let server_ep = endpoint_with_test_cert(
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+                server_cert,
+                server_key,
+            )
+            .expect("server endpoint bind");
+            let server_addr = server_ep.local_addr().expect("server addr");
+
+            // Server side: spawn a task that accepts + runs
+            // server_hello, then parks. We'll fetch the populated
+            // `cached_send_a` via a shared `Arc<PeerSession>` passed
+            // through a oneshot channel.
+            let (server_session_tx, server_session_rx) =
+                tokio::sync::oneshot::channel::<PeerSession>();
+            let server_task = tokio::task::spawn_local(async move {
+                let conn = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    accept(&server_ep),
+                )
+                .await
+                .expect("server accept timeout")
+                .expect("server accept");
+                let session = PeerSession::from_connection(conn);
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    server_hello(&session),
+                )
+                .await
+                .expect("server hello timeout")
+                .expect("server hello");
+                // Hand ownership to the test thread so it can
+                // inspect `cached_send_a.priority()`.
+                let _ = server_session_tx.send(session);
+                // Park until the test thread drops the QUIC
+                // connection; on drop the conn closes and this
+                // task wakes from `accept`'s perspective only on
+                // close, so we just sleep briefly to let the test
+                // thread finish inspecting before tearing down.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            });
+
+            let pins_dir = ephemeral_pins_dir();
+            let _ = std::fs::remove_dir_all(&pins_dir);
+            let (client_cert, client_key) = ephemeral_cert();
+            let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+                .expect("client endpoint bind");
+            let conn = dial(
+                &client_ep,
+                server_addr,
+                client_cert[0].clone(),
+                client_key,
+                &pins_dir,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("dial");
+            let client_arc = Arc::new(PeerSession::from_connection(conn));
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client_hello(&client_arc),
+            )
+            .await
+            .expect("client hello timeout")
+            .expect("client hello should succeed");
+
+            // === Assertion 1: client-side cached_send_a priority ===
+            // The client side ran `client_hello`, populating
+            // `cached_send_a`. Its `priority()` must report
+            // `PRIORITY_CONTROL` so that Ping / Enter frames sent
+            // from the master to the controlled side are scheduled
+            // ahead of any concurrent bulk HTTP/3 body transfer.
+            //
+            // **Why the priority read is inside the guard scope**:
+            // `SendStream` is not `Clone`, so we can't take it out
+            // of the mutex and then drop the guard. We hold the
+            // guard open just long enough to read `priority()`,
+            // then drop it.
+            let client_priority = {
+                let guard = client_arc.cached_send_a.lock().await;
+                let send_a = guard
+                    .as_ref()
+                    .expect("client cached_send_a should be populated after client_hello");
+                send_a.priority().expect("client stream A not closed")
+            };
+            assert_eq!(
+                client_priority, PRIORITY_CONTROL,
+                "client-side cached_send_a must be pinned to PRIORITY_CONTROL (+100) after client_hello; \
+                 got {client_priority}. Without this, a multi-MB HTTP/3 image response can starve \
+                 the Ping the master sends, triggering the 1.5s Pong watchdog (2026-09-10 screenshot bug)."
+            );
+
+            // === Assertion 2: server-side cached_send_a priority ===
+            // The server side ran `server_hello`, populating
+            // `cached_send_a`. Its `priority()` must also be
+            // `PRIORITY_CONTROL` so that the Pong / Ack / Leave
+            // frames sent back to the master are scheduled ahead
+            // of any concurrent bulk HTTP/3 body transfer the
+            // master is writing.
+            let server_session = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                server_session_rx,
+            )
+            .await
+            .expect("server session oneshot timed out")
+            .expect("server session send failed");
+            // `SendStream` is not `Clone`, so the priority read
+            // has to happen inside the guard's lifetime scope.
+            let server_priority = {
+                let guard = server_session.cached_send_a.lock().await;
+                let send_a = guard
+                    .as_ref()
+                    .expect("server cached_send_a should be populated after server_hello");
+                send_a.priority().expect("server stream A not closed")
+            };
+            assert_eq!(
+                server_priority, PRIORITY_CONTROL,
+                "server-side cached_send_a must be pinned to PRIORITY_CONTROL (+100) after server_hello; \
+                 got {server_priority}. Without this, the Pong the controlled side sends back \
+                 can be queued behind the master's HTTP/3 image response, triggering the 1.5s \
+                 Pong watchdog (2026-09-10 screenshot bug)."
+            );
+
+            // Cleanup: close the connections so the test exits cleanly.
+            client_arc
+                .connection()
+                .close(quinn::VarInt::from(0u32), b"test done");
+            server_session
+                .connection()
+                .close(quinn::VarInt::from(0u32), b"test done");
+            drop(client_ep);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
+            let _ = std::fs::remove_dir_all(&pins_dir);
+        });
+    }
+
+    /// Regression test for `send_stream_b` priority pinning. After
+    /// the first call to `send_stream_b` (which lazily opens a bidi),
+    /// the cached `cached_send_b` must report `priority() ==
+    /// PRIORITY_INPUT`. Without this, high-frequency mouse-button /
+    /// keyboard events on Stream B can be queued behind concurrent
+    /// bulk HTTP/3 image responses (smaller surface than the Stream A
+    /// Pong bug, but the same root cause — see the 2026-09-10
+    /// screenshot bug).
+    ///
+    /// **Why a multi-thread runtime**: `send_stream_b` uses
+    /// `tokio::io::AsyncWriteExt::write_all` on a quinn SendStream;
+    /// quinn's runtime requires a multi-thread LocalSet to drive the
+    /// connection's background tasks during the test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_b_priority_pinned_after_lazy_open() {
+        use crate::quic_transport::endpoint::install_crypto_provider;
+        use std::sync::Arc;
+        local_set_test!(stream_b_priority_pinned_after_lazy_open, {
+            install_crypto_provider();
+
+            let (server_cert, server_key) = ephemeral_cert();
+            let (server_ep, server_addr) = motion_test_server(server_cert, server_key);
+
+            let server_task = tokio::task::spawn_local(async move {
+                let conn = tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
+                    .await
+                    .expect("server accept timeout")
+                    .expect("server accept");
+                let session = Arc::new(PeerSession::from_connection(conn));
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    server_hello(&session),
+                )
+                .await
+                .expect("server hello timeout")
+                .expect("server hello");
+                // Keep the session alive while the client exercises
+                // `send_stream_b`. The client closes the conn from its
+                // side, which surfaces as a closed `accept_bi` loop on
+                // the server. Wait a bit then return.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            });
+
+            let pins_dir = ephemeral_pins_dir();
+            let _ = std::fs::remove_dir_all(&pins_dir);
+            let (client_cert, client_key) = ephemeral_cert();
+            let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+                .expect("client endpoint bind");
+            let conn = dial(
+                &client_ep,
+                server_addr,
+                client_cert[0].clone(),
+                client_key,
+                &pins_dir,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("dial");
+            let client_arc = Arc::new(PeerSession::from_connection(conn));
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client_hello(&client_arc),
+            )
+            .await
+            .expect("client hello timeout")
+            .expect("client hello should succeed");
+
+            // Lazy-open Stream B with one frame. The internal
+            // `open_bi()` populates `cached_send_b` and the fix
+            // sets priority on that cached stream.
+            //
+            // **Why a Keyboard::Key event (not Button)**: the
+            // default `InputChannelConfig { keyboard: Stream,
+            // mouse_button: Datagram }` routes Keyboard::Key to
+            // StreamB (see `route_input` in `protocol.rs`); mouse
+            // Button goes to Datagram by default. Using Key is the
+            // deterministic way to exercise `send_stream_b` here.
+            let dummy_event = ProtoEvent::Input(input_event::Event::Keyboard(
+                input_event::KeyboardEvent::Key {
+                    time: 0,
+                    key: 30,
+                    state: 1,
+                },
+            ));
+            client_arc
+                .send_input(&dummy_event, &InputChannelConfig::default())
+                .await
+                .expect("send_input(Key) should succeed");
+
+            let client_priority = {
+                let guard = client_arc.cached_send_b.lock().await;
+                let send_b = guard
+                    .as_ref()
+                    .expect("cached_send_b should be populated after first send_stream_b");
+                send_b.priority().expect("client stream B not closed")
+            };
+            assert_eq!(
+                client_priority, PRIORITY_INPUT,
+                "cached_send_b must be pinned to PRIORITY_INPUT (+50) after the first lazy open; \
+                 got {client_priority}."
+            );
+
+            client_arc
+                .connection()
+                .close(quinn::VarInt::from(0u32), b"test done");
+            drop(client_ep);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
+            let _ = std::fs::remove_dir_all(&pins_dir);
+        });
+    }
+
+    /// Regression test for `send_stream_c` priority pinning. After
+    /// the first call to `send_stream_c` (which lazily opens a bidi
+    /// and writes the var-codec metadata frame), `cached_send_c`
+    /// must report `priority() == PRIORITY_META`. Without this,
+    /// clipboard metadata events on Stream C can be queued behind
+    /// concurrent bulk HTTP/3 image responses — the receiver would
+    /// then issue its `GET /clipboard/image/{sha}` late, and the
+    /// whole transfer takes longer than necessary.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_c_priority_pinned_after_lazy_open() {
+        use crate::quic_transport::endpoint::install_crypto_provider;
+        use lan_mouse_proto::{ClipboardText, ProtoEvent};
+        use std::sync::Arc;
+        local_set_test!(stream_c_priority_pinned_after_lazy_open, {
+            install_crypto_provider();
+
+            let (server_cert, server_key) = ephemeral_cert();
+            let (server_ep, server_addr) = motion_test_server(server_cert, server_key);
+
+            let server_task = tokio::task::spawn_local(async move {
+                let conn = tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
+                    .await
+                    .expect("server accept timeout")
+                    .expect("server accept");
+                let session = Arc::new(PeerSession::from_connection(conn));
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    server_hello(&session),
+                )
+                .await
+                .expect("server hello timeout")
+                .expect("server hello");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            });
+
+            let pins_dir = ephemeral_pins_dir();
+            let _ = std::fs::remove_dir_all(&pins_dir);
+            let (client_cert, client_key) = ephemeral_cert();
+            let client_ep = endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+                .expect("client endpoint bind");
+            let conn = dial(
+                &client_ep,
+                server_addr,
+                client_cert[0].clone(),
+                client_key,
+                &pins_dir,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("dial");
+            let client_arc = Arc::new(PeerSession::from_connection(conn));
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client_hello(&client_arc),
+            )
+            .await
+            .expect("client hello timeout")
+            .expect("client hello should succeed");
+
+            // Lazy-open Stream C with a ClipboardText event.
+            let event = ProtoEvent::ClipboardText(ClipboardText {
+                fingerprint: [0x11; 32],
+                sha256: [0x22; 32],
+                size: 0,
+                content_inline: None,
+            });
+            client_arc
+                .send_input(&event, &InputChannelConfig::default())
+                .await
+                .expect("send_input(ClipboardText) should succeed");
+
+            let client_priority = {
+                let guard = client_arc.cached_send_c.lock().await;
+                let send_c = guard
+                    .as_ref()
+                    .expect("cached_send_c should be populated after first send_stream_c");
+                send_c.priority().expect("client stream C not closed")
+            };
+            assert_eq!(
+                client_priority, PRIORITY_META,
+                "cached_send_c must be pinned to PRIORITY_META (+50) after the first lazy open; \
+                 got {client_priority}."
+            );
+
+            client_arc
+                .connection()
+                .close(quinn::VarInt::from(0u32), b"test done");
+            drop(client_ep);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), server_task).await;
+            let _ = std::fs::remove_dir_all(&pins_dir);
+        });
     }
 }

@@ -996,6 +996,19 @@ async fn server_accept_bi_task(
                 "server accept_bi: HTTP/3 request detected from {addr} (prefix={:02X?}), forwarding to router",
                 prefix
             );
+            // **Stream priority — PRIORITY_BULK**: see `PRIORITY_*`
+            // constants in `session.rs`. Symmetric with the
+            // client-side `client_accept_bi_task` change. The
+            // server side typically only serves small clipboard
+            // text bodies, but pinning every HTTP/3 response
+            // stream to LOW priority keeps the contract uniform
+            // and matches the principle that bulk transfer
+            // streams must never starve control-plane traffic
+            // (2026-09-10 screenshot bug).
+            crate::quic_transport::session::set_stream_priority(
+                &send,
+                crate::quic_transport::session::PRIORITY_BULK,
+            );
             // Chain the buffered prefix back in front of the live
             // stream. After this, `prefix` is moved into the
             // chain and the HTTP/3 handler reads from the chained

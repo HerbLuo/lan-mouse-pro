@@ -262,6 +262,17 @@ pub async fn client_hello(peer: &PeerSession) -> std::result::Result<(), Error> 
                 .take_stream_a_send()
                 .await
                 .expect("stream_a_cache just put Some(Pair { send: Some, recv: Some }) — take_stream_a_send must return Some");
+            // **Stream priority — PRIORITY_CONTROL**: see `PRIORITY_*`
+            // constants in `session.rs` for the rationale. Stream A
+            // carries Ping / Pong / Ack / Enter / Leave — every control
+            // frame the application layer relies on for liveness
+            // detection (Pong watchdog, 1.5 s threshold) and capture
+            // release. Without HIGH priority, a concurrent bulk HTTP/3
+            // image response (see the 2026-09-10 screenshot bug) can
+            // starve control frames past the watchdog threshold and
+            // force-close the connection. Set BEFORE storing so Quinn's
+            // scheduler sees the priority on the very first packet.
+            super::session::set_stream_priority(&send_a, super::session::PRIORITY_CONTROL);
             *peer.cached_send_a.lock().await = Some(send_a);
             peer.hello_ok.store(true, Ordering::Release);
             Ok(())
@@ -364,6 +375,13 @@ pub async fn server_hello(peer: &PeerSession) -> std::result::Result<(), Error> 
         .take_stream_a_send()
         .await
         .expect("stream_a_cache just put Some(Pair { send: Some, recv: Some }) — take_stream_a_send must return Some");
+    // **Stream priority — PRIORITY_CONTROL**: see the matching note in
+    // `client_hello` above. Stream A carries the same control-plane
+    // traffic in both directions (Ping → Pong, Enter → Ack); the
+    // server side must also pin its send half to PRIORITY_CONTROL so
+    // the Pong it sends back isn't queued behind any HTTP/3 image
+    // response the master might be writing concurrently.
+    super::session::set_stream_priority(&send_a, super::session::PRIORITY_CONTROL);
     *peer.cached_send_a.lock().await = Some(send_a);
 
     peer.hello_ok.store(true, Ordering::Release);

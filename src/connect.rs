@@ -1070,6 +1070,21 @@ async fn client_accept_bi_task(
                 "client accept_bi: HTTP/3 request detected (prefix={:02X?}), forwarding to router",
                 prefix
             );
+            // **Stream priority — PRIORITY_BULK**: see `PRIORITY_*`
+            // constants in `session.rs`. The response on this stream
+            // can be a multi-MB clipboard image body — pinning the
+            // stream's send half to LOW priority ensures that
+            // concurrent Stream A control frames (Ping / Pong / Ack)
+            // are scheduled ahead of these bulk bytes. Without this,
+            // a large screenshot can starve the Pong watchdog past
+            // its 1.5 s threshold and force-close the connection
+            // (2026-09-10 screenshot bug). Set BEFORE handing the
+            // stream to `handle_http3_stream` so the priority is in
+            // effect for the very first byte the handler writes.
+            crate::quic_transport::session::set_stream_priority(
+                &send,
+                crate::quic_transport::session::PRIORITY_BULK,
+            );
             // Chain the buffered prefix back in front of the live
             // stream. `chain` is zero-cost: it's a thin wrapper
             // that returns the prefix bytes first, then delegates
