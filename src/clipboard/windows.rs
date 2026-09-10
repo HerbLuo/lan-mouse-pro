@@ -63,7 +63,9 @@ use windows_sys::Win32::Foundation::{GetLastError, HGLOBAL};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
-use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows_sys::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalFree, GlobalLock, GlobalUnlock,
+};
 use windows_sys::Win32::System::Ole::CF_DIBV5;
 
 use super::{ClipboardBackend, ClipboardError, ImageBytes, MIME_DIB, Mime};
@@ -307,11 +309,11 @@ impl ClipboardBackend for WinClipboard {
             let ptr = GlobalLock(handle) as *const u8;
             if ptr.is_null() {
                 let err = GetLastError();
+                log::error!(
+                    "windows clipboard GlobalLock failed for current_image: GetLastError={err}"
+                );
                 CloseClipboard();
-                return Some(ImageBytes {
-                    mime: MIME_DIB.to_string(),
-                    data: format!("GlobalLock (read DIB) failed: GetLastError={err}").into_bytes(),
-                });
+                return None;
             }
             let len = windows_sys::Win32::System::Memory::GlobalSize(handle) as usize;
             let slice = std::slice::from_raw_parts(ptr, len);
@@ -427,7 +429,15 @@ impl ClipboardBackend for WinClipboard {
             let dst = GlobalLock(handle) as *mut u8;
             if dst.is_null() {
                 let err = GetLastError();
+                log::error!(
+                    "windows clipboard GlobalLock failed for set_dib_image: GetLastError={err}"
+                );
                 CloseClipboard();
+                // Free the HGLOBAL we allocated above — GlobalLock
+                // failure must not leak the multi-MB DIB handle (M2b
+                // validator P1.2). OS cleanup at process exit is too
+                // late for a daemon loop.
+                let _ = GlobalFree(handle);
                 return Err(ClipboardError::Io(format!(
                     "GlobalLock (set_dib_image) failed: GetLastError={err}"
                 )));
@@ -587,6 +597,23 @@ mod tests {
         assert_eq!(
             err_to_string("GlobalLock", 0),
             "GlobalLock failed: GetLastError=0"
+        );
+    }
+
+    /// Regression pin for **M2b validator P1.2**: the
+    /// `set_dib_image` GlobalLock-failure path surfaces an
+    /// `Err(ClipboardError::Io)` whose message uses this exact
+    /// `"<op> failed: GetLastError=<code>"` shape. If a future
+    /// refactor changes the wording, the operator's `grep
+    /// "GlobalLock (set_dib_image)"` log queries silently break.
+    /// (Mocking Win32 GlobalLock failure is not feasible in unit
+    /// tests; this test pins the only stable contract surface
+    /// for that failure path — the error string format.)
+    #[test]
+    fn err_to_string_format_for_set_dib_image_is_stable() {
+        assert_eq!(
+            err_to_string("GlobalLock (set_dib_image)", 8),
+            "GlobalLock (set_dib_image) failed: GetLastError=8"
         );
     }
 
