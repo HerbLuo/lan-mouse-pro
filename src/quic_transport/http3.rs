@@ -229,6 +229,12 @@ impl Router {
 /// `Router` needs to remain `Default + Clone` (the spike + tests use
 /// `Router::new()`). The "production router" is a concrete 5-route
 /// factory — it lives at the module boundary, not on the type.
+///
+/// **Why tests still use this `default_router()`**: the unit tests in
+/// `tests::*` exercise the 404 contract without needing a real cache
+/// (the cache wiring is covered by `default_router_with_cache` tests
+/// below). Tests that want to exercise the cache-backed happy path
+/// use [`Self::default_router_with_cache`].
 pub fn default_router() -> Arc<Router> {
     Arc::new(
         Router::new()
@@ -246,6 +252,144 @@ pub fn default_router() -> Arc<Router> {
                 Response::not_found()
             }),
     )
+}
+
+/// **M1b STEP-1b.2** — production router with the
+/// `/clipboard/text/{sha256}` route backed by a real
+/// [`crate::clipboard::cache::ClipboardCache`].
+///
+/// The handler:
+/// 1. Parses the 64-char hex sha256 suffix from the request path.
+/// 2. Looks it up in the cache (with lazy 5 min TTL eviction — see
+///    [`crate::clipboard::cache::ClipboardCache::lookup`]).
+/// 3. Returns 200 + raw bytes on hit, 404 on miss / malformed input.
+///
+/// **404 is normal**: per PLAN §1 评审 #3 2nd, a receiver that sees
+/// a 404 here logs warn "cache miss" and skips. This means "the
+/// source pushed newer content (active eviction) or the 5 min TTL
+/// expired" — both are non-fatal; the receiver's next copy is the
+/// natural retry. The handler must NOT panic / propagate the miss
+/// as an error.
+///
+/// **Why pass the cache by `Arc<Mutex<...>>`**: the same cache is
+/// shared between the dispatcher (writer) and every per-peer HTTP/3
+/// server (reader). Cloning the `Arc` is cheap; locking is short
+/// (one `HashMap::get` + optional `remove`).
+pub fn default_router_with_cache(
+    cache: Arc<std::sync::Mutex<crate::clipboard::cache::ClipboardCache>>,
+) -> Arc<Router> {
+    Arc::new(
+        Router::new()
+            .get("/healthz", |_req: &Request| Response::ok("ok"))
+            .get_prefix("/clipboard/text/", move |req: &Request| {
+                clipboard_text_route(req, &cache)
+            })
+            .get_prefix("/clipboard/image/", |req: &Request| {
+                log::trace!("http3 /clipboard/image/ stub: {}", req.path);
+                Response::not_found()
+            })
+            .get_prefix("/clipboard/file/", |req: &Request| {
+                log::trace!("http3 /clipboard/file/ stub: {}", req.path);
+                Response::not_found()
+            }),
+    )
+}
+
+/// **M1b STEP-1b.2** — `/clipboard/text/{sha256}` route handler.
+///
+/// **Why free-standing instead of inline**: tests construct a
+/// `Router` and inline-register the same handler logic so the
+/// router closure (which is `Arc<dyn Fn + Send + Sync>`) does not
+/// need a `Mutex` for tests that don't share state. The handler
+/// logic itself is the part worth pinning with unit tests.
+#[allow(clippy::doc_lazy_continuation)]
+///
+/// **Sync, not async**: the cache lookup is a single `HashMap::get`
+/// + optional `HashMap::remove`. `tokio::sync::Mutex` would force
+/// this to be `async`, and the router handler signature is
+/// `Fn(&Request) -> Response` (sync). `std::sync::Mutex` is the
+/// right primitive.
+fn clipboard_text_route(
+    req: &Request,
+    cache: &Arc<std::sync::Mutex<crate::clipboard::cache::ClipboardCache>>,
+) -> Response {
+    // Strip the prefix to extract the sha256 suffix. The router's
+    // `get_prefix` matched because `req.path` starts with
+    // `/clipboard/text/`; anything past the prefix is the candidate
+    // hex string.
+    let suffix = match req.path.strip_prefix("/clipboard/text/") {
+        Some(s) => s,
+        None => {
+            log::warn!(
+                "http3 /clipboard/text/ handler received unexpected path: {}",
+                req.path
+            );
+            return Response::not_found();
+        }
+    };
+
+    // Reject anything that is not exactly 64 lowercase hex chars.
+    // The receiver's `Http3Client::get_text` always emits the full
+    // 64-char lowercase hex form (see `format!("/clipboard/text/{sha256}")`),
+    // so a malformed suffix indicates either a buggy peer or a
+    // hostile scanner. Both must yield 404 (silent ignore on the
+    // receiver side, not an error that panics the dispatcher).
+    if suffix.len() != 64 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        log::warn!(
+            "http3 /clipboard/text/ rejecting malformed sha256 suffix (len={}, expected 64): {}",
+            suffix.len(),
+            req.path
+        );
+        return Response::not_found();
+    }
+    let sha = match decode_hex_32(suffix) {
+        Some(b) => b,
+        None => {
+            // Should be unreachable given the ASCII + length check
+            // above; the explicit `None` arm is defensive against
+            // future suffix-content edge cases (e.g. mixed case that
+            // bypassed `is_ascii_hexdigit`).
+            log::warn!(
+                "http3 /clipboard/text/ hex decode failed despite ASCII check: {}",
+                req.path
+            );
+            return Response::not_found();
+        }
+    };
+
+    match cache.lock() {
+        Ok(mut guard) => match guard.lookup(&sha) {
+            Some(content) => {
+                log::trace!(
+                    "http3 /clipboard/text/ hit ({} bytes) for suffix {}",
+                    content.len(),
+                    suffix
+                );
+                Response::ok(content)
+            }
+            None => {
+                // Cache miss (or TTL-expired) — silent 404. Receiver
+                // logs warn and skips. See PLAN §1 评审 #3 2nd.
+                log::debug!("http3 /clipboard/text/ cache miss for suffix {}", suffix);
+                Response::not_found()
+            }
+        },
+        Err(poisoned) => {
+            // Mutex poisoned means a previous holder panicked. The
+            // cache is a best-effort resource; reporting 404 is safer
+            // than panicking again. Log error so the operator sees
+            // the poison.
+            log::error!(
+                "http3 /clipboard/text/ cache mutex poisoned for suffix {}; \
+                 treating as miss",
+                suffix
+            );
+            // Recover from the poison by extracting the inner guard.
+            // We don't read from the poisoned data — just return 404.
+            drop(poisoned.into_inner());
+            Response::not_found()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +998,41 @@ fn quic_err_to_io(e: quinn::ConnectionError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e)
 }
 
+/// **M1b STEP-1b.2** — decode a 64-char ASCII hex string into 32
+/// bytes. Accepts both upper and lower case (matches the
+/// `is_ascii_hexdigit` check at the call site). Returns `None` for
+/// any other input — defensive against future suffix-content edge
+/// cases.
+///
+/// **Why inline rather than via the `hex` crate**: avoids adding a
+/// new dependency for what is, at heart, a 32-iteration byte
+/// unpacking. The router's hot path runs once per inbound
+/// `GET /clipboard/text/{sha256}`, so the unoptimised form is
+/// fine.
+fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let hi = hex_nibble(bytes[i * 2])?;
+        let lo = hex_nibble(bytes[i * 2 + 1])?;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+/// Single hex nibble → 0..=15. Returns `None` for non-hex input.
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1401,5 +1580,179 @@ mod tests {
                 "GET against a hanging server must time out (got Ok)"
             );
         });
+    }
+
+    // === M1b STEP-1b.2 — cache-backed /clipboard/text/{sha256} route tests
+    // ======================================================================
+    //
+    // These tests pin the contract documented in
+    // `default_router_with_cache`: 200 + bytes on hit, 404 on miss /
+    // malformed suffix. The end-to-end version
+    // (`http3_client_get_text_returns_cache_hit_bytes`) drives the
+    // route through a real QUIC client + server, mirroring the
+    // existing `http3_client_*_roundtrip` tests.
+
+    use crate::clipboard::cache::ClipboardCache;
+    use std::sync::Mutex as StdMutex;
+
+    /// Insert a payload, GET it through the cache-backed router,
+    /// verify 200 + identical bytes. Pins the happy-path of
+    /// `default_router_with_cache`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_text_returns_cache_hit_bytes() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_get_text_returns_cache_hit_bytes,
+            {
+                let cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                let sha = [0xAA; 32];
+                let body = b"a large text payload pushed from the source daemon".to_vec();
+                cache.lock().unwrap().insert(sha, body.clone());
+
+                let router = super::default_router_with_cache(cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                let (status, returned) = client.get_text(&"aa".repeat(32)).await.expect("get_text");
+                assert_eq!(status, 200, "cache hit must return 200");
+                assert_eq!(
+                    returned, body,
+                    "returned body must match the inserted cache entry"
+                );
+            }
+        );
+    }
+
+    /// Cache miss returns 404 with the standard "not found" body
+    /// (receiver-side handler must surface this as a normal pull
+    /// miss — log warn + skip — never an error).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_text_returns_404_on_cache_miss() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_get_text_returns_404_on_cache_miss,
+            {
+                let cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                // Cache is empty — no insert.
+                let router = super::default_router_with_cache(cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                let (status, body) = client
+                    .get_text("bb".repeat(32).as_str())
+                    .await
+                    .expect("get_text");
+                assert_eq!(
+                    status, 404,
+                    "cache miss must return 404 (silent ignore on the receiver)"
+                );
+                assert_eq!(
+                    &body[..],
+                    b"not found",
+                    "404 body should be the standard 'not found' bytes"
+                );
+            }
+        );
+    }
+
+    /// After active eviction: a sha256 that was present when the
+    /// server started becomes a 404 once removed. Pins PLAN §1
+    /// 评审 #3 2nd: "receiver pulls X (cache miss) after source
+    /// pushes Y → 404".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_text_returns_404_after_active_eviction() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_get_text_returns_404_after_active_eviction,
+            {
+                let cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                let sha_x = [0x11; 32];
+                cache.lock().unwrap().insert(sha_x, b"X".to_vec());
+
+                let router = super::default_router_with_cache(cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                // First GET: hit, returns X.
+                let (status, body) = client
+                    .get_text("11".repeat(32).as_str())
+                    .await
+                    .expect("first get_text");
+                assert_eq!(status, 200);
+                assert_eq!(body, b"X");
+
+                // Active eviction (mirrors the dispatcher's
+                // `remove(prev_sha)` before pushing a new payload).
+                assert!(cache.lock().unwrap().remove(&sha_x));
+
+                // Second GET: the previous sha256 is now a miss.
+                let (status, _) = client
+                    .get_text("11".repeat(32).as_str())
+                    .await
+                    .expect("second get_text");
+                assert_eq!(
+                    status, 404,
+                    "after active eviction, prev sha256 must yield 404"
+                );
+            }
+        );
+    }
+
+    /// Malformed suffix (not 64 hex chars) returns 404. Defensive
+    /// against buggy / hostile peers — the route must not panic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_text_returns_404_on_malformed_suffix() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_get_text_returns_404_on_malformed_suffix,
+            {
+                let cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                let router = super::default_router_with_cache(cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                // Too short.
+                let (status, _) = client
+                    .get_bytes("/clipboard/text/abc")
+                    .await
+                    .expect("too short");
+                assert_eq!(status, 404, "non-hex / too-short suffix must yield 404");
+
+                // Right length but non-hex chars.
+                let (status, _) = client
+                    .get_bytes("/clipboard/text/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+                    .await
+                    .expect("non-hex");
+                assert_eq!(status, 404, "non-hex suffix must yield 404");
+            }
+        );
+    }
+
+    /// Hex-decoder sanity: 64 lowercase hex chars decode to the
+    /// expected 32-byte array. Pins the helper used by the route
+    /// handler without standing up a QUIC server.
+    #[test]
+    fn hex_decode_32_lowercase_round_trip() {
+        let hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let bytes = decode_hex_32(hex).expect("decode lowercase");
+        let expected = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb,
+            0xcc, 0xdd, 0xee, 0xff,
+        ];
+        assert_eq!(bytes, expected);
+    }
+
+    /// Hex-decoder rejects bad input.
+    #[test]
+    fn hex_decode_32_rejects_non_hex() {
+        assert!(decode_hex_32("not hex at all").is_none());
+        assert!(decode_hex_32("").is_none());
+        // Right length but with a non-hex char.
+        assert!(decode_hex_32(&"z".repeat(64)).is_none());
+        // Wrong length (63).
+        assert!(decode_hex_32(&"a".repeat(63)).is_none());
+        // Wrong length (65).
+        assert!(decode_hex_32(&"a".repeat(65)).is_none());
     }
 }
