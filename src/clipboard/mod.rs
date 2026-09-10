@@ -87,6 +87,15 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+/// **PLAN-2 / M1b STEP-1b.2** — content-addressed outbound clipboard
+/// text cache. The dispatcher writes large (> 1 KiB) clipboard text
+/// bytes keyed by sha256; the HTTP/3-lite server reads from the same
+/// cache to serve `GET /clipboard/text/{sha256}` from remote peers.
+///
+/// See [`cache::ClipboardCache`] for the full design (capacity,
+/// TTL, active eviction, concurrency).
+pub mod cache;
+
 use thiserror::Error;
 
 /// Backend-specific error for clipboard operations.
