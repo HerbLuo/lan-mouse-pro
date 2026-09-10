@@ -168,12 +168,20 @@ impl ClipboardBackend for MacOsPasteboard {
             .output()
             .ok()?;
         if !output.status.success() {
-            // pbpaste exits 1 if the clipboard holds non-text content
-            // (e.g. an image) — the dispatcher treats `None` as
-            // "skip this tick" which is the correct behaviour for an
-            // image-only clipboard. Other non-zero exits (very rare)
-            // are also surfaced as `None` so the dispatcher keeps
-            // running instead of taking the backend down.
+            // pbpaste exits non-zero when the pasteboard has no
+            // text representation at all (very rare — the empty
+            // clipboard returns success + 0-byte stdout). Other
+            // non-zero exits are also surfaced as `None` so the
+            // dispatcher keeps running instead of taking the
+            // backend down.
+            //
+            // **Image-only pasteboards return success + empty
+            // stdout** (verified locally: write a PNG via
+            // `NSPasteboard`, `pbpaste` exits 0 with no bytes).
+            // The dispatcher addresses that by checking the
+            // image branch first — see
+            // `Service::handle_clipboard_tick` image-first
+            // dispatch order.
             return None;
         }
         let text = String::from_utf8(output.stdout).ok()?;
@@ -887,6 +895,65 @@ mod tests {
         assert_eq!(
             result, None,
             "current_image on empty pasteboard must return None"
+        );
+    }
+
+    /// **Pin the macOS pasteboard quirk** (image-first dispatch
+    /// rationale): when the pasteboard holds only an image
+    /// (built-in screenshot tools advertise an empty string
+    /// representation alongside the PNG), `pbpaste` returns
+    /// `Some("")` — success exit code + 0-byte stdout — not
+    /// `None`. A text-first dispatcher would short-circuit on the
+    /// empty text and never reach `dispatch_image`, so the
+    /// screenshot would never be pushed to peers.
+    ///
+    /// **Why this test matters**:
+    /// 1. Documents the platform behavior that motivated the
+    ///    image-first dispatch order in
+    ///    `Service::handle_clipboard_tick`.
+    /// 2. Acts as a regression test: if a future macOS release
+    ///    changes `pbpaste` to exit non-zero on image-only
+    ///    pasteboards, the dispatcher priority becomes a
+    ///    no-op-and-text-first works again. We catch that here.
+    /// 3. Mirrors the real bug — user takes screenshot, Mac
+    ///    pushes empty text instead of the image, Windows
+    ///    receives `ClipboardText(size=0, sha=e3b0c442)`.
+    ///    This test fails any time the bug is reintroduced.
+    ///
+    /// **Setup**: write a small PNG via `NSPasteboard`, then
+    /// call `current_text()`. The
+    /// `ImageClipboardGuard` restores whatever the user had
+    /// before the test ran.
+    #[test]
+    fn current_text_on_image_only_pasteboard_returns_some_empty_string() {
+        let _lock = lock_for_test();
+        let mut backend = MacOsPasteboard::new().expect("new");
+        let _guard = ImageClipboardGuard::new();
+
+        // Write a PNG to the pasteboard (image-only state — no
+        // .tiff, no .string type, no file representations).
+        let png = test_png_bytes();
+        write_pasteboard_bytes(NS_PASTEBOARD_TYPE_PNG, &png);
+
+        // Sanity: current_image must report the image (otherwise
+        // this test setup is wrong, not the platform behavior).
+        let image = backend
+            .current_image()
+            .expect("current_image must return Some after writing PNG to pasteboard");
+        assert_eq!(image.mime, "image/png");
+        assert_eq!(image.data, png);
+
+        // **The bug pin**: pbpaste returns Some("") (empty
+        // string) for image-only pasteboards — NOT None. A
+        // text-first dispatcher would fire dispatch_text with
+        // "" here, which is exactly the bug the dispatcher
+        // image-first priority fixes.
+        let text = backend.current_text();
+        assert_eq!(
+            text,
+            Some(String::new()),
+            "pbpaste returns Some(\"\") on macOS image-only pasteboards (NOT None); \
+             the dispatcher's image-first priority exists to work around this asymmetry"
         );
     }
 

@@ -1834,15 +1834,26 @@ impl Service {
 
     /// Clipboard dispatcher 500 ms tick handler.
     ///
-    /// **Two-phase poll**: text first (the M1a / M1b path),
-    /// image second (the M2a STEP-2a.3 path). Each tick dispatches
-    /// at most one event — whichever kind is currently on the
-    /// clipboard. If the clipboard holds text, the text branch fires
-    /// and the image branch is skipped; otherwise the image branch
-    /// is consulted. This matches the platform reality (the macOS
-    /// pasteboard publishes one "current" representation per
-    /// `pbpaste` / `NSPasteboard.dataForType` call) without forcing
-    /// the dispatcher to multiplex two parallel event streams.
+    /// **Two-phase poll, image-first**: image branch runs before
+    /// text. On macOS specifically `pbpaste` returns `Some("")`
+    /// (success exit + 0-byte stdout) for an image-only pasteboard
+    /// — verified locally by writing a PNG to `NSPasteboard` and
+    /// running `pbpaste`: `rc=0`, stdout empty. With text-first
+    /// priority the empty text would short-circuit before the
+    /// image branch ever fires, so the screenshot never gets
+    /// pushed. Image-first makes the dispatcher robust against
+    /// that platform quirk: when both text and image are present,
+    /// the image wins (the pasteboard's richer representation);
+    /// when only text is present the image branch returns `None`
+    /// and the text branch fires (same observable behavior as
+    /// before for the text-only case).
+    ///
+    /// Each tick dispatches at most one event — whichever kind
+    /// is currently on the clipboard. This matches the platform
+    /// reality (the macOS pasteboard publishes one "current"
+    /// representation per `pbpaste` / `NSPasteboard.dataForType`
+    /// call) without forcing the dispatcher to multiplex two
+    /// parallel event streams.
     ///
     /// **Why a 500 ms tick**: matches PLAN §3 M1a "macOS 实现
     /// ... 500ms tick" / "Linux 500 ms tick" cadence. Fast enough
@@ -1850,30 +1861,45 @@ impl Service {
     /// backend read (1-3 ms for pbcopy / xclip / NSPasteboard) is
     /// negligible.
     ///
-    /// **M2a STEP-2a.3** — `dispatch_image` runs only when text
-    /// is `None`. The macOS backend's `changeCount` short-circuit
-    /// in STEP-2a.2 means `current_image()` returns without
-    /// expensive work most ticks; on platforms without an
-    /// equivalent the cost is still dominated by the sha256 hash
-    /// (5-15 ms for a 4 K screenshot) which is well within the
-    /// 500 ms budget.
+    /// **M2a STEP-2a.3 — image-first dispatch order**:
+    /// `dispatch_image` runs first, before the text branch.
+    ///
+    /// **Why image-first (not text-first)**: macOS `pbpaste`
+    /// returns `Some("")` (success exit + 0-byte stdout) when
+    /// the pasteboard holds only an image — the empty text
+    /// representation is published alongside the PNG by some
+    /// macOS apps (notably the built-in screenshot tools).
+    /// Verified locally: writing a PNG via `NSPasteboard` +
+    /// running `pbpaste` returns `rc=0`, empty stdout. A
+    /// text-first dispatcher would short-circuit on the empty
+    /// string and never reach `dispatch_image`, so the
+    /// screenshot would never be pushed to peers. Image-first
+    /// makes the dispatch correct on macOS while preserving
+    /// the text-only behavior on every other platform
+    /// (image branch returns `None` → text branch fires next,
+    /// observable behavior identical to text-first).
+    ///
+    /// **macOS backend's `changeCount` short-circuit** (STEP-2a.2)
+    /// keeps `current_image()` cheap on quiescent ticks — the
+    /// image read is dominated by the sha256 hash (5-15 ms for
+    /// a 4 K screenshot) which fits the 500 ms budget.
     async fn handle_clipboard_tick(&mut self) {
         let Some(backend) = self.clipboard_backend.as_mut() else {
             return;
         };
-        // Phase 1: text. If the clipboard holds text, dispatch
-        // it and skip image entirely (matches the M1a / M1b
-        // semantics — the tick returns early on text).
-        if let Some(new_text) = backend.current_text() {
-            self.dispatch_text(new_text).await;
-            return;
-        }
-        // Phase 2: image. No text on the clipboard → check for
-        // image. `current_image()` is `&mut self` on the backend,
-        // so the borrow for the text branch has already ended —
-        // safe to call here without overlapping borrows.
+        // Phase 1: image. Check first so macOS screenshot
+        // pasteboards (which advertise an empty string alongside
+        // the PNG) do not get masked by an empty-text short-circuit.
+        // `current_image()` is `&mut self` on the backend, so this
+        // borrow must end before the text branch can run.
         if let Some(image) = backend.current_image() {
             self.dispatch_image(image).await;
+            return;
+        }
+        // Phase 2: text. No image on the clipboard → fall through
+        // to the M1a / M1b text branch.
+        if let Some(new_text) = backend.current_text() {
+            self.dispatch_text(new_text).await;
         }
     }
 
@@ -2087,7 +2113,12 @@ impl Service {
                 image.data.len()
             );
         } else {
-            log::debug!(
+            // Image events are inherently rarer than text events
+            // (a few per hour vs dozens per minute), so logging
+            // at INFO here is fine and lets operators confirm
+            // the image branch fired without enabling RUST_LOG.
+            // The text path stays at DEBUG to avoid log spam.
+            log::info!(
                 "clipboard dispatched image ({} bytes, mime={}, sha={}) to {} peer(s)",
                 image.data.len(),
                 image.mime,
