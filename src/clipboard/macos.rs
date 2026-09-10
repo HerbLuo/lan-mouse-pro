@@ -36,15 +36,13 @@
 //! **Threading model**: the [`ClipboardBackend`] trait is `Send` but
 //! not `Sync`; the daemon's `current_thread` + `LocalSet` runtime
 //! owns the dispatcher task that consumes the backend, so no
-//! concurrency concerns for the text path (the subprocess calls
-//! block ~1-3 ms per invocation; on the dispatcher's 500 ms tick
-//! this is invisible). The `watch_image` stream spawns a
-//! `tokio::task::spawn_local` task that polls
-//! `NSPasteboard.generalPasteboard().changeCount()` — this is safe
-//! because `NSPasteboard` is documented as thread-safe for
-//! `generalPasteboard()` access (returns a process-wide singleton)
-//! and the spawn_local task runs on the same single thread as the
-//! dispatcher.
+//! concurrency concerns (the text subprocess calls block ~1-3 ms per
+//! invocation; on the dispatcher's 500 ms tick this is invisible).
+//! `NSPasteboard::generalPasteboard()` is documented as thread-safe
+//! (returns a process-wide singleton) and is bound to the calling
+//! thread's autorelease pool in [`MacOsPasteboard::new`] so any
+//! subsequent `current_image` / `set_image` call from the
+//! dispatcher's tick task is safe.
 //!
 //! **Cached text**: the `cached: Option<String>` field mirrors what
 //! `current_text` last read; `set_text` updates it after a successful
@@ -55,18 +53,13 @@
 
 #![cfg(target_os = "macos")]
 
-use std::cell::Cell;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
-use futures::channel::mpsc;
-use futures::{SinkExt, StreamExt};
 use objc2_app_kit::NSPasteboard;
 use objc2_foundation::{NSData, NSString};
-use tokio::time::{MissedTickBehavior, interval};
 
-use super::{ClipboardBackend, ClipboardError, ImageBytes, ImageChange, Mime};
+use super::{ClipboardBackend, ClipboardError, ImageBytes, Mime};
 
 /// `NSPasteboard` type identifier for PNG payloads.
 ///
@@ -83,14 +76,6 @@ const NS_PASTEBOARD_TYPE_PNG: &str = "public.png";
 /// re-encoded as PNG before being returned to the dispatcher.
 const NS_PASTEBOARD_TYPE_TIFF: &str = "public.tiff";
 
-/// Polling interval for `watch_image`'s `changeCount` watcher. Matches
-/// the dispatcher's text-path tick (`service.rs` `clipboard_tick`) so
-/// image and text changes are observed at the same cadence. Fast
-/// enough to feel instant (user copies, daemon detects within ~0.5 s);
-/// slow enough that the NSPasteboard read (sub-millisecond on a
-/// quiescent host) is negligible.
-const IMAGE_WATCH_TICK: Duration = Duration::from_millis(500);
-
 /// macOS clipboard backend. Wraps the `pbcopy` / `pbpaste` subprocess
 /// pair for text and `NSPasteboard` via `objc2` for images.
 ///
@@ -99,24 +84,9 @@ const IMAGE_WATCH_TICK: Duration = Duration::from_millis(500);
 /// future log statements can correlate "I just wrote X" with "X was
 /// already there before I wrote it" without a second subprocess
 /// call.
-///
-/// The `last_image_change_count` field tracks the last-seen
-/// `NSPasteboard.changeCount()` for self-write detection: when
-/// `set_image` succeeds it stamps `pb.changeCount()`, so subsequent
-/// `watch_image` ticks can recognise "I just wrote this image" without
-/// re-reading the (potentially multi-MB) PNG bytes. Stored in `Cell`
-/// because `i64` is `Copy` and the field is mutated through `&self`
-/// (the dispatcher never holds an exclusive reference during image
-/// polls).
 #[derive(Debug)]
 pub struct MacOsPasteboard {
     cached: Option<String>,
-    /// Last observed `NSPasteboard.changeCount()`. `None` until the
-    /// first image read / write; subsequent reads / writes overwrite.
-    /// Used by `set_image` to stamp the post-write changeCount and by
-    /// future dispatcher code (M2a STEP-2a.3) to skip the read when
-    /// the changeCount has not advanced.
-    last_image_change_count: Cell<Option<i64>>,
 }
 
 impl MacOsPasteboard {
@@ -151,10 +121,7 @@ impl MacOsPasteboard {
         // AppKit is missing the macOS build itself would not have
         // produced a binary, so the linker guarantees presence.
         let _ = NSPasteboard::generalPasteboard();
-        Ok(Self {
-            cached: None,
-            last_image_change_count: Cell::new(None),
-        })
+        Ok(Self { cached: None })
     }
 }
 
@@ -238,22 +205,13 @@ impl ClipboardBackend for MacOsPasteboard {
     /// **No changeCount optimisation here**: this method always
     /// reads. The dispatcher (M2a STEP-2a.3) compares the freshly-read
     /// bytes' fingerprint to the last-broadcast fingerprint to decide
-    /// whether to push — same pattern as the text path. changeCount
-    /// is checked inside `watch_image` (where it saves an entire
-    /// read on quiescent ticks) but not here (where it would change
-    /// the trait's "Some(bytes) means there is an image, None means
-    /// there is not" semantics).
+    /// whether to push — same pattern as the text path. Optimising the
+    /// quiescent-tick skip via `NSPasteboard.changeCount()` would
+    /// change the trait's "Some(bytes) means there is an image, None
+    /// means there is not" semantics, so it stays out of this method.
     fn current_image(&mut self) -> Option<ImageBytes> {
         let pb = NSPasteboard::generalPasteboard();
-        let result = read_image_bytes_from_pasteboard(&pb);
-        // `changeCount` returns `NSInteger` (alias for `isize`); the
-        // cell stores `Option<i64>` so cast explicitly. Truncation is
-        // impossible on practical timescales (`isize` saturates at
-        // ~9.2e18 increments; the macOS change count resets on
-        // logout / reboot).
-        self.last_image_change_count
-            .set(Some(pb.changeCount() as i64));
-        result
+        read_image_bytes_from_pasteboard(&pb)
     }
 
     /// Write `bytes` to the clipboard as PNG.
@@ -285,8 +243,6 @@ impl ClipboardBackend for MacOsPasteboard {
         let nsdata = NSData::with_bytes(bytes);
         let ok = pb.setData_forType(Some(&nsdata), &png_type);
         if ok {
-            self.last_image_change_count
-                .set(Some(pb.changeCount() as i64));
             Ok(())
         } else {
             Err(ClipboardError::Io(format!(
@@ -294,82 +250,12 @@ impl ClipboardBackend for MacOsPasteboard {
             )))
         }
     }
-
-    /// Stream of image changes observed via `NSPasteboard.changeCount()`.
-    ///
-    /// Spawns a `tokio::task::spawn_local` task that polls every
-    /// [`IMAGE_WATCH_TICK`] (500 ms). On every tick it reads
-    /// `NSPasteboard.generalPasteboard().changeCount()`; if the count
-    /// has advanced since the previous tick, the task calls
-    /// `read_image_bytes_from_pasteboard` and forwards the result to
-    /// the returned stream's channel.
-    ///
-    /// **`'static` lifetime**: the stream cannot borrow from `&mut
-    /// self` (the trait signature), so the polling task uses
-    /// `NSPasteboard::generalPasteboard()` directly — it is a
-    /// process-wide singleton and re-acquiring it from inside the
-    /// task is cheap. The backend's `last_image_change_count` field
-    /// is not consulted by this stream (it is only meaningful for the
-    /// one-shot `set_image` self-write path; the stream is for the
-    /// *outbound* direction where we do not pre-mark).
-    ///
-    /// **Channel capacity 16**: enough to absorb a 16-tick burst
-    /// (8 s at 500 ms cadence) before backpressure kicks in. The
-    /// receiver is expected to consume promptly; if the dispatcher
-    /// falls behind the channel is closed and the stream ends —
-    /// graceful termination rather than unbounded buffering.
-    ///
-    /// **Why not `NSNotificationCenter`**: NSPasteboard publishes a
-    /// `NSPasteboardDidChangeNotification` that would let us skip the
-    /// 500 ms polling loop and react instantly. Subscribing from
-    /// `objc2` requires standing up an `NSObject` observer that the
-    /// objc2 retain-graph tracks; the complexity is not justified
-    /// for a 500 ms cadence (still feels instant to a user copying a
-    /// screenshot). If M4 polling proves too coarse we can layer
-    /// notifications on top without changing the trait signature.
-    fn watch_image(&mut self) -> futures::stream::BoxStream<'static, ImageChange> {
-        let (mut tx, rx) = mpsc::channel::<ImageChange>(16);
-        tokio::task::spawn_local(async move {
-            let pb = NSPasteboard::generalPasteboard();
-            let mut last_count: i64 = pb.changeCount() as i64;
-            let mut tick = interval(IMAGE_WATCH_TICK);
-            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            // Burn the immediate first tick (`interval` fires once at
-            // t=0 unless we skip it; we want the first real comparison
-            // to happen at t=500 ms so we have a meaningful
-            // `last_count` to compare against).
-            tick.tick().await;
-            loop {
-                tick.tick().await;
-                let current_count: i64 = pb.changeCount() as i64;
-                if current_count == last_count {
-                    continue;
-                }
-                last_count = current_count;
-                let Some(bytes) = read_image_bytes_from_pasteboard(&pb) else {
-                    // changeCount advanced but the pasteboard no longer
-                    // holds a PNG/TIFF image (e.g. user copied text
-                    // between ticks). Emit nothing — the text-path
-                    // dispatcher will observe the text change on its
-                    // own tick.
-                    continue;
-                };
-                if tx.send(ImageChange { bytes }).await.is_err() {
-                    // Receiver dropped (dispatcher torn down). Exit
-                    // the loop; the spawn_local future completes
-                    // cleanly.
-                    break;
-                }
-            }
-        });
-        rx.boxed()
-    }
 }
 
 // ============================================================================
-//  Image helpers (free functions, not on `&mut self` so `watch_image`'s
-//  spawn_local task can call them without holding a borrow into the
-//  backend).
+//  Image helpers (free functions, not on `&mut self`, so the
+//  dispatcher's tick task can call them without holding a borrow into
+//  the backend).
 // ============================================================================
 
 /// Read raw bytes for a given `NSPasteboard` type identifier. Returns
@@ -381,7 +267,7 @@ impl ClipboardBackend for MacOsPasteboard {
 /// **Safe wrapper around `dataForType`**: `NSData::to_vec()` copies
 /// the bytes into a fresh `Vec<u8>`, so the returned `Vec` does not
 /// alias the autoreleased `NSData` and is safe to keep / clone /
-/// send across the watch_image channel.
+/// return to the dispatcher's tick task.
 fn read_pasteboard_bytes(pb: &NSPasteboard, type_str: &str) -> Option<Vec<u8>> {
     let ns_type = NSString::from_str(type_str);
     let data = pb.dataForType(&ns_type)?;
@@ -413,9 +299,9 @@ fn tiff_to_png_normalized(tiff: &[u8]) -> Result<Vec<u8>, ClipboardError> {
 /// (re-encoded as PNG). Returns `None` if neither type is present or
 /// if the only available type is a malformed TIFF.
 ///
-/// Used by both `current_image` (one-shot) and `watch_image`
-/// (polling-stream) so the TIFF→PNG normalisation + warn-on-bad-TIFF
-/// semantics stay in one place.
+/// Called from `current_image` (one-shot read on each dispatcher
+/// tick); the TIFF→PNG normalisation + warn-on-bad-TIFF semantics
+/// are encapsulated here so the read path stays a single helper.
 fn read_image_bytes_from_pasteboard(pb: &NSPasteboard) -> Option<ImageBytes> {
     // Preferred: PNG (most apps provide it).
     if let Some(bytes) = read_pasteboard_bytes(pb, NS_PASTEBOARD_TYPE_PNG) {
