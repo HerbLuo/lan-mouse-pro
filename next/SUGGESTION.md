@@ -24,6 +24,8 @@
 
 **优先级**：🟡（不阻塞 M1a；M2a / M3a 阶段可能升级为 🟠）
 
+**Status update 2026-09-10 / STEP-P2-M2a-2a.2**：image 路径**已迁移**到 NSPasteboard via `objc2 0.6.4` + `objc2-app-kit 0.3.2`（PLAN 评审 #2 3rd 强制要求 —— `pbcopy` 不暴露 pasteboard types，无法做 PNG 优先 + TIFF fallback 归一化策略）。text 路径**保留** pbcopy/pbpaste（原理由 2 仍成立：sha256 fingerprint short-circuit 已经避免重复 push，changeCount 优化无收益）。后续 leader 决策：是否 move 到 FIXED（作为 "image 部分迁移完成，text 部分保留 deviation" 半归档）或 keep SUGGESTION。
+
 ---
 
 ## #S-2 🟡 — Windows + Linux clipboard backend 跨平台编译未在本地验证
