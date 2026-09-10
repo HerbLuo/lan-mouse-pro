@@ -363,6 +363,138 @@ impl ClipboardBackend for MacOsPasteboard {
         fresh
     }
 
+    /// **2026-09-10 screenshot-bug fix (master side)** — async
+    /// override that runs the pasteboard read + JPEG/TIFF
+    /// normalisation on `tokio::task::spawn_blocking`, freeing
+    /// the LocalSet thread for the 2–5 s the PNG encoder takes on
+    /// a full-screen screenshot. Without this, the master daemon's
+    /// `handle_clipboard_tick` is held in `image::write_to(Png)` for
+    /// the entire encode, starving every other tokio task
+    /// (Pong watchdog, peer.run stream A reads, ping_heartbeat_task).
+    ///
+    /// **Master-only impact**: this override only matters on the
+    /// master side where `dispatch_image` is the call site for
+    /// outbound clipboard pushes. The Windows / Linux receive side
+    /// (`apply_inbound_clipboard_image` calling `current_image`)
+    /// doesn't need the spawn_blocking path — the Windows backend's
+    /// `current_image` returns raw bytes from the OS clipboard
+    /// without re-encoding, so it never hits the heavy path.
+    /// We only call `current_image_async` from the dispatcher's
+    /// outbound image branch (`handle_clipboard_tick`).
+    ///
+    /// **Return-type shape**: `Pin<Box<dyn Future + Send + 'a>>`
+    /// (matching the trait's signature) keeps
+    /// `Box<dyn ClipboardBackend>` object-safe.
+    ///
+    /// **Cache hit fast-path**: still synchronous on the
+    /// LocalSet thread — `bytes.clone()` for a 3–4 MB PNG is a
+    /// single memcpy (~1 ms). We don't want to push that through a
+    /// thread-pool dispatch on every quiescent tick (500 ms cadence).
+    ///
+    /// **Why a separate method instead of replacing
+    /// `current_image`**: tests in this file call
+    /// `backend.current_image()` directly (e.g. lines 1253+).
+    /// Replacing the sync method with an async one would force every
+    /// test to be rewritten. Adding the async version alongside
+    /// preserves the sync API for tests and the `Send`-only trait
+    /// bound.
+    fn current_image_async<'a>(
+        &'a mut self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Option<ImageBytes>> + Send + 'a>,
+    > {
+        // Cache hit: read changeCount synchronously, return
+        // immediately. This is the 99% path during normal use —
+        // the user copies an image once, then the dispatcher
+        // polls every 500 ms. Only the first poll after a
+        // pasteboard write goes through spawn_blocking.
+        let pb = NSPasteboard::generalPasteboard();
+        let change_count = pb.changeCount();
+        if let Some(cached) = &self.image_cache {
+            if cached.change_count == change_count {
+                // Clone BEFORE constructing the async block —
+                // `cached` borrows `self.image_cache`, which the
+                // returned future would carry for `'a`. Cloning
+                // frees `self` for the duration of the await.
+                let bytes = cached.bytes.clone();
+                return Box::pin(async move { Some(bytes) });
+            }
+        }
+
+        // Cache miss: read the three pasteboard byte buffers
+        // synchronously on the LocalSet thread (cheap IPC; NSPasteboard
+        // operations are documented thread-safe once
+        // `generalPasteboard()` has been bound, which `new()` does),
+        // then run the CPU-heavy encode on the blocking thread pool.
+        let png_bytes = read_pasteboard_bytes(&pb, NS_PASTEBOARD_TYPE_PNG);
+        let jpeg_bytes = read_pasteboard_bytes(&pb, NS_PASTEBOARD_TYPE_JPEG);
+        let tiff_bytes = read_pasteboard_bytes(&pb, NS_PASTEBOARD_TYPE_TIFF);
+
+        Box::pin(async move {
+            let fresh = tokio::task::spawn_blocking(
+                move || -> Option<ImageBytes> {
+                    // PNG passthrough — no CPU work.
+                    if let Some(bytes) = png_bytes {
+                        return Some(ImageBytes {
+                            mime: Mime::Png.mime_str().to_string(),
+                            data: bytes,
+                        });
+                    }
+                    // JPEG → PNG normalisation. The expensive
+                    // path — `image::load_from_memory` +
+                    // `img.write_to(Png)` for a 1920×1080 screenshot
+                    // can take 2–5 s on a MacBook. Running it here
+                    // keeps the LocalSet free.
+                    if let Some(jpeg) = jpeg_bytes {
+                        if let Ok(png) = jpeg_to_png_normalized(&jpeg) {
+                            log::info!(
+                                "clipboard: JPEG→PNG normalized for cross-platform transfer \
+                                 ({} bytes → {} bytes)",
+                                jpeg.len(),
+                                png.len()
+                            );
+                            return Some(ImageBytes {
+                                mime: Mime::Png.mime_str().to_string(),
+                                data: png,
+                            });
+                        }
+                        log::warn!("clipboard: JPEG decode failed (will probe TIFF next)");
+                    }
+                    if let Some(tiff) = tiff_bytes {
+                        if let Ok(png) = tiff_to_png_normalized(&tiff) {
+                            log::info!(
+                                "clipboard: TIFF→PNG normalized for cross-platform transfer \
+                                 ({} bytes → {} bytes)",
+                                tiff.len(),
+                                png.len()
+                            );
+                            return Some(ImageBytes {
+                                mime: Mime::Png.mime_str().to_string(),
+                                data: png,
+                            });
+                        }
+                        log::warn!("clipboard: TIFF decode failed (no image available)");
+                    }
+                    None
+                },
+            )
+            .await
+            // On JoinError (panic in the blocking task), treat
+            // as no image — consistent with the sync version's
+            // "silent skip on failure".
+            .ok()
+            .flatten();
+
+            if let Some(bytes) = fresh.as_ref() {
+                self.image_cache = Some(ImageCacheEntry {
+                    change_count,
+                    bytes: bytes.clone(),
+                });
+            }
+            fresh
+        })
+    }
+
     /// Write `bytes` to the clipboard as PNG.
     ///
     /// **`mime` is ignored** — the macOS backend writes PNG bytes
