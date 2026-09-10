@@ -411,41 +411,6 @@ pub trait ClipboardBackend: Send {
         None
     }
 
-    /// **Async version of [`Self::current_image`]** —
-    /// added in 2026-09-10 to unblock the LocalSet thread when
-    /// `current_image` does heavy CPU work (macOS JPEG→PNG /
-    /// TIFF→PNG normalisation).
-    ///
-    /// **Default impl**: just calls the sync version. Cheap
-    /// backends (text-only, cached, raw-byte passthrough) need no
-    /// override — blocking the LocalSet thread for a sub-millisecond
-    /// read is fine. **Heavy backends (macOS JPEG→PNG /
-    /// TIFF→PNG normalisation) must override** and run their CPU
-    /// work on a blocking thread pool (`tokio::task::spawn_blocking`)
-    /// so the LocalSet isn't starved.
-    ///
-    /// **Symptom that motivated this split** (2026-09-10 screenshot
-    /// bug): the macOS backend's JPEG→PNG normalisation takes
-    /// 2–5 s for a full-screen screenshot, blocking the LocalSet
-    /// thread for the entire duration. Every other tokio task
-    /// (`peer.run` reading stream A, the Pong-arrival forwarder
-    /// updating `last_pong_at`, the `ping_heartbeat_task` sending
-    /// Pings, the `client_accept_bi_task` HTTP/3 response) is
-    /// starved for that 2–5 s window. The 1.5 s Pong watchdog fires
-    /// mid-conversion, force-closing the connection.
-    ///
-    /// **Why the return type is `Pin<Box<dyn Future + Send>>`
-    /// (not `async fn`)**: `async fn` in a trait breaks object
-    /// safety (no `Box<dyn ClipboardBackend>`), and the dispatcher
-    /// already stores the backend as `Box<dyn ClipboardBackend>`.
-    /// Returning a boxed future preserves dyn compatibility while
-    /// still letting the caller `await` the result.
-    fn current_image_async<'a>(
-        &'a mut self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ImageBytes>> + Send + 'a>> {
-        Box::pin(async move { self.current_image() })
-    }
-
     /// Replace the clipboard image with `bytes` (encoded as `mime`).
     ///
     /// The dispatcher passes raw PNG / JPEG / BMP bytes that match the
@@ -958,42 +923,6 @@ mod tests {
             backend.current_image(),
             None,
             "set_text must not be conflated with current_image"
-        );
-    }
-
-    /// **`current_image_async` default impl** (2026-09-10 screenshot
-    /// bug fix): the trait default wraps the sync `current_image`
-    /// result in a `Pin<Box<dyn Future + Send>>`. This pins the
-    /// contract for backends that don't override the async method
-    /// (Windows / Linux receivers — `current_image` returns raw
-    /// bytes from the OS clipboard without CPU-heavy re-encoding,
-    /// so blocking the LocalSet thread for a sub-ms read is fine).
-    /// The dispatcher can `await` `current_image_async` regardless
-    /// of which backend is plugged in.
-    ///
-    /// **Why this test pins the trait shape and not specific
-    /// behaviour**: `DummyBackend::current_image` returns `None`,
-    /// so the default async impl resolves to `None` too. What
-    /// matters here is that the call:
-    /// 1. Returns a `Pin<Box<dyn Future + Send>>` (object-safe —
-    ///    required for `Box<dyn ClipboardBackend>`).
-    /// 2. Polls to completion via `futures::executor::block_on`
-    ///    without panicking.
-    /// 3. Returns the same value as `current_image()`.
-    ///
-    /// If a future change accidentally returns a non-`Send` future,
-    /// or breaks dyn-compatibility, this test fails to compile —
-    /// catching the regression at `cargo test` time rather than at
-    /// runtime in the dispatcher's select! arm.
-    #[test]
-    fn current_image_async_default_impl_returns_same_as_sync() {
-        let mut backend = DummyBackend::new();
-        let sync_result = backend.current_image();
-        let async_result = futures::executor::block_on(backend.current_image_async());
-        assert_eq!(
-            sync_result, async_result,
-            "current_image_async's default impl must wrap current_image's result verbatim \
-             (DummyBackend returns None for both)"
         );
     }
 

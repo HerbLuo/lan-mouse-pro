@@ -1890,35 +1890,9 @@ impl Service {
         // Phase 1: image. Check first so macOS screenshot
         // pasteboards (which advertise an empty string alongside
         // the PNG) do not get masked by an empty-text short-circuit.
-        //
-        // **Why `current_image_async` (not `current_image`)** (2026-09-10
-        // screenshot bug): the macOS backend's JPEG→PNG / TIFF→PNG
-        // normalisation does a CPU-heavy `image::write_to(Png)`
-        // encode. For a full-screen screenshot that takes 2–5 s on
-        // a MacBook Air. Running it synchronously blocks the
-        // LocalSet thread (the dispatcher's `handle_clipboard_tick`
-        // arm runs on the LocalSet's single executor), starving
-        // `peer.run` (stream A reads), the Pong-arrival forwarder,
-        // the `ping_heartbeat_task`, and the
-        // `client_accept_bi_task` (HTTP/3 response). The 1.5 s
-        // Pong watchdog then fires mid-conversion and
-        // force-closes the connection. The async override
-        // routes the heavy work through `tokio::task::spawn_blocking`
-        // so the LocalSet thread stays free. Cheap backends
-        // (Windows / Linux receivers, text-only) hit the trait
-        // default impl and incur no thread-pool overhead.
-        //
-        // **Master-only call site**: this is the only
-        // `current_image_async` call. The Windows receive side's
-        // `apply_inbound_clipboard_image` keeps calling the sync
-        // `current_image` — Windows's `current_image` returns raw
-        // bytes from the OS clipboard without re-encoding, so it
-        // never hits the heavy path and doesn't need
-        // spawn_blocking. Scoping the async call here keeps the
-        // receiver-side change surface to zero (avoiding the
-        // `apply_inbound_clipboard_image` async refactor that
-        // caused connection issues in earlier iterations).
-        if let Some(image) = backend.current_image_async().await {
+        // `current_image()` is `&mut self` on the backend, so this
+        // borrow must end before the text branch can run.
+        if let Some(image) = backend.current_image() {
             self.dispatch_image(image).await;
             return;
         }
