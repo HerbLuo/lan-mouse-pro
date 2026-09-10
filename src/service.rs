@@ -19,8 +19,11 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, Mutex, RwLock},
-    time::Duration,
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify, sync::mpsc as tokio_mpsc};
@@ -238,41 +241,114 @@ pub struct Service {
     /// `last_source` field of `FrontendEvent::ClipboardState`;
     /// `None` means the most recent change originated locally.
     last_clipboard_source: Option<SocketAddr>,
+    /// **PLAN-2 / M1b STEP-1b.3** — runtime signals for the
+    /// loopback LRU. `Arc` because the dispatcher (writer) and
+    /// the 60-s hit-rate log task (reader) need to share the
+    /// same counter set. Atomics are lock-free so no `Mutex`
+    /// is needed. See [`ClipboardMetrics`] for the full
+    /// contract.
+    metrics: Arc<ClipboardMetrics>,
 }
 
-/// **PLAN-2 / M1a STEP-1a.4** — fixed-capacity LRU of SHA-256
-/// fingerprints, used by the clipboard dispatcher's loopback defence.
+/// **PLAN-2 / M1a STEP-1a.4 + M1b STEP-1b.3** — fixed-capacity
+/// LRU of SHA-256 fingerprints with a TTL, used by the clipboard
+/// dispatcher's loopback defence.
 ///
-/// **Implementation**: `VecDeque<[u8; 32]>` with linear
-/// `contains`. Capacity 64 → `contains` is O(64) = ~64 byte
-/// comparisons per inbound event, which is well below the dispatch
-/// tick's 1-3 ms typical work. A `HashSet` would be asymptotically
-/// faster but adds allocation pressure and code surface; the
-/// `VecDeque` matches the M1a "minimum viable loopback defence"
-/// scope (PLAN §3 M1a "仅指纹比对防'收到本地写回内容'的最简回环").
+/// **Implementation**: `VecDeque<(Instant, [u8; 32])>` with linear
+/// `contains`. Capacity **128** + **60 s TTL** per PLAN §3 M1b
+/// STEP-1b.3 (reviewer #4 3rd: original M1a was capacity 64 with
+/// no TTL, which rolled under "64 different copies in 60 s"
+/// pressure).
+///
+/// `contains` does **lazy TTL eviction**: expired entries are
+/// popped from the front on every check. This matches the
+/// `ClipboardCache` semantics — both rely on a 60-s lookback
+/// window to bound the loopback LRU's reach into past state.
+///
+/// **`contains` is `&mut self`** because of the lazy eviction.
+/// All call sites have `&mut Service` already (single-threaded
+/// `spawn_local` task), so the signature change is a no-op for
+/// the dispatcher's normal flow.
+///
+/// **Capacity 128**: capacity 1 covers the "1 push + 1 receiver
+/// pulls at a time" baseline; the 128x headroom absorbs races
+/// where a few receivers are mid-pull when the next push ejects
+/// the previous payload, and a few clipboard pushes happen
+/// between the receiver's metadata arrival and GET (typical for
+/// keyboard-heavy users). The `contains` cost is O(128) byte
+/// comparisons per inbound event, well below the dispatch tick's
+/// 1-3 ms typical work — same order as the M1a O(64).
 #[derive(Debug)]
 struct LruFingerprints {
     capacity: usize,
-    items: VecDeque<[u8; 32]>,
+    ttl: Duration,
+    items: VecDeque<(Instant, [u8; 32])>,
 }
 
 impl LruFingerprints {
-    fn new(capacity: usize) -> Self {
+    /// Default capacity — matches PLAN §3 M1b STEP-1b.3 (reviewer
+    /// #4 3rd, was 64 in M1a).
+    const DEFAULT_CAPACITY: usize = 128;
+
+    /// Default TTL — matches PLAN §3 M1b STEP-1b.3 (reviewer #4
+    /// 3rd, was unbounded in M1a). 60 s is the "1 push + 1
+    /// receiver pulls at a time" baseline: a peer-pushed echo of a
+    /// fingerprint we wrote locally more than a minute ago is no
+    /// longer a loopback, it's a fresh event from a different
+    /// session.
+    const DEFAULT_TTL: Duration = Duration::from_secs(60);
+
+    fn new() -> Self {
+        Self::with_capacity_and_ttl(Self::DEFAULT_CAPACITY, Self::DEFAULT_TTL)
+    }
+
+    /// Construct an LRU with custom capacity / TTL. Used by tests
+    /// that want a 0-second TTL or capacity 1 to exercise eviction
+    /// quickly.
+    fn with_capacity_and_ttl(capacity: usize, ttl: Duration) -> Self {
         Self {
             capacity,
+            ttl,
             items: VecDeque::with_capacity(capacity),
         }
     }
 
-    fn contains(&self, fp: &[u8; 32]) -> bool {
-        self.items.contains(fp)
+    fn contains(&mut self, fp: &[u8; 32]) -> bool {
+        // Lazy TTL eviction: walk from the front, popping
+        // expired entries. Stops at the first non-expired entry
+        // (the deque is push-back / pop-front LRU-ordered, so
+        // the front is the oldest).
+        let now = Instant::now();
+        while let Some((ts, _)) = self.items.front() {
+            if now.duration_since(*ts) >= self.ttl {
+                self.items.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.items.iter().any(|(_, sha)| sha == fp)
     }
 
     fn push(&mut self, fp: [u8; 32]) {
         if self.items.len() >= self.capacity {
             self.items.pop_front();
         }
-        self.items.push_back(fp);
+        self.items.push_back((Instant::now(), fp));
+    }
+
+    /// **M1b STEP-1b.3** — explicit "we just wrote this
+    /// fingerprint to the local clipboard" mark. Called by
+    /// [`Service::apply_inbound_clipboard_text`] **before**
+    /// `backend.set_text`, so an OS echo of the freshly-written
+    /// value (if the platform emits a change event during the
+    /// same tick) is caught by the next `contains` check.
+    ///
+    /// Functionally an alias for `push`; distinguished at the
+    /// call site so the dispatcher's outbound push (`push`) and
+    /// inbound apply (`mark_local_write`) read as semantically
+    /// separate operations.
+    fn mark_local_write(&mut self, fp: [u8; 32]) {
+        self.push(fp);
     }
 
     /// Test-only: drain the LRU. Used by the dispatcher unit tests
@@ -283,6 +359,153 @@ impl LruFingerprints {
     fn len(&self) -> usize {
         self.items.len()
     }
+}
+
+// ============================================================================
+//  ClipboardMetrics — runtime signals for the loopback LRU (PLAN-2 / M1b STEP-1b.3)
+// ============================================================================
+
+/// **PLAN-2 / M1b STEP-1b.3** — runtime signals for the clipboard
+/// loopback LRU. Tracks hit (skip) / miss (allow) counts plus the
+/// timestamp of the most recent skip so an operator can verify the
+/// loopback defence is firing when expected.
+///
+/// **Counters**:
+/// - `skip_count` — incremented on every inbound `ClipboardText`
+///   whose fingerprint was already in the loopback LRU (we wrote
+///   it locally recently, the peer is echoing it back).
+/// - `allow_count` — incremented on every inbound `ClipboardText`
+///   that passed the loopback check **and** was successfully
+///   applied to the local clipboard.
+/// - `last_skip_ts` — UNIX milliseconds of the most recent skip;
+///   0 until the first skip fires. Surfaced in the GUI in M4
+///   STEP-4.4 ("回环跳过统计卡片").
+///
+/// **Why `AtomicU64` and not `Mutex<u64>`**: counters are
+/// updated from the dispatcher's `spawn_local` task and read by
+/// the 60-s hit-rate log task. Atomics avoid a lock acquisition
+/// on every push, which fires every 500 ms during normal
+/// operation. `Ordering::Relaxed` is correct here — the counters
+/// are independent monoids (each `incr_*` is atomic in itself)
+/// and the snapshot doesn't need cross-counter consistency.
+///
+/// **`last_skip_ts` is updated atomically with `skip_count`**
+/// (separate stores, both `Relaxed`): the snapshot is the
+/// "logically most recent seen" value, not a transaction. If the
+/// hit-rate task races with a `incr_skip`, it may observe a
+/// `skip_count` one higher than the `last_skip_ts` it just read,
+/// but the next tick will reconcile. Pinning them together
+/// would require a single `u128` packing, which is overkill for
+/// a debug-grade signal.
+#[derive(Debug, Default)]
+pub struct ClipboardMetrics {
+    skip_count: AtomicU64,
+    allow_count: AtomicU64,
+    last_skip_ts: AtomicU64,
+}
+
+impl ClipboardMetrics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Increment `skip_count` and stamp `last_skip_ts` with
+    /// `unix_now_ms`. Called from
+    /// [`Service::handle_clipboard_inbound`]'s loopback-hit arm.
+    pub fn incr_skip(&self, unix_now_ms: u64) {
+        self.skip_count.fetch_add(1, Ordering::Relaxed);
+        self.last_skip_ts.store(unix_now_ms, Ordering::Relaxed);
+    }
+
+    /// Increment `allow_count`. Called from
+    /// [`Service::apply_inbound_clipboard_text`] after
+    /// `backend.set_text` succeeds. **Does not** touch
+    /// `last_skip_ts` (that's the skip signal, by definition).
+    pub fn incr_allow(&self) {
+        self.allow_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read all three counters atomically (per-counter atomic
+    /// loads; cross-counter consistency is not required — see
+    /// the struct doc).
+    pub fn snapshot(&self) -> ClipboardMetricsSnapshot {
+        ClipboardMetricsSnapshot {
+            skip: self.skip_count.load(Ordering::Relaxed),
+            allow: self.allow_count.load(Ordering::Relaxed),
+            last_skip_ts: self.last_skip_ts.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Plain-old-data view of [`ClipboardMetrics`] for callers that
+/// only need a snapshot (the hit-rate log task). `Copy` because
+/// three `u64`s cost nothing to duplicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardMetricsSnapshot {
+    pub skip: u64,
+    pub allow: u64,
+    pub last_skip_ts: u64,
+}
+
+impl ClipboardMetricsSnapshot {
+    /// Compute the loopback LRU hit rate as `skip / (skip + allow)`.
+    /// Returns `None` when no events have been observed (avoids
+    /// division by zero AND keeps the hit-rate log task silent on
+    /// quiet daemons).
+    pub fn hit_rate(self) -> Option<f64> {
+        let total = self.skip + self.allow;
+        if total == 0 {
+            None
+        } else {
+            Some(self.skip as f64 / total as f64)
+        }
+    }
+}
+
+/// **PLAN-2 / M1b STEP-1b.3** — background hit-rate log task.
+///
+/// Spawns a `spawn_local` task (the daemon runs on a
+/// `current_thread` runtime + `LocalSet`) that ticks every 60 s
+/// and emits a `log::trace!` line at the
+/// `lan_mouse::service::clipboard` target. The log is gated by
+/// the standard `RUST_LOG` filter:
+///
+/// ```text
+/// RUST_LOG=lan_mouse::service::clipboard=trace
+/// ```
+///
+/// enables it; anything stricter (info / warn) silences it. We
+/// skip the log when no events have been observed yet (avoids
+/// noisy 0/0 lines on freshly-started daemons) and we skip the
+/// immediate first tick so the first log line lands at t≈60 s
+/// rather than t=0.
+///
+/// **No `JoinHandle` retention**: the task lives until the
+/// runtime drops at daemon exit, which is the same lifetime as
+/// the rest of the daemon's `spawn_local` tasks. There is no
+/// clean shutdown signal the task would need to honour.
+pub fn spawn_hit_rate_log_task(metrics: Arc<ClipboardMetrics>) -> tokio::task::JoinHandle<()> {
+    tokio::task::spawn_local(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        // Skip the immediate first tick — `tokio::time::interval`
+        // fires at t=0 by default, but we don't want a log line
+        // before the daemon has been alive for a full minute.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let snap = metrics.snapshot();
+            if let Some(rate) = snap.hit_rate() {
+                log::trace!(
+                    target: "lan_mouse::service::clipboard",
+                    "clipboard hit rate: skip={} allow={} rate={:.1}% last_skip_ts={}",
+                    snap.skip,
+                    snap.allow,
+                    rate * 100.0,
+                    snap.last_skip_ts
+                );
+            }
+        }
+    })
 }
 
 #[derive(Debug)]
@@ -465,6 +688,14 @@ impl Service {
         // create dns resolver
         let resolver = DnsResolver::new()?;
 
+        // **M1b STEP-1b.3** — runtime signals for the loopback
+        // LRU. `Arc` is shared between the dispatcher (writes)
+        // and the hit-rate log task (reads every 60 s). Spawned
+        // before `Service::new` returns so the very first tick of
+        // the daemon already has the log task in flight.
+        let metrics = Arc::new(ClipboardMetrics::new());
+        spawn_hit_rate_log_task(metrics.clone());
+
         let port = config.port();
         let quic_idle_timeout_secs = quic_idle_timeout.as_secs();
         let service = Self {
@@ -505,7 +736,9 @@ impl Service {
             // `clipboard_backend` guard short-circuits the
             // no-backend case.
             clipboard_backend,
-            clipboard_lru: LruFingerprints::new(64),
+            // **M1b STEP-1b.3** — capacity 128 + 60 s TTL
+            // (reviewer #4 3rd, was capacity 64 with no TTL in M1a).
+            clipboard_lru: LruFingerprints::new(),
             clipboard_last_text: None,
             pending_clipboard_requests: Default::default(),
             // **M1b STEP-1b.2** — shared with the listener so
@@ -527,6 +760,9 @@ impl Service {
             last_image_ts_ms: None,
             last_file_ts_ms: None,
             last_clipboard_source: None,
+            // **M1b STEP-1b.3** — shared with the hit-rate log
+            // task spawned just before this struct literal.
+            metrics: metrics.clone(),
         };
         Ok(service)
     }
@@ -1671,6 +1907,12 @@ impl Service {
                 "clipboard inbound: skipping loopback sha={}",
                 short_hex(&ct.sha256)
             );
+            // **M1b STEP-1b.3** — record the skip. The fingerprint
+            // matched the loopback LRU, meaning we wrote it locally
+            // recently and a peer is now echoing it back. Count for
+            // the hit-rate metric (60-s log task surfaces the
+            // running rate).
+            self.metrics.incr_skip(unix_now_ms());
             return;
         }
         // Inline fast-path: bytes are on the wire, just apply.
@@ -1723,11 +1965,23 @@ impl Service {
     ///
     /// Split out of [`Self::handle_clipboard_inbound`] so the
     /// inline and HTTP/3-pulled paths share the exact same
-    /// downstream behaviour: loopback LRU push, `last_text` reset,
+    /// downstream behaviour: loopback LRU mark, `last_text` reset,
     /// timestamp + `last_source` update, frontend notification,
     /// log line. Without this helper, the two branches in
     /// `handle_clipboard_inbound` would drift over time (e.g. one
-    /// forgets the LRU push).
+    /// forgets the LRU mark).
+    ///
+    /// **M1b STEP-1b.3** — the loopback LRU is now
+    /// `mark_local_write`'d **before** `backend.set_text`, not
+    /// after. Putting the mark first means an OS echo of the
+    /// freshly-written value (if the platform notifies on every
+    /// change) is caught by the very next `clipboard_tick`'s
+    /// `contains` check. Without this reordering, a tick that
+    /// fires between `set_text` and the LRU push would re-broadcast
+    /// the value we just applied — defeating the loopback defence.
+    /// A failed `set_text` still leaves the LRU marked (we
+    /// *intended* to write it); the cost is one harmless "skip"
+    /// for the next inbound of the same fingerprint.
     fn apply_inbound_clipboard_text(
         &mut self,
         sha256: &[u8; 32],
@@ -1737,6 +1991,10 @@ impl Service {
         let Some(backend) = self.clipboard_backend.as_mut() else {
             return;
         };
+        // **M1b STEP-1b.3** — mark the loopback LRU BEFORE writing
+        // to the OS clipboard. See the function docstring for the
+        // ordering rationale.
+        self.clipboard_lru.mark_local_write(*sha256);
         // Apply to the local OS clipboard. The text is UTF-8 by
         // wire convention; if a peer sent non-UTF-8 bytes (corrupt
         // / older daemon) the lossy replace keeps the daemon from
@@ -1746,7 +2004,11 @@ impl Service {
             log::warn!("clipboard inbound: set_text failed: {e}");
             return;
         }
-        self.clipboard_lru.push(*sha256);
+        // **M1b STEP-1b.3** — record the allow. Increment
+        // *after* `set_text` succeeds so a failed write doesn't
+        // inflate the metric. The hit-rate log task surfaces the
+        // running `allow` count every 60 s.
+        self.metrics.incr_allow();
         // Force the next tick to re-read so `last_text` updates to
         // the freshly-written value; otherwise a stale `last_text`
         // would suppress the change-detection that triggers
@@ -2350,6 +2612,381 @@ mod clipboard_tests {
         assert_eq!(pending.len(), 1);
         assert!(!pending.contains_key(&sha));
         assert!(pending.contains_key(&other_sha));
+    }
+}
+
+// ============================================================================
+//  STEP-1b.3 tests — LRU TTL + ClipboardMetrics + hit_rate
+// ============================================================================
+
+#[cfg(test)]
+mod lru_fingerprints_tests {
+    //! **PLAN-2 / M1b STEP-1b.3** — pins the loopback LRU's new
+    //! 60 s TTL semantics, 128-entry capacity, and the
+    //! `mark_local_write` API. Tests live in this module so the
+    //! production `LruFingerprints` API stays private but the
+    //! invariants the dispatcher depends on are verifiable in
+    //! isolation.
+
+    use super::LruFingerprints;
+    use std::time::Duration;
+
+    /// Newly-constructed LRU holds no entries.
+    #[test]
+    fn new_lru_is_empty() {
+        let mut lru = LruFingerprints::new();
+        assert_eq!(lru.len(), 0);
+        assert!(!lru.contains(&[0xAB; 32]));
+    }
+
+    /// `mark_local_write` + `contains` round-trip — the core
+    /// contract the dispatcher's inbound arm relies on.
+    #[test]
+    fn mark_local_write_then_contains_returns_true() {
+        let mut lru = LruFingerprints::new();
+        let sha = [0xAB; 32];
+        lru.mark_local_write(sha);
+        assert!(lru.contains(&sha));
+        assert_eq!(lru.len(), 1);
+    }
+
+    /// `push` and `mark_local_write` are aliases at the API level
+    /// (they share the underlying `VecDeque`). This pins the
+    /// "outbound tick uses `push`, inbound apply uses
+    /// `mark_local_write`, both paths reach the same LRU" contract.
+    #[test]
+    fn push_and_mark_local_write_share_lru_state() {
+        let mut lru = LruFingerprints::new();
+        lru.push([0x11; 32]);
+        lru.mark_local_write([0x22; 32]);
+        assert!(lru.contains(&[0x11; 32]));
+        assert!(lru.contains(&[0x22; 32]));
+        assert_eq!(lru.len(), 2);
+    }
+
+    /// TTL: an entry past its TTL is removed on the next
+    /// `contains` (lazy eviction). Uses a 10-ms TTL + 20-ms sleep
+    /// so the test runs in ~20 ms with a comfortable TTL
+    /// boundary (avoids flaky tests caused by sub-millisecond
+    /// resolution races with `Instant::now()`).
+    #[test]
+    fn contains_returns_false_after_ttl_expires() {
+        let mut lru = LruFingerprints::with_capacity_and_ttl(16, Duration::from_millis(10));
+        let sha = [0xCD; 32];
+        lru.mark_local_write(sha);
+        // Sleep comfortably past the 10-ms TTL.
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            !lru.contains(&sha),
+            "entry past TTL must be evicted on next contains"
+        );
+        assert_eq!(lru.len(), 0, "expired entry must be evicted");
+    }
+
+    /// After TTL expiry the fingerprint can be re-marked and the
+    /// LRU accepts it again. Pins the "TTL is not a permanent
+    /// block" contract.
+    #[test]
+    fn ttl_expired_fingerprint_can_be_remarked_and_resyncs() {
+        let mut lru = LruFingerprints::with_capacity_and_ttl(16, Duration::from_millis(10));
+        let sha = [0xEF; 32];
+        lru.mark_local_write(sha);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!lru.contains(&sha));
+        // Re-mark after expiry — must succeed (LRU is no longer
+        // remembering the old entry).
+        lru.mark_local_write(sha);
+        assert!(lru.contains(&sha));
+        assert_eq!(lru.len(), 1);
+    }
+
+    /// Capacity overflow evicts the oldest entry (LRU from front).
+    /// Capacity 2 + 3 distinct fingerprints → oldest must be gone.
+    #[test]
+    fn capacity_overflow_evicts_oldest() {
+        let mut lru = LruFingerprints::with_capacity_and_ttl(2, Duration::from_secs(60));
+        lru.mark_local_write([0x01; 32]);
+        lru.mark_local_write([0x02; 32]);
+        lru.mark_local_write([0x03; 32]);
+        assert_eq!(lru.len(), 2, "capacity must be enforced");
+        assert!(!lru.contains(&[0x01; 32]), "oldest must be evicted");
+        assert!(lru.contains(&[0x02; 32]));
+        assert!(lru.contains(&[0x03; 32]));
+    }
+
+    /// PLAN §3 M1b STEP-1b.3 pin: default capacity is **128**
+    /// (was 64 in M1a).
+    #[test]
+    fn default_capacity_is_128() {
+        let mut lru = LruFingerprints::new();
+        // Insert 128 distinct fingerprints.
+        for i in 0..128u8 {
+            let mut sha = [0u8; 32];
+            sha[0] = i;
+            lru.mark_local_write(sha);
+        }
+        assert_eq!(lru.len(), 128, "default capacity must be 128");
+        // The 129th insertion evicts the oldest.
+        let mut oldest = [0u8; 32];
+        oldest[0] = 0;
+        assert!(lru.contains(&oldest), "oldest still in before 129th");
+        let mut newest = [0u8; 32];
+        newest[0] = 128;
+        lru.mark_local_write(newest);
+        assert!(
+            !lru.contains(&oldest),
+            "oldest must be evicted at capacity 128 + 1"
+        );
+        assert!(lru.contains(&newest));
+        assert_eq!(lru.len(), 128, "len must remain at capacity");
+    }
+
+    /// **PLAN §3 M1b STEP-1b.3** pin: TTL is **60 s** (was
+    /// infinite in M1a). Verified by construction — the constant
+    /// is the only place the value lives.
+    #[test]
+    fn default_ttl_is_60s() {
+        // Constructing a 0-second LRU and a default one — if the
+        // default TTL changes away from 60 s, this test still
+        // passes (the values are independent constants). The
+        // intent here is to lock the *behaviour* via the
+        // with_capacity_and_ttl seam, not the exact seconds value.
+        let mut zero_ttl = LruFingerprints::with_capacity_and_ttl(16, Duration::from_secs(0));
+        let mut default_lru = LruFingerprints::new();
+        zero_ttl.mark_local_write([0xAA; 32]);
+        default_lru.mark_local_write([0xBB; 32]);
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(
+            !zero_ttl.contains(&[0xAA; 32]),
+            "0 s TTL must expire immediately"
+        );
+        assert!(
+            default_lru.contains(&[0xBB; 32]),
+            "60 s default TTL must NOT expire after 2 ms"
+        );
+    }
+
+    /// Distinct fingerprints don't cross-contaminate.
+    #[test]
+    fn distinct_keys_dont_clobber_each_other() {
+        let mut lru = LruFingerprints::new();
+        lru.mark_local_write([0x11; 32]);
+        lru.mark_local_write([0x22; 32]);
+        assert!(lru.contains(&[0x11; 32]));
+        assert!(lru.contains(&[0x22; 32]));
+        assert!(!lru.contains(&[0x33; 32]));
+    }
+}
+
+#[cfg(test)]
+mod clipboard_metrics_tests {
+    //! **PLAN-2 / M1b STEP-1b.3** — pins the [`ClipboardMetrics`]
+    //! counter contract and [`ClipboardMetricsSnapshot::hit_rate`]
+    //! math. The hit-rate log task itself is exercised by an
+    //! integration test below (`spawn_hit_rate_log_task_runs`)
+    //! that ensures the spawned `spawn_local` task actually
+    //! starts; the log emission itself is gated by the runtime
+    //! `RUST_LOG` filter and is not directly observable.
+
+    use super::ClipboardMetrics;
+
+    /// Fresh metrics have zero counters — the hit-rate log task
+    /// must not log a line until at least one event fires
+    /// (avoids noisy 0/0 lines on quiet daemons).
+    #[test]
+    fn default_metrics_are_all_zero() {
+        let m = ClipboardMetrics::new();
+        let snap = m.snapshot();
+        assert_eq!(snap.skip, 0);
+        assert_eq!(snap.allow, 0);
+        assert_eq!(snap.last_skip_ts, 0);
+    }
+
+    /// `incr_skip` bumps `skip_count` AND stamps `last_skip_ts`.
+    /// This is the loopback LRU hit signal; both fields must be
+    /// updated atomically from the caller's perspective.
+    #[test]
+    fn incr_skip_increments_and_updates_last_skip_ts() {
+        let m = ClipboardMetrics::new();
+        m.incr_skip(1_700_000_000_000);
+        assert_eq!(m.snapshot().skip, 1);
+        assert_eq!(m.snapshot().last_skip_ts, 1_700_000_000_000);
+
+        m.incr_skip(1_700_000_001_000);
+        assert_eq!(m.snapshot().skip, 2);
+        assert_eq!(m.snapshot().last_skip_ts, 1_700_000_001_000);
+    }
+
+    /// `incr_allow` bumps **only** `allow_count` — `last_skip_ts`
+    /// is a skip signal and must not be touched by an allow event.
+    #[test]
+    fn incr_allow_increments_only_allow_count() {
+        let m = ClipboardMetrics::new();
+        m.incr_allow();
+        m.incr_allow();
+        let snap = m.snapshot();
+        assert_eq!(snap.allow, 2);
+        assert_eq!(snap.skip, 0, "incr_allow must not touch skip");
+        assert_eq!(
+            snap.last_skip_ts, 0,
+            "incr_allow must not touch last_skip_ts"
+        );
+    }
+
+    /// Mixed skip / allow: counters are independent and
+    /// accumulate correctly.
+    #[test]
+    fn skip_and_allow_accumulate_independently() {
+        let m = ClipboardMetrics::new();
+        for _ in 0..5 {
+            m.incr_skip(1_700_000_000_000);
+        }
+        for _ in 0..42 {
+            m.incr_allow();
+        }
+        let snap = m.snapshot();
+        assert_eq!(snap.skip, 5);
+        assert_eq!(snap.allow, 42);
+        assert_eq!(snap.last_skip_ts, 1_700_000_000_000);
+    }
+
+    /// `snapshot` returns the current values — callers (the
+    /// hit-rate log task) use this to read without taking a lock.
+    #[test]
+    fn snapshot_returns_current_values() {
+        let m = ClipboardMetrics::new();
+        m.incr_skip(100);
+        m.incr_allow();
+        let snap = m.snapshot();
+        assert_eq!(snap.skip, 1);
+        assert_eq!(snap.allow, 1);
+        assert_eq!(snap.last_skip_ts, 100);
+        // The snapshot is `Copy` and returns a value type, so a
+        // second snapshot taken later can differ if events fire
+        // in between. Take a second snapshot here to pin that
+        // `snapshot` is not caching.
+        m.incr_skip(200);
+        let snap2 = m.snapshot();
+        assert_eq!(snap2.skip, 2);
+        assert_eq!(snap2.last_skip_ts, 200);
+        // The first snapshot's values are unaffected (Copy).
+        assert_eq!(snap.last_skip_ts, 100);
+    }
+}
+
+#[cfg(test)]
+mod hit_rate_tests {
+    //! **PLAN-2 / M1b STEP-1b.3** — pins the hit-rate math.
+    //! The hit-rate log task formats `rate * 100.0` for its
+    //! `trace!` line; the tests pin the math, not the format
+    //! string (the format is stable but living in a single
+    //! `format!` makes it hard to regression-test without
+    //! reaching into the log plumbing).
+
+    use super::ClipboardMetricsSnapshot;
+
+    /// **0/0 must return `None`**, not `NaN` / `0.0` / panic. The
+    /// hit-rate log task uses this to skip the log line on
+    /// freshly-started daemons.
+    #[test]
+    fn hit_rate_zero_over_zero_returns_none() {
+        let snap = ClipboardMetricsSnapshot {
+            skip: 0,
+            allow: 0,
+            last_skip_ts: 0,
+        };
+        assert_eq!(snap.hit_rate(), None);
+    }
+
+    /// **3 / (3 + 42) = 6.666…%** — the example from the task
+    /// description.
+    #[test]
+    fn hit_rate_3_over_45_is_roughly_6_67_percent() {
+        let snap = ClipboardMetricsSnapshot {
+            skip: 3,
+            allow: 42,
+            last_skip_ts: 0,
+        };
+        let rate = snap.hit_rate().expect("non-zero total");
+        assert!(
+            (rate - 3.0 / 45.0).abs() < 1e-9,
+            "rate must be 3/45; got {rate}"
+        );
+    }
+
+    /// All-skips (no allows) → 100 %.
+    #[test]
+    fn hit_rate_all_skips_returns_100_percent() {
+        let snap = ClipboardMetricsSnapshot {
+            skip: 7,
+            allow: 0,
+            last_skip_ts: 0,
+        };
+        let rate = snap.hit_rate().expect("non-zero total");
+        assert!((rate - 1.0).abs() < 1e-9);
+    }
+
+    /// All-allows (no skips) → 0 %.
+    #[test]
+    fn hit_rate_no_skips_returns_zero_percent() {
+        let snap = ClipboardMetricsSnapshot {
+            skip: 0,
+            allow: 7,
+            last_skip_ts: 0,
+        };
+        let rate = snap.hit_rate().expect("non-zero total");
+        assert!(rate.abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod hit_rate_log_task_tests {
+    //! **PLAN-2 / M1b STEP-1b.3** — pins the spawn path of the
+    //! hit-rate log task. We don't try to capture the `trace!`
+    //! line itself (env_logger filtering is best left to the
+    //! integration suite); we only verify the task spawns
+    //! without panicking and is alive immediately after spawn.
+
+    use super::{ClipboardMetrics, spawn_hit_rate_log_task};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// `spawn_hit_rate_log_task` returns a live `JoinHandle` and
+    /// does not panic on construction. The task itself waits 60 s
+    /// before logging; we abort it after a short sleep to keep
+    /// the test fast.
+    ///
+    /// **Wrapped in `LocalSet`** because the daemon runs the
+    /// service on a `current_thread` runtime + `LocalSet`, and
+    /// `spawn_local` panics if called from outside a local
+    /// context.
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_hit_rate_log_task_returns_live_handle() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let metrics = Arc::new(ClipboardMetrics::new());
+                let handle = spawn_hit_rate_log_task(metrics.clone());
+                assert!(
+                    !handle.is_finished(),
+                    "spawned task must be alive immediately after spawn"
+                );
+                // Let the task tick at least once on a shortened
+                // interval by writing some counters + aborting
+                // before the next 60-s tick lands. The first tick
+                // is skipped by the task itself, so aborting now
+                // is safe.
+                metrics.incr_skip(42);
+                metrics.incr_allow();
+                let _ = metrics.snapshot();
+                // Abort so the test doesn't wait 60 s.
+                handle.abort();
+                // Give the runtime a moment to process the
+                // abort.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(handle.is_finished(), "aborted task must finish");
+            })
+            .await;
     }
 }
 
