@@ -107,8 +107,15 @@ libc = "0.2.148"
 # M1a STEP-1a.3 — Windows clipboard backend (`OpenClipboard` /
 # `GetClipboardData` / `SetClipboardData` via `windows-sys`). Only
 # pulled in when compiling for `target_os = "windows"`.
+# M2b STEP-2b.1 — added `Win32_Graphics_Gdi` (BITMAPV5HEADER /
+# BITMAPINFOHEADER structs used by CF_DIBV5 payload encoding) and
+# `Win32_System_Ole` (CF_DIB / CF_DIBV5 clipboard format constants).
+# Also added `image` (PNG decode + BMP encode for the PNG→DIB write
+# path on Windows; same crate is reused by the macOS backend but
+# with a tighter macOS-only feature list below).
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_DataExchange"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_DataExchange", "Win32_Graphics_Gdi", "Win32_System_Ole"] }
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
 
 # M2a STEP-2a.2 — macOS clipboard image backend (`NSPasteboard` via
 # `objc2` + `image` crate for TIFF→PNG normalization, PLAN §3 评审
@@ -118,10 +125,13 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-app-kit = "0.3"
-# `image` features: PNG (write) + TIFF (read fallback). Default features
-# include many formats we don't need; explicit feature list keeps the
-# dep tree minimal. See `src/clipboard/macos.rs::tiff_to_png_normalized`.
-image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
+# `image` features: PNG (write) + TIFF (read fallback) + BMP (read
+# for DIB fallback in `dib_to_png_via_image_crate`, M2b STEP-2b.1).
+# Default features include many formats we don't need; explicit
+# feature list keeps the dep tree minimal. See
+# `src/clipboard/macos.rs::tiff_to_png_normalized` and
+# `src/clipboard/macos.rs::dib_to_png_via_image_crate`.
+image = { version = "0.25", default-features = false, features = ["png", "tiff", "bmp"] }
 
 [features]
 default = [
