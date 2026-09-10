@@ -2050,22 +2050,58 @@ impl Service {
     ///
     /// Steps:
     /// 1. SHA-256 the image bytes (content fingerprint).
-    /// 2. Compare to `last_outbound_image_sha` — skip if the
+    /// 2. **Image LRU loopback check** against
+    ///    `image_lru_fingerprints` (mirrors the text branch's
+    ///    `clipboard_lru.contains` short-circuit). On hit →
+    ///    log debug + skip. Without this check, the daemon
+    ///    would ping-pong every inbound image back to its
+    ///    sender on the next 500 ms tick: `apply_inbound_…`
+    ///    marks the LRU before `set_image`, and Windows
+    ///    transcodes inbound PNG → BMP-encoded DIB so the
+    ///    freshly-written clipboard content's SHA does NOT
+    ///    match `last_outbound_image_sha`.
+    /// 3. Compare to `last_outbound_image_sha` — skip if the
     ///    same image was the most recent push (bandwidth
     ///    optimisation: avoids re-broadcasting the same image
     ///    every 500 ms while the clipboard sits unchanged).
-    /// 3. Active eviction: `cache.remove(prev_image_sha)`
+    /// 4. Active eviction: `cache.remove(prev_image_sha)`
     ///    before broadcast (mirrors the text branch's
     ///    "evict prev before push" contract).
-    /// 4. Cache insert: store the new image bytes keyed by sha256
+    /// 5. Cache insert: store the new image bytes keyed by sha256
     ///    so the receiver's HTTP/3 GET can pull them.
-    /// 5. Broadcast the `ClipboardImage` metadata event.
-    /// 6. Update `last_outbound_image_sha` + `last_image_ts_ms` +
+    /// 6. Broadcast the `ClipboardImage` metadata event.
+    /// 7. Update `last_outbound_image_sha` + `last_image_ts_ms` +
     ///    emit `FrontendEvent::ClipboardState`.
     async fn dispatch_image(&mut self, image: crate::clipboard::ImageBytes) {
         // Step 1: SHA-256 the image bytes.
         let sha = sha256_of_bytes(&image.data);
-        // Step 2: skip if same image as last push. The macOS
+        // Step 2: image LRU loopback check (mirrors the text
+        // branch's `clipboard_lru.contains(&sha)` short-circuit).
+        // The inbound apply path (`apply_inbound_clipboard_image`)
+        // calls `mark_local_image_write` BEFORE `backend.set_image`,
+        // so any image we just wrote locally is in the LRU and any
+        // tick that observes it back via `current_image()` must
+        // skip the broadcast — otherwise the daemon would
+        // ping-pong the same image to its peer every 500 ms.
+        //
+        // **Why this is needed even though `last_outbound_image_sha`
+        // already exists**: Windows transcodes inbound PNG →
+        // BMP-encoded DIB (different bytes, different SHA), so the
+        // freshly-written clipboard content's SHA does NOT match
+        // `last_outbound_image_sha` (which holds the previous
+        // *outbound* push's SHA). Without the LRU check the
+        // post-apply tick would dispatch the freshly-written DIB
+        // back to the original sender. The text branch has the
+        // same protection (it predates this fix).
+        if self.image_lru_fingerprints.contains(&sha) {
+            log::debug!(
+                "clipboard tick: image LRU loopback hit sha={} ({} bytes), skipping broadcast",
+                short_hex(&sha),
+                image.data.len()
+            );
+            return;
+        }
+        // Step 3: skip if same image as last push. The macOS
         // backend's `changeCount` short-circuit in STEP-2a.2 means
         // `current_image()` runs less often than the tick rate, but
         // every call still produces a sha256 hash worth a few ms
@@ -2075,9 +2111,9 @@ impl Service {
         if Some(&sha) == self.last_outbound_image_sha.as_ref() {
             return;
         }
-        // Step 3: active eviction (mirrors the text branch).
+        // Step 4: active eviction (mirrors the text branch).
         self.evict_prev_outbound_image_cache();
-        // Step 4: cache insert. The bytes already passed the
+        // Step 5: cache insert. The bytes already passed the
         // dedup check above, so this is always a fresh sha256
         // entry. (Overwriting an existing entry with the same
         // sha256 — which can only happen via direct manipulation
@@ -2091,7 +2127,7 @@ impl Service {
                 short_hex(&sha)
             );
         }
-        // Step 5: build + broadcast the metadata event. The wire
+        // Step 6: build + broadcast the metadata event. The wire
         // format is `ClipboardImage { fingerprint, mime, sha256,
         // size }` — fingerprint == sha256 by the text-path
         // convention; size is the byte count of `image.data`.
@@ -2126,7 +2162,7 @@ impl Service {
                 recipients
             );
         }
-        // Step 6: bookkeeping + frontend notification.
+        // Step 7: bookkeeping + frontend notification.
         self.last_outbound_image_sha = Some(sha);
         let now_ms = unix_now_ms();
         self.last_image_ts_ms = Some(now_ms);
@@ -2498,6 +2534,31 @@ impl Service {
         if let Err(e) = apply_inbound_image_bytes(&mut self.clipboard_backend, bytes, mime) {
             log::warn!("clipboard inbound image: set_image failed: {e}");
             return;
+        }
+        // Step 2.5: re-read the clipboard and mark the
+        // *post-transcode* SHA into the image LRU. Windows's
+        // `set_image` decodes the inbound PNG via the `image`
+        // crate and re-encodes as BMP-encoded DIB (different
+        // bytes / different SHA). The LRU entry from Step 1
+        // holds the *original* PNG SHA, which won't match the
+        // freshly-written DIB — so the very next 500 ms tick
+        // would dispatch the just-applied DIB back to its
+        // source. Marking the post-apply SHA closes that loop
+        // even when the backend transcodes.
+        if let Some(backend) = self.clipboard_backend.as_mut() {
+            if let Some(written) = backend.current_image() {
+                let written_sha = sha256_of_bytes(&written.data);
+                if &written_sha != sha256 {
+                    log::debug!(
+                        "clipboard inbound image: backend transcoded (inbound sha={} → \
+                         on-clipboard sha={}, mime={}); marking transcoded SHA in image LRU",
+                        short_hex(sha256),
+                        short_hex(&written_sha),
+                        written.mime
+                    );
+                }
+                self.mark_local_image_write(written_sha);
+            }
         }
         // Step 3: record the allow (mirrors the text branch's
         // "only on success" contract).
@@ -3910,6 +3971,7 @@ mod dispatch_image_tests {
     use crate::clipboard::ImageBytes;
     use crate::clipboard::cache::ClipboardCache;
     use crate::service::evict_prev_outbound_clipboard_cache;
+    use crate::service::{IMAGE_LOOPBACK_CAPACITY, IMAGE_LOOPBACK_TTL, LruFingerprints};
 
     /// **`sha256_of_bytes` correctness**: the empty-input SHA-256
     /// (`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`)
@@ -4063,6 +4125,68 @@ mod dispatch_image_tests {
             cache.lock().unwrap().bytes(),
             1_024,
             "duplicate short-circuit must not affect byte counter"
+        );
+    }
+
+    /// **Post-apply image LRU loopback check** (pin for the
+    /// Windows-transcode regression). After `apply_inbound_…`
+    /// calls `mark_local_image_write(sha_inbound)` AND
+    /// `mark_local_image_write(sha_post_transcode)`, the
+    /// dispatcher's `image_lru_fingerprints.contains(&sha)`
+    /// short-circuit must skip the broadcast for *both* the
+    /// inbound SHA and the post-transcode SHA.
+    ///
+    /// **Why this matters**: Windows's `set_image` decodes the
+    /// inbound PNG via the `image` crate and re-encodes as
+    /// BMP-encoded DIB (different bytes / different SHA). The
+    /// LRU entry from the inbound mark does NOT match the
+    /// freshly-written DIB's SHA, so without the post-apply mark
+    /// the next 500 ms tick would dispatch the just-applied DIB
+    /// back to its source. With the post-apply mark the tick
+    /// is skipped.
+    ///
+    /// This test pins the LRU-mark invariant at the data
+    /// structure level (we don't stand up a full `Service` here
+    /// — see `image_inbound_tests::apply_inbound_*` for the
+    /// end-to-end version).
+    #[test]
+    fn lru_loopback_check_skips_dispatch_when_sha_matches() {
+        // Construct an `LruFingerprints` matching the image
+        // branch's IMAGE_LOOPBACK_CAPACITY / IMAGE_LOOPBACK_TTL.
+        let mut lru: LruFingerprints =
+            LruFingerprints::with_capacity_and_ttl(IMAGE_LOOPBACK_CAPACITY, IMAGE_LOOPBACK_TTL);
+        let original_png_bytes: Vec<u8> = (0u8..=255u8).cycle().take(8192).collect();
+        let original_png_sha = sha256_of_bytes(&original_png_bytes);
+        // Simulate Windows's transcoded DIB: different bytes
+        // (BMP-encoded, larger), different SHA.
+        let transcoded_dib_bytes: Vec<u8> =
+            original_png_bytes.iter().enumerate().map(|(i, b)| b.wrapping_add(i as u8)).collect();
+        let transcoded_dib_sha = sha256_of_bytes(&transcoded_dib_bytes);
+        assert_ne!(
+            original_png_sha, transcoded_dib_sha,
+            "transcode must produce different bytes / SHA"
+        );
+        // Step 1 of apply_inbound_clipboard_image:
+        // mark_local_image_write(inbound_sha)
+        lru.push(original_png_sha);
+        // Step 2.5 of apply_inbound_clipboard_image:
+        // mark_local_image_write(post_transcode_sha) — re-read
+        // the clipboard after set_image and mark the actual
+        // bytes-on-clipboard SHA.
+        lru.push(transcoded_dib_sha);
+
+        // Tick fires; the dispatcher computes sha_of_bytes for
+        // the freshly-written DIB. Both the inbound SHA and the
+        // post-transcode SHA must be in the LRU so the tick
+        // skips the broadcast.
+        assert!(
+            lru.contains(&original_png_sha),
+            "inbound SHA must be in LRU after apply"
+        );
+        assert!(
+            lru.contains(&transcoded_dib_sha),
+            "post-transcode SHA must be in LRU after apply (this is the loopback defence \
+             against Windows's PNG → BMP-encoded-DIB transcoding)"
         );
     }
 }

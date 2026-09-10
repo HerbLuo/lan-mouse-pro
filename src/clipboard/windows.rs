@@ -62,7 +62,7 @@ use std::path::PathBuf;
 
 use windows_sys::Win32::Foundation::{GetLastError, GlobalFree, HGLOBAL};
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
@@ -198,6 +198,23 @@ impl ClipboardBackend for WinClipboard {
             let err = unsafe { GetLastError() };
             return Err(ClipboardError::Io(format!(
                 "OpenClipboard failed: GetLastError={err}"
+            )));
+        }
+        // **M2b STEP-2b.1 + fix**: Win32 protocol requires
+        // `EmptyClipboard()` before `SetClipboardData()` so the
+        // previous clipboard contents (e.g. an existing
+        // `CF_UNICODETEXT` or `CF_DIBV5`) are wiped — otherwise
+        // callers reading in another format would see stale
+        // bytes. Without this call the dispatcher's loopback
+        // detection could miss a freshly applied value if the
+        // backend re-reads a different format than it wrote.
+        if unsafe { EmptyClipboard() } == 0 {
+            let err = unsafe { GetLastError() };
+            unsafe {
+                CloseClipboard();
+            }
+            return Err(ClipboardError::Io(format!(
+                "EmptyClipboard (set_text) failed: GetLastError={err}"
             )));
         }
 
@@ -415,6 +432,24 @@ impl ClipboardBackend for WinClipboard {
             let err = unsafe { GetLastError() };
             return Err(ClipboardError::Io(format!(
                 "OpenClipboard (set_dib_image) failed: GetLastError={err}"
+            )));
+        }
+        // **M2b STEP-2b.1 + fix**: Win32 protocol requires
+        // `EmptyClipboard()` before any `SetClipboardData()` call —
+        // otherwise the previous clipboard contents remain
+        // accessible via other formats (e.g. `CF_BITMAP` after a
+        // Win+PrintScreen), so a subsequent `current_image()` may
+        // observe stale bytes. Without this call the loopback
+        // detection on the dispatcher side could miss the freshly
+        // applied image (because the bytes-on-clipboard SHA does
+        // not match the original PNG SHA).
+        if unsafe { EmptyClipboard() } == 0 {
+            let err = unsafe { GetLastError() };
+            unsafe {
+                CloseClipboard();
+            }
+            return Err(ClipboardError::Io(format!(
+                "EmptyClipboard (set_dib_image) failed: GetLastError={err}"
             )));
         }
         let byte_len = bytes.len();
