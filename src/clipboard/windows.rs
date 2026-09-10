@@ -57,17 +57,18 @@
 #![cfg(target_os = "windows")]
 
 use std::ffi::OsString;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
-use windows_sys::Win32::Foundation::{GetLastError, HGLOBAL};
+use windows_sys::Win32::Foundation::{GetLastError, GlobalFree, HGLOBAL};
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, DragQueryFileW, GetClipboardData, OpenClipboard, SetClipboardData,
+    CloseClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{
-    GMEM_MOVEABLE, GlobalAlloc, GlobalFree, GlobalLock, GlobalUnlock,
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
 };
 use windows_sys::Win32::System::Ole::CF_DIBV5;
+use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
 
 use super::{ClipboardBackend, ClipboardError, ImageBytes, MIME_DIB, Mime};
 
@@ -508,7 +509,7 @@ impl ClipboardBackend for WinClipboard {
         // `GlobalLock` it because `DragQueryFileW` expects a raw
         // `HDROP` handle (it locks internally). Casting
         // `HGLOBAL → HDROP` is bit-equivalent on Windows.
-        let hdrop = handle as windows_sys::Win32::System::Ole::HDROP;
+        let hdrop = handle as HDROP;
         // SAFETY: `DragQueryFileW` with `UINT uFile = 0xFFFFFFFF`
         // returns the file count. NULL-terminated file paths in
         // wide-char UTF-16.
