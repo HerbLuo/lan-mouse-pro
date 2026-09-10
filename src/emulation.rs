@@ -333,22 +333,30 @@ impl ListenTask {
                                 self.listener.reply(addr, ProtoEvent::Hello { magic: PROTOCOL_MAGIC, commit: local_commit() }).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
-                            // **PLAN-2 / M1a STEP-1a.4** — server-side
-                            // inbound clipboard. The
+                            // **PLAN-2 / M1a STEP-1a.4 + M2a
+                            // STEP-2a.4** — server-side inbound
+                            // clipboard. The
                             // `server_stream_c_reader_task` (in
                             // `listen.rs`) pushes every var-codec
                             // frame as `ListenEvent::Msg { event, addr }`;
-                            // we forward `ClipboardText` here so the
-                            // service-level dispatcher can apply it
-                            // to the local OS clipboard.
+                            // we forward `ClipboardText` and
+                            // `ClipboardImage` here so the
+                            // service-level dispatcher can apply
+                            // them to the local OS clipboard.
                             //
-                            // **M1a scope**: only `ClipboardText` is
-                            // wired (small text, ≤ 1 KiB inline).
-                            // `ClipboardImage` / `ClipboardFiles` /
-                            // `FileTransfer*` are M2a / M3a — they
-                            // stay dropped in the `_ => {}` arm below
-                            // until those milestones wire their
-                            // own inbound handlers.
+                            // **M2a STEP-2a.4** added the
+                            // `ClipboardImage` arm — without it
+                            // the image event landed in the
+                            // `_ => {}` catch-all and was silently
+                            // dropped at the receiver, so the
+                            // metadata arrived but the bytes
+                            // were never fetched or applied.
+                            //
+                            // `ClipboardFiles` / `FileTransfer*`
+                            // are still M3a — they stay dropped in
+                            // the `_ => {}` arm below until those
+                            // milestones wire their own inbound
+                            // handlers.
                             //
                             // **Why a `tokio` channel (not the
                             // existing `local_channel` for
@@ -383,6 +391,53 @@ impl ListenTask {
                                     log::debug!(
                                         "ListenTask: clipboard_inbound_tx closed (service gone), \
                                          dropping inbound ClipboardText from {addr}"
+                                    );
+                                }
+                            }
+                            // **M2a STEP-2a.4** — image branch
+                            // mirrors the text path above: forward
+                            // the metadata event into the same
+                            // `clipboard_inbound_tx` so the
+                            // service's `handle_clipboard_inbound`
+                            // can fetch the bytes over HTTP/3 and
+                            // apply them locally. Without this
+                            // arm the image event would land in
+                            // the `_ => {}` catch-all and be
+                            // silently dropped — the receiver
+                            // would receive the metadata but never
+                            // pull or apply the bytes.
+                            //
+                            // **Why forward the whole
+                            // `ClipboardImage`**: the bytes are
+                            // not on the wire inline (they live
+                            // in the source's `clipboard_cache`);
+                            // the dispatcher's
+                            // `handle_clipboard_inbound_image`
+                            // issues the HTTP/3 GET after
+                            // receiving this metadata event.
+                            ProtoEvent::ClipboardImage(ci) => {
+                                let sha_prefix: String = ci
+                                    .sha256
+                                    .iter()
+                                    .take(4)
+                                    .map(|b| format!("{b:02x}"))
+                                    .collect();
+                                log::debug!(
+                                    "ListenTask: forwarding ClipboardImage (sha={}…, {} bytes, mime={}) \
+                                     from {from_addr} to dispatcher",
+                                    sha_prefix,
+                                    ci.size,
+                                    ci.mime,
+                                    from_addr = addr
+                                );
+                                if self
+                                    .clipboard_inbound_tx
+                                    .send((addr, ProtoEvent::ClipboardImage(ci)))
+                                    .is_err()
+                                {
+                                    log::debug!(
+                                        "ListenTask: clipboard_inbound_tx closed (service gone), \
+                                         dropping inbound ClipboardImage from {addr}"
                                     );
                                 }
                             }
