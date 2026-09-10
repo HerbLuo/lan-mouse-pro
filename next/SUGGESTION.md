@@ -45,3 +45,15 @@
 - 🟢 中期：CI matrix (`ubuntu-latest` + `windows-latest` + `macos-latest` + `macos-15-intel`) **已存在**（`.github/workflows/rust.yml`，4 os × 4 job = 16 个 job）。每次 push/PR 自动触发 `cargo build` / `cargo check --workspace --all-targets --all-features` / `cargo test --workspace --all-features` / `cargo clippy --workspace --all-targets --all-features -- -D warnings` —— windows-latest job 会编 windows.rs。
 - 🟡 长期：Windows 真机 round-trip（`OpenClipboard` / `GetClipboardData` / `SetClipboardData` 实机 + clipboard 含多语言 UTF-16 + 跨进程 race condition）需 M1a 真机测试矩阵手动跑（PLAN §8 M1a 矩阵）。
 - 优先级 🟡：核心修复 (#11) 已落；剩下 MSVC target + 真机 round-trip 留给 M1b+ 阶段
+
+---
+
+## #S-3 ⚪ — `src/clipboard` 模块 `pub(crate)` 阻碍集成测试 stub un-stub
+
+**触发 STEP**：STEP-P2-M1b-1b.4
+
+**现象**：`tests/clipboard_text_e2e.rs` 的 stub `active_eviction_concurrent_with_lookup_old_returns_miss` 想 `use lan_mouse::clipboard::cache::ClipboardCache;` → E0603 "module `clipboard` is private"。`src/lib.rs:14` 显式 `pub(crate) mod clipboard;`。Active eviction 契约 pin 在 `src/service.rs::register_pending_clipboard_request`（unit test 层，pub(crate) 满足），但 integration test 层无法触达。
+
+**建议**：M2a 阶段当 `clipboard::Backend` 需要暴露给 GUI Toaster 通知（PLAN §3 M4 STEP-4.4 GeneralPanel 卡片"剪贴板刚被 X 改了"提示）时顺手把 `pub(crate)` 升级为 `pub`；届时 un-stub `tests/clipboard_text_e2e.rs::active_eviction_concurrent_with_lookup_old_returns_miss` 并把 `src/service.rs::register_pending_clipboard_request` 的 body 搬过去。
+
+**优先级**：⚪（不阻塞 M1b；M2a / M4 阶段可能升级为 🟡）
