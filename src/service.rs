@@ -19,13 +19,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify, sync::mpsc as tokio_mpsc};
 
 use crate::clipboard::{ClipboardBackend, default_backend};
+use crate::quic_transport::http3::Http3Client;
 use lan_mouse_proto::{ClipboardText, ProtoEvent};
 use sha2::{Digest, Sha256};
 
@@ -142,12 +143,44 @@ pub struct Service {
     /// `None` after an inbound `set_text` so the next tick re-reads
     /// and confirms the new value.
     clipboard_last_text: Option<String>,
-    /// Metadata-only clipboard text events waiting for the HTTP/3 pull
-    /// implemented in M1b.2. M1b.1 deliberately registers the SHA-256
-    /// without issuing a request. Only the latest hash is retained because
-    /// clipboard synchronization follows last-writer-wins semantics and an
-    /// older pending hash is stale once a newer notification arrives.
+    /// **M1b.1 STOP-GAP** — vestigial hash set kept for the
+    /// "metadata-only notification arrived but not yet pulled"
+    /// bookkeeping introduced in 1b.1. M1b.2 replaces the
+    /// notification-only behaviour with a direct HTTP/3 GET
+    /// (`Http3Client::get_text`), so the field is no longer
+    /// updated; it is kept here to preserve the 1b.1 struct shape
+    /// (the field's helper is exercised by an independent unit
+    /// test). Will be cleaned up in a future PR alongside the
+    /// helper — see `next/SUGGESTION.md`.
+    #[allow(dead_code)]
     pending_clipboard_requests: HashMap<[u8; 32], ()>,
+    /// **PLAN-2 / M1b STEP-1b.2** — content-addressed outbound
+    /// clipboard text cache (sha256 → bytes). The dispatcher writes
+    /// large (> 1 KiB) payloads here; the HTTP/3-lite server reads
+    /// from the same cache to serve `GET /clipboard/text/{sha256}`
+    /// from remote peers.
+    ///
+    /// `Arc<Mutex<...>>` because both the dispatcher (writer) and the
+    /// per-peer HTTP/3 server (reader) need access. `Service` clones
+    /// the `Arc` into `LanMouseListener::new` at startup so every
+    /// per-peer server reads from the same backing store.
+    ///
+    /// Active eviction (the dispatcher's "remove prev before push"
+    /// path) keeps the cache size well under its 128-entry capacity
+    /// in practice; the 5 min TTL is a fallback for the "source
+    /// silent > 5 min" case. See
+    /// [`crate::clipboard::cache::ClipboardCache`] for the contract.
+    clipboard_cache: Arc<Mutex<crate::clipboard::cache::ClipboardCache>>,
+    /// **PLAN-2 / M1b STEP-1b.2** — sha256 of the most recent
+    /// outbound `ClipboardText` push. Tracked so the dispatcher's
+    /// next push can evict this entry from [`Self::clipboard_cache`]
+    /// before installing the new one (PLAN §1 评审 #3 2nd:
+    /// "源端 cache 失效 push/pull race").
+    ///
+    /// Inline (≤ 1 KiB) and metadata-only (> 1 KiB) pushes both
+    /// update this field — the active eviction is keyed by sha256, so
+    /// it doesn't care which path produced the previous push.
+    last_outbound_text_sha: Option<[u8; 32]>,
     /// **M1a STEP-1a.4** — receiver for inbound clipboard events.
     /// Senders live in two places:
     /// - `Emulation::new` clones the sender into the
@@ -315,12 +348,22 @@ impl Service {
         // to TOML but require a daemon restart to take effect (see the
         // `FrontendRequest::SetQuicIdleTimeout` docstring).
         let quic_idle_timeout = config.quic_idle_timeout();
+        // **M1b STEP-1b.2** — outbound clipboard text cache (sha256
+        // → bytes). Shared `Arc` is moved into the listener
+        // constructor and cloned by every per-peer HTTP/3 server to
+        // back `GET /clipboard/text/{sha256}`. Same `Arc` is kept
+        // on `Service` so the dispatcher's tick path can write to
+        // the same backing store. See
+        // [`crate::clipboard::cache::ClipboardCache`] for the
+        // contract.
+        let clipboard_cache = Arc::new(Mutex::new(crate::clipboard::cache::ClipboardCache::new()));
         let listener = LanMouseListener::new(
             config.port(),
             cert_der.0.clone(),
             cert_der.1.clone_key(),
             authorized_keys.clone(),
             quic_idle_timeout,
+            clipboard_cache.clone(),
         )
         .await?;
         let client_endpoint =
@@ -465,6 +508,14 @@ impl Service {
             clipboard_lru: LruFingerprints::new(64),
             clipboard_last_text: None,
             pending_clipboard_requests: Default::default(),
+            // **M1b STEP-1b.2** — shared with the listener so
+            // per-peer HTTP/3 servers can read from the same store
+            // the dispatcher writes to.
+            clipboard_cache: clipboard_cache.clone(),
+            // **M1b STEP-1b.2** — `None` until the first push; the
+            // dispatcher treats the "first push" case as "no prev
+            // to evict" without checking this.
+            last_outbound_text_sha: None,
             clipboard_inbound_rx,
             clipboard_inbound_tx,
             // **M1a follow-up #1** — push-notify receiver. The
@@ -512,7 +563,7 @@ impl Service {
                 // here. Client-side: `peer.set_clipboard_inbox` (set
                 // in `connect_to_handle`) pushes here.
                 Some(inbound) = self.clipboard_inbound_rx.recv() => {
-                    self.handle_clipboard_inbound(inbound);
+                    self.handle_clipboard_inbound(inbound).await;
                 }
                 // **M1a follow-up #1** — peer just transitioned
                 // `active_addr: None → Some(addr)`. Read current
@@ -1525,8 +1576,29 @@ impl Service {
         );
         self.clipboard_lru.push(sha);
         self.clipboard_last_text = Some(new_text.clone());
-        let event =
-            ProtoEvent::ClipboardText(ClipboardText::from_content(sha, sha, new_text.into_bytes()));
+        // **M1b STEP-1b.2** — capture the bytes for the cache.
+        // We compute it before moving `new_text` into the event
+        // constructor. The cache *only* stores payloads > 1 KiB
+        // because smaller payloads travel inline on the wire
+        // (receiver uses the inline bytes, never pulls).
+        let bytes_for_cache = new_text.into_bytes();
+        let push_was_metadata_only =
+            bytes_for_cache.len() > lan_mouse_proto::CLIPBOARD_TEXT_INLINE_LIMIT;
+        let event = ProtoEvent::ClipboardText(ClipboardText::from_content(
+            sha,
+            sha,
+            bytes_for_cache.clone(),
+        ));
+        // **M1b STEP-1b.2** — active eviction (PLAN §1 评审 #3 2nd):
+        // before broadcasting, evict the previous push from
+        // `clipboard_cache` so a receiver that started pulling the
+        // old sha256 races to a 404 (graceful log-warn + skip on
+        // the receiver side) instead of silently applying stale
+        // content. Run before the broadcast so a slow receiver
+        // observing our next push is guaranteed to see
+        // `lookup(prev_sha) == None` from the moment we mark
+        // `last_outbound_text_sha` below.
+        self.evict_prev_outbound_clipboard_cache();
         let mut recipients = 0usize;
         self.broadcast_clipboard_event(event, &mut recipients).await;
         if recipients == 0 {
@@ -1542,6 +1614,20 @@ impl Service {
                 short_hex(&sha)
             );
         }
+        // **M1b STEP-1b.2** — store the new push's bytes so a
+        // peer's HTTP/3 GET can pull them. Inline payloads skip the
+        // cache (the bytes are already on the wire).
+        if push_was_metadata_only {
+            if let Ok(mut guard) = self.clipboard_cache.lock() {
+                guard.insert(sha, bytes_for_cache);
+            } else {
+                log::warn!(
+                    "clipboard cache mutex poisoned on insert sha={}; skipping cache write",
+                    short_hex(&sha)
+                );
+            }
+        }
+        self.last_outbound_text_sha = Some(sha);
         let now_ms = unix_now_ms();
         self.last_text_ts_ms = Some(now_ms);
         self.last_clipboard_source = None;
@@ -1556,10 +1642,24 @@ impl Service {
     /// Clipboard inbound handler for `ClipboardText` from a peer (server or
     /// client side, see the field doc on `clipboard_inbound_rx`).
     ///
-    /// Inline payloads are applied immediately. Metadata-only payloads are
-    /// registered in `pending_clipboard_requests` and intentionally stop
-    /// there; M1b.2 owns the `ClipboardRequest` / HTTP/3 pull path.
-    fn handle_clipboard_inbound(&mut self, (addr, event): (SocketAddr, ProtoEvent)) {
+    /// **Inline payloads** (`ct.content_inline.is_some()`) are
+    /// applied to the local OS clipboard immediately — no extra
+    /// round-trip needed.
+    ///
+    /// **Metadata-only payloads** (`ct.content_inline == None`) are
+    /// **pulled over HTTP/3**: the receiver issues
+    /// `GET /clipboard/text/{sha256}` on the source peer's QUIC
+    /// connection. The bytes are then applied to the local clipboard
+    /// on 200; a 404 (cache miss / TTL expired / active eviction)
+    /// is logged at warn and the inbound event is dropped silently —
+    /// see PLAN §1 评审 #3 2nd: "404 cache miss silently ignored".
+    ///
+    /// **Why `async`** (was `fn` in M1a): the HTTP/3 GET must await
+    /// `quinn::Connection::open_bi` + read the response. The
+    /// `tokio::select!` arm in `Service::run` already runs inside
+    /// an async context, so this conversion does not change the
+    /// dispatcher's runtime requirements.
+    async fn handle_clipboard_inbound(&mut self, (addr, event): (SocketAddr, ProtoEvent)) {
         let ProtoEvent::ClipboardText(ct) = event else {
             // Only text is wired in M1a. Image / Files / FileTransfer
             // events flow through `clipboard_inbound_rx` once M2a /
@@ -1573,17 +1673,67 @@ impl Service {
             );
             return;
         }
-        let Some(content) = ct.content_inline.as_ref() else {
-            let newly_registered =
-                register_pending_clipboard_request(&mut self.pending_clipboard_requests, ct.sha256);
-            log::info!(
-                "clipboard inbound: registered metadata-only sha={} ({} bytes, new={}, HTTP/3 pull deferred to M1b.2)",
-                short_hex(&ct.sha256),
-                ct.size,
-                newly_registered
+        // Inline fast-path: bytes are on the wire, just apply.
+        if let Some(content) = ct.content_inline.as_ref() {
+            self.apply_inbound_clipboard_text(&ct.sha256, content, addr);
+            return;
+        }
+        // Metadata-only slow-path: HTTP/3 GET against the source
+        // peer's connection. Per PLAN §3 M1b STEP-1b.2.
+        let Some(conn) = self.peer_connection_for_addr(addr).await else {
+            log::warn!(
+                "clipboard inbound: metadata-only sha={} from {addr} but no live peer \
+                 connection found — skipping (peer may have disconnected mid-flight)",
+                short_hex(&ct.sha256)
             );
             return;
         };
+        let sha_hex = short_hex(&ct.sha256);
+        let client = Http3Client::new(conn);
+        let result = client.get_text(&sha_hex).await;
+        match result {
+            Ok((status, body)) => match status {
+                200 => {
+                    log::info!(
+                        "clipboard inbound: pulled {} bytes from {addr} via HTTP/3 (sha={})",
+                        body.len(),
+                        sha_hex
+                    );
+                    self.apply_inbound_clipboard_text(&ct.sha256, &body, addr);
+                }
+                _ => {
+                    log::warn!(
+                        "clipboard inbound: HTTP/3 GET /clipboard/text/{sha_hex} \
+                         from {addr} returned {status} (cache miss? active eviction?) — skipping"
+                    );
+                }
+            },
+            Err(e) => {
+                log::warn!(
+                    "clipboard inbound: HTTP/3 GET /clipboard/text/{sha_hex} \
+                     from {addr} failed: {e} — skipping"
+                );
+            }
+        }
+    }
+
+    /// **M1b STEP-1b.2** — apply clipboard text bytes to the local
+    /// OS backend + update the loopback LRU + emit the
+    /// `ClipboardState` frontend event.
+    ///
+    /// Split out of [`Self::handle_clipboard_inbound`] so the
+    /// inline and HTTP/3-pulled paths share the exact same
+    /// downstream behaviour: loopback LRU push, `last_text` reset,
+    /// timestamp + `last_source` update, frontend notification,
+    /// log line. Without this helper, the two branches in
+    /// `handle_clipboard_inbound` would drift over time (e.g. one
+    /// forgets the LRU push).
+    fn apply_inbound_clipboard_text(
+        &mut self,
+        sha256: &[u8; 32],
+        bytes: &[u8],
+        source: SocketAddr,
+    ) {
         let Some(backend) = self.clipboard_backend.as_mut() else {
             return;
         };
@@ -1591,12 +1741,12 @@ impl Service {
         // wire convention; if a peer sent non-UTF-8 bytes (corrupt
         // / older daemon) the lossy replace keeps the daemon from
         // panicking — the user will see replacement characters.
-        let text = String::from_utf8_lossy(content);
+        let text = String::from_utf8_lossy(bytes);
         if let Err(e) = backend.set_text(&text) {
             log::warn!("clipboard inbound: set_text failed: {e}");
             return;
         }
-        self.clipboard_lru.push(ct.sha256);
+        self.clipboard_lru.push(*sha256);
         // Force the next tick to re-read so `last_text` updates to
         // the freshly-written value; otherwise a stale `last_text`
         // would suppress the change-detection that triggers
@@ -1605,18 +1755,45 @@ impl Service {
         self.clipboard_last_text = None;
         let now_ms = unix_now_ms();
         self.last_text_ts_ms = Some(now_ms);
-        self.last_clipboard_source = Some(addr);
+        self.last_clipboard_source = Some(source);
         self.notify_frontend(FrontendEvent::ClipboardState {
             last_text_ts: self.last_text_ts_ms,
             last_image_ts: self.last_image_ts_ms,
             last_file_ts: self.last_file_ts_ms,
-            last_source: Some(format!("{addr}")),
+            last_source: Some(format!("{source}")),
         });
         log::info!(
-            "clipboard inbound: applied {} bytes from {addr} (sha={})",
-            content.len(),
-            short_hex(&ct.sha256)
+            "clipboard inbound: applied {} bytes from {source} (sha={})",
+            bytes.len(),
+            short_hex(sha256)
         );
+    }
+
+    /// **M1b STEP-1b.2** — resolve the QUIC `Connection` for a peer
+    /// `SocketAddr` so the HTTP/3 GET can be issued against it.
+    ///
+    /// Two cases the inbound channel can come from:
+    /// 1. **Incoming peer** — slave daemon receiving master's push
+    ///    via `Emulation::quic_conns` (the listener-side registry).
+    ///    Looked up synchronously (`RefCell::borrow`).
+    /// 2. **Outgoing client** — master daemon receiving a slave's
+    ///    push via `Capture`'s underlying `LanMouseConnection::peers`.
+    ///    Looked up asynchronously (`Mutex::lock().await`).
+    ///
+    /// Both registries are keyed by `SocketAddr` (the remote address
+    /// the peer used to dial / was dialled at). If both lookups
+    /// miss, the peer is gone (race with `Disconnected`) — return
+    /// `None` so the caller logs warn + skips.
+    async fn peer_connection_for_addr(&self, addr: SocketAddr) -> Option<quinn::Connection> {
+        // (1) Incoming-peer table (listener-side).
+        if let Some(peer) = self.emulation.peer_for_addr(addr) {
+            return Some(peer.connection().clone());
+        }
+        // (2) Outgoing-client table (dialer-side).
+        self.capture
+            .peer_for_addr(addr)
+            .await
+            .map(|p| p.connection().clone())
     }
 
     /// **PLAN-2 / M1a follow-up #1** — recover copies the user
@@ -1679,8 +1856,18 @@ impl Service {
         );
         self.clipboard_lru.push(sha);
         self.clipboard_last_text = Some(new_text.clone());
-        let event =
-            ProtoEvent::ClipboardText(ClipboardText::from_content(sha, sha, new_text.into_bytes()));
+        let bytes_for_cache = new_text.into_bytes();
+        let push_was_metadata_only =
+            bytes_for_cache.len() > lan_mouse_proto::CLIPBOARD_TEXT_INLINE_LIMIT;
+        let event = ProtoEvent::ClipboardText(ClipboardText::from_content(
+            sha,
+            sha,
+            bytes_for_cache.clone(),
+        ));
+        // **M1b STEP-1b.2** — same active-eviction + cache-insert
+        // contract as the tick path. See the docstring on
+        // [`Self::handle_clipboard_tick`] for the rationale.
+        self.evict_prev_outbound_clipboard_cache();
         let mut recipients = 0usize;
         self.broadcast_clipboard_event(event, &mut recipients).await;
         if recipients == 0 {
@@ -1695,6 +1882,17 @@ impl Service {
                 short_hex(&sha)
             );
         }
+        if push_was_metadata_only {
+            if let Ok(mut guard) = self.clipboard_cache.lock() {
+                guard.insert(sha, bytes_for_cache);
+            } else {
+                log::warn!(
+                    "clipboard cache mutex poisoned on insert sha={}; skipping cache write",
+                    short_hex(&sha)
+                );
+            }
+        }
+        self.last_outbound_text_sha = Some(sha);
         let now_ms = unix_now_ms();
         self.last_text_ts_ms = Some(now_ms);
         self.last_clipboard_source = None;
@@ -1704,6 +1902,31 @@ impl Service {
             last_file_ts: self.last_file_ts_ms,
             last_source: None,
         });
+    }
+
+    /// **M1b STEP-1b.2** — evict the most recently pushed
+    /// `ClipboardText` sha256 from [`Self::clipboard_cache`].
+    ///
+    /// Called by both [`Self::handle_clipboard_tick`] and
+    /// [`Self::handle_clipboard_recover_push`] *immediately before*
+    /// they push a new `ClipboardText`, so the cache never holds
+    /// the previous payload once the new push is dispatched. A
+    /// receiver that races the eviction will see `lookup(prev_sha)
+    /// == None` from that moment on.
+    ///
+    /// **First push case**: `last_outbound_text_sha` is `None`, so
+    /// the function is a no-op. No log noise.
+    ///
+    /// **Why a dedicated helper**: pins the "evict prev before
+    /// push" contract in one place so the two push paths cannot
+    /// drift. Both the tick and the recover-push paths *must* call
+    /// this in the same order (before the new push, after the new
+    /// sha is computed, before `broadcast_clipboard_event`).
+    fn evict_prev_outbound_clipboard_cache(&mut self) {
+        evict_prev_outbound_clipboard_cache(
+            &self.clipboard_cache,
+            &mut self.last_outbound_text_sha,
+        );
     }
 
     /// **PLAN-2 / M1a STEP-1a.4** — broadcast a clipboard event to
@@ -1878,6 +2101,7 @@ fn short_hex(b: &[u8; 32]) -> String {
 /// pull. Returns `true` when `sha256` differs from the previously pending
 /// hash. Only the latest hash is kept because a newer clipboard notification
 /// supersedes an older one under last-writer-wins semantics.
+#[cfg(test)]
 fn register_pending_clipboard_request(
     pending: &mut HashMap<[u8; 32], ()>,
     sha256: [u8; 32],
@@ -1886,6 +2110,42 @@ fn register_pending_clipboard_request(
     pending.clear();
     pending.insert(sha256, ());
     newly_registered
+}
+
+/// **M1b STEP-1b.2** — free-function form of
+/// [`Service::evict_prev_outbound_clipboard_cache`]. Extracted so
+/// the dispatcher's "evict prev before push" contract is testable
+/// without standing up a full `Service::new` (which would need
+/// `AsyncFrontendListener`, `LanMouseConnection`, certificates,
+/// etc.).
+///
+/// **Mutex-poison handling**: a previous holder panicking poisons
+/// the mutex. We `into_inner()` to recover (the dispatcher's
+/// "always continue" contract), logging warn so an operator can
+/// spot the poison.
+fn evict_prev_outbound_clipboard_cache(
+    cache: &Arc<Mutex<crate::clipboard::cache::ClipboardCache>>,
+    last_outbound_text_sha: &mut Option<[u8; 32]>,
+) {
+    let Some(prev_sha) = *last_outbound_text_sha else {
+        return;
+    };
+    let mut guard = match cache.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            log::warn!(
+                "clipboard cache mutex poisoned on evict prev sha={}; clearing poison and continuing",
+                short_hex(&prev_sha)
+            );
+            poisoned.into_inner()
+        }
+    };
+    if guard.remove(&prev_sha) {
+        log::trace!(
+            "clipboard cache: evicted prev outbound sha={}",
+            short_hex(&prev_sha)
+        );
+    }
 }
 
 /// **PLAN-2 / M1a STEP-1a.4** — milliseconds since the UNIX
