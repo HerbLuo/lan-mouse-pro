@@ -524,28 +524,46 @@ fn read_image_bytes_from_pasteboard(pb: &NSPasteboard) -> Option<ImageBytes> {
 /// **Why `image`-crate decode (and not just `image::load_from_memory`)**:
 /// the `image` crate's BMP decoder accepts BMP files (14-byte file
 /// header + DIB), but raw DIB (without the file header) is *not*
-/// directly supported. The DIB bytes **may** decode directly via
-/// `image::load_from_memory` if the leading `biSize` field is
-/// `BM` (which it is for a BMP file but **not** for a raw DIB
-/// payload from `CF_DIBV5`); if it doesn't decode, the
-/// `image::ImageError::Decoding(Format)` variant surfaces a
-/// specific message we log + propagate.
+/// directly supported. The most common Windows clipboard payload
+/// (`CF_DIBV5`) is a **raw DIB** with no BMP file header — calling
+/// `image::load_from_memory` directly on it fails with `The image
+/// format could not be determined`. We detect the absence of the
+/// `BM` magic and prepend a synthetic 14-byte BMP file header
+/// (with `biSize` taken from the leading u32 of the DIB) before
+/// handing the bytes to the decoder. This unblocks every DIB
+/// variant whose `biSize` lands at a recognised offset:
+/// `BITMAPCOREHEADER` (12), `BITMAPINFOHEADER` (40),
+/// `OS22XBITMAPHEADER` max variant (64), `BITMAPV4HEADER` (108),
+/// `BITMAPV5HEADER` (124).
+///
+/// **Path**:
+/// 1. If `dib_bytes.starts_with(b"BM")` → BMP file (with header)
+///    already → pass straight through to `image::load_from_memory`.
+/// 2. Otherwise → prepend [`prepend_bmp_file_header`] and decode.
+/// 3. Re-encode the decoded pixels as PNG so the bytes match the
+///    `image/png` mime the receive side advertised to the user.
 ///
 /// **Known limitation (documented for transparency, not a bug
-/// fix in this STEP)**: a small fraction of Windows screenshots
-/// publish DIB variants that the `image` crate cannot decode
-/// directly (e.g. BITMAPV5HEADER with `BI_BITFIELDS` 32-bit
-/// RGBA masks that `image` does not yet handle). For those,
-/// we surface the `image`-crate error so the caller logs +
-/// skips — the receiving macOS user sees "图片已转换格式" UI
-/// hint (M4 GeneralPanel) and can copy manually if the loss
-/// matters.
+/// fix in this STEP)**: `BITMAPV5HEADER` + `BI_BITFIELDS` with
+/// non-standard colour masks (e.g. 32-bit RGBA with custom bit
+/// positions that the `image` crate does not yet handle) still
+/// fails after the synthetic-header step. For those, we surface
+/// the `image`-crate error so the caller logs + skips — the
+/// receiving macOS user sees "图片已转换格式" UI hint (M4
+/// GeneralPanel) and can copy manually if the loss matters.
 ///
 /// **Returns**: PNG bytes on success, or
 /// [`ClipboardError::Io`] with the underlying `image`-crate
 /// error message on decode / encode failure.
 fn dib_to_png_via_image_crate(dib_bytes: &[u8]) -> Result<Vec<u8>, ClipboardError> {
-    let img = image::load_from_memory(dib_bytes)
+    // Detect BMP-file vs raw-DIB upfront so the error path
+    // surfaces the right "no header" hint when applicable.
+    let img_bytes: Vec<u8> = if dib_bytes.starts_with(b"BM") {
+        dib_bytes.to_vec()
+    } else {
+        prepend_bmp_file_header(dib_bytes)?
+    };
+    let img = image::load_from_memory(&img_bytes)
         .map_err(|e| ClipboardError::Io(format!("image::load_from_memory DIB: {e}")))?;
     let mut out = Vec::new();
     {
@@ -553,6 +571,83 @@ fn dib_to_png_via_image_crate(dib_bytes: &[u8]) -> Result<Vec<u8>, ClipboardErro
         img.write_to(&mut cursor, image::ImageFormat::Png)
             .map_err(|e| ClipboardError::Io(format!("image::write_to PNG (DIB→PNG): {e}")))?;
     }
+    Ok(out)
+}
+
+/// **M2b STEP-2b.1** — prepend a synthetic 14-byte BMP file
+/// header to a raw DIB so the `image` crate's BMP decoder
+/// (which expects a full BMP file) can decode it.
+///
+/// **Why this is needed**: Windows clipboard screenshots publish
+/// `CF_DIBV5` as a raw DIB (`BITMAPINFOHEADER` / `BITMAPV4HEADER`
+/// / `BITMAPV5HEADER` + pixel data + optional colour table) —
+/// the 14-byte BMP file header is NOT included. The `image`
+/// crate's BMP decoder requires the BMP file format; feeding
+/// it raw DIB produces `The image format could not be
+/// determined`. This helper synthesises the file header from
+/// the leading `biSize` field of the DIB so the decoder accepts
+/// the input.
+///
+/// **BMP file header layout** (14 bytes, little-endian):
+/// | bytes  | field             | value                                       |
+/// |--------|-------------------|---------------------------------------------|
+/// | 0..2   | magic             | `"BM"` (`0x42 0x4D`)                        |
+/// | 2..6   | file size (u32 LE)| `14 + dib_bytes.len()` (informational)     |
+/// | 6..8   | reserved1 (u16)   | `0`                                         |
+/// | 8..10  | reserved2 (u16)   | `0`                                         |
+/// | 10..14 | pixel offset (u32)| `14 + biSize` (where `biSize` = u32 LE @ 0) |
+///
+/// **Why we read `biSize` from the input**: the decoder uses
+/// the pixel-data offset to skip past the DIB header. For
+/// `BITMAPINFOHEADER` (40-byte) the pixel data starts at
+/// offset `14 + 40 = 54`; for `BITMAPV5HEADER` (124-byte) it
+/// starts at offset `14 + 124 = 138`. Hard-coding `54` would
+/// break every non-`BITMAPINFOHEADER` variant.
+///
+/// **Validation**:
+/// - `dib_bytes.len() < 4` → reject (cannot read `biSize`).
+/// - `bi_size < 12` → reject (every known DIB variant has
+///   `biSize ≥ 12`; smaller values are degenerate / not a DIB).
+/// - `dib_bytes.len() < bi_size` → reject (`biSize` claims the
+///   header is larger than the buffer — degenerate payload).
+fn prepend_bmp_file_header(dib_bytes: &[u8]) -> Result<Vec<u8>, ClipboardError> {
+    if dib_bytes.len() < 4 {
+        return Err(ClipboardError::Io(format!(
+            "prepend_bmp_file_header: DIB too short to contain biSize \
+             ({} bytes, need ≥ 4)",
+            dib_bytes.len()
+        )));
+    }
+    let bi_size = u32::from_le_bytes([dib_bytes[0], dib_bytes[1], dib_bytes[2], dib_bytes[3]]);
+    if bi_size < 12 {
+        return Err(ClipboardError::Io(format!(
+            "prepend_bmp_file_header: DIB biSize={bi_size} is below the smallest \
+             recognised variant (BITMAPCOREHEADER = 12) — not a DIB"
+        )));
+    }
+    if dib_bytes.len() < bi_size as usize {
+        return Err(ClipboardError::Io(format!(
+            "prepend_bmp_file_header: DIB shorter than biSize \
+             (dib={} bytes, biSize={bi_size})",
+            dib_bytes.len()
+        )));
+    }
+    let file_size = 14u32
+        .checked_add(dib_bytes.len() as u32)
+        .ok_or_else(|| {
+            ClipboardError::Io(format!(
+                "prepend_bmp_file_header: DIB + header overflows u32 (dib={} bytes)",
+                dib_bytes.len()
+            ))
+        })?;
+    let pixel_offset = 14u32 + bi_size;
+    let mut out = Vec::with_capacity(14 + dib_bytes.len());
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&file_size.to_le_bytes());
+    out.extend_from_slice(&[0u8, 0]); // reserved1
+    out.extend_from_slice(&[0u8, 0]); // reserved2
+    out.extend_from_slice(&pixel_offset.to_le_bytes());
+    out.extend_from_slice(dib_bytes);
     Ok(out)
 }
 
@@ -1231,5 +1326,150 @@ mod tests {
         let decoded = image::load_from_memory(&read_back).expect("decode landed PNG");
         assert_eq!(decoded.width(), 4, "DIB→PNG must preserve width");
         assert_eq!(decoded.height(), 2, "DIB→PNG must preserve height");
+    }
+
+    /// **Raw DIB (without BMP file header) → PNG regression test**
+    /// — Windows clipboard `CF_DIBV5` payloads are **raw DIB**,
+    /// not full BMP files. The `image` crate's BMP decoder
+    /// requires the 14-byte BMP file header, so
+    /// `image::load_from_memory(raw_dib)` fails with `The image
+    /// format could not be determined` — exactly the failure
+    /// users saw on Mac receiving a screenshot from Windows
+    /// (sha=5ced5967 case).
+    ///
+    /// This test pins the
+    /// `dib_to_png_via_image_crate` fallback: strip the
+    /// 14-byte BMP header from a known-good BMP file to
+    /// produce a raw DIB, feed it to `set_dib_image`, and
+    /// verify the PNG that lands on the pasteboard decodes
+    /// back to the original dimensions.
+    ///
+    /// **Build a raw DIB fixture**: take the existing BMP
+    /// fixture (`test_dib_bytes`) and drop the first 14 bytes.
+    #[test]
+    fn set_dib_image_handles_raw_dib_without_bmp_header() {
+        let _lock = lock_for_test();
+        let mut backend = MacOsPasteboard::new().expect("new");
+        let _guard = ImageClipboardGuard::new();
+
+        let bmp_file = test_dib_bytes();
+        assert_eq!(
+            &bmp_file[..2],
+            b"BM",
+            "BMP fixture must start with BM magic"
+        );
+        // Sanity: BMP file header is exactly 14 bytes.
+        assert!(
+            bmp_file.len() > 14,
+            "BMP fixture too small to strip header: {} bytes",
+            bmp_file.len()
+        );
+        let raw_dib: Vec<u8> = bmp_file[14..].to_vec();
+        // Confirm the raw DIB starts with biSize = 40 (BITMAPINFOHEADER)
+        // — the leading 4 bytes of the DIB are the `biSize` field.
+        assert_eq!(
+            u32::from_le_bytes([raw_dib[0], raw_dib[1], raw_dib[2], raw_dib[3]]),
+            40,
+            "raw DIB must start with biSize=40 (BITMAPINFOHEADER)"
+        );
+        // Confirm the raw DIB does NOT start with "BM" magic
+        // (otherwise we'd just exercise the BMP-file pass-through
+        // path, which is the previous test).
+        assert_ne!(
+            &raw_dib[..2], b"BM",
+            "raw DIB fixture must not start with BM magic"
+        );
+
+        backend
+            .set_dib_image(&raw_dib)
+            .expect(
+                "set_dib_image must accept raw DIB (no BMP file header) — the prepend_bmp_file_header \
+                 fallback unblocks the image-crate BMP decoder",
+            );
+
+        // Verify PNG lands on the pasteboard with the right
+        // dimensions.
+        let pb = NSPasteboard::generalPasteboard();
+        let read_back = pb
+            .dataForType(&NSString::from_str(NS_PASTEBOARD_TYPE_PNG))
+            .expect("PNG must be on pasteboard after set_dib_image")
+            .to_vec();
+        assert_eq!(
+            &read_back[..8],
+            &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+            "raw-DIB input must round-trip to PNG magic"
+        );
+        let decoded = image::load_from_memory(&read_back).expect("decode landed PNG");
+        assert_eq!(decoded.width(), 4, "raw DIB → PNG must preserve width");
+        assert_eq!(decoded.height(), 2, "raw DIB → PNG must preserve height");
+    }
+
+    /// **`prepend_bmp_file_header` validation tests** — pins
+    /// the validation contract: too-short inputs, sub-12
+    /// `biSize`, and biSize-larger-than-buffer all produce
+    /// `ClipboardError::Io`. These guard against degenerate
+    /// payloads that would otherwise produce silently-corrupted
+    /// PNGs (or panic in the BMP decoder).
+    #[test]
+    fn prepend_bmp_file_header_rejects_too_short_input() {
+        let empty = prepend_bmp_file_header(&[]).expect_err("empty input must reject");
+        assert!(
+            matches!(empty, ClipboardError::Io(_)),
+            "empty input must return ClipboardError::Io; got {empty:?}"
+        );
+        let three_bytes = prepend_bmp_file_header(&[0x28, 0, 0, 0].get(..3).unwrap())
+            .expect_err("3-byte input must reject (cannot read u32 biSize)");
+        assert!(
+            matches!(three_bytes, ClipboardError::Io(_)),
+            "3-byte input must return ClipboardError::Io; got {three_bytes:?}"
+        );
+    }
+
+    /// `prepend_bmp_file_header` rejects `biSize < 12` (smallest
+    /// recognised DIB variant is BITMAPCOREHEADER with
+    /// `biSize = 12`).
+    #[test]
+    fn prepend_bmp_file_header_rejects_below_minimum_bi_size() {
+        // biSize = 8, well below 12.
+        let bytes = vec![0x08, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD];
+        let result = prepend_bmp_file_header(&bytes).expect_err("biSize=8 must reject");
+        assert!(
+            matches!(result, ClipboardError::Io(_)),
+            "biSize below 12 must return ClipboardError::Io; got {result:?}"
+        );
+    }
+
+    /// `prepend_bmp_file_header` rejects inputs that claim a
+    /// `biSize` larger than the buffer (degenerate — would
+    /// produce an invalid synthetic header).
+    #[test]
+    fn prepend_bmp_file_header_rejects_bi_size_larger_than_buffer() {
+        // biSize = 40 but the buffer is only 8 bytes.
+        let bytes = vec![0x28, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD];
+        let result = prepend_bmp_file_header(&bytes).expect_err("biSize > buffer must reject");
+        assert!(
+            matches!(result, ClipboardError::Io(_)),
+            "biSize larger than buffer must return ClipboardError::Io; got {result:?}"
+        );
+    }
+
+    /// `prepend_bmp_file_header` produces a byte sequence the
+    /// `image` crate can decode (for a known BITMAPINFOHEADER
+    /// payload). This is the round-trip contract that
+    /// `dib_to_png_via_image_crate` relies on.
+    #[test]
+    fn prepend_bmp_file_header_produces_decodable_bmp_for_bitmapinfoheader() {
+        let bmp_file = test_dib_bytes();
+        assert_eq!(&bmp_file[..2], b"BM");
+        let raw_dib = bmp_file[14..].to_vec();
+        let synthetic = prepend_bmp_file_header(&raw_dib).expect("prepend must succeed");
+        // Sanity: starts with "BM" magic.
+        assert_eq!(&synthetic[..2], b"BM");
+        // Sanity: 14 bytes longer than input (header prepended).
+        assert_eq!(synthetic.len(), raw_dib.len() + 14);
+        // The `image` crate must be able to decode the result.
+        let decoded = image::load_from_memory(&synthetic).expect("synthetic BMP must decode");
+        assert_eq!(decoded.width(), 4);
+        assert_eq!(decoded.height(), 2);
     }
 }
