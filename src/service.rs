@@ -2526,78 +2526,47 @@ impl Service {
             );
             return;
         };
-        // Step 3: pull image bytes via HTTP/3. Use `full_hex` (64
-        // chars) — the source-side route rejects malformed /
-        // truncated suffixes with 404 (same trap the text path
-        // hit in the M1b follow-up).
-        let sha_hex = full_hex(&ci.sha256);
-        let client = Http3Client::new(conn);
-        let result = client.get_image(&sha_hex).await;
-        match result {
-            Ok((status, body)) => match status {
-                200 => {
-                    log::info!(
-                        "clipboard inbound image: pulled {} bytes from {addr} via HTTP/3 \
-                         (sha={}, mime={})",
-                        body.len(),
-                        short_hex(&ci.sha256),
-                        ci.mime
-                    );
-                    // **2026-09-10 inbound-apply off-thread
-                    // follow-up** — mark the image LRU BEFORE
-                    // spawning (window defence against an OS
-                    // echo that re-polls the clipboard via
-                    // `current_image` synchronously with
-                    // `set_data_for_type`), then spawn the apply
-                    // task and return immediately. Holding the
-                    // apply on this main task would block the
-                    // `capture.event()` arm for 100–300 ms on
-                    // Windows (PNG→DIB decode/encode), which
-                    // would starve master's StreamA mouse writes
-                    // and drop frames on the controlled side. The
-                    // spawned task reports completion via the
-                    // `apply_image_applied_tx` channel; the main
-                    // task's `handle_inbound_image_applied` arm
-                    // does the LRU + metrics + frontend
-                    // bookkeeping.
-                    self.mark_local_image_write(ci.sha256);
-                    let Some(cmd_tx) = self.clipboard_backend_cmd.clone() else {
-                        log::warn!(
-                            "clipboard inbound image: cmd_tx uninitialised \
-                             (Service::run not entered yet?) — dropping apply"
-                        );
-                        return;
-                    };
-                    let Some(applied_tx) = self.apply_image_applied_tx.clone() else {
-                        log::warn!(
-                            "clipboard inbound image: applied_tx uninitialised \
-                             (Service::run not entered yet?) — dropping apply"
-                        );
-                        return;
-                    };
-                    tokio::task::spawn_local(apply_inbound_image_task(
-                        cmd_tx,
-                        applied_tx,
-                        ci.sha256,
-                        body,
-                        ci.mime,
-                        addr,
-                    ));
-                }
-                _ => {
-                    log::warn!(
-                        "clipboard inbound image: HTTP/3 GET /clipboard/image/{sha_hex} \
-                         from {addr} returned {status} (cache miss? active eviction?) — skipping"
-                    );
-                }
-            },
-            Err(e) => {
-                log::warn!(
-                    "clipboard inbound image: HTTP/3 GET /clipboard/image/{sha_hex} \
-                     from {addr} failed: {e} — skipping"
-                );
-            }
-        }
+        // **2026-09-10 inbound-apply off-thread follow-up (round 2)** —
+        // mark the image LRU BEFORE spawning (window defence
+        // against an OS echo that re-polls the clipboard via
+        // `current_image` synchronously with `set_data_for_type`),
+        // then spawn the apply task and return immediately. The
+        // spawned task owns both the HTTP/3 GET body pull
+        // (`5–15 MiB on the same QUIC connection's cwnd — was
+        // 100 ms–1 s of main-task block in the 8de4219 path`)
+        // and the heavy `set_image` + `current_image` round
+        // trip. Main task pays only for the (sub-ms) LRU mark
+        // + `spawn_local` call, leaving `capture.event()` free
+        // to poll StreamA mouse events during the GET + apply.
+        self.mark_local_image_write(ci.sha256);
+        let Some(cmd_tx) = self.clipboard_backend_cmd.clone() else {
+            log::warn!(
+                "clipboard inbound image: cmd_tx uninitialised \
+                 (Service::run not entered yet?) — dropping apply"
+            );
+            return;
+        };
+        let Some(applied_tx) = self.apply_image_applied_tx.clone() else {
+            log::warn!(
+                "clipboard inbound image: applied_tx uninitialised \
+                 (Service::run not entered yet?) — dropping apply"
+            );
+            return;
+        };
+        log::info!(
+            "clipboard inbound image: apply kicked off to spawn_local task \
+             (sha={}, mime={}) for {addr}",
+            short_hex(&ci.sha256),
+            ci.mime
+        );
+        tokio::task::spawn_local(apply_inbound_image_task(
+            cmd_tx,
+            applied_tx,
+            conn,
+            ci.sha256,
+            ci.mime,
+            addr,
+        ));
     }
 
     /// **M1b STEP-1b.2** — apply clipboard text bytes to the local
@@ -3664,6 +3633,87 @@ async fn clipboard_poller(
 /// [`InboundImageApplyResult`] and recorded in the LRU by
 /// the main task's `handle_inbound_image_applied` arm.
 async fn apply_inbound_image_task(
+    cmd_tx: tokio_mpsc::UnboundedSender<BackendCmd>,
+    applied_tx: tokio_mpsc::UnboundedSender<InboundImageApplyResult>,
+    conn: quinn::Connection,
+    inbound_sha: [u8; 32],
+    mime: String,
+    source: SocketAddr,
+) {
+    // **2026-09-10 inbound-apply off-thread follow-up (round 2)** —
+    // the HTTP/3 GET is moved into the spawned task too. The
+    // 8de4219 commit moved only the heavy `set_image` +
+    // `current_image` round trip off-thread, but the GET
+    // downloads 5–15 MiB on the same QUIC connection's cwnd
+    // and was still blocking the main task for the GET
+    // duration (100 ms–1 s on a fast LAN). Pulling the GET
+    // body inside the spawned task means the main task only
+    // pays for the (sync, sub-ms) connection lookup + LRU
+    // mark + `spawn_local(...)` itself.
+    let sha_hex = full_hex(&inbound_sha);
+    let client = crate::quic_transport::http3::Http3Client::new(conn);
+    let bytes = match client.get_image(&sha_hex).await {
+        Ok((status, body)) if status == 200 => body,
+        Ok((status, _)) => {
+            let _ = applied_tx.send(InboundImageApplyResult {
+                inbound_sha,
+                source,
+                mime,
+                bytes_len: 0,
+                success: false,
+                post_write_sha: None,
+                error_msg: Some(format!(
+                    "HTTP/3 GET /clipboard/image/{sha_hex} returned {status}"
+                )),
+            });
+            return;
+        }
+        Err(e) => {
+            let _ = applied_tx.send(InboundImageApplyResult {
+                inbound_sha,
+                source,
+                mime,
+                bytes_len: 0,
+                success: false,
+                post_write_sha: None,
+                error_msg: Some(format!(
+                    "HTTP/3 GET /clipboard/image/{sha_hex} failed: {e}"
+                )),
+            });
+            return;
+        }
+    };
+    apply_image_inner(
+        cmd_tx,
+        applied_tx,
+        inbound_sha,
+        bytes,
+        mime,
+        source,
+    )
+    .await;
+}
+
+/// **2026-09-10 inbound-apply off-thread follow-up (round 2)** —
+/// post-HTTP/3-GET apply logic, extracted from
+/// [`apply_inbound_image_task`] so unit tests can exercise the
+/// SetImage + CurrentImage round trip without standing up a
+/// real HTTP/3 server (the [`clipboard_poller_dummy_backend_set_and_get_text`]
+/// test pattern — the existing [`apply_inbound_image_task_roundtrip`]
+/// test in this module uses this helper with a `RecordingBackend`
+/// directly).
+///
+/// **Failure-handling contract** (mirrors the original
+/// `apply_inbound_clipboard_image` flow):
+/// - Poller gone on `SetImage` cmd send → `success=false`,
+///   `error_msg = "poller task is gone …"`.
+/// - `set_image` returned `Err` → `success=false`,
+///   `error_msg = "set_image: {e}"`.
+/// - `SetImage` succeeded but `CurrentImage` cmd send failed →
+///   `success=true` with `post_write_sha=None` (LRU holds only
+///   the inbound SHA; the post-transcode SHA is lost).
+/// - All steps OK → `success=true`, `post_write_sha=Some(…)`.
+async fn apply_image_inner(
     cmd_tx: tokio_mpsc::UnboundedSender<BackendCmd>,
     applied_tx: tokio_mpsc::UnboundedSender<InboundImageApplyResult>,
     inbound_sha: [u8; 32],
@@ -4915,8 +4965,8 @@ mod image_inbound_tests {
     //! test matrix in PLAN §8 M2a (macOS 真机).
     use super::{
         BackendCmd, ClipboardBackend, IMAGE_LOOPBACK_CAPACITY, IMAGE_LOOPBACK_TTL,
-        InboundImageApplyResult, LruFingerprints, Mime, apply_inbound_image_bytes,
-        apply_inbound_image_task, clipboard_poller,
+        InboundImageApplyResult, LruFingerprints, Mime, apply_image_inner,
+        apply_inbound_image_bytes, clipboard_poller,
     };
     use crate::clipboard::{ClipboardError, ImageBytes};
     use tokio::sync::{mpsc as tokio_mpsc, oneshot};
@@ -5568,20 +5618,24 @@ mod image_inbound_tests {
                 let inbound_bytes: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
                 let expected_post_write_sha = sha256_of_bytes_for_test(&inbound_bytes);
                 let inbound_sha: [u8; 32] = [0xCC; 32]; // arbitrary; doesn't have to match
+                let bytes_for_task = inbound_bytes.clone();
 
-                tokio::task::spawn_local(apply_inbound_image_task(
-                    cmd_tx,
-                    applied_tx,
-                    inbound_sha,
-                    inbound_bytes.clone(),
-                    "image/png".to_string(),
-                    "10.2.1.15:50247".parse().unwrap(),
-                ));
+                tokio::task::spawn_local(async move {
+                    apply_image_inner(
+                        cmd_tx,
+                        applied_tx,
+                        inbound_sha,
+                        bytes_for_task,
+                        "image/png".to_string(),
+                        "10.2.1.15:50247".parse().unwrap(),
+                    )
+                    .await;
+                });
 
                 let result = applied_rx
                     .recv()
                     .await
-                    .expect("apply_inbound_image_task must send exactly one result");
+                    .expect("apply_image_inner must send exactly one result");
                 assert!(
                     result.success,
                     "RecordingBackend::set_image is a no-op success — apply must succeed; \
@@ -5634,7 +5688,7 @@ mod image_inbound_tests {
     /// This pins the "poller gone → caller learns via result,
     /// not via hang" contract.
     #[tokio::test(flavor = "current_thread")]
-    async fn apply_inbound_image_task_poller_gone() {
+    async fn apply_image_inner_poller_gone() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -5646,14 +5700,17 @@ mod image_inbound_tests {
                 // returns Err (no live receiver).
                 drop(cmd_rx);
 
-                tokio::task::spawn_local(apply_inbound_image_task(
-                    cmd_tx,
-                    applied_tx,
-                    [0u8; 32],
-                    b"some-bytes".to_vec(),
-                    "image/png".to_string(),
-                    "10.2.1.15:50247".parse().unwrap(),
-                ));
+                tokio::task::spawn_local(async move {
+                    apply_image_inner(
+                        cmd_tx,
+                        applied_tx,
+                        [0u8; 32],
+                        b"some-bytes".to_vec(),
+                        "image/png".to_string(),
+                        "10.2.1.15:50247".parse().unwrap(),
+                    )
+                    .await;
+                });
 
                 let result = applied_rx
                     .recv()
