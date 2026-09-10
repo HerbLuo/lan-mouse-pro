@@ -60,6 +60,26 @@ mod windows;
 /// TTL, active eviction, concurrency).
 pub mod cache;
 
+/// **PLAN-2 / M3a STEP-3a.1** — per-file metadata projection
+/// (`FileEntry` + streaming sha256 + extension-based MIME guess).
+/// Consumed by STEP-3a.2 (`service::clipboard_dispatcher.file_branch`)
+/// to populate the `lan_mouse_proto::ClipboardFiles { entries }`
+/// envelope that travels over StreamC before the bytes themselves
+/// ride HTTP/3-lite in STEP-3a.4.
+///
+/// Re-exports [`FileEntry`] at the module root so the dispatcher
+/// can write `crate::clipboard::FileEntry` without reaching into
+/// the submodule name.
+pub mod file_meta;
+
+// Forward-compat re-export: STEP-3a.2 (`service::clipboard_dispatcher`)
+// will consume `crate::clipboard::FileEntry`; the re-export is staged
+// here so the dispatcher's import path is stable before the file
+// branch lands. `#[allow(unused_imports)]` silences the lib-build
+// warning until STEP-3a.2 actually uses the symbol.
+#[allow(unused_imports)]
+pub use file_meta::FileEntry;
+
 use thiserror::Error;
 
 /// Backend-specific error for clipboard operations.
