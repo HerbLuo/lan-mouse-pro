@@ -643,11 +643,28 @@ fn err_to_string(op: &str, err: u32) -> String {
 /// require a manual `BITMAPV5HEADER` + `BI_BITFIELDS` mask
 /// construction; this is captured as SUGGESTION follow-up
 /// (M2b+ scope, see `next/SUGGESTION.md` once filed).
+///
+/// **Alpha drop is now mandatory, not "documented"**: the
+/// `image` crate's BMP writer emits a **32-bit `BI_BITFIELDS`**
+/// BMP for RGBA8 inputs, which carries a known bit-shift bug
+/// in the alpha-mask handling — Windows clipboard viewers
+/// (notably the WeChat desktop client's paste path, verified
+/// 2026-09-10) read the BGRA pixel stream incorrectly and
+/// either drop the paste silently or render a garbled image.
+/// Forcing `to_rgb8()` here collapses every input (RGBA PNG
+/// from JPEG-decoded-re-encoded screenshots on macOS, RGB
+/// PNG from native macOS screencapture, 16-bit PNG, etc.) to
+/// a uniform **24-bit `BI_RGB`** BMP — the format Windows
+/// and WeChat handle reliably. This is also consistent with
+/// the long-standing "24-bit RGB only" design intent above.
 fn encode_png_to_dib(png_bytes: &[u8]) -> Result<Vec<u8>, ClipboardError> {
     // Step 1: decode the PNG.
     let img = image::load_from_memory(png_bytes)
         .map_err(|e| ClipboardError::Io(format!("image::load_from_memory PNG: {e}")))?;
-    // Step 2: re-encode as a BMP file (the `image` crate has no
+    // Step 2: drop alpha channel before BMP encode (see fn doc
+    // for the BI_BITFIELDS / WeChat rationale).
+    let img = img.to_rgb8();
+    // Step 3: re-encode as a BMP file (the `image` crate has no
     // standalone DIB writer; BMP is the closest standard with
     // DIB-compatible pixel data).
     let mut bmp_file = Vec::new();
@@ -656,7 +673,7 @@ fn encode_png_to_dib(png_bytes: &[u8]) -> Result<Vec<u8>, ClipboardError> {
         img.write_to(&mut cursor, image::ImageFormat::Bmp)
             .map_err(|e| ClipboardError::Io(format!("image::write_to BMP: {e}")))?;
     }
-    // Step 3: strip the 14-byte BMP file header to leave the
+    // Step 4: strip the 14-byte BMP file header to leave the
     // bare DIB (BITMAPINFOHEADER + pixel data + colour table).
     if bmp_file.len() < 14 {
         return Err(ClipboardError::Io(format!(
@@ -906,6 +923,69 @@ mod tests {
             .expect("image crate must be able to decode the emitted DIB");
         assert_eq!(decoded.width(), 4, "width preserved");
         assert_eq!(decoded.height(), 2, "height preserved");
+    }
+
+    /// **Regression pin for the WeChat `BI_BITFIELDS` bug** (M2b
+    /// follow-up, 2026-09-10): the `image` crate's BMP encoder
+    /// emits a 32-bit `BI_BITFIELDS` BMP for RGBA8 inputs, which
+    /// carries a bit-shift bug in the alpha-mask handling. WeChat
+    /// (and some other Windows clipboard viewers) read the BGRA
+    /// pixel stream incorrectly — silent paste failure. The fix
+    /// is the `to_rgb8()` collapse in `encode_png_to_dib`, which
+    /// must produce a **24-bit `BI_RGB`** BMP regardless of input
+    /// colour mode (RGB8 / RGBA8 / 16-bit, etc.).
+    ///
+    /// We assert `biBitCount == 24` directly on the little-endian
+    /// bytes of the `BITMAPINFOHEADER` so the regression surfaces
+    /// without depending on the `image` crate's own decoder (the
+    /// decoder might silently accept both 24- and 32-bit BMPs
+    /// without surfacing the bug we're guarding against).
+    #[test]
+    fn encode_png_to_dib_emits_24bit_birgb_for_rgba_png_input() {
+        // Build a small RGBA8 PNG (4×2 gradient with alpha=200)
+        // to exercise the alpha-channel collapse path. A 4×2
+        // fixture keeps the assertion cheap and the BMP output
+        // (4×2×3 + 40 header = 64 bytes) under a single test
+        // buffer.
+        let rgba = image::RgbaImage::from_fn(4, 2, |x, y| {
+            image::Rgba([(x * 60) as u8, (y * 60) as u8, 128, 200])
+        });
+        let mut png_buf = Vec::new();
+        rgba.write_to(&mut Cursor::new(&mut png_buf), image::ImageFormat::Png)
+            .expect("RGBA PNG write");
+        // Sanity: the PNG really is RGBA (color type 6 = RGBA,
+        // bit depth 8). If a future `image` crate release changes
+        // the encoder default, this guard fails before the BMP
+        // assertion below.
+        assert_eq!(
+            png_buf[..8],
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n'],
+            "PNG magic check"
+        );
+        let dib = encode_png_to_dib(&png_buf).expect("encode_png_to_dib on RGBA PNG");
+        assert!(
+            dib.len() >= 40,
+            "DIB must be at least 40 bytes (BITMAPINFOHEADER), got {}",
+            dib.len()
+        );
+        // biSize (bytes 0-3 LE)
+        let bi_size = u32::from_le_bytes([dib[0], dib[1], dib[2], dib[3]]);
+        assert_eq!(bi_size, 40, "biSize must be 40 (BITMAPINFOHEADER)");
+        // biBitCount (bytes 14-15 LE). The bug regression is
+        // this field reading 32 (BI_BITFIELDS) instead of 24
+        // (BI_RGB) — pin the 24 contract.
+        let bi_bitcount = u16::from_le_bytes([dib[14], dib[15]]);
+        assert_eq!(
+            bi_bitcount, 24,
+            "biBitCount must be 24 (BI_RGB) after the to_rgb8() collapse; \
+             32 would mean the RGBA→BI_BITFIELDS bug has regressed (WeChat clip)"
+        );
+        // biCompression (bytes 16-19 LE). 0 = BI_RGB, 3 = BI_BITFIELDS.
+        let bi_compression = u32::from_le_bytes([dib[16], dib[17], dib[18], dib[19]]);
+        assert_eq!(
+            bi_compression, 0,
+            "biCompression must be 0 (BI_RGB); 3 (BI_BITFIELDS) is the bug"
+        );
     }
 
     /// `encode_png_to_dib` returns `Err(Io)` for malformed PNG
