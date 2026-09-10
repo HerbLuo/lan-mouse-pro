@@ -1084,12 +1084,8 @@ async fn client_accept_bi_task(
             // because `[u8; N]` only impls `AsyncRead` through
             // `Cursor` / explicit wrapper.
             let chained = tokio::io::AsyncReadExt::chain(prefix.as_slice(), recv);
-            crate::quic_transport::http3::handle_http3_stream(
-                http3_router.clone(),
-                send,
-                chained,
-            )
-            .await;
+            crate::quic_transport::http3::handle_http3_stream(http3_router.clone(), send, chained)
+                .await;
             continue;
         }
         // Not HTTP/3 — re-interpret the prefix as a Stream C / B

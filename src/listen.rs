@@ -1006,12 +1006,8 @@ async fn server_accept_bi_task(
             // `AsyncRead + Unpin`; `&[u8]` satisfies this via
             // tokio's blanket impl.
             let chained = tokio::io::AsyncReadExt::chain(prefix.as_slice(), recv);
-            crate::quic_transport::http3::handle_http3_stream(
-                http3_router.clone(),
-                send,
-                chained,
-            )
-            .await;
+            crate::quic_transport::http3::handle_http3_stream(http3_router.clone(), send, chained)
+                .await;
             continue;
         }
 
