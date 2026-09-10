@@ -117,6 +117,17 @@ libc = "0.2.148"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_DataExchange", "Win32_Graphics_Gdi", "Win32_System_Ole"] }
 image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
 
+# M2b STEP-2b.2 — Linux clipboard image backend (xclip /
+# wl-paste / wl-copy). Only pulled in when compiling for
+# `target_os = "linux"`. Features: PNG (write + read for round-trip
+# tests) + BMP (decode for the DIB → PNG fallback used by
+# `set_dib_image`). No TIFF / JPEG support — the dispatcher
+# normalises inbound to PNG before reaching this backend (PLAN §3
+# M2a STEP-2a.2 "源端强制 PNG 归一化"), and the Linux toolchain
+# (xclip / wl-paste) only natively speaks `image/png`.
+[target.'cfg(target_os = "linux")'.dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "bmp"] }
+
 # M2a STEP-2a.2 — macOS clipboard image backend (`NSPasteboard` via
 # `objc2` + `image` crate for TIFF→PNG normalization, PLAN §3 评审
 # #2 3rd). Only pulled in when compiling for `target_os = "macos"`.
