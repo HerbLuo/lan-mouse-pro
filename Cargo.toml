@@ -53,6 +53,7 @@ log = "0.4.20"
 env_logger = "0.11.3"
 serde_json = "1.0.107"
 tokio = { version = "1.32.0", features = [
+    "fs",
     "io-util",
     "io-std",
     "macros",
@@ -100,6 +101,10 @@ tokio = { version = "1.32.0", features = ["rt-multi-thread", "time", "macros"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 rand = "0.8"
+# M3a STEP-3a.1 — file_meta unit tests use tempdir() to materialise
+# 1 KiB / 1 MiB / 200 MiB fixtures. Already pulled in transitively by
+# `h3`; declared explicitly so the dev-deps graph stays self-describing.
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.148"
