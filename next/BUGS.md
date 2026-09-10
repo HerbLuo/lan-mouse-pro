@@ -54,15 +54,7 @@
 
 ### 全屏截图后鼠标卡顿且无法粘贴
 
-**现状（用户实测确认）**：
-
-- **触发条件**：macOS 主控端用户全屏截图 → `dispatch_image` 把 1–4 MB PNG 通过 `ClipboardImage` 推到 Windows 被控端 → 鼠标跨边界时被卡住几秒；Pong watchdog 1.5s 超时 → 连接被强制关闭
-- **对照实验**（用户实测，可重复）：
-  - 复制**小文本** → 鼠标正常工作
-  - 复制**全屏截图**（1.1 MB JPEG → 3.3–3.7 MB PNG）→ 鼠标卡住
-- **结论**：触发点严格绑定到 PNG 编码路径（即 macOS 的 `screencapture -c` 后默认 JPEG，需要 `image::write_to(Png)` 转码）
-
-**根因分析**（已做两轮修复尝试，均不彻底）：
+**根因分析**（已做两轮修复尝试，均不彻底，代码已回滚）：
 
 1. **第一轮怀疑**：HTTP/3 大块 body 传输（master → controlled 把 3.7 MB PNG 通过 HTTP/3 response 写回）阻塞了 QUIC 连接上的 control 帧（Pong/Ack） → QUIC 流优先级修复（commit `b4191d4`）把 stream A 设为 `PRIORITY_CONTROL=+100`、HTTP/3 设为 `PRIORITY_BULK=-100`
    - **结果**：失败。用户实测截图后依然卡顿，说明根因不在 QUIC 包调度层面
@@ -103,22 +95,371 @@
 3. **结构性：把大 body transfer 走专用 QUIC 连接**（master 临时为该次 HTTP/3 GET 开一条带独立 cwnd 的连接，用完即关）——彻底隔离 bulk transfer 与 control plane。
 4. **结构性：换 PNG 编码为更快的格式**（WebP / AVIF / 直接传 JPEG passthrough）——平台后端 JPEG passthrough 不需要转码。
 
-**当前 git 状态**（备忘）：
+这是被控端日志：[2026-09-10T22:11:41Z INFO input_capture::windows::event_thread] initial monitors: 1 monitor(s)
+[2026-09-10T22:11:41Z INFO input_capture::windows::event_thread] monitor: id=windows:unknown-\\.\
+DISPLAY1 name="Intel(R) UHD Graphics" pos=(0, 0) size=(1280, 800) primary=true scale=1
+[2026-09-10T22:11:41Z INFO input_capture] using capture backend: windows
+[2026-09-10T22:11:41Z INFO lan_mouse::emulation] creating input emulation ...
+[2026-09-10T22:11:41Z INFO input_emulation] using emulation backend: windows
+[2026-09-10T22:11:41Z INFO lan_mouse] opening http://127.0.0.1:3939 in the default browser
+[2026-09-10T22:11:42Z INFO lan_mouse] using config: "C:\\Users\\hb\\AppData\\Local\\lan-mouse\\conf
+ig.toml"
+[2026-09-10T22:11:42Z INFO lan_mouse] Press [KeyLeftCtrl, KeyLeftShift, KeyLeftMeta, KeyLeftAlt] to
+release the mouse
+[2026-09-10T22:11:42Z INFO lan_mouse::web] lan-mouse web UI listening on http://127.0.0.1:3939
+[2026-09-10T22:11:42Z WARN lan_mouse::service] clipboard dispatched to 0 peers (sha=e3b0c442); peer
+gate filtered all clients — check `enable_clipboard_to` in TOML and that the connection is active
+[2026-09-10T22:11:47Z INFO lan_mouse::quic_transport::tls] AuthorizedKeysVerifier: authorized peer
+a4:9b:47:25:50:3d:17:4f:b2:64:59:95:f8:a4:4d:ff:0c:31:ca:ea:d3:a9:88:8c:8f:38:c8:c7:91:48:e7:a2
+[2026-09-10T22:11:47Z INFO lan_mouse::listen] QUIC peer connected: 10.2.1.15:50247
+[2026-09-10T22:11:47Z INFO lan_mouse::listen] QUIC peer 10.2.1.15:50247 authorized (fingerprint a4:
+9b:47:25:50:3d:17:4f:b2:64:59:95:f8:a4:4d:ff:0c:31:ca:ea:d3:a9:88:8c:8f:38:c8:c7:91:48:e7:a2)
+[2026-09-10T22:11:47Z INFO lan_mouse::listen] server accept_bi: stream C first frame length=78 (> M
+AX_EVENT_SIZE=21) from 10.2.1.15:50247, reading inline + spawning stream C reader
+[2026-09-10T22:11:47Z INFO lan_mouse::listen] server accept_bi: stream C first frame from 10.2.1.15
+:50247: ClipboardText(fp=e3b0c442, sha=e3b0c442, size=0, inline=yes)
+[2026-09-10T22:11:51Z INFO lan_mouse::emulation] releasing capture: 10.2.1.15:50247 entered this de
+vice (fp=a4:9b:47:25:50:3d:17:4f:b2:64:59:95:f8:a4:4d:ff:0c:31:ca:ea:d3:a9:88:8c:8f:38:c8:c7:91:48:e
+7:a2)
+[2026-09-10T22:11:51Z INFO lan_mouse::emulation] emulation: sending Ack(0) to 10.2.1.15:50247 (resp
+onding to master Enter)
+[2026-09-10T22:11:51Z INFO lan_mouse::quic_transport::session] send_input: routing Ack(0) via Strea
+mA (entry; awaiting send)
+[2026-09-10T22:11:51Z INFO lan_mouse::quic_transport::session] send_input: Ack(0) via StreamA retur
+ned (ok=true)
+[2026-09-10T22:11:51Z INFO lan_mouse::listen] reply: Ack(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:11:51Z INFO lan_mouse::capture] release_capture: ENTER (state=Idle, active_client=No
+ne)
+[2026-09-10T22:11:51Z INFO lan_mouse::emulation] releasing capture: 10.2.1.15:50247 entered this de
+vice (fp=a4:9b:47:25:50:3d:17:4f:b2:64:59:95:f8:a4:4d:ff:0c:31:ca:ea:d3:a9:88:8c:8f:38:c8:c7:91:48:e
+7:a2)
+[2026-09-10T22:11:51Z INFO lan_mouse::emulation] emulation: sending Ack(0) to 10.2.1.15:50247 (resp
+onding to master Enter)
+[2026-09-10T22:11:51Z INFO lan_mouse::quic_transport::session] send_input: routing Ack(0) via Strea
+mA (entry; awaiting send)
+[2026-09-10T22:11:51Z INFO lan_mouse::quic_transport::session] send_input: Ack(0) via StreamA retur
+ned (ok=true)
+[2026-09-10T22:11:51Z INFO lan_mouse::listen] reply: Ack(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:11:51Z INFO lan_mouse::capture] release_capture: ENTER (state=Idle, active_client=No
+ne)
+[2026-09-10T22:11:51Z INFO input_capture::windows::event_thread] monitors changed: 1 monitor(s)
+[2026-09-10T22:11:51Z INFO input_capture::windows::event_thread] monitor: id=windows:unknown-\\.\
+DISPLAY1 name="Intel(R) UHD Graphics" pos=(0, 0) size=(1280, 800) primary=true scale=1
+[2026-09-10T22:11:51Z INFO lan_mouse::capture] capture: EnterOnly trigger on 9223372036854775808 (e
+vent=BeginPending) — forwarding to service as CaptureBegin
+[2026-09-10T22:11:51Z INFO lan_mouse::capture] releasing capture: no active client at this position
+[2026-09-10T22:11:51Z INFO lan_mouse::quic_transport::session] send_input: routing Leave(0) via Str
+eamA (entry; awaiting send)
+[2026-09-10T22:11:51Z INFO lan_mouse::quic_transport::session] send_input: Leave(0) via StreamA ret
+urned (ok=true)
+[2026-09-10T22:11:51Z INFO lan_mouse::listen] reply: Leave(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:11:52Z INFO lan_mouse::emulation] emulation: received Leave from 10.2.1.15:50247 — r
+emoving emulation_proxy
+[2026-09-10T22:11:52Z INFO lan_mouse::quic_transport::session] send_input: routing Ack(0) via Strea
+mA (entry; awaiting send)
+[2026-09-10T22:11:52Z INFO lan_mouse::quic_transport::session] send_input: Ack(0) via StreamA retur
+ned (ok=true)
+[2026-09-10T22:11:52Z INFO lan_mouse::listen] reply: Ack(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:11:52Z INFO lan_mouse::capture] capture: monitor list changed (0 → 1)
+[2026-09-10T22:11:55Z INFO lan_mouse::emulation] releasing capture: 10.2.1.15:50247 entered this de
+vice (fp=a4:9b:47:25:50:3d:17:4f:b2:64:59:95:f8:a4:4d:ff:0c:31:ca:ea:d3:a9:88:8c:8f:38:c8:c7:91:48:e
+7:a2)
+[2026-09-10T22:11:55Z INFO lan_mouse::emulation] emulation: sending Ack(0) to 10.2.1.15:50247 (resp
+onding to master Enter)
+[2026-09-10T22:11:55Z INFO lan_mouse::quic_transport::session] send_input: routing Ack(0) via Strea
+mA (entry; awaiting send)
+[2026-09-10T22:11:55Z INFO lan_mouse::quic_transport::session] send_input: Ack(0) via StreamA retur
+ned (ok=true)
+[2026-09-10T22:11:55Z INFO lan_mouse::listen] reply: Ack(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:11:55Z INFO lan_mouse::capture] release_capture: ENTER (state=Idle, active_client=No
+ne)
+[2026-09-10T22:11:56Z INFO lan_mouse::capture] capture: EnterOnly trigger on 9223372036854775808 (e
+vent=BeginPending) — forwarding to service as CaptureBegin
+[2026-09-10T22:11:56Z INFO lan_mouse::capture] releasing capture: no active client at this position
+[2026-09-10T22:11:56Z INFO lan_mouse::quic_transport::session] send_input: routing Leave(0) via Str
+eamA (entry; awaiting send)
+[2026-09-10T22:11:56Z INFO lan_mouse::quic_transport::session] send_input: Leave(0) via StreamA ret
+urned (ok=true)
+[2026-09-10T22:11:56Z INFO lan_mouse::listen] reply: Leave(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:11:56Z INFO lan_mouse::emulation] emulation: received Leave from 10.2.1.15:50247 — r
+emoving emulation_proxy
+[2026-09-10T22:11:56Z INFO lan_mouse::quic_transport::session] send_input: routing Ack(0) via Strea
+mA (entry; awaiting send)
+[2026-09-10T22:11:56Z INFO lan_mouse::quic_transport::session] send_input: Ack(0) via StreamA retur
+ned (ok=true)
+[2026-09-10T22:11:56Z INFO lan_mouse::listen] reply: Ack(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:11:58Z INFO lan_mouse::listen] server stream C reader: from 10.2.1.15:50247: Clipboa
+rdImage(fp=21595697, sha=21595697, size=7245, mime=image/png)
+[2026-09-10T22:11:58Z INFO lan_mouse::service] clipboard inbound image: pulled 7245 bytes from 10.2
+.1.15:50247 via HTTP/3 (sha=21595697, mime=image/png)
+[2026-09-10T22:11:58Z INFO lan_mouse::service] clipboard inbound image: applied 7245 bytes from 10.
+2.1.15:50247 (sha=21595697, mime=image/png)
+[2026-09-10T22:11:59Z INFO lan_mouse::emulation] releasing capture: 10.2.1.15:50247 entered this de
+vice (fp=a4:9b:47:25:50:3d:17:4f:b2:64:59:95:f8:a4:4d:ff:0c:31:ca:ea:d3:a9:88:8c:8f:38:c8:c7:91:48:e
+7:a2)
+[2026-09-10T22:11:59Z INFO lan_mouse::emulation] emulation: sending Ack(0) to 10.2.1.15:50247 (resp
+onding to master Enter)
+[2026-09-10T22:11:59Z INFO lan_mouse::quic_transport::session] send_input: routing Ack(0) via Strea
+mA (entry; awaiting send)
+[2026-09-10T22:11:59Z INFO lan_mouse::quic_transport::session] send_input: Ack(0) via StreamA retur
+ned (ok=true)
+[2026-09-10T22:11:59Z INFO lan_mouse::listen] reply: Ack(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:11:59Z INFO lan_mouse::capture] release_capture: ENTER (state=Idle, active_client=No
+ne)
+[2026-09-10T22:12:00Z INFO lan_mouse::capture] capture: EnterOnly trigger on 9223372036854775808 (e
+vent=BeginPending) — forwarding to service as CaptureBegin
+[2026-09-10T22:12:00Z INFO lan_mouse::capture] releasing capture: no active client at this position
+[2026-09-10T22:12:00Z INFO lan_mouse::quic_transport::session] send_input: routing Leave(0) via Str
+eamA (entry; awaiting send)
+[2026-09-10T22:12:00Z INFO lan_mouse::quic_transport::session] send_input: Leave(0) via StreamA ret
+urned (ok=true)
+[2026-09-10T22:12:00Z INFO lan_mouse::listen] reply: Leave(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:12:00Z INFO lan_mouse::emulation] emulation: received Leave from 10.2.1.15:50247 — r
+emoving emulation_proxy
+[2026-09-10T22:12:00Z INFO lan_mouse::quic_transport::session] send_input: routing Ack(0) via Strea
+mA (entry; awaiting send)
+[2026-09-10T22:12:00Z INFO lan_mouse::quic_transport::session] send_input: Ack(0) via StreamA retur
+ned (ok=true)
+[2026-09-10T22:12:00Z INFO lan_mouse::listen] reply: Ack(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:12:02Z INFO lan_mouse::emulation] releasing capture: 10.2.1.15:50247 entered this de
+vice (fp=a4:9b:47:25:50:3d:17:4f:b2:64:59:95:f8:a4:4d:ff:0c:31:ca:ea:d3:a9:88:8c:8f:38:c8:c7:91:48:e
+7:a2)
+[2026-09-10T22:12:02Z INFO lan_mouse::emulation] emulation: sending Ack(0) to 10.2.1.15:50247 (resp
+onding to master Enter)
+[2026-09-10T22:12:02Z INFO lan_mouse::quic_transport::session] send_input: routing Ack(0) via Strea
+mA (entry; awaiting send)
+[2026-09-10T22:12:02Z INFO lan_mouse::quic_transport::session] send_input: Ack(0) via StreamA retur
+ned (ok=true)
+[2026-09-10T22:12:02Z INFO lan_mouse::listen] reply: Ack(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:12:02Z INFO lan_mouse::capture] release_capture: ENTER (state=Idle, active_client=No
+ne)
+[2026-09-10T22:12:03Z INFO lan_mouse::emulation] releasing capture: 10.2.1.15:50247 entered this de
+vice (fp=a4:9b:47:25:50:3d:17:4f:b2:64:59:95:f8:a4:4d:ff:0c:31:ca:ea:d3:a9:88:8c:8f:38:c8:c7:91:48:e
+7:a2)
+[2026-09-10T22:12:03Z INFO lan_mouse::emulation] emulation: sending Ack(0) to 10.2.1.15:50247 (resp
+onding to master Enter)
+[2026-09-10T22:12:03Z INFO lan_mouse::quic_transport::session] send_input: routing Ack(0) via Strea
+mA (entry; awaiting send)
+[2026-09-10T22:12:03Z INFO lan_mouse::quic_transport::session] send_input: Ack(0) via StreamA retur
+ned (ok=true)
+[2026-09-10T22:12:03Z INFO lan_mouse::listen] reply: Ack(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:12:03Z INFO lan_mouse::capture] release_capture: ENTER (state=Idle, active_client=No
+ne)
+[2026-09-10T22:12:03Z INFO lan_mouse::capture] capture: EnterOnly trigger on 9223372036854775808 (e
+vent=BeginPending) — forwarding to service as CaptureBegin
+[2026-09-10T22:12:03Z INFO lan_mouse::capture] releasing capture: no active client at this position
+[2026-09-10T22:12:03Z INFO lan_mouse::quic_transport::session] send_input: routing Leave(0) via Str
+eamA (entry; awaiting send)
+[2026-09-10T22:12:03Z INFO lan_mouse::quic_transport::session] send_input: Leave(0) via StreamA ret
+urned (ok=true)
+[2026-09-10T22:12:03Z INFO lan_mouse::listen] reply: Leave(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:12:03Z INFO lan_mouse::emulation] emulation: received Leave from 10.2.1.15:50247 — r
+emoving emulation_proxy
+[2026-09-10T22:12:03Z INFO lan_mouse::quic_transport::session] send_input: routing Ack(0) via Strea
+mA (entry; awaiting send)
+[2026-09-10T22:12:03Z INFO lan_mouse::quic_transport::session] send_input: Ack(0) via StreamA retur
+ned (ok=true)
+[2026-09-10T22:12:03Z INFO lan_mouse::listen] reply: Ack(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:12:10Z INFO lan_mouse::listen] server stream C reader: from 10.2.1.15:50247: Clipboa
+rdImage(fp=2c37a096, sha=2c37a096, size=4264029, mime=image/png)
+[2026-09-10T22:12:10Z INFO lan_mouse::emulation] releasing capture: 10.2.1.15:50247 entered this de
+vice (fp=a4:9b:47:25:50:3d:17:4f:b2:64:59:95:f8:a4:4d:ff:0c:31:ca:ea:d3:a9:88:8c:8f:38:c8:c7:91:48:e
+7:a2)
+[2026-09-10T22:12:10Z INFO lan_mouse::emulation] emulation: sending Ack(0) to 10.2.1.15:50247 (resp
+onding to master Enter)
+[2026-09-10T22:12:10Z INFO lan_mouse::quic_transport::session] send_input: routing Ack(0) via Strea
+mA (entry; awaiting send)
+[2026-09-10T22:12:10Z INFO lan_mouse::quic_transport::session] send_input: Ack(0) via StreamA retur
+ned (ok=true)
+[2026-09-10T22:12:10Z INFO lan_mouse::listen] reply: Ack(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:12:10Z INFO lan_mouse::emulation] releasing capture: 10.2.1.15:50247 entered this de
+vice (fp=a4:9b:47:25:50:3d:17:4f:b2:64:59:95:f8:a4:4d:ff:0c:31:ca:ea:d3:a9:88:8c:8f:38:c8:c7:91:48:e
+7:a2)
+[2026-09-10T22:12:10Z INFO lan_mouse::emulation] emulation: sending Ack(0) to 10.2.1.15:50247 (resp
+onding to master Enter)
+[2026-09-10T22:12:10Z INFO lan_mouse::quic_transport::session] send_input: routing Ack(0) via Strea
+mA (entry; awaiting send)
+[2026-09-10T22:12:10Z INFO lan_mouse::quic_transport::session] send_input: Ack(0) via StreamA retur
+ned (ok=true)
+[2026-09-10T22:12:10Z INFO lan_mouse::listen] reply: Ack(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:12:10Z INFO lan_mouse::capture] release_capture: ENTER (state=Idle, active_client=No
+ne)
+[2026-09-10T22:12:10Z WARN lan_mouse::service] clipboard inbound image: HTTP/3 GET /clipboard/image
+/2c37a096da0a5dcedc3f278cb01240b97f0f26986065b8a9b30486142f5f03c6 from 10.2.1.15:50247 failed: conne
+ction lost — skipping
+[2026-09-10T22:12:10Z INFO lan_mouse::listen] stream A reader exiting (IO closed): hello handshake
+failed: read frame length: connection lost
+[2026-09-10T22:12:10Z WARN lan_mouse::listen] QUIC peer supervisor exited with err: hello handshake
+failed: read frame length: connection lost
+[2026-09-10T22:12:10Z INFO lan_mouse::listen] server stream reader: stream ended (10.2.1.15:50247):
+hello handshake failed: read frame length: connection lost
+[2026-09-10T22:12:10Z INFO lan_mouse::listen] server stream C reader: stream ended (10.2.1.15:50247
+): hello handshake failed: read stream C length: connection lost
+[2026-09-10T22:12:10Z INFO lan_mouse::listen] server accept_bi: exiting (conn closed): closed by pe
+er: pong_health_timeout (code 51966)
+[2026-09-10T22:12:10Z INFO lan_mouse::listen] server datagram_reader: read_datagram error, exiting:
+closed by peer: pong_health_timeout (code 51966)
+[2026-09-10T22:12:10Z INFO lan_mouse::capture] release_capture: ENTER (state=Idle, active_client=No
+ne)
+[2026-09-10T22:12:11Z INFO lan_mouse::quic_transport::tls] AuthorizedKeysVerifier: authorized peer
+a4:9b:47:25:50:3d:17:4f:b2:64:59:95:f8:a4:4d:ff:0c:31:ca:ea:d3:a9:88:8c:8f:38:c8:c7:91:48:e7:a2
+[2026-09-10T22:12:11Z INFO lan_mouse::listen] QUIC peer connected: 10.2.1.15:50247
+[2026-09-10T22:12:11Z INFO lan_mouse::listen] QUIC peer 10.2.1.15:50247 authorized (fingerprint a4:
+9b:47:25:50:3d:17:4f:b2:64:59:95:f8:a4:4d:ff:0c:31:ca:ea:d3:a9:88:8c:8f:38:c8:c7:91:48:e7:a2)
+[2026-09-10T22:12:11Z INFO lan_mouse::listen] server accept_bi: stream C first frame length=78 (> M
+AX_EVENT_SIZE=21) from 10.2.1.15:50247, reading inline + spawning stream C reader
+[2026-09-10T22:12:11Z INFO lan_mouse::listen] server accept_bi: stream C first frame from 10.2.1.15
+:50247: ClipboardText(fp=e3b0c442, sha=e3b0c442, size=0, inline=yes)
+[2026-09-10T22:12:14Z INFO lan_mouse::emulation] releasing capture: 10.2.1.15:50247 entered this de
+vice (fp=a4:9b:47:25:50:3d:17:4f:b2:64:59:95:f8:a4:4d:ff:0c:31:ca:ea:d3:a9:88:8c:8f:38:c8:c7:91:48:e
+7:a2)
+[2026-09-10T22:12:14Z INFO lan_mouse::emulation] emulation: sending Ack(0) to 10.2.1.15:50247 (resp
+onding to master Enter)
+[2026-09-10T22:12:14Z INFO lan_mouse::quic_transport::session] send_input: routing Ack(0) via Strea
+mA (entry; awaiting send)
+[2026-09-10T22:12:14Z INFO lan_mouse::quic_transport::session] send_input: Ack(0) via StreamA retur
+ned (ok=true)
+[2026-09-10T22:12:14Z INFO lan_mouse::listen] reply: Ack(0) to 10.2.1.15:50247 delivered
+[2026-09-10T22:12:14Z INFO lan_mouse::capture] release_capture: ENTER (state=Idle, active_client=No
+ne)
+[2026-09-10T22:12:15Z INFO lan_mouse::capture] capture: EnterOnly trigger on 9223372036854775808 (e
+vent=BeginPending) — forwarding to service as CaptureBegin
+[2026-09-10T22:12:15Z INFO lan_mouse::capture] releasing capture: no active client at this position
+[2026-09-10T22:12:15Z INFO lan_mouse::quic_transport::session] send_input: routing Leave(0) via Str
+eamA (entry; awaiting send)
+[2026-09-10T22:12:15Z INFO lan_mouse::quic_transport::session] send_input: Leave(0) via StreamA ret
+urned (ok=true)
+[2026-09-10T22:12:15Z INFO lan_mouse::listen] reply: Leave(0) to 10.2.1.15:50247 delivered
+这是主控端日志：
+[2026-09-10T22:11:47Z INFO input_capture::macos] initial monitors: 2 monitor(s)
+[2026-09-10T22:11:47Z INFO input_capture::macos] monitor: id=macos:0000:0000::unknown-1 name="Display 1" pos=(0, 0) size=(1512, 982) primary=true scale=2
+[2026-09-10T22:11:47Z INFO input_capture::macos] monitor: id=macos:0000:0000::unknown-3 name="Display 3" pos=(-233, -1080) size=(1920, 1080) primary=false scale=2
+[2026-09-10T22:11:47Z INFO input_capture::macos] Enabling CGEvent tap
+[2026-09-10T22:11:47Z INFO input_capture::macos] registered CGDisplay reconfiguration callback on tap thread run loop
+[2026-09-10T22:11:47Z INFO input_capture] using capture backend: MacOS
+[2026-09-10T22:11:47Z INFO lan_mouse::emulation] creating input emulation ...
+[2026-09-10T22:11:47Z INFO input_emulation] using emulation backend: macos
+[2026-09-10T22:11:47Z INFO lan_mouse] opening http://127.0.0.1:3939 in the default browser
+[2026-09-10T22:11:47Z INFO lan_mouse] using config: "/Users/hb/.config/lan-mouse/config.toml"
+[2026-09-10T22:11:47Z INFO lan_mouse] Press [KeyLeftCtrl, KeyLeftShift, KeyLeftMeta, KeyLeftAlt] to release the mouse
+[2026-09-10T22:11:47Z INFO lan_mouse::web] lan-mouse web UI listening on http://127.0.0.1:3939
+[2026-09-10T22:11:47Z INFO lan_mouse::service] activated client 2 (BarrierKey { pos: Left, monitor: Some("macos:0000:0000::unknown-1"), offset: 0, span: 10000 })
+[2026-09-10T22:11:47Z WARN lan_mouse::service] clipboard dispatched to 0 peers (sha=e3b0c442); peer gate filtered all clients — check `enable_clipboard_to` in TOML and that the connection is active
+[2026-09-10T22:11:47Z INFO lan_mouse::connect] client 2 connecting ...
+[2026-09-10T22:11:47Z INFO lan_mouse::connect] client (2) dial_any ... (primary: 10.2.1.35:2268, candidates: 1)
+[2026-09-10T22:11:47Z INFO lan_mouse::connect] client (2) connected @ 10.2.1.35:2268 (quic) — first connection
+[2026-09-10T22:11:47Z INFO lan_mouse::connect] spawn_peer_supervisor: starting for handle 2 addr 10.2.1.35:2268
+[2026-09-10T22:11:47Z INFO lan_mouse::quic_transport::streams] read_loop: stream B reader spawned (cap=64), stream C reader spawned (M0c STEP-0.5b)
+[2026-09-10T22:11:47Z INFO lan_mouse::service] clipboard recover push: peer handle=2 just became active — pushing 0 bytes (sha=e3b0c442)
+[2026-09-10T22:11:47Z INFO lan_mouse::service] clipboard recover push: dispatched to 1 peer(s) (sha=e3b0c442)
+[2026-09-10T22:11:51Z INFO lan_mouse::capture] capture: BeginPending (handle=2) - awaiting Ack within 500ms
+[2026-09-10T22:11:51Z INFO lan_mouse::capture] capture: CancelPending (handle=2)
+[2026-09-10T22:11:51Z INFO lan_mouse::capture] capture: BeginPending (handle=2) - awaiting Ack within 500ms
+[2026-09-10T22:11:51Z INFO lan_mouse::capture] client 2 acknowledged Enter after 10.254917ms
+[2026-09-10T22:11:51Z INFO lan_mouse::capture] capture: pending -> active promotion (handle=2, Begin already Entered for BeginPending)
+[2026-09-10T22:11:51Z INFO lan_mouse::service] entering client 2 ...
+[2026-09-10T22:11:52Z INFO lan_mouse::capture] releasing capture: left remote client device region
+[2026-09-10T22:11:52Z INFO lan_mouse::capture] release_capture: ENTER (state=Sending, active_client=Some(2))
+[2026-09-10T22:11:52Z INFO lan_mouse::capture] release_capture: synthesizing 0 key-up events to client 2
+[2026-09-10T22:11:52Z INFO lan_mouse::capture] release_capture: sending modifiers=0 to client 2
+[2026-09-10T22:11:52Z INFO lan_mouse::capture] release_capture: sending Leave to client 2
+[2026-09-10T22:11:52Z INFO lan_mouse::quic_transport::session] send_input: routing Leave(0) via StreamA (entry; awaiting send)
+[2026-09-10T22:11:52Z INFO lan_mouse::quic_transport::session] send_input: Leave(0) via StreamA returned (ok=true)
+[2026-09-10T22:11:52Z INFO lan_mouse::capture] release_capture: setting state = Idle (force-reset)
+[2026-09-10T22:11:52Z INFO lan_mouse::capture] release_capture: calling capture.release() (OS-level release)
+[2026-09-10T22:11:52Z INFO lan_mouse::capture] release_capture: capture.release() returned (ok=true)
+[2026-09-10T22:11:52Z WARN lan_mouse::capture] capture: Input event arrived while state=Idle — dropping (host capture inactive)
+[2026-09-10T22:11:55Z INFO lan_mouse::capture] capture: BeginPending (handle=2) - awaiting Ack within 500ms
+[2026-09-10T22:11:55Z INFO lan_mouse::capture] client 2 acknowledged Enter after 11.4965ms
+[2026-09-10T22:11:55Z INFO lan_mouse::capture] capture: pending -> active promotion (handle=2, Begin already Entered for BeginPending)
+[2026-09-10T22:11:55Z INFO lan_mouse::service] entering client 2 ...
+[2026-09-10T22:11:56Z INFO lan_mouse::capture] releasing capture: left remote client device region
+[2026-09-10T22:11:56Z INFO lan_mouse::capture] release_capture: ENTER (state=Sending, active_client=Some(2))
+[2026-09-10T22:11:56Z INFO lan_mouse::capture] release_capture: synthesizing 0 key-up events to client 2
+[2026-09-10T22:11:56Z INFO lan_mouse::capture] release_capture: sending modifiers=0 to client 2
+[2026-09-10T22:11:56Z INFO lan_mouse::capture] release_capture: sending Leave to client 2
+[2026-09-10T22:11:56Z INFO lan_mouse::quic_transport::session] send_input: routing Leave(0) via StreamA (entry; awaiting send)
+[2026-09-10T22:11:56Z INFO lan_mouse::quic_transport::session] send_input: Leave(0) via StreamA returned (ok=true)
+[2026-09-10T22:11:56Z INFO lan_mouse::capture] release_capture: setting state = Idle (force-reset)
+[2026-09-10T22:11:56Z INFO lan_mouse::capture] release_capture: calling capture.release() (OS-level release)
+[2026-09-10T22:11:56Z INFO lan_mouse::capture] release_capture: capture.release() returned (ok=true)
+[2026-09-10T22:11:58Z INFO lan_mouse::clipboard::macos] clipboard: JPEG→PNG normalized for cross-platform transfer (7477 bytes → 7245 bytes)
+[2026-09-10T22:11:58Z INFO lan_mouse::service] clipboard dispatched image (7245 bytes, mime=image/png, sha=21595697) to 1 peer(s)
+[2026-09-10T22:11:59Z INFO lan_mouse::capture] capture: BeginPending (handle=2) - awaiting Ack within 500ms
+[2026-09-10T22:11:59Z INFO lan_mouse::capture] client 2 acknowledged Enter after 11.014ms
+[2026-09-10T22:11:59Z INFO lan_mouse::capture] capture: pending -> active promotion (handle=2, Begin already Entered for BeginPending)
+[2026-09-10T22:11:59Z INFO lan_mouse::service] entering client 2 ...
+[2026-09-10T22:12:00Z INFO lan_mouse::capture] releasing capture: left remote client device region
+[2026-09-10T22:12:00Z INFO lan_mouse::capture] release_capture: ENTER (state=Sending, active_client=Some(2))
+[2026-09-10T22:12:00Z INFO lan_mouse::capture] release_capture: synthesizing 0 key-up events to client 2
+[2026-09-10T22:12:00Z INFO lan_mouse::capture] release_capture: sending modifiers=0 to client 2
+[2026-09-10T22:12:00Z INFO lan_mouse::capture] release_capture: sending Leave to client 2
+[2026-09-10T22:12:00Z INFO lan_mouse::quic_transport::session] send_input: routing Leave(0) via StreamA (entry; awaiting send)
+[2026-09-10T22:12:00Z INFO lan_mouse::quic_transport::session] send_input: Leave(0) via StreamA returned (ok=true)
+[2026-09-10T22:12:00Z INFO lan_mouse::capture] release_capture: setting state = Idle (force-reset)
+[2026-09-10T22:12:00Z INFO lan_mouse::capture] release_capture: calling capture.release() (OS-level release)
+[2026-09-10T22:12:00Z INFO lan_mouse::capture] release_capture: capture.release() returned (ok=true)
+[2026-09-10T22:12:02Z INFO lan_mouse::capture] capture: BeginPending (handle=2) - awaiting Ack within 500ms
+[2026-09-10T22:12:03Z INFO lan_mouse::capture] capture: CancelPending (handle=2)
+[2026-09-10T22:12:03Z INFO lan_mouse::capture] capture: BeginPending (handle=2) - awaiting Ack within 500ms
+[2026-09-10T22:12:03Z INFO lan_mouse::capture] client 2 acknowledged Enter after 7.031125ms
+[2026-09-10T22:12:03Z INFO lan_mouse::capture] capture: pending -> active promotion (handle=2, Begin already Entered for BeginPending)
+[2026-09-10T22:12:03Z INFO lan_mouse::service] entering client 2 ...
+[2026-09-10T22:12:03Z INFO lan_mouse::capture] releasing capture: left remote client device region
+[2026-09-10T22:12:03Z INFO lan_mouse::capture] release_capture: ENTER (state=Sending, active_client=Some(2))
+[2026-09-10T22:12:03Z INFO lan_mouse::capture] release_capture: synthesizing 0 key-up events to client 2
+[2026-09-10T22:12:03Z INFO lan_mouse::capture] release_capture: sending modifiers=0 to client 2
+[2026-09-10T22:12:03Z INFO lan_mouse::capture] release_capture: sending Leave to client 2
+[2026-09-10T22:12:03Z INFO lan_mouse::quic_transport::session] send_input: routing Leave(0) via StreamA (entry; awaiting send)
+[2026-09-10T22:12:03Z INFO lan_mouse::quic_transport::session] send_input: Leave(0) via StreamA returned (ok=true)
+[2026-09-10T22:12:03Z INFO lan_mouse::capture] release_capture: setting state = Idle (force-reset)
+[2026-09-10T22:12:03Z INFO lan_mouse::capture] release_capture: calling capture.release() (OS-level release)
+[2026-09-10T22:12:03Z INFO lan_mouse::capture] release_capture: capture.release() returned (ok=true)
+[2026-09-10T22:12:10Z INFO lan_mouse::clipboard::macos] clipboard: JPEG→PNG normalized for cross-platform transfer (1264213 bytes → 4264029 bytes)
+[2026-09-10T22:12:10Z INFO lan_mouse::service] clipboard dispatched image (4264029 bytes, mime=image/png, sha=2c37a096) to 1 peer(s)
+[2026-09-10T22:12:10Z INFO lan_mouse::capture] capture: BeginPending (handle=2) - awaiting Ack within 500ms
+[2026-09-10T22:12:10Z INFO lan_mouse::capture] capture: CancelPending (handle=2)
+[2026-09-10T22:12:10Z INFO lan_mouse::capture] capture: BeginPending (handle=2) - awaiting Ack within 500ms
+[2026-09-10T22:12:10Z INFO lan_mouse::capture] capture: CancelPending (handle=2)
+[2026-09-10T22:12:10Z INFO lan_mouse::capture] capture: BeginPending (handle=2) - awaiting Ack within 500ms
+[2026-09-10T22:12:10Z WARN lan_mouse::connect] Pong health watchdog: peer 10.2.1.35:2268 hasn't responded in 3.350630333s (> 1.5s) — force-closing with WAKE_CLOSE_CODE + notifying capture
+[2026-09-10T22:12:10Z INFO lan_mouse::quic_transport::session] run: conn.closed() fired: LocallyClosed
+[2026-09-10T22:12:10Z INFO lan_mouse::quic_transport::session] peer.run(Client) exiting with close reason: LocallyClosed
+[2026-09-10T22:12:10Z INFO lan_mouse::connect] spawn_peer_supervisor: peer.run() returned for handle 2 addr 10.2.1.35:2268
+[2026-09-10T22:12:10Z INFO lan_mouse::connect] client (2) conn 10.2.1.35:2268 closed gracefully: LocallyClosed — no retry
+[2026-09-10T22:12:10Z INFO lan_mouse::quic_transport::streams] stream B reader exiting (IO closed): hello handshake failed: read frame length: connection lost
+[2026-09-10T22:12:10Z INFO lan_mouse::quic_transport::streams] stream C reader exiting (IO closed): hello handshake failed: read stream C length: connection lost
+[2026-09-10T22:12:10Z INFO lan_mouse::connect] client accept_bi: exiting (conn closed): closed
+[2026-09-10T22:12:10Z INFO lan_mouse::quic_transport::streams] datagram_reader: read_datagram error, exiting: closed
+[2026-09-10T22:12:10Z INFO lan_mouse::capture] capture: PeerLost(handle=2) from pong health watchdog — releasing capture
+[2026-09-10T22:12:10Z INFO lan_mouse::capture] releasing capture: left remote client device region
+[2026-09-10T22:12:10Z INFO lan_mouse::capture] release_capture: ENTER (state=Pending { handle: 2, key: BarrierKey { pos: Left, monitor: Some("macos:0000:0000::unknown-1"), offset: 0, span: 10000 }, started: Instant { tv_sec: 715793, tv_nsec: 875329041 } }, active_client=None)
+[2026-09-10T22:12:10Z INFO lan_mouse::capture] release_capture: was in Pending for handle 2 - cancel_pending (no Leave to send)
+[2026-09-10T22:12:10Z WARN lan_mouse::connect] stream A forwarder: outgoing_events rx closed — forwarder exiting
+[2026-09-10T22:12:10Z INFO lan_mouse::capture] capture: CancelPending (handle=2)
+[2026-09-10T22:12:11Z INFO lan_mouse::capture] capture: BeginPending (handle=2) - awaiting Ack within 500ms
+[2026-09-10T22:12:11Z WARN lan_mouse::capture] releasing capture: BeginPending send failed: not connected (cancelling pending, host cursor stays visible)
+[2026-09-10T22:12:11Z INFO lan_mouse::connect] client 2 connecting ...
+[2026-09-10T22:12:11Z INFO lan_mouse::connect] client (2) dial_any ... (primary: 10.2.1.35:2268, candidates: 1)
+[2026-09-10T22:12:11Z INFO lan_mouse::capture] capture: CancelPending (handle=2)
+[2026-09-10T22:12:11Z INFO lan_mouse::capture] capture: BeginPending (handle=2) - awaiting Ack within 500ms
+[2026-09-10T22:12:11Z WARN lan_mouse::capture] releasing capture: BeginPending send failed: not connected (cancelling pending, host cursor stays visible)
+[2026-09-10T22:12:11Z INFO lan_mouse::capture] capture: CancelPending (handle=2)
+[2026-09-10T22:12:11Z INFO lan_mouse::capture] capture: BeginPending (handle=2) - awaiting Ack within 500ms
+[2026-09-10T22:12:11Z WARN lan_mouse::capture] releasing capture: BeginPending send failed: not connected (cancelling pending, host cursor stays visible)
+[2026-09-10T22:12:11Z INFO lan_mouse::capture] capture: CancelPending (handle=2)
+[2026-09-10T22:12:11Z INFO lan_mouse::connect] client (2) connected @ 10.2.1.35:2268 (quic) — first connection
+[2026-09-10T22:12:11Z INFO lan_mouse::connect] spawn_peer_supervisor: starting for handle 2 addr 10.2.1.35:2268
+[2026-09-10T22:12:11Z INFO lan_mouse::quic_transport::streams] read_loop: stream B reader spawned (cap=64), stream C reader spawned (M0c STEP-0.5b)
+[2026-09-10T22:12:11Z INFO lan_mouse::service] clipboard recover push: peer handle=2 just became active — pushing 0 bytes (sha=e3b0c442)
+[2026-09-10T22:12:11Z INFO lan_mouse::service] clipboard recover push: dispatched to 1 peer(s) (sha=e3b0c442)
+[2026-09-10T22:12:14Z INFO lan_mouse::capture] capture: BeginPending (handle=2) - awaiting Ack within 500ms
+[2026-09-10T22:12:14Z INFO lan_mouse::capture] client 2 acknowledged Enter after 12.486875ms
+[2026-09-10T22:12:14Z INFO lan_mouse::capture] capture: pending -> active promotion (handle=2, Begin already Entered for BeginPending)
+[2026-09-10T22:12:14Z INFO lan_mouse::service] entering client 2 ...
+日志中有两次截图，第一次是小图，是好的，第二次是大图，卡顿。
 
-```
-c8a87f8  docs(known-bugs): record 2026-09-10 screenshot mouse-stuck bug + failed fix attempts
-420221a  Revert "fix(clipboard/master): route macOS JPEG/TIFF→PNG normalisation through spawn_blocking"
-b4191d4  fix(quic/clipboard): stream priorities + macos changeCount image cache (2026-09-10)
-a353255  revert(commit 0d5cd3f): drop RGBA→24-bit BI_RGB collapse + regression test
-```
-
-主控端 + 被控端现在都应运行 `b4191d4`（或 `420221a`）的代码，bug 未修复。
-
-**相关 commit 详情**：
-
-- `b4191d4`：流优先级修复（防御层，保留）
-- `4313940`（已 revert）：spawn_blocking 修复（让事情变糟）
-- `d97f3bd`（之前已 revert）：全量 spawn_blocking 修复（含 `apply_inbound_clipboard_image` async 重构）
+方案 4a（macOS JPEG passthrough 砍掉 PNG encoding 本身）是什么，我发现切换为png模式截大图后，更加卡，而且同样无法粘贴
 
 ---
 

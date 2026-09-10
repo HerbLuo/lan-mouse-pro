@@ -141,14 +141,31 @@ pub struct Service {
     /// `BackendCmd` requests to the [`clipboard_poller`] task
     /// that owns [`Self::clipboard_backend`]. Inbound write
     /// handlers ([`Self::apply_inbound_clipboard_text`] /
-    /// [`Self::apply_inbound_clipboard_image`]) and the
+    /// [`Self::handle_clipboard_inbound_image`] which spawns
+    /// [`apply_inbound_image_task`]) and the
     /// recover-push path ([`Self::handle_clipboard_recover_push`])
-    /// send `SetText` / `SetImage` / `SetDibImage` / `CurrentText`
-    /// / `CurrentImage` requests through this channel and await
+    /// send `SetText` / `CurrentText` requests through this
+    /// channel and await
     /// a `oneshot` reply. `None` until [`Self::run`] sets it up;
     /// in practice always `Some` for the lifetime of the main
     /// `select!`.
     clipboard_backend_cmd: Option<tokio_mpsc::UnboundedSender<BackendCmd>>,
+    /// **2026-09-10 inbound-apply off-thread follow-up** —
+    /// sender for [`InboundImageApplyResult`] events from
+    /// [`apply_inbound_image_task`] (the spawned task that owns
+    /// the actual `BackendCmd::SetImage` / `BackendCmd::CurrentImage`
+    /// round trip + the post-write LRU SHA computation) back to
+    /// the main task's select!. The main task consumes these in a
+    /// dedicated arm to update the image LRU + metrics + frontend
+    /// notify. `None` until [`Self::run`] sets it up.
+    ///
+    /// **Why a separate channel from `clipboard_backend_cmd`**:
+    /// the cmd channel flows main → poller (commands to the
+    /// backend). The apply-result channel flows spawned-task →
+    /// main (results back). Keeping them separate makes the
+    /// lifetimes obvious and lets the main select! arm pattern-
+    /// match on the result type cleanly.
+    apply_image_applied_tx: Option<tokio_mpsc::UnboundedSender<InboundImageApplyResult>>,
     /// **M1a STEP-1a.4** — LRU of recently-written fingerprints.
     /// Loopback defence: a peer-pushed `ClipboardText` whose
     /// `sha256` is in the LRU is treated as our own writeback and
@@ -829,6 +846,10 @@ impl Service {
             // `run` yet (e.g. unit tests) is still safe to
             // construct.
             clipboard_backend_cmd: None,
+            // **2026-09-10 inbound-apply off-thread follow-up** —
+            // set up alongside `clipboard_backend_cmd` in
+            // [`Self::run`]. `None` until then.
+            apply_image_applied_tx: None,
             // **M1b STEP-1b.3** — capacity 128 + 60 s TTL
             // (reviewer #4 3rd, was capacity 64 with no TTL in M1a).
             clipboard_lru: LruFingerprints::new(),
@@ -930,6 +951,20 @@ impl Service {
         let (image_tx, mut image_rx) = tokio_mpsc::unbounded_channel::<crate::clipboard::ImageBytes>();
         let (text_tx, mut text_rx) = tokio_mpsc::unbounded_channel::<String>();
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<BackendCmd>();
+        // **2026-09-10 inbound-apply off-thread follow-up** —
+        // inbound image apply runs in a spawned `spawn_local`
+        // task ([`apply_inbound_image_task`]) and reports its
+        // result back to this main task via this channel. The
+        // main task's `select!` consumes results in the
+        // `handle_inbound_image_applied` arm to update the
+        // image LRU + metrics + frontend notify. Keeping the
+        // apply off-thread releases the main task's `&mut self`
+        // borrow the moment the HTTP/3 GET completes, so the
+        // capture arm can poll inbound mouse events without
+        // being blocked by Windows' PNG→DIB decode/encode
+        // (100–300 ms).
+        let (applied_tx, mut applied_rx) =
+            tokio_mpsc::unbounded_channel::<InboundImageApplyResult>();
         // Stash the cmd sender on `self` so inbound write handlers
         // (`apply_inbound_clipboard_text` / `apply_inbound_clipboard_image` /
         // `handle_clipboard_recover_push`) can route `BackendCmd` requests
@@ -937,6 +972,7 @@ impl Service {
         // `Option<...>` shape so tests that don't drive `Service::run`
         // can still construct a Service with no backend wired in.
         self.clipboard_backend_cmd = Some(cmd_tx);
+        self.apply_image_applied_tx = Some(applied_tx);
         let clipboard_backend = self.clipboard_backend.take();
         let clipboard_tick = std::mem::replace(
             &mut self.clipboard_tick,
@@ -1015,6 +1051,18 @@ impl Service {
                 // `set_active_addr` succeeds.
                 Some(handle) = self.clipboard_push_notify_rx.recv() => {
                     self.handle_clipboard_recover_push(handle).await;
+                }
+                // **2026-09-10 inbound-apply off-thread follow-up** —
+                // completion event from
+                // [`apply_inbound_image_task`]. The spawned task
+                // owns the heavy `set_image` / `current_image`
+                // round trip; the main task only updates the
+                // image LRU + metrics + frontend state here, so
+                // the main `&mut self` borrow is held only for the
+                // duration of these bookkeeping mutations
+                // (sub-millisecond), not for the PNG→DIB encode.
+                Some(applied) = applied_rx.recv() => {
+                    self.handle_inbound_image_applied(applied);
                 }
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -2495,7 +2543,46 @@ impl Service {
                         short_hex(&ci.sha256),
                         ci.mime
                     );
-                    self.apply_inbound_clipboard_image(&ci.sha256, &body, &ci.mime, addr).await;
+                    // **2026-09-10 inbound-apply off-thread
+                    // follow-up** — mark the image LRU BEFORE
+                    // spawning (window defence against an OS
+                    // echo that re-polls the clipboard via
+                    // `current_image` synchronously with
+                    // `set_data_for_type`), then spawn the apply
+                    // task and return immediately. Holding the
+                    // apply on this main task would block the
+                    // `capture.event()` arm for 100–300 ms on
+                    // Windows (PNG→DIB decode/encode), which
+                    // would starve master's StreamA mouse writes
+                    // and drop frames on the controlled side. The
+                    // spawned task reports completion via the
+                    // `apply_image_applied_tx` channel; the main
+                    // task's `handle_inbound_image_applied` arm
+                    // does the LRU + metrics + frontend
+                    // bookkeeping.
+                    self.mark_local_image_write(ci.sha256);
+                    let Some(cmd_tx) = self.clipboard_backend_cmd.clone() else {
+                        log::warn!(
+                            "clipboard inbound image: cmd_tx uninitialised \
+                             (Service::run not entered yet?) — dropping apply"
+                        );
+                        return;
+                    };
+                    let Some(applied_tx) = self.apply_image_applied_tx.clone() else {
+                        log::warn!(
+                            "clipboard inbound image: applied_tx uninitialised \
+                             (Service::run not entered yet?) — dropping apply"
+                        );
+                        return;
+                    };
+                    tokio::task::spawn_local(apply_inbound_image_task(
+                        cmd_tx,
+                        applied_tx,
+                        ci.sha256,
+                        body,
+                        ci.mime,
+                        addr,
+                    ));
                 }
                 _ => {
                     log::warn!(
@@ -2676,120 +2763,74 @@ impl Service {
     /// already short-circuits on `last_outbound_image_sha` match
     /// (STEP-2a.3), so an analogous "force re-read" isn't needed.
     ///
-    /// **2026-09-10 screenshot-bug fix** — now `async` because
-    /// the backend is owned by the spawned `clipboard_poller` and
-    /// both `set_image` / `set_dib_image` and the post-write
-    /// `current_image` re-read go through `BackendCmd` requests.
-    async fn apply_inbound_clipboard_image(
-        &mut self,
-        sha256: &[u8; 32],
-        bytes: &[u8],
-        mime: &str,
-        source: SocketAddr,
-    ) {
-        // Clone the cmd sender up front so we don't hold a
-        // borrow across the `&mut self` calls below (LRU
-        // mark + bookkeeping).
-        let Some(cmd_tx) = self.clipboard_backend_cmd.clone() else {
-            return;
-        };
-        // Step 1: mark the image LRU BEFORE `set_image`. See the
-        // function docstring for the window-defence ordering rationale.
-        self.mark_local_image_write(*sha256);
-        // Step 2: route the bytes through the platform backend.
-        // Unknown mime labels fall back to PNG (see
-        // `apply_inbound_image_bytes`'s docstring for the
-        // routing predicate).
-        let is_dib = Mime::is_dib_label(mime);
-        let mime_enum = if is_dib {
-            None
-        } else {
-            Some(Mime::from_label(mime).unwrap_or_else(|| {
-                log::warn!("clipboard inbound image: unknown mime label '{mime}'; defaulting to PNG");
-                Mime::Png
-            }))
-        };
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let cmd = if is_dib {
-            BackendCmd::SetDibImage {
-                bytes: bytes.to_vec(),
-                reply: reply_tx,
-            }
-        } else {
-            BackendCmd::SetImage {
-                bytes: bytes.to_vec(),
-                mime: mime_enum.expect("non-DIB path always sets mime_enum"),
-                reply: reply_tx,
-            }
-        };
-        if cmd_tx.send(cmd).is_err() {
-            // **2026-09-10 code-review follow-up** — log the
-            // poller-gone condition. See the matching comment on
-            // `apply_inbound_clipboard_text` for the rationale.
+    /// **2026-09-10 inbound-apply off-thread follow-up** —
+    /// completion handler for [`apply_inbound_image_task`]. The
+    /// spawned task owns the heavy `BackendCmd::SetImage` /
+    /// `BackendCmd::CurrentImage` round trip + SHA computation;
+    /// the main task only does the bookkeeping that requires
+    /// `&mut self` (image LRU mark + metrics + frontend notify).
+    /// This split lets `capture.event()` keep firing during the
+    /// 100–300 ms Windows PNG→DIB encode, so master's StreamA
+    /// mouse writes don't back-pressure and the controlled side
+    /// doesn't drop frames.
+    ///
+    /// **Why `&mut self` instead of another spawned task**:
+    /// `image_lru_fingerprints.push` + `notify_frontend` +
+    /// `last_image_ts_ms` / `last_clipboard_source` all need
+    /// `&mut self`, and the borrow window here is sub-millisecond
+    /// (LRU push is O(1), the frontend event is a channel push).
+    /// This is exactly the kind of fast `&mut self` work the
+    /// main `select!` was designed to absorb.
+    ///
+    /// **Failure semantics**: when the apply failed (any
+    /// non-`None` `error_msg`), we log warn + skip metrics /
+    /// frontend notify — same "no inflate on failure" contract
+    /// as the text branch.
+    fn handle_inbound_image_applied(&mut self, result: InboundImageApplyResult) {
+        let inbound_sha = result.inbound_sha;
+        let source = result.source;
+        let mime = result.mime.as_str();
+        let bytes_len = result.bytes_len;
+        if !result.success {
             log::warn!(
-                "clipboard inbound image: poller task is gone (panic or shutdown); \
-                 dropping inbound image push from {source} (sha={}, {} bytes, mime={mime})",
-                short_hex(sha256),
-                bytes.len()
+                "clipboard inbound image apply failed from {source}: {} \
+                 (sha={}, {} bytes, mime={mime})",
+                result.error_msg.as_deref().unwrap_or("(no detail)"),
+                short_hex(&inbound_sha),
+                bytes_len
             );
             return;
         }
-        let set_result = match reply_rx.await {
-            Ok(r) => r,
-            Err(_) => {
-                log::warn!("clipboard inbound image: set_image reply channel closed");
-                return;
-            }
-        };
-        if let Err(e) = set_result {
-            log::warn!("clipboard inbound image: set_image failed: {e}");
-            return;
-        }
-        // Step 2.5: re-read the clipboard and mark the
-        // *post-transcode* SHA into the image LRU. Windows's
-        // `set_image` decodes the inbound PNG via the `image`
-        // crate and re-encodes as BMP-encoded DIB (different
-        // bytes / different SHA). The LRU entry from Step 1
-        // holds the *original* PNG SHA, which won't match the
-        // freshly-written DIB — so the very next 500 ms tick
-        // would dispatch the just-applied DIB back to its
-        // source. Marking the post-apply SHA closes that loop
-        // even when the backend transcodes.
-        let (cur_reply_tx, cur_reply_rx) = oneshot::channel();
-        if cmd_tx
-            .send(BackendCmd::CurrentImage { reply: cur_reply_tx })
-            .is_err()
-        {
-            // **2026-09-10 code-review follow-up (Finding #3)** —
-            // the post-write re-read send failed. On Windows this
-            // is the only path that records the *post-transcode*
-            // SHA into the image LRU; without it, the next 500 ms
-            // tick would dispatch the freshly-written DIB back
-            // to its source (loopback echo). Bail out *before*
-            // `metrics.incr_allow` + the frontend notify so the
-            // dispatcher doesn't advertise a successful apply
-            // it couldn't fully verify.
-            log::warn!(
-                "clipboard inbound image: post-write CurrentImage cmd send failed \
-                 (poller gone); skipping allow-count + frontend notify for sha={} \
-                 ({} bytes, mime={mime})",
-                short_hex(sha256),
-                bytes.len()
-            );
-            return;
-        }
-        if let Ok(Some(written)) = cur_reply_rx.await {
-            let written_sha = sha256_of_bytes(&written.data);
-            if &written_sha != sha256 {
+        // Step 2.5 (LRU side): record the *post-transcode* SHA
+        // in the image LRU. The inbound SHA was marked *before*
+        // the apply task was spawned (window defence); this is
+        // the post-write mark that prevents the next 500 ms tick
+        // from dispatching the freshly-written DIB back to its
+        // source on Windows.
+        if let Some(written_sha) = result.post_write_sha {
+            if &written_sha != &inbound_sha {
                 log::debug!(
                     "clipboard inbound image: backend transcoded (inbound sha={} → \
                      on-clipboard sha={}, mime={}); marking transcoded SHA in image LRU",
-                    short_hex(sha256),
+                    short_hex(&inbound_sha),
                     short_hex(&written_sha),
-                    written.mime
+                    mime
                 );
             }
             self.mark_local_image_write(written_sha);
+        } else if let Some(err) = result.error_msg.as_deref() {
+            // Success with no post-write SHA — the set_image
+            // succeeded but the CurrentImage re-read dropped.
+            // Log at info (the inbound-SHA LRU mark from Step 1
+            // still gives loopback protection for the inbound
+            // bytes themselves; only transcoded-SHA echo is at
+            // risk).
+            log::info!(
+                "clipboard inbound image: post-write SHA unavailable: {err} \
+                 (sha={}, {} bytes, mime={mime})",
+                short_hex(&inbound_sha),
+                bytes_len
+            );
         }
         // Step 3: record the allow (mirrors the text branch's
         // "only on success" contract).
@@ -2807,8 +2848,8 @@ impl Service {
         log::info!(
             "clipboard inbound image: applied {} bytes from {source} \
              (sha={}, mime={mime})",
-            bytes.len(),
-            short_hex(sha256)
+            bytes_len,
+            short_hex(&inbound_sha)
         );
     }
 
@@ -3416,6 +3457,43 @@ enum BackendCmd {
     },
 }
 
+/// **2026-09-10 inbound-apply off-thread follow-up** —
+/// completion event for [`apply_inbound_image_task`]. The
+/// spawned task performs `BackendCmd::SetImage` /
+/// `BackendCmd::SetDibImage` + `BackendCmd::CurrentImage` on
+/// the poller (heavy: PNG→DIB decode/encode on Windows is
+/// 100–300 ms) and reports the outcome here. The main task
+/// consumes these in a dedicated `select!` arm to update the
+/// image LRU + metrics + frontend notify.
+///
+/// **Why a `struct` not a tuple**: the field names document the
+/// `Option<[u8; 32]>` semantics (post-write SHA may be `None`
+/// if the poller crashed between SetImage and CurrentImage).
+/// A 4-tuple would be unreadable at the call sites.
+struct InboundImageApplyResult {
+    /// Inbound SHA from the wire (already marked in LRU
+    /// *before* spawning the apply task).
+    inbound_sha: [u8; 32],
+    /// Source peer address (for log lines + `last_clipboard_source`).
+    source: SocketAddr,
+    /// Wire mime string (kept verbatim for the log + frontend
+    /// — we don't `Mime::from_label` here because the main task
+    /// may want the raw label, not the enum-resolved one).
+    mime: String,
+    /// Inbound bytes length (for log lines; the actual `Vec<u8>`
+    /// is dropped after the cmd is sent).
+    bytes_len: usize,
+    /// `true` iff `set_image` / `set_dib_image` succeeded.
+    success: bool,
+    /// Post-write SHA from `BackendCmd::CurrentImage`. `None`
+    /// when the apply failed or when the post-write re-read
+    /// itself failed (poller gone).
+    post_write_sha: Option<[u8; 32]>,
+    /// Human-readable error from any failed step. `None` on
+    /// success.
+    error_msg: Option<String>,
+}
+
 /// **2026-09-10 screenshot-bug fix** — dedicated spawned task
 /// that owns the OS clipboard backend and serves two distinct
 /// request streams:
@@ -3552,6 +3630,164 @@ async fn clipboard_poller(
             else => return,
         }
     }
+}
+
+/// **2026-09-10 inbound-apply off-thread follow-up** — spawned
+/// `spawn_local` task that owns the heavy `BackendCmd::SetImage`
+/// / `SetDibImage` + post-write `BackendCmd::CurrentImage`
+/// round trip for inbound clipboard images.
+///
+/// **Why a spawned task (not inline `await` in
+/// `handle_clipboard_inbound_image`)**: the inline path holds
+/// `&mut self` on the main task for the duration of the await
+/// chain — on Windows, `set_image` decodes the inbound PNG via
+/// the `image` crate and re-encodes as BMP-encoded DIB in
+/// 100–300 ms. During that window the main task's `select!`
+/// cannot poll the `capture.event()` arm, so master's StreamA
+/// mouse writes back-pressure and the controlled side drops
+/// mouse frames. Spawning the apply to its own task releases
+/// the main task's borrow the moment the HTTP/3 GET completes.
+///
+/// **Why the apply still routes through the poller**: the
+/// backend is owned by the poller (sole owner) — only the
+/// poller can call `set_image` / `set_dib_image` /
+/// `current_image_async`. The spawned apply task sends
+/// commands + awaits oneshot replies, exactly like the main
+/// task's inline path used to do, but on a separate task.
+///
+/// **LRU mark ordering**: the main task marks the inbound SHA
+/// in the image LRU *before* spawning this task (Step 1 of the
+/// original `apply_inbound_clipboard_image` flow) — this
+/// matches the window-defence contract that prevented OS-echo
+/// of the freshly-written clipboard before the original fix.
+/// The post-write re-read SHA (Step 2.5) is reported back via
+/// [`InboundImageApplyResult`] and recorded in the LRU by
+/// the main task's `handle_inbound_image_applied` arm.
+async fn apply_inbound_image_task(
+    cmd_tx: tokio_mpsc::UnboundedSender<BackendCmd>,
+    applied_tx: tokio_mpsc::UnboundedSender<InboundImageApplyResult>,
+    inbound_sha: [u8; 32],
+    bytes: Vec<u8>,
+    mime: String,
+    source: SocketAddr,
+) {
+    let bytes_len = bytes.len();
+    let is_dib = Mime::is_dib_label(&mime);
+    let mime_enum = if is_dib {
+        None
+    } else {
+        Some(Mime::from_label(&mime).unwrap_or_else(|| {
+            // The main task's `handle_clipboard_inbound_image`
+            // already logs the unknown-mime warning before
+            // spawning. Here we just pick the same PNG
+            // fallback the inlined copy used to use — no
+            // duplicate log needed.
+            Mime::Png
+        }))
+    };
+
+    // Step 2: route the bytes through the platform backend.
+    // We send a single combined `BackendCmd` per phase instead
+    // of two separate ones — keeps the round-trip count to 2
+    // (one for set, one for re-read) and matches what the
+    // inline path did before this refactor.
+    let (set_reply_tx, set_reply_rx) = oneshot::channel();
+    let set_cmd = if is_dib {
+        BackendCmd::SetDibImage {
+            bytes,
+            reply: set_reply_tx,
+        }
+    } else {
+        BackendCmd::SetImage {
+            bytes,
+            mime: mime_enum.expect("non-DIB path always sets mime_enum"),
+            reply: set_reply_tx,
+        }
+    };
+    if cmd_tx.send(set_cmd).is_err() {
+        // Poller gone — daemon shutting down or poller panicked.
+        let _ = applied_tx.send(InboundImageApplyResult {
+            inbound_sha,
+            source,
+            mime,
+            bytes_len,
+            success: false,
+            post_write_sha: None,
+            error_msg: Some("poller task is gone (panic or shutdown)".into()),
+        });
+        return;
+    }
+    let set_result = match set_reply_rx.await {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = applied_tx.send(InboundImageApplyResult {
+                inbound_sha,
+                source,
+                mime,
+                bytes_len,
+                success: false,
+                post_write_sha: None,
+                error_msg: Some("set_image reply channel closed".into()),
+            });
+            return;
+        }
+    };
+    if let Err(e) = set_result {
+        let _ = applied_tx.send(InboundImageApplyResult {
+            inbound_sha,
+            source,
+            mime,
+            bytes_len,
+            success: false,
+            post_write_sha: None,
+            error_msg: Some(format!("set_image: {e}")),
+        });
+        return;
+    }
+
+    // Step 2.5: post-write re-read for the transcoded SHA.
+    // On Windows the on-clipboard bytes after `set_image` are
+    // BMP-encoded DIB, not the inbound PNG — without this
+    // re-read, the next 500 ms tick would dispatch the
+    // freshly-written DIB back to its source (loopback echo).
+    // The poller's `BackendCmd::CurrentImage` handler uses
+    // `current_image_async` (the round-2 fix), which is fast
+    // on Windows (DIB read is a Windows API call, no encode).
+    let (cur_reply_tx, cur_reply_rx) = oneshot::channel();
+    if cmd_tx.send(BackendCmd::CurrentImage { reply: cur_reply_tx }).is_err() {
+        // Set_image succeeded but poller dropped before
+        // CurrentImage — record success with no post-write
+        // SHA so the LRU is updated with the inbound SHA only.
+        let _ = applied_tx.send(InboundImageApplyResult {
+            inbound_sha,
+            source,
+            mime,
+            bytes_len,
+            success: true,
+            post_write_sha: None,
+            error_msg: Some(
+                "set_image succeeded but post-write re-read cmd send failed \
+                 (poller gone); LRU will only hold inbound SHA"
+                    .into(),
+            ),
+        });
+        return;
+    }
+    let post_write_sha = match cur_reply_rx.await {
+        Ok(Some(written)) => Some(sha256_of_bytes(&written.data)),
+        Ok(None) => None,
+        Err(_) => None,
+    };
+
+    let _ = applied_tx.send(InboundImageApplyResult {
+        inbound_sha,
+        source,
+        mime,
+        bytes_len,
+        success: true,
+        post_write_sha,
+        error_msg: None,
+    });
 }
 
 /// **STEP-M2-2.6**: pure helper that turns an internal
@@ -4679,7 +4915,8 @@ mod image_inbound_tests {
     //! test matrix in PLAN §8 M2a (macOS 真机).
     use super::{
         BackendCmd, ClipboardBackend, IMAGE_LOOPBACK_CAPACITY, IMAGE_LOOPBACK_TTL,
-        LruFingerprints, Mime, apply_inbound_image_bytes, clipboard_poller,
+        InboundImageApplyResult, LruFingerprints, Mime, apply_inbound_image_bytes,
+        apply_inbound_image_task, clipboard_poller,
     };
     use crate::clipboard::{ClipboardError, ImageBytes};
     use tokio::sync::{mpsc as tokio_mpsc, oneshot};
@@ -5293,6 +5530,153 @@ mod image_inbound_tests {
             .await;
     }
 
+    /// **2026-09-10 inbound-apply off-thread follow-up — roundtrip pin**:
+    /// when a `RecordingBackend` is wired in, the spawned
+    /// [`apply_inbound_image_task`] correctly:
+    ///   1. Sends `BackendCmd::SetImage` and awaits the reply.
+    ///   2. Sends `BackendCmd::CurrentImage` and awaits the reply.
+    ///   3. Computes the post-write SHA + reports it back via
+    ///      [`InboundImageApplyResult`].
+    /// This pins the spawned-task contract end-to-end before any
+    /// platform-specific overrides complicate the picture.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_inbound_image_task_roundtrip() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let backend = Arc::new(RecordingBackend::new());
+                let (image_tx, _image_rx) =
+                    tokio_mpsc::unbounded_channel::<crate::clipboard::ImageBytes>();
+                let (text_tx, _text_rx) = tokio_mpsc::unbounded_channel::<String>();
+                let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<BackendCmd>();
+                let (applied_tx, mut applied_rx) =
+                    tokio_mpsc::unbounded_channel::<InboundImageApplyResult>();
+                let interval = tokio::time::interval(Duration::from_millis(50));
+
+                tokio::task::spawn_local(clipboard_poller(
+                    Some(Box::new(RecordingBackendAdapter(backend.clone()))),
+                    interval,
+                    image_tx,
+                    text_tx,
+                    cmd_rx,
+                ));
+
+                // Inbound image bytes. RecordingBackend stores the
+                // bytes verbatim and reports them back from
+                // `current_image`, so post-write SHA == SHA-256 of
+                // the input bytes (no transcoding).
+                let inbound_bytes: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+                let expected_post_write_sha = sha256_of_bytes_for_test(&inbound_bytes);
+                let inbound_sha: [u8; 32] = [0xCC; 32]; // arbitrary; doesn't have to match
+
+                tokio::task::spawn_local(apply_inbound_image_task(
+                    cmd_tx,
+                    applied_tx,
+                    inbound_sha,
+                    inbound_bytes.clone(),
+                    "image/png".to_string(),
+                    "10.2.1.15:50247".parse().unwrap(),
+                ));
+
+                let result = applied_rx
+                    .recv()
+                    .await
+                    .expect("apply_inbound_image_task must send exactly one result");
+                assert!(
+                    result.success,
+                    "RecordingBackend::set_image is a no-op success — apply must succeed; \
+                     error_msg={:?}",
+                    result.error_msg
+                );
+                assert_eq!(
+                    result.post_write_sha,
+                    Some(expected_post_write_sha),
+                    "post-write SHA must equal SHA-256 of bytes the RecordingBackend stored verbatim"
+                );
+                assert_eq!(result.inbound_sha, inbound_sha);
+                assert_eq!(result.bytes_len, 4096);
+                assert_eq!(result.mime, "image/png");
+
+                // The RecordingBackend should have observed the
+                // exact bytes + mime we sent.
+                assert_eq!(
+                    backend.image_bytes().as_deref(),
+                    Some(inbound_bytes.as_slice()),
+                    "RecordingBackend must have received the inbound bytes verbatim"
+                );
+                assert_eq!(
+                    backend.image_mime(),
+                    Some(Mime::Png),
+                    "RecordingBackend must have observed Mime::Png"
+                );
+                assert_eq!(
+                    backend.call_count(),
+                    1,
+                    "set_image must be called exactly once"
+                );
+
+                // **2026-09-10 inbound-apply off-thread contract**:
+                // the spawned task reports completion via
+                // `applied_tx`. Dropping `applied_tx` (by letting
+                // it go out of scope) closes the receiver; this
+                // mirrors what Service::run does on shutdown.
+                drop(applied_rx);
+            })
+            .await;
+    }
+
+    /// **2026-09-10 inbound-apply off-thread follow-up — poller-gone pin**:
+    /// when the poller task has already exited (panicked or
+    /// shutdown), the spawned [`apply_inbound_image_task`]
+    /// detects the cmd_tx.send failure on the first SetImage /
+    /// SetDibImage cmd and reports `success=false` via
+    /// [`InboundImageApplyResult`] *without* awaiting forever.
+    /// This pins the "poller gone → caller learns via result,
+    /// not via hang" contract.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_inbound_image_task_poller_gone() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<BackendCmd>();
+                let (applied_tx, mut applied_rx) =
+                    tokio_mpsc::unbounded_channel::<InboundImageApplyResult>();
+                // Drop cmd_rx immediately — sender survives but
+                // receiver is gone, so the first `cmd_tx.send`
+                // returns Err (no live receiver).
+                drop(cmd_rx);
+
+                tokio::task::spawn_local(apply_inbound_image_task(
+                    cmd_tx,
+                    applied_tx,
+                    [0u8; 32],
+                    b"some-bytes".to_vec(),
+                    "image/png".to_string(),
+                    "10.2.1.15:50247".parse().unwrap(),
+                ));
+
+                let result = applied_rx
+                    .recv()
+                    .await
+                    .expect("apply task must always report a result");
+                assert!(!result.success, "poller gone → success must be false");
+                assert!(
+                    result
+                        .error_msg
+                        .as_deref()
+                        .map(|s| s.contains("poller task is gone"))
+                        .unwrap_or(false),
+                    "error_msg must mention poller-gone; got {:?}",
+                    result.error_msg
+                );
+                assert_eq!(
+                    result.post_write_sha, None,
+                    "post-write SHA must be None on failure"
+                );
+            })
+            .await;
+    }
+
     /// Tiny helper that mirrors `sha256_of_bytes` (free fn,
     /// module-private). Computed locally so this test module
     /// doesn't depend on the production helper's visibility.
@@ -5332,6 +5716,22 @@ mod image_inbound_tests {
             // `Arc<RecordingBackend>` without `Arc::make_mut`.
             self.0.record_set_image(bytes, mime);
             Ok(())
+        }
+
+        fn current_image(&mut self) -> Option<crate::clipboard::ImageBytes> {
+            // Echo the most-recent `set_image` bytes back as the
+            // post-write clipboard content. Mirrors what a
+            // Windows backend does after `set_image` (it
+            // transcodes PNG→DIB and stores; subsequent
+            // `current_image` reads back the DIB). For the
+            // round-trip test the bytes pass through unchanged,
+            // so the post-write SHA equals the inbound SHA.
+            let bytes = self.0.image_bytes().unwrap_or_default();
+            let mime = self.0.image_mime().unwrap_or(Mime::Png);
+            Some(crate::clipboard::ImageBytes {
+                mime: mime.mime_str().to_string(),
+                data: bytes,
+            })
         }
     }
 }
