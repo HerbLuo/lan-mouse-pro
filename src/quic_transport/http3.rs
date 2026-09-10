@@ -254,9 +254,9 @@ pub fn default_router() -> Arc<Router> {
     )
 }
 
-/// **M1b STEP-1b.2** — production router with the
-/// `/clipboard/text/{sha256}` route backed by a real
-/// [`crate::clipboard::cache::ClipboardCache`].
+/// **M1b STEP-1b.2 + M2a STEP-2a.3** — production router with the
+/// `/clipboard/text/{sha256}` and `/clipboard/image/{sha256}` routes
+/// backed by a real [`crate::clipboard::cache::ClipboardCache`].
 ///
 /// The handler:
 /// 1. Parses the 64-char hex sha256 suffix from the request path.
@@ -275,18 +275,34 @@ pub fn default_router() -> Arc<Router> {
 /// shared between the dispatcher (writer) and every per-peer HTTP/3
 /// server (reader). Cloning the `Arc` is cheap; locking is short
 /// (one `HashMap::get` + optional `remove`).
+///
+/// **M2a STEP-2a.3 — text + image share one cache**: the dispatcher
+/// pushes both `ClipboardText` and `ClipboardImage` payloads into
+/// the same `ClipboardCache` (keyed by sha256). The
+/// `/clipboard/text/{sha}` and `/clipboard/image/{sha}` routes read
+/// from the same backing store; the only difference between the two
+/// is the prefix, which selects whether the receiver expected text
+/// or image bytes. Bytes never travel with a Content-Type header in
+/// the current revision — receivers know the format from the prefix
+/// (text receivers don't issue `/clipboard/image/` GETs, and vice
+/// versa). M2b will add a mime header when non-PNG formats enter the
+/// wire path.
 pub fn default_router_with_cache(
     cache: Arc<std::sync::Mutex<crate::clipboard::cache::ClipboardCache>>,
 ) -> Arc<Router> {
+    // Both prefixes share one cache `Arc`. Each closure captures
+    // its own clone — `Arc` is `Send + Sync` and the clone is
+    // cheap (single refcount bump).
+    let cache_for_text = cache.clone();
+    let cache_for_image = cache;
     Arc::new(
         Router::new()
             .get("/healthz", |_req: &Request| Response::ok("ok"))
             .get_prefix("/clipboard/text/", move |req: &Request| {
-                clipboard_text_route(req, &cache)
+                cache_lookup_route(req, &cache_for_text, "/clipboard/text/")
             })
-            .get_prefix("/clipboard/image/", |req: &Request| {
-                log::trace!("http3 /clipboard/image/ stub: {}", req.path);
-                Response::not_found()
+            .get_prefix("/clipboard/image/", move |req: &Request| {
+                cache_lookup_route(req, &cache_for_image, "/clipboard/image/")
             })
             .get_prefix("/clipboard/file/", |req: &Request| {
                 log::trace!("http3 /clipboard/file/ stub: {}", req.path);
@@ -295,33 +311,38 @@ pub fn default_router_with_cache(
     )
 }
 
-/// **M1b STEP-1b.2** — `/clipboard/text/{sha256}` route handler.
+/// **M1b STEP-1b.2 + M2a STEP-2a.3** — generic
+/// `/clipboard/{kind}/{sha256}` route handler shared by the text and
+/// image routes.
 ///
-/// **Why free-standing instead of inline**: tests construct a
-/// `Router` and inline-register the same handler logic so the
-/// router closure (which is `Arc<dyn Fn + Send + Sync>`) does not
-/// need a `Mutex` for tests that don't share state. The handler
-/// logic itself is the part worth pinning with unit tests.
-#[allow(clippy::doc_lazy_continuation)]
+/// **Why one helper for both prefixes**: text and image route
+/// handlers are byte-for-byte identical — the cache is content-
+/// addressed and the lookup path does not care whether the bytes are
+/// text or image. Splitting into two near-duplicate functions (the
+/// original M1b design) doubled the unit-test surface and risked
+/// silent drift between the two branches. One helper, called from
+/// both `get_prefix` arms of [`default_router_with_cache`], keeps the
+/// contract in one place.
 ///
 /// **Sync, not async**: the cache lookup is a single `HashMap::get`
 /// + optional `HashMap::remove`. `tokio::sync::Mutex` would force
 /// this to be `async`, and the router handler signature is
 /// `Fn(&Request) -> Response` (sync). `std::sync::Mutex` is the
 /// right primitive.
-fn clipboard_text_route(
+#[allow(clippy::doc_lazy_continuation)]
+fn cache_lookup_route(
     req: &Request,
     cache: &Arc<std::sync::Mutex<crate::clipboard::cache::ClipboardCache>>,
+    prefix: &str,
 ) -> Response {
     // Strip the prefix to extract the sha256 suffix. The router's
-    // `get_prefix` matched because `req.path` starts with
-    // `/clipboard/text/`; anything past the prefix is the candidate
-    // hex string.
-    let suffix = match req.path.strip_prefix("/clipboard/text/") {
+    // `get_prefix` matched because `req.path` starts with `prefix`;
+    // anything past the prefix is the candidate hex string.
+    let suffix = match req.path.strip_prefix(prefix) {
         Some(s) => s,
         None => {
             log::warn!(
-                "http3 /clipboard/text/ handler received unexpected path: {}",
+                "http3 {prefix} handler received unexpected path: {}",
                 req.path
             );
             return Response::not_found();
@@ -329,14 +350,15 @@ fn clipboard_text_route(
     };
 
     // Reject anything that is not exactly 64 lowercase hex chars.
-    // The receiver's `Http3Client::get_text` always emits the full
-    // 64-char lowercase hex form (see `format!("/clipboard/text/{sha256}")`),
-    // so a malformed suffix indicates either a buggy peer or a
-    // hostile scanner. Both must yield 404 (silent ignore on the
-    // receiver side, not an error that panics the dispatcher).
+    // The receiver's `Http3Client::get_text` / `get_image` always
+    // emits the full 64-char lowercase hex form (see
+    // `format!("/clipboard/{{text,image}}/{sha256}")`), so a
+    // malformed suffix indicates either a buggy peer or a hostile
+    // scanner. Both must yield 404 (silent ignore on the receiver
+    // side, not an error that panics the dispatcher).
     if suffix.len() != 64 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
         log::warn!(
-            "http3 /clipboard/text/ rejecting malformed sha256 suffix (len={}, expected 64): {}",
+            "http3 {prefix} rejecting malformed sha256 suffix (len={}, expected 64): {}",
             suffix.len(),
             req.path
         );
@@ -350,7 +372,7 @@ fn clipboard_text_route(
             // future suffix-content edge cases (e.g. mixed case that
             // bypassed `is_ascii_hexdigit`).
             log::warn!(
-                "http3 /clipboard/text/ hex decode failed despite ASCII check: {}",
+                "http3 {prefix} hex decode failed despite ASCII check: {}",
                 req.path
             );
             return Response::not_found();
@@ -361,7 +383,7 @@ fn clipboard_text_route(
         Ok(mut guard) => match guard.lookup(&sha) {
             Some(content) => {
                 log::trace!(
-                    "http3 /clipboard/text/ hit ({} bytes) for suffix {}",
+                    "http3 {prefix} hit ({} bytes) for suffix {}",
                     content.len(),
                     suffix
                 );
@@ -370,7 +392,7 @@ fn clipboard_text_route(
             None => {
                 // Cache miss (or TTL-expired) — silent 404. Receiver
                 // logs warn and skips. See PLAN §1 评审 #3 2nd.
-                log::debug!("http3 /clipboard/text/ cache miss for suffix {}", suffix);
+                log::debug!("http3 {prefix} cache miss for suffix {}", suffix);
                 Response::not_found()
             }
         },
@@ -380,8 +402,7 @@ fn clipboard_text_route(
             // than panicking again. Log error so the operator sees
             // the poison.
             log::error!(
-                "http3 /clipboard/text/ cache mutex poisoned for suffix {}; \
-                 treating as miss",
+                "http3 {prefix} cache mutex poisoned for suffix {}; treating as miss",
                 suffix
             );
             // Recover from the poison by extracting the inner guard.
@@ -390,6 +411,35 @@ fn clipboard_text_route(
             Response::not_found()
         }
     }
+}
+
+/// **M1b STEP-1b.2** — `/clipboard/text/{sha256}` route handler.
+///
+/// Convenience wrapper over [`cache_lookup_route`] with the
+/// `/clipboard/text/` prefix pre-bound. Kept as a named function so
+/// grep-based searches and any future text-specific tweaks have a
+/// stable symbol to land on.
+#[allow(dead_code)]
+fn clipboard_text_route(
+    req: &Request,
+    cache: &Arc<std::sync::Mutex<crate::clipboard::cache::ClipboardCache>>,
+) -> Response {
+    cache_lookup_route(req, cache, "/clipboard/text/")
+}
+
+/// **M2a STEP-2a.3** — `/clipboard/image/{sha256}` route handler.
+///
+/// Convenience wrapper over [`cache_lookup_route`] with the
+/// `/clipboard/image/` prefix pre-bound. The image and text routes
+/// share the same cache and lookup logic; the wrapper exists for
+/// grep symmetry with the text route and to keep the call sites
+/// in `default_router_with_cache` self-documenting.
+#[allow(dead_code)]
+fn clipboard_image_route(
+    req: &Request,
+    cache: &Arc<std::sync::Mutex<crate::clipboard::cache::ClipboardCache>>,
+) -> Response {
+    cache_lookup_route(req, cache, "/clipboard/image/")
 }
 
 // ---------------------------------------------------------------------------
@@ -983,11 +1033,8 @@ pub fn looks_like_http3_request(first4: &[u8; 4]) -> bool {
 /// acquire a permit itself — it expects the caller to gate it.
 /// [`build_server`] is the convenience wrapper that does the
 /// acquire + spawn dance; tests use it directly.
-pub async fn handle_http3_stream<R>(
-    router: Arc<Router>,
-    mut send: SendStream,
-    mut recv: R,
-) where
+pub async fn handle_http3_stream<R>(router: Arc<Router>, mut send: SendStream, mut recv: R)
+where
     R: tokio::io::AsyncRead + Unpin,
 {
     // Best-effort: surface protocol errors as a debug log + early
@@ -1897,6 +1944,197 @@ mod tests {
         assert!(decode_hex_32(&"a".repeat(63)).is_none());
         // Wrong length (65).
         assert!(decode_hex_32(&"a".repeat(65)).is_none());
+    }
+
+    // === M2a STEP-2a.3 — `/clipboard/image/{sha256}` route tests
+    // ======================================================================
+    //
+    // Mirror the M1b STEP-1b.2 text-route tests above. The image
+    // route shares the same `cache_lookup_route` implementation, so
+    // the cache contract is identical — these tests pin the
+    // *prefix dispatch* (image prefix wires to the cache, not the
+    // 404 stub) and the *cache-hit/miss behaviour for image bytes*.
+
+    /// Insert a 4 K-screenshot-sized PNG (5 MiB), GET it through the
+    /// cache-backed router, verify 200 + identical bytes. Pins the
+    /// happy-path of the image route — the production use case
+    /// (PLAN §3 M2a STEP-2a.3) is a 4 K screenshot 端到端通.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_image_returns_cache_hit_bytes() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_get_image_returns_cache_hit_bytes,
+            {
+                let cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                let sha = [0x55; 32];
+                // 5 MiB payload — typical 4 K screenshot size.
+                let body: Vec<u8> = (0..5 * 1024 * 1024u32).map(|i| (i & 0xFF) as u8).collect();
+                cache.lock().unwrap().insert(sha, body.clone());
+
+                let router = super::default_router_with_cache(cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                let (status, returned) =
+                    client.get_image(&"55".repeat(32)).await.expect("get_image");
+                assert_eq!(status, 200, "image cache hit must return 200");
+                assert_eq!(
+                    returned, body,
+                    "returned image bytes must match the inserted cache entry"
+                );
+            }
+        );
+    }
+
+    /// Cache miss on the image route returns 404 with the standard
+    /// "not found" body (receiver-side handler must surface this as
+    /// a normal pull miss — log warn + skip — never an error).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_image_returns_404_on_cache_miss() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_get_image_returns_404_on_cache_miss,
+            {
+                let cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                // Cache is empty — no insert.
+                let router = super::default_router_with_cache(cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                let (status, body) = client.get_image(&"ab".repeat(32)).await.expect("get_image");
+                assert_eq!(
+                    status, 404,
+                    "image cache miss must return 404 (silent ignore on the receiver)"
+                );
+                assert_eq!(
+                    &body[..],
+                    b"not found",
+                    "404 body should be the standard 'not found' bytes"
+                );
+            }
+        );
+    }
+
+    /// After active eviction (mirrors the dispatcher's
+    /// `cache.remove(prev_sha)` before pushing a new image), a
+    /// previously-cached sha256 becomes a 404.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_image_returns_404_after_active_eviction() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_get_image_returns_404_after_active_eviction,
+            {
+                let cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                let sha_x = [0x11; 32];
+                cache.lock().unwrap().insert(sha_x, b"PNG-bytes-X".to_vec());
+
+                let router = super::default_router_with_cache(cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                // First GET: hit, returns the bytes we just cached.
+                let (status, body) = client
+                    .get_image(&"11".repeat(32))
+                    .await
+                    .expect("first get_image");
+                assert_eq!(status, 200);
+                assert_eq!(body, b"PNG-bytes-X");
+
+                // Active eviction (mirrors the dispatcher's
+                // `remove(prev_sha)` before pushing a new image).
+                assert!(cache.lock().unwrap().remove(&sha_x));
+
+                // Second GET: the previous sha256 is now a miss.
+                let (status, _) = client
+                    .get_image(&"11".repeat(32))
+                    .await
+                    .expect("second get_image");
+                assert_eq!(
+                    status, 404,
+                    "after active eviction, prev image sha256 must yield 404"
+                );
+            }
+        );
+    }
+
+    /// Malformed suffix on the image route returns 404 (same
+    /// defensive contract as the text route). Pins that the
+    /// shared `cache_lookup_route` handles bad sha256 input
+    /// identically for both prefixes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_image_returns_404_on_malformed_suffix() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_get_image_returns_404_on_malformed_suffix,
+            {
+                let cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                let router = super::default_router_with_cache(cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                // Too short.
+                let (status, _) = client
+                    .get_bytes("/clipboard/image/abc")
+                    .await
+                    .expect("too short");
+                assert_eq!(
+                    status, 404,
+                    "non-hex / too-short image suffix must yield 404"
+                );
+
+                // Right length but non-hex chars.
+                let (status, _) = client
+                    .get_bytes("/clipboard/image/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+                    .await
+                    .expect("non-hex");
+                assert_eq!(status, 404, "non-hex image suffix must yield 404");
+            }
+        );
+    }
+
+    /// The image and text routes share one cache — a sha256 cached
+    /// via the image route is **also** readable via the text route
+    /// (the cache is content-addressed; the prefix is purely a
+    /// receiver-side signal of "which dispatcher-pushed this"). This
+    /// test pins the contract: a future refactor that splits the
+    /// caches by prefix would silently break cross-kind receivers
+    /// and is caught here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_and_text_routes_share_one_cache() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            image_and_text_routes_share_one_cache,
+            {
+                let cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                let sha = [0x77; 32];
+                let body = b"a payload cached via the dispatcher".to_vec();
+                cache.lock().unwrap().insert(sha, body.clone());
+
+                let router = super::default_router_with_cache(cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                // Read via the image route (the dispatcher pushed
+                // as a `ClipboardImage`).
+                let (img_status, img_body) =
+                    client.get_image(&"77".repeat(32)).await.expect("get_image");
+                assert_eq!(img_status, 200);
+                assert_eq!(img_body, body);
+
+                // Read via the text route — same sha256, same
+                // bytes. The cache is content-addressed; the
+                // dispatcher's `kind` (text vs image) is purely
+                // metadata on the wire and does not partition the
+                // backing store.
+                let (txt_status, txt_body) =
+                    client.get_text(&"77".repeat(32)).await.expect("get_text");
+                assert_eq!(
+                    txt_status, 200,
+                    "text route must read the same sha256 as image route (shared cache)"
+                );
+                assert_eq!(txt_body, body);
+            }
+        );
     }
 
     // === HTTP/3 vs StreamC discriminator (M1b follow-up) =====================
