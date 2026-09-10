@@ -125,6 +125,21 @@ pub(crate) struct LanMouseConnection {
     /// Unbounded: the success path is once-per-dial, so backpressure
     /// is never a concern.
     clipboard_push_notify_tx: tokio::sync::mpsc::UnboundedSender<ClientHandle>,
+    /// **M1b follow-up** — shared clipboard text cache. Cloned into
+    /// every `connect_to_handle` / supervisor's redial so the
+    /// unified `accept_bi` dispatcher can build a per-peer
+    /// HTTP/3 router that reads from the same cache the dispatcher
+    /// writes to. See [`crate::quic_transport::http3::default_router_with_cache`].
+    ///
+    /// **Why hold on `LanMouseConnection` (not in each
+    /// `connect_to_handle` call)**: the cache is a long-lived shared
+    /// resource (the dispatcher's `handle_clipboard_tick` writes to
+    /// it on every local clipboard change). Storing the `Arc` on
+    /// `LanMouseConnection` mirrors the listener-side pattern in
+    /// `listen.rs::LanMouseListener::clipboard_cache`, so both
+    /// directions see the same backing store and any future
+    /// eviction policy is implemented in one place.
+    clipboard_cache: Arc<std::sync::Mutex<crate::clipboard::cache::ClipboardCache>>,
 }
 
 impl LanMouseConnection {
@@ -143,6 +158,13 @@ impl LanMouseConnection {
     /// the dial window. See the field doc on
     /// `LanMouseConnection::clipboard_push_notify_tx` for the full
     /// rationale.
+    ///
+    /// **M1b follow-up** — `clipboard_cache` is the shared
+    /// outbound-clipboard text cache. The unified `accept_bi`
+    /// dispatcher on each peer builds a per-peer HTTP/3 router
+    /// backed by this cache so receivers can `GET /clipboard/text/{sha256}`
+    /// to fetch metadata-only payloads. See the field doc on
+    /// `clipboard_cache` for the rationale.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         client_endpoint: Endpoint,
@@ -157,6 +179,7 @@ impl LanMouseConnection {
             lan_mouse_proto::ProtoEvent,
         )>,
         clipboard_push_notify_tx: tokio::sync::mpsc::UnboundedSender<ClientHandle>,
+        clipboard_cache: Arc<std::sync::Mutex<crate::clipboard::cache::ClipboardCache>>,
     ) -> Self {
         let (recv_tx, recv_rx) = channel();
         let quic_creds = Rc::new(QuicDialerCreds { cert_chain, key });
@@ -174,6 +197,7 @@ impl LanMouseConnection {
             peer_lost_tx,
             clipboard_inbound_tx,
             clipboard_push_notify_tx,
+            clipboard_cache,
         }
     }
 
@@ -240,6 +264,7 @@ impl LanMouseConnection {
                 self.peer_lost_tx.clone(),
                 self.clipboard_inbound_tx.clone(),
                 self.clipboard_push_notify_tx.clone(),
+                self.clipboard_cache.clone(),
             ));
         }
         Ok(())
@@ -370,6 +395,7 @@ impl LanMouseConnection {
                 self.peer_lost_tx.clone(),
                 self.clipboard_inbound_tx.clone(),
                 self.clipboard_push_notify_tx.clone(),
+                self.clipboard_cache.clone(),
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
@@ -601,6 +627,15 @@ async fn connect_to_handle(
     // rationale; this clone lives for the duration of the dial
     // task and is consumed once at the success branch.
     clipboard_push_notify_tx: tokio::sync::mpsc::UnboundedSender<ClientHandle>,
+    // **M1b follow-up** — shared clipboard text cache. Built once
+    // per dial / redial into the unified `accept_bi` dispatcher so
+    // the resulting per-peer HTTP/3 router can serve
+    // `GET /clipboard/text/{sha256}` requests against the same
+    // backing store the dispatcher's `handle_clipboard_tick`
+    // writes to. The dispatcher uses the cache to look up bodies
+    // for metadata-only `ClipboardText` pushes; the HTTP/3 router
+    // is the read side of the same cache.
+    clipboard_cache: Arc<std::sync::Mutex<crate::clipboard::cache::ClipboardCache>>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     let Some(ips_set) = client_manager.get_ips(handle) else {
@@ -856,6 +891,11 @@ async fn connect_to_handle(
         // every reconnect (initial dial + every supervisor redial),
         // not just the first one.
         clipboard_push_notify_tx,
+        // **M1b follow-up** — clipboard cache, forwarded to the
+        // supervisor's redial `connect_to_handle` so each redial's
+        // unified `accept_bi` dispatcher builds its per-peer HTTP/3
+        // router against the same shared cache.
+        clipboard_cache.clone(),
     ));
 
     // **M1a follow-up #2 — client-side accept_bi loop**. Symmetric
@@ -876,11 +916,26 @@ async fn connect_to_handle(
     // `stream_c_clipboard_text_round_trip` test in
     // `quic_transport::session.rs:1677+` for the comment that
     // documents this asymmetry explicitly.
+    //
+    // **M1b follow-up** — the unified dispatcher now also serves
+    // HTTP/3 GET requests for metadata-only clipboard bodies.
+    // Without this, the receiver's
+    // `GET /clipboard/text/{sha256}` request lands on the
+    // dispatcher as a "Stream C" frame (the first 4 bytes happen
+    // to be `[0x00, 0x03, 'G', 'E']` = 214853 BE, larger than
+    // MAX_EVENT_SIZE), the dispatcher tries to read 214853 bytes
+    // of body, fails after the actual GET request size (~80 B),
+    // and the receiver never sees a response. Building the router
+    // here (with the cache the dispatcher writes to) closes the
+    // loop. See [`crate::quic_transport::http3::looks_like_http3_request`]
+    // for the discriminator.
+    let router = crate::quic_transport::http3::default_router_with_cache(clipboard_cache.clone());
     spawn_local(client_accept_bi_task(
         peer,
         client_manager,
         recv_tx,
         clipboard_inbound_tx,
+        router,
     ));
 
     Ok(())
@@ -938,6 +993,14 @@ async fn client_accept_bi_task(
         std::net::SocketAddr,
         lan_mouse_proto::ProtoEvent,
     )>,
+    // **M1b follow-up** — HTTP/3 router used to handle
+    // `GET /clipboard/text/{sha256}` requests from the peer.
+    // Built once per peer dial from the shared `clipboard_cache`.
+    // The unified `accept_bi` dispatcher classifies each bidi
+    // before deciding what to do with it; HTTP/3 requests go to
+    // [`crate::quic_transport::http3::handle_http3_stream`],
+    // everything else goes to the Stream C / Stream B path.
+    http3_router: Arc<crate::quic_transport::http3::Router>,
 ) {
     let parked_streams: Rc<RefCell<Vec<(quinn::SendStream, quinn::RecvStream)>>> =
         Rc::new(RefCell::new(Vec::new()));
@@ -949,10 +1012,46 @@ async fn client_accept_bi_task(
                 return;
             }
         };
-        // Discriminator: try to read the first frame's length prefix.
-        use tokio::io::AsyncReadExt;
-        let len: u32 = match recv.read_u32().await {
-            Ok(n) => n,
+        // **M1b follow-up — unified dispatcher**.
+        //
+        // Peers can open two kinds of bidi streams on us:
+        // (a) HTTP/3-lite requests for clipboard bodies —
+        //     `GET /clipboard/text/{sha256}` issued by the receiver
+        //     after a metadata-only `ClipboardText` push.
+        // (b) Stream C var-codec frames — `ClipboardText` /
+        //     `ClipboardImage` / `FileTransferOffer` / etc. with a
+        //     `[u32 BE body_len][body bytes...]` framing.
+        //
+        // Both shapes start with a 4-byte length-ish prefix, so the
+        // dispatcher's first move is to read those 4 bytes and use
+        // the [`looks_like_http3_request`] discriminator to decide
+        // which path to take:
+        //
+        // - HTTP/3: chain the 4 buffered bytes back in front of
+        //   the live `RecvStream` via
+        //   `tokio::io::AsyncReadExt::chain`, then call
+        //   [`crate::quic_transport::http3::handle_http3_stream`].
+        //   The handler reads the request, dispatches via the
+        //   router, writes the response, and `finish`es the send
+        //   half. We keep `send` alive — `handle_http3_stream`
+        //   takes it by value.
+        //
+        // - Stream C / B: re-interpret the same 4 bytes as a
+        //   big-endian body length and proceed as before (the
+        //   existing logic reads the body, decodes a var-codec
+        //   proto event, etc.). The 4 bytes are NOT put back —
+        //   `read_u32` already consumed them.
+        //
+        // **Why read 4 bytes (not 2)**: we need a sufficient
+        // sample to discriminate — `body_len` for a Stream C
+        // frame is always `>= 77` bytes (smallest var-codec event)
+        // but the discriminator wants to peek at positions 2..=3
+        // for ASCII letters. Reading only 2 bytes would be
+        // ambiguous for short body_lens that happen to land in
+        // the right range; 4 bytes give us the full prefix.
+        let mut prefix = [0u8; 4];
+        match recv.read_exact(&mut prefix).await {
+            Ok(()) => {}
             Err(e) => {
                 // Bunch bidi: peer opened a bidi and never wrote.
                 // Park both halves so the peer's writer doesn't see
@@ -965,7 +1064,37 @@ async fn client_accept_bi_task(
                 parked_streams.borrow_mut().push((send, recv));
                 continue;
             }
-        };
+        }
+        if crate::quic_transport::http3::looks_like_http3_request(&prefix) {
+            log::debug!(
+                "client accept_bi: HTTP/3 request detected (prefix={:02X?}), forwarding to router",
+                prefix
+            );
+            // Chain the buffered prefix back in front of the live
+            // stream. `chain` is zero-cost: it's a thin wrapper
+            // that returns the prefix bytes first, then delegates
+            // to `recv`. After this `prefix` is moved into the
+            // chain and the HTTP/3 handler reads from the chained
+            // reader as if no discriminator had run.
+            //
+            // **Why `&[u8]` not `[u8; 4]`**: `tokio::io::AsyncReadExt::chain`
+            // requires its first argument to be `AsyncRead + Unpin`;
+            // `&[u8]` (the slice) satisfies this via tokio's
+            // blanket impl. Passing the array directly fails
+            // because `[u8; N]` only impls `AsyncRead` through
+            // `Cursor` / explicit wrapper.
+            let chained = tokio::io::AsyncReadExt::chain(prefix.as_slice(), recv);
+            crate::quic_transport::http3::handle_http3_stream(
+                http3_router.clone(),
+                send,
+                chained,
+            )
+            .await;
+            continue;
+        }
+        // Not HTTP/3 — re-interpret the prefix as a Stream C / B
+        // big-endian body length.
+        let len: u32 = u32::from_be_bytes(prefix);
         let remote = peer.connection().remote_address();
         if len as usize > lan_mouse_proto::MAX_EVENT_SIZE {
             // **Stream C**: read body inline, decode, forward to
@@ -1214,6 +1343,13 @@ async fn spawn_peer_supervisor(
     // user's clipboard activity that happened during the
     // RetryState backoff window.
     clipboard_push_notify_tx: tokio::sync::mpsc::UnboundedSender<ClientHandle>,
+    // **M1b follow-up** — shared clipboard text cache. The
+    // redial `connect_to_handle` rebuilds the per-peer HTTP/3
+    // router from this cache, so the unified `accept_bi`
+    // dispatcher on the new peer can serve
+    // `GET /clipboard/text/{sha256}` requests against the same
+    // backing store the dispatcher writes to.
+    clipboard_cache: Arc<std::sync::Mutex<crate::clipboard::cache::ClipboardCache>>,
 ) {
     log::info!("spawn_peer_supervisor: starting for handle {handle} addr {addr}");
 
@@ -1342,6 +1478,13 @@ async fn spawn_peer_supervisor(
                     // RetryState backoff window following
                     // a peer death would be lost.
                     clipboard_push_notify_tx.clone(),
+                    // **M1b follow-up** — clipboard cache,
+                    // forwarded to the redial
+                    // `connect_to_handle` so the new peer's
+                    // unified `accept_bi` dispatcher rebuilds
+                    // its per-peer HTTP/3 router against the
+                    // same shared cache.
+                    clipboard_cache.clone(),
                 ));
             } else {
                 log::info!(

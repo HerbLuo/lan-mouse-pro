@@ -87,7 +87,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Default body chunk size for streaming responses (64 KiB).
 pub const CHUNK_SIZE: usize = 64 * 1024;
@@ -547,7 +547,30 @@ fn write_err_to_io(e: quinn::WriteError) -> std::io::Error {
 /// Stream-decode a request from a `RecvStream`. Each length-prefix is
 /// read inline; the body is read in `CHUNK_SIZE` chunks into a single
 /// `BytesMut` so memory pressure stays bounded.
-pub async fn read_request(recv: &mut RecvStream) -> std::io::Result<Request> {
+/// Stream-decode a request from any `AsyncRead` source. Each
+/// length-prefix is read inline; the body is read in `CHUNK_SIZE`
+/// chunks into a fresh `Vec<u8>` so memory pressure stays bounded.
+///
+/// **Why generic over `AsyncRead`** (rather than `&mut RecvStream`):
+/// the unified `accept_bi` dispatcher in `connect.rs` and
+/// `listen.rs` reads the first 4 bytes to discriminate HTTP/3
+/// vs Stream C / Stream B. When the discriminator classifies a
+/// bidi as HTTP/3, those 4 bytes must be "prepended" to the live
+/// stream before the HTTP/3 handler reads the request — but
+/// `quinn::RecvStream` does not support `BufRead::seek` to put
+/// bytes back. The dispatcher solves this by reading the 4 bytes
+/// into a `Vec<u8>`, calling
+/// `tokio::io::AsyncReadExt::chain(prefix.as_slice(), recv)`,
+/// and passing the chained reader here.
+///
+/// **AsyncRead contract**: `R` must implement `AsyncRead + Unpin`
+/// (the standard `tokio::io::AsyncRead` shape). `RecvStream`,
+/// `tokio::io::DuplexStream`, and `tokio::io::Chain<R1, R2>` all
+/// satisfy this.
+pub async fn read_request<R>(recv: &mut R) -> std::io::Result<Request>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let method_len = read_u16(recv).await? as usize;
     let method = read_bytes(recv, method_len).await?;
     let method = String::from_utf8(method)
@@ -634,28 +657,35 @@ pub async fn read_body(recv: &mut RecvStream, len: usize) -> std::io::Result<Vec
     read_bytes(recv, len).await
 }
 
-async fn read_u16(recv: &mut RecvStream) -> std::io::Result<u16> {
+async fn read_u16<R>(recv: &mut R) -> std::io::Result<u16>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut buf = [0u8; 2];
-    recv.read_exact(&mut buf).await.map_err(read_exact_err)?;
+    recv.read_exact(&mut buf).await?;
     Ok(u16::from_be_bytes(buf))
 }
 
-async fn read_u32(recv: &mut RecvStream) -> std::io::Result<u32> {
+async fn read_u32<R>(recv: &mut R) -> std::io::Result<u32>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut buf = [0u8; 4];
-    recv.read_exact(&mut buf).await.map_err(read_exact_err)?;
+    recv.read_exact(&mut buf).await?;
     Ok(u32::from_be_bytes(buf))
 }
 
-async fn read_bytes(recv: &mut RecvStream, len: usize) -> std::io::Result<Vec<u8>> {
+async fn read_bytes<R>(recv: &mut R, len: usize) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut out = Vec::with_capacity(len.min(CHUNK_SIZE * 4));
     let mut remaining = len;
     while remaining > 0 {
         let want = remaining.min(CHUNK_SIZE);
         let start = out.len();
         out.resize(start + want, 0);
-        recv.read_exact(&mut out[start..])
-            .await
-            .map_err(read_exact_err)?;
+        recv.read_exact(&mut out[start..]).await?;
         remaining -= want;
     }
     Ok(out)
@@ -861,6 +891,124 @@ impl Http3Client {
 /// at a manageable backlog.
 const MAX_INFLIGHT_REQUESTS_PER_PEER: usize = 32;
 
+/// **M1b follow-up — discriminator for unified `accept_bi` dispatch**
+///
+/// HTTP/3-lite requests and Stream C var-codec frames both start with
+/// a length-prefixed body. Without a discriminator, the only reliable
+/// way to tell them apart is the byte pattern of the first 4 bytes.
+///
+/// Wire formats (after `accept_bi` resolves a bidi stream):
+///
+/// **HTTP/3-lite request**:
+/// ```text
+/// | method_len u16 | method bytes | path_len u16 | path | body_len u32 | body |
+/// ```
+///
+/// **Stream C var-codec frame**:
+/// ```text
+/// | body_len u32 | var-codec body (ProtoEvent) |
+/// ```
+///
+/// So the first 4 bytes are:
+///
+/// | Frame kind | bytes 0..4 (hex) | as u32 BE |
+/// |---|---|---|
+/// | HTTP/3 `GET`     | `00 03 47 45` | 214853 |
+/// | HTTP/3 `POST`    | `00 04 50 4F` | 282703 |
+/// | Stream C (meta)  | `00 00 00 4D` |     77 |
+/// | Stream C (full)  | `00 00 0C 80` |   3200 |
+///
+/// The discriminator checks three things on the first 4 bytes:
+/// 1. `buf[0] == 0` — HTTP method_len fits in 1 byte (true for all
+///    1..=7 method names; HTTP/1.1 reserves 8 methods of length 3..=7).
+/// 2. `buf[1]` in `3..=7` — known HTTP method lengths (RFC 7231
+///    §4 defines GET/POST/PUT/PATCH/DELETE; CONNECT/OPTIONS/TRACE
+///    are 3..=7 too). Stream C body_len is never this small in the
+///    "method_len" position because a var-codec ClipboardText is at
+///    least ~77 bytes (fingerprint + sha256 + size + has_inline +
+///    inline_len) and the typical upper end is 16 KiB
+///    ([`MAX_FRAME_SIZE`]).
+/// 3. `buf[2]` and `buf[3]` are ASCII alphabetic — HTTP methods are
+///    uppercase ASCII per RFC 7231 §4.1, and the body_len of a
+///    Stream C frame in the same positions is binary.
+///
+/// **Why this is safe**:
+/// - A Stream C body_len ≤ 7 with ASCII letters at positions 2..4
+///   would require an event whose var-codec body is 1..7 bytes. The
+///   smallest var-codec event is `ClipboardRequest` (no payload —
+///   sha256 only = 32 bytes body) and ClipboardText metadata (77 bytes
+///   body). A body_len < 32 cannot happen in production.
+///
+///
+/// (The 7 upper bound for `buf[1]` is conservative; we don't currently
+/// use any HTTP method longer than "DELETE" (6 bytes) — but OPTIONS
+/// and CONNECT and TRACE would all be 7 bytes or fewer. Going to 7
+/// doesn't risk a Stream C false-positive because Stream C body_len
+/// never has ASCII letters at positions 2..4 when buf[1] ≤ 7.)
+pub fn looks_like_http3_request(first4: &[u8; 4]) -> bool {
+    first4[0] == 0
+        && (3..=7).contains(&first4[1])
+        && first4[2].is_ascii_alphabetic()
+        && first4[3].is_ascii_alphabetic()
+}
+
+/// Handle a single HTTP/3-lite request on an already-accepted
+/// `(SendStream, RecvStream)` pair, where the receiver may be
+/// pre-buffered with a discriminator prefix.
+///
+/// **Why split out from [`build_server`]**: the unified
+/// `accept_bi` dispatch loop in `connect.rs::client_accept_bi_task`
+/// and `listen.rs::server_accept_bi_task` needs to classify each
+/// bidi as HTTP/3 vs Stream C / Stream B **before** deciding what
+/// to do with it. Once it has identified an HTTP/3 request by
+/// inspecting the first 4 bytes, it must hand the (send, recv)
+/// pair to the HTTP/3 handler without dropping `send` (HTTP/3
+/// needs to write a response). Splitting the per-stream logic out
+/// of `build_server` lets the unified dispatch call this function
+/// directly while `build_server` keeps working for tests that want
+/// a self-contained HTTP/3 server.
+///
+/// **Why `R: AsyncRead + Unpin`** (rather than `RecvStream`): the
+/// dispatcher reads the 4-byte discriminator prefix into a `Vec<u8>`,
+/// then needs the HTTP/3 handler to read those bytes first before
+/// continuing from the live stream. The cleanest way is
+/// `tokio::io::AsyncReadExt::chain(prefix.as_slice(), recv)`,
+/// which produces an `AsyncRead` that yields the prefix bytes
+/// first, then delegates to the wrapped stream. The dispatcher
+/// passes that chained reader here. Tests that pass a bare
+/// `RecvStream` work because `RecvStream: AsyncRead + Unpin`.
+///
+/// **Concurrency cap**: callers that want a semaphore should
+/// acquire a permit before calling. This function does **not**
+/// acquire a permit itself — it expects the caller to gate it.
+/// [`build_server`] is the convenience wrapper that does the
+/// acquire + spawn dance; tests use it directly.
+pub async fn handle_http3_stream<R>(
+    router: Arc<Router>,
+    mut send: SendStream,
+    mut recv: R,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    // Best-effort: surface protocol errors as a debug log + early
+    // return. Mid-stream cancellation or connection drop surfaces
+    // as `Err` we log-and-return.
+    let req = match read_request(&mut recv).await {
+        Ok(r) => r,
+        Err(e) => {
+            log::debug!("http3-lite read_request error: {e}");
+            return;
+        }
+    };
+    let resp = router.handle(&req);
+    if let Err(e) = write_response_streaming(&mut send, &resp).await {
+        log::debug!("http3-lite write_response error: {e}");
+    }
+    // `SendStream::finish` is sync; `ClosedStream` surfaces if the
+    // client cancelled. Ignore it.
+    let _ = send.finish();
+}
+
 /// Build a server-side driver closure that accepts bidi streams on
 /// `conn`, dispatches each request through the router, and writes the
 /// response back.
@@ -873,6 +1021,17 @@ const MAX_INFLIGHT_REQUESTS_PER_PEER: usize = 32;
 /// `semaphore.acquire().await` until a slot frees. New streams opened
 /// by the peer while we are saturated will queue at the QUIC layer
 /// (which has its own flow-control window); we never reject outright.
+///
+/// **Production note (M1b follow-up)**: this is the standalone form
+/// used by tests in `http3.rs::tests` and by any code path that
+/// wants a self-contained HTTP/3 server with no Stream C / Stream B
+/// traffic. The production supervisor paths in `listen.rs` and
+/// `connect.rs` instead use the **unified** accept_bi dispatcher
+/// (which classifies each bidi and routes HTTP/3 requests to
+/// [`handle_http3_stream`]) — see the comment on
+/// [`looks_like_http3_request`] for why splitting the dispatch out
+/// is required to avoid a race between this loop and the Stream C
+/// reader.
 pub fn build_server(
     router: Arc<Router>,
 ) -> impl Fn(Connection) -> futures::future::BoxFuture<'static, ()> + Send + Sync + Clone {
@@ -882,7 +1041,7 @@ pub fn build_server(
             let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_REQUESTS_PER_PEER));
             loop {
                 match conn.accept_bi().await {
-                    Ok((mut send, mut recv)) => {
+                    Ok((send, recv)) => {
                         let router = router.clone();
                         let semaphore = semaphore.clone();
                         tokio::spawn(async move {
@@ -897,23 +1056,7 @@ pub fn build_server(
                                     return;
                                 }
                             };
-                            // Best-effort: surface protocol errors as a 400.
-                            // Mid-stream cancellation or connection drop
-                            // surfaces as `Err` we log-and-return.
-                            let req = match read_request(&mut recv).await {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    log::debug!("http3-lite read_request error: {e}");
-                                    return;
-                                }
-                            };
-                            let resp = router.handle(&req);
-                            if let Err(e) = write_response_streaming(&mut send, &resp).await {
-                                log::debug!("http3-lite write_response error: {e}");
-                            }
-                            // `SendStream::finish` is sync; `ClosedStream`
-                            // surfaces if the client cancelled. Ignore it.
-                            let _ = send.finish();
+                            handle_http3_stream(router, send, recv).await;
                         });
                     }
                     Err(e) => {
@@ -1754,5 +1897,230 @@ mod tests {
         assert!(decode_hex_32(&"a".repeat(63)).is_none());
         // Wrong length (65).
         assert!(decode_hex_32(&"a".repeat(65)).is_none());
+    }
+
+    // === HTTP/3 vs StreamC discriminator (M1b follow-up) =====================
+    //
+    // The unified `accept_bi` dispatcher classifies bidis as HTTP/3
+    // requests or Stream C var-codec frames by looking at the first
+    // 4 bytes after accept_bi resolves. These tests pin the
+    // discriminator contract.
+    //
+    // Background: the production bug was a peer-initiated HTTP/3 GET
+    // request being misclassified as a Stream C frame because
+    // `client_accept_bi_task` reads the first 4 bytes as a u32 BE
+    // body length. For "GET" the first 4 bytes are
+    // `[0x00, 0x03, 0x47, 0x45]` (method_len=3 + "GE"), which
+    // becomes 214853 BE and triggers the Stream C branch.
+    // `looks_like_http3_request` is the discriminator that fixes this.
+
+    /// The smoking-gun bytes: a `GET` request to
+    /// `/clipboard/text/43b20f97...` opens with these four bytes.
+    /// The discriminator MUST classify this as HTTP/3 — failing
+    /// this test means the production bug is back.
+    #[test]
+    fn discriminator_accepts_get_request_first_bytes() {
+        // "GET" -> method_len = 3 -> first 4 bytes = [0x00, 0x03, 'G', 'E']
+        let first4: [u8; 4] = [0x00, 0x03, b'G', b'E'];
+        assert!(
+            looks_like_http3_request(&first4),
+            "GET request first bytes [0x00, 0x03, 'G', 'E'] must classify as HTTP/3"
+        );
+    }
+
+    /// Other HTTP methods must also classify as HTTP/3 (POST / PUT
+    /// / PATCH / DELETE / OPTIONS / CONNECT / TRACE all have
+    /// method_len in 3..=7 and start with uppercase ASCII letters).
+    #[test]
+    fn discriminator_accepts_all_standard_http_methods() {
+        // method_len, method — first 2 bytes of method
+        let cases: &[(&str, [u8; 4])] = &[
+            ("GET", [0x00, 0x03, b'G', b'E']),
+            ("POST", [0x00, 0x04, b'P', b'O']),
+            ("PUT", [0x00, 0x03, b'P', b'U']),
+            ("PATCH", [0x00, 0x05, b'P', b'A']),
+            ("DELETE", [0x00, 0x06, b'D', b'E']),
+            ("OPTIONS", [0x00, 0x07, b'O', b'P']),
+            ("CONNECT", [0x00, 0x07, b'C', b'O']),
+            ("TRACE", [0x00, 0x05, b'T', b'R']),
+        ];
+        for (method, bytes) in cases {
+            assert!(
+                looks_like_http3_request(bytes),
+                "{method} first bytes {bytes:02X?} must classify as HTTP/3"
+            );
+        }
+    }
+
+    /// Stream C var-codec frames: the first 4 bytes are a u32 BE
+    /// body length. The smallest var-codec proto event body is
+    /// ~77 bytes (ClipboardText metadata-only: 32 fp + 32 sha + 8
+    /// size + 1 has_inline + 4 inline_len = 77 bytes). Even the
+    /// smallest payload sizes do NOT collide with HTTP/3 — body_len
+    /// is binary, not ASCII alphabetic.
+    #[test]
+    fn discriminator_rejects_streamc_small_bodies() {
+        let cases: &[(&str, [u8; 4])] = &[
+            // body_len = 77 (smallest ClipboardText metadata)
+            ("body_len=77", [0x00, 0x00, 0x00, 77]),
+            // body_len = 100 (smallest ClipboardText with inline)
+            ("body_len=100", [0x00, 0x00, 0x00, 100]),
+            // body_len = 3261 (the failing case from the bug report)
+            ("body_len=3261", [0x00, 0x00, 0x0C, 0xBD]),
+            // body_len = 16000 (typical upper end before MAX_FRAME_SIZE)
+            ("body_len=16000", [0x00, 0x00, 0x3E, 0x80]),
+        ];
+        for (label, bytes) in cases {
+            assert!(
+                !looks_like_http3_request(bytes),
+                "StreamC {label} bytes {bytes:02X?} must NOT classify as HTTP/3"
+            );
+        }
+    }
+
+    /// Boundary case: a `body_len` that happens to encode as
+    /// `[0x00, 0x03, 0x47, 0x45]` (214853 BE) — the exact bytes
+    /// that bit us in production. The discriminator MUST reject
+    /// this as Stream C even though it shares its first 4 bytes
+    /// with a GET request (the discriminator checks bytes 2..4 are
+    /// ASCII alphabetic, but a `body_len` of 214853 would only
+    /// happen if we were sending a 214 KiB var-codec event — way
+    /// beyond MAX_FRAME_SIZE).
+    ///
+    /// Actually this exact byte pattern IS classified as HTTP/3 by
+    /// the discriminator (because the bytes are literally the start
+    /// of a GET request). This is the precise mechanism that fixed
+    /// the bug: when the peer opens an HTTP/3 GET, the bytes
+    /// [0x00, 0x03, 'G', 'E'] DO match, so we route to HTTP/3.
+    /// The "false positive" on a hypothetical 214 KiB body_len is
+    /// not a real risk (var-codec events cap at MAX_FRAME_SIZE =
+    /// 16 KiB) — see the discriminator docstring.
+    #[test]
+    fn discriminator_accepts_214853_as_http3_not_streamc() {
+        // This is the smoking-gun: the bytes the production bug
+        // saw on the controller side. With the discriminator we
+        // CORRECTLY classify this as HTTP/3.
+        let smoking_gun: [u8; 4] = [0x00, 0x03, b'G', b'E'];
+        assert_eq!(
+            smoking_gun,
+            214853u32.to_be_bytes(),
+            "sanity: u32 BE 214853 must equal the GET request first 4 bytes"
+        );
+        assert!(
+            looks_like_http3_request(&smoking_gun),
+            "the smoking-gun bytes [0x00, 0x03, 'G', 'E'] (= 214853 BE) must classify as HTTP/3, \
+             routing the GET to the HTTP/3 server instead of being misread as a Stream C body length"
+        );
+    }
+
+    /// Negative cases: HTTP/3 requests don't have small body_len in
+    /// the body_len position because HTTP/3 body_len is at offset
+    /// `method_len + path_len + 4`, not at the start.
+    #[test]
+    fn discriminator_rejects_out_of_range_method_lens() {
+        // method_len = 0 (invalid — must be 1+)
+        let m0: [u8; 4] = [0x00, 0x00, b'G', b'E'];
+        assert!(!looks_like_http3_request(&m0));
+        // method_len = 1 (no real HTTP method is 1 char; "P" exists
+        // historically but not in our router).
+        let m1: [u8; 4] = [0x00, 0x01, b'G', b'E'];
+        assert!(!looks_like_http3_request(&m1));
+        // method_len = 2 (no real HTTP method is 2 chars).
+        let m2: [u8; 4] = [0x00, 0x02, b'G', b'E'];
+        assert!(!looks_like_http3_request(&m2));
+        // method_len = 8 (out of conservative range; HTTP/3 would
+        // never produce a method of 8+ chars at our router).
+        let m8: [u8; 4] = [0x00, 0x08, b'G', b'E'];
+        assert!(!looks_like_http3_request(&m8));
+    }
+
+    /// Negative cases: non-alphabetic at positions 2..4 (Stream C
+    /// body_len bytes are binary, not letters).
+    #[test]
+    fn discriminator_rejects_non_alphabetic_method_chars() {
+        // method_len = 3 but second byte is a digit (Stream C body_len)
+        let digits: [u8; 4] = [0x00, 0x03, 0x30, 0x31]; // "01"
+        assert!(
+            !looks_like_http3_request(&digits),
+            "digits at positions 2..4 should reject (Stream C body_len is binary, not ASCII letters)"
+        );
+        // method_len = 3 but second byte is a control char.
+        let ctrl: [u8; 4] = [0x00, 0x03, 0x00, 0x01];
+        assert!(!looks_like_http3_request(&ctrl));
+    }
+
+    /// Negative case: high byte of method_len != 0 (a method of
+    /// 256+ bytes is absurd; the discriminator rejects).
+    #[test]
+    fn discriminator_rejects_large_method_len() {
+        let big: [u8; 4] = [0x01, 0x03, b'G', b'E'];
+        assert!(!looks_like_http3_request(&big));
+    }
+
+    // === M1b follow-up — generic read_request over AsyncRead ===
+    //
+    // The unified `accept_bi` dispatcher relies on
+    // [`read_request`] being callable on a chained reader
+    // (`tokio::io::Chain<&[u8], RecvStream>`). Before M1b,
+    // `read_request` was hard-coded to `&mut RecvStream`. The
+    // following test pins the new generic contract: `read_request`
+    // works on a plain `&[u8]` (via `Cursor`) too, which proves
+    // the body of the function only uses the AsyncRead trait.
+    //
+    // The end-to-end dispatcher + chain behavior is exercised by
+    // the existing `http3_client_healthz_roundtrip` /
+    // `http3_client_get_text_*` tests in this module — they
+    // drive the same router through a real QUIC server, just
+    // without the discriminator prefix. The discriminator
+    // unit tests above (`discriminator_*`) pin the discriminator
+    // contract that the dispatcher relies on; together those
+    // two pieces of coverage are sufficient to lock down the
+    // regression without standing up a separate duplex harness.
+
+    /// `read_request` over a `Cursor<&[u8]>` recovers the
+    /// request unchanged. Pins the AsyncRead generic contract.
+    #[test]
+    fn read_request_generic_over_async_read() {
+        // Run the async test in a futures executor so we can
+        // assert synchronously.
+        let request_bytes = encode_request("GET", "/healthz", b"");
+        let result = futures::executor::block_on(async {
+            let mut cursor = std::io::Cursor::new(request_bytes.as_slice());
+            read_request(&mut cursor).await
+        });
+        let req = result.expect("read_request over Cursor<&[u8]> must succeed");
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "/healthz");
+        assert!(req.body.is_empty());
+    }
+
+    /// `read_request` over a `Chain<&[u8], Cursor<&[u8]>>` (the
+    /// exact shape the dispatcher produces) recovers a request
+    /// whose first 4 bytes have been "pre-consumed" by a
+    /// discriminator. This is the regression pin: without the
+    /// chain step, the handler would skip the first 4 bytes
+    /// and decode garbage.
+    #[test]
+    fn read_request_over_chain_recovers_after_discriminator_prefix() {
+        let full_request = encode_request("GET", "/healthz", b"");
+        assert!(full_request.len() >= 4);
+        let (prefix, rest) = full_request.split_at(4);
+        let prefix_arr: [u8; 4] = [prefix[0], prefix[1], prefix[2], prefix[3]];
+        assert!(
+            looks_like_http3_request(&prefix_arr),
+            "test precondition: the discriminator must classify the prefix as HTTP/3"
+        );
+        let result = futures::executor::block_on(async {
+            // Chain: yield `prefix` first (the bytes the
+            // dispatcher already consumed), then delegate to
+            // the rest (the bytes still on the wire).
+            let chained = prefix.chain(std::io::Cursor::new(rest));
+            let mut chained = chained;
+            read_request(&mut chained).await
+        });
+        let req = result.expect("read_request over chain must succeed");
+        assert_eq!(req.method, "GET", "method after chain must be GET");
+        assert_eq!(req.path, "/healthz", "path after chain must be /healthz");
+        assert!(req.body.is_empty(), "body after chain must be empty");
     }
 }

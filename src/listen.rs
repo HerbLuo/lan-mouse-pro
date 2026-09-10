@@ -783,30 +783,30 @@ async fn handle_quic_peer_supervisor(
         listen_tx.clone(),
         addr,
         parked_streams.clone(),
+        // **M1b follow-up** — build the per-peer HTTP/3 router
+        // here and pass it into the unified `accept_bi`
+        // dispatcher. The dispatcher classifies each bidi as
+        // HTTP/3 vs Stream C / B and routes accordingly,
+        // eliminating the race that existed when this loop and
+        // a separate `start_http3_server` task both called
+        // `accept_bi()`. See the comment on
+        // [`server_accept_bi_task`] and on
+        // [`crate::quic_transport::http3::looks_like_http3_request`].
+        crate::quic_transport::http3::default_router_with_cache(clipboard_cache.clone()),
     ));
 
-    // **M0c / STEP-0.5b** — spawn the HTTP/3-lite server on this
-    // peer's QUIC `Connection`. `http3.rs::default_router_with_cache`
-    // registers 5 routes: `/healthz` 200 + 4 stubs (`/clipboard/text/{sha256}`
-    // backed by `clipboard_cache`, etc.) that M1a/M2a/M3a fill with cache lookups. The
-    // server-side spawn was added in M0b STEP-0.3+0.4 but never
-    // triggered — `listen.rs` was the only caller path and was
-    // deliberately untouched per the M0b scope discipline. M0c wires
-    // it up here.
-    //
-    // **M1b STEP-1b.2** — the `/clipboard/text/{sha256}` route now
-    // reads from the shared `clipboard_cache` (the same cache the
-    // source-side dispatcher writes to). Receivers pull bytes here
-    // after receiving a metadata-only `ClipboardText` from the peer.
-    //
-    // The spawned task runs until the underlying `Connection`
-    // closes (`accept_bi()` returns `Err`). The `JoinHandle` is
-    // dropped immediately — `listen.rs` currently relies on
-    // `Connection` close for graceful exit (matching the M0b
-    // `start_http3_server` docstring contract).
-    let _http3_join = peer.start_http3_server(
-        crate::quic_transport::http3::default_router_with_cache(clipboard_cache.clone()),
-    );
+    // **M1b follow-up** — the standalone
+    // `peer.start_http3_server(...)` call was removed: the unified
+    // `server_accept_bi_task` above now handles HTTP/3 GET
+    // requests via the same `accept_bi` loop that handles Stream
+    // C / Stream B traffic. Running two concurrent `accept_bi`
+    // loops on the same `Connection` was racy — whichever task
+    // woke first would consume the bidi, and a metadata-only
+    // `ClipboardText` push from the peer's stream C writer would
+    // occasionally be misread as an HTTP/3 request (or vice
+    // versa). The discriminator in the unified loop
+    // ([`crate::quic_transport::http3::looks_like_http3_request`])
+    // removes the ambiguity.
 
     // (6) Loop read_frame(recv_a) → ListenEvent::Msg
     //
@@ -920,6 +920,25 @@ async fn server_accept_bi_task(
     listen_tx: Sender<ListenEvent>,
     addr: SocketAddr,
     parked_streams: Rc<RefCell<Vec<(quinn::SendStream, quinn::RecvStream)>>>,
+    // **M1b follow-up** — HTTP/3 router used to handle
+    // `GET /clipboard/text/{sha256}` requests from the peer.
+    // The unified dispatcher classifies each bidi before deciding
+    // what to do with it: HTTP/3 requests go to
+    // [`crate::quic_transport::http3::handle_http3_stream`],
+    // everything else goes to the Stream C / Stream B path.
+    //
+    // **Why this duplicates the listen.rs HTTP/3 server spawn**:
+    // before M1b the server side started a separate
+    // `peer.start_http3_server(...)` task that ALSO called
+    // `accept_bi()` in a loop. That loop raced with this
+    // `server_accept_bi_task` — whichever tokio task woke first
+    // won the bidi. Folding the HTTP/3 routing into the unified
+    // dispatcher eliminates the race. The `start_http3_server`
+    // call site in `handle_quic_peer_supervisor` is removed in
+    // the same commit. See
+    // [`crate::quic_transport::http3::looks_like_http3_request`]
+    // for the discriminator.
+    http3_router: Arc<crate::quic_transport::http3::Router>,
 ) {
     loop {
         let (send, mut recv) = match peer.connection().accept_bi().await {
@@ -930,12 +949,34 @@ async fn server_accept_bi_task(
             }
         };
 
-        // Try to read the first frame's length — discriminator between
-        // bunch bidi (EOF), real stream B (valid u32 ≤ MAX_EVENT_SIZE),
-        // and real stream C (valid u32 > MAX_EVENT_SIZE — M0c).
-        use tokio::io::AsyncReadExt;
-        let len: u32 = match recv.read_u32().await {
-            Ok(n) => n,
+        // **M1b follow-up — unified discriminator**.
+        //
+        // Peers can open two kinds of bidi streams on us:
+        // (a) HTTP/3-lite requests for clipboard bodies —
+        //     `GET /clipboard/text/{sha256}` issued by the
+        //     receiver (controlled) after a metadata-only
+        //     `ClipboardText` push.
+        // (b) Stream C var-codec frames — `ClipboardText` /
+        //     `ClipboardImage` / `FileTransferOffer` / etc. with
+        //     a `[u32 BE body_len][body bytes...]` framing.
+        //
+        // Both start with a 4-byte length-ish prefix. Read 4 bytes
+        // and use [`looks_like_http3_request`] to decide:
+        // - HTTP/3 → chain the buffered bytes back in front of
+        //   the live stream via
+        //   `tokio::io::AsyncReadExt::chain`, then call
+        //   [`crate::quic_transport::http3::handle_http3_stream`].
+        //   Keep `send` alive — the handler takes it by value to
+        //   write the response.
+        // - Stream C / B → re-interpret the same 4 bytes as a
+        //   big-endian body length and proceed as before.
+        //
+        // Bunch bidi (EOF on first read) → park both halves,
+        // matching the symmetric client-side parking in
+        // `connect.rs::client_accept_bi_task`.
+        let mut prefix = [0u8; 4];
+        match recv.read_exact(&mut prefix).await {
+            Ok(()) => {}
             Err(e) => {
                 // EOF = bunch bidi (client never wrote). Both `send` and
                 // `recv` must NOT be dropped here, otherwise we send FIN /
@@ -949,7 +990,36 @@ async fn server_accept_bi_task(
                 parked_streams.borrow_mut().push((send, recv));
                 continue;
             }
-        };
+        }
+        if crate::quic_transport::http3::looks_like_http3_request(&prefix) {
+            log::debug!(
+                "server accept_bi: HTTP/3 request detected from {addr} (prefix={:02X?}), forwarding to router",
+                prefix
+            );
+            // Chain the buffered prefix back in front of the live
+            // stream. After this, `prefix` is moved into the
+            // chain and the HTTP/3 handler reads from the chained
+            // reader as if no discriminator had run.
+            //
+            // **Why `&[u8]` not `[u8; 4]`**: `AsyncReadExt::chain`
+            // requires its first argument to be
+            // `AsyncRead + Unpin`; `&[u8]` satisfies this via
+            // tokio's blanket impl.
+            let chained = tokio::io::AsyncReadExt::chain(prefix.as_slice(), recv);
+            crate::quic_transport::http3::handle_http3_stream(
+                http3_router.clone(),
+                send,
+                chained,
+            )
+            .await;
+            continue;
+        }
+
+        // Not HTTP/3 — re-interpret the prefix as a Stream C / B
+        // big-endian body length. The original semantics
+        // (length > MAX_EVENT_SIZE → Stream C, otherwise Stream B)
+        // are preserved.
+        let len: u32 = u32::from_be_bytes(prefix);
 
         // **M0c STEP-0.5b** — Stream C discriminator: a length-prefix
         // greater than `MAX_EVENT_SIZE` (21 bytes) is a var-codec

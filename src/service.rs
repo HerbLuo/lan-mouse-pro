@@ -636,6 +636,7 @@ impl Service {
             peer_lost_tx,
             clipboard_inbound_tx.clone(),
             clipboard_push_notify_tx,
+            clipboard_cache.clone(),
         );
 
         // input capture + emulation
