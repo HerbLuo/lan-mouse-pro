@@ -80,7 +80,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     rc::Rc,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 use thiserror::Error;
@@ -181,6 +181,22 @@ pub(crate) struct LanMouseListener {
     /// because registration / deregistration / lookup are synchronous; the
     /// async `peer.send_input` path takes its own lock once.
     quic_conns: Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>>,
+    /// **PLAN-2 / M1b STEP-1b.2** — shared handle to the outbound
+    /// clipboard text cache. Each per-peer HTTP/3 server uses this
+    /// to back its `/clipboard/text/{sha256}` GET handler so a
+    /// receiver can pull the bytes that the source-side dispatcher
+    /// just inserted. Cloned (cheaply — `Arc`) into every per-peer
+    /// task at accept time via [`Self::clipboard_cache`].
+    ///
+    /// **Stored, not consumed, in the constructor**: the dispatcher
+    /// (lives on `Service`) and future per-peer tasks (e.g. a
+    /// `Disconnected` arm that wants to inspect cached entries) may
+    /// need to read this later. The `#[allow(dead_code)]` is here
+    /// because today's only consumer is the accept-task spawn,
+    /// which takes its own `clone()` of the constructor-supplied
+    /// parameter rather than of `self.clipboard_cache`.
+    #[allow(dead_code)]
+    clipboard_cache: Arc<Mutex<crate::clipboard::cache::ClipboardCache>>,
     /// macOS-only: held for its `Drop` side effect (stops the
     /// CFRunLoop in the power-observer thread). The observer sends
     /// `()` into the wake channel on system-wake; the wake task
@@ -199,6 +215,7 @@ impl LanMouseListener {
         key: rustls::pki_types::PrivateKeyDer<'static>,
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
         idle_timeout: Duration,
+        clipboard_cache: Arc<Mutex<crate::clipboard::cache::ClipboardCache>>,
     ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
 
@@ -245,7 +262,12 @@ impl LanMouseListener {
         let endpoint =
             quic_transport::endpoint_with_verifier(addr, cert_chain, key, verifier, idle_timeout)?;
 
-        let accept_task = spawn_quic_accept_task(endpoint, listen_tx.clone(), quic_conns.clone());
+        let accept_task = spawn_quic_accept_task(
+            endpoint,
+            listen_tx.clone(),
+            quic_conns.clone(),
+            clipboard_cache.clone(),
+        );
 
         Ok(Self {
             listen_rx,
@@ -254,6 +276,7 @@ impl LanMouseListener {
             rejection_forwarder_task,
             wake_task,
             quic_conns,
+            clipboard_cache,
             #[cfg(target_os = "macos")]
             power_observer,
         })
@@ -355,9 +378,7 @@ impl LanMouseListener {
     /// inner `Rc<RefCell<…>>` keeps the surface narrow and avoids
     /// a `Clone` impl on `LanMouseListener` that would otherwise
     /// duplicate every field's `Rc`/`Sender`.
-    pub(crate) fn quic_conns(
-        &self,
-    ) -> Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>> {
+    pub(crate) fn quic_conns(&self) -> Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>> {
         self.quic_conns.clone()
     }
 
@@ -463,6 +484,7 @@ fn spawn_quic_accept_task(
     ep: quinn::Endpoint,
     listen_tx: Sender<ListenEvent>,
     quic_conns: Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>>,
+    clipboard_cache: Arc<Mutex<crate::clipboard::cache::ClipboardCache>>,
 ) -> JoinHandle<()> {
     spawn_local(async move {
         log::info!("QUIC listener listening on {ep:?}");
@@ -478,6 +500,7 @@ fn spawn_quic_accept_task(
             let remote = incoming.remote_address();
             let tx_clone = listen_tx.clone();
             let quic_conns_for_supervisor = quic_conns.clone();
+            let clipboard_cache_for_supervisor = clipboard_cache.clone();
             spawn_local(async move {
                 // The TLS 1.3 handshake runs here, off the accept loop, so a
                 // peer that stalls mid-handshake cannot stop other peers from
@@ -498,8 +521,13 @@ fn spawn_quic_accept_task(
                 };
                 let peer = Rc::new(PeerSession::from_connection(conn));
                 log::info!("QUIC peer connected: {remote}");
-                if let Err(e) =
-                    handle_quic_peer_supervisor(peer, tx_clone, quic_conns_for_supervisor).await
+                if let Err(e) = handle_quic_peer_supervisor(
+                    peer,
+                    tx_clone,
+                    quic_conns_for_supervisor,
+                    clipboard_cache_for_supervisor,
+                )
+                .await
                 {
                     log::warn!("QUIC peer supervisor exited with err: {e}");
                 }
@@ -643,6 +671,7 @@ async fn handle_quic_peer_supervisor(
     peer: Rc<PeerSession>,
     listen_tx: Sender<ListenEvent>,
     quic_conns: Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>>,
+    clipboard_cache: Arc<Mutex<crate::clipboard::cache::ClipboardCache>>,
 ) -> Result<(), quic_transport::Error> {
     let addr = peer.connection().remote_address();
 
@@ -757,20 +786,27 @@ async fn handle_quic_peer_supervisor(
     ));
 
     // **M0c / STEP-0.5b** — spawn the HTTP/3-lite server on this
-    // peer's QUIC `Connection`. `http3.rs::default_router()` registers
-    // 5 routes: `/healthz` 200 + 4 stubs (`/clipboard/text/{sha256}`
-    // 404, etc.) that M1a/M2a/M3a fill with cache lookups. The
+    // peer's QUIC `Connection`. `http3.rs::default_router_with_cache`
+    // registers 5 routes: `/healthz` 200 + 4 stubs (`/clipboard/text/{sha256}`
+    // backed by `clipboard_cache`, etc.) that M1a/M2a/M3a fill with cache lookups. The
     // server-side spawn was added in M0b STEP-0.3+0.4 but never
     // triggered — `listen.rs` was the only caller path and was
     // deliberately untouched per the M0b scope discipline. M0c wires
     // it up here.
+    //
+    // **M1b STEP-1b.2** — the `/clipboard/text/{sha256}` route now
+    // reads from the shared `clipboard_cache` (the same cache the
+    // source-side dispatcher writes to). Receivers pull bytes here
+    // after receiving a metadata-only `ClipboardText` from the peer.
     //
     // The spawned task runs until the underlying `Connection`
     // closes (`accept_bi()` returns `Err`). The `JoinHandle` is
     // dropped immediately — `listen.rs` currently relies on
     // `Connection` close for graceful exit (matching the M0b
     // `start_http3_server` docstring contract).
-    let _http3_join = peer.start_http3_server(crate::quic_transport::http3::default_router());
+    let _http3_join = peer.start_http3_server(
+        crate::quic_transport::http3::default_router_with_cache(clipboard_cache.clone()),
+    );
 
     // (6) Loop read_frame(recv_a) → ListenEvent::Msg
     //
@@ -1210,9 +1246,15 @@ mod tests {
 
             let (listen_tx, mut listen_rx) = channel();
             let quic_conns = Rc::new(RefCell::new(HashMap::new()));
+            // **M1b STEP-1b.2** — production listeners clone the
+            // shared clipboard cache into the accept task; tests
+            // construct a private cache so each test starts clean.
+            let clipboard_cache =
+                Arc::new(Mutex::new(crate::clipboard::cache::ClipboardCache::new()));
             // Moved by value, exactly as `LanMouseListener::new` does it — if
             // the loop exits, the endpoint is dropped and the socket closes.
-            let _accept_task = spawn_quic_accept_task(server_ep, listen_tx, quic_conns);
+            let _accept_task =
+                spawn_quic_accept_task(server_ep, listen_tx, quic_conns, clipboard_cache);
 
             // (1) Unauthorized peer → rejected at the mTLS stage.
             let bad_ep = quic_transport::endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())

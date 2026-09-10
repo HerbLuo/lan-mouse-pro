@@ -374,6 +374,16 @@ impl LanMouseConnection {
         }
         Err(LanMouseConnectionError::NotConnected)
     }
+
+    /// **M1b STEP-1b.2** — clone the `Rc<Mutex<...>>` handle to the
+    /// outgoing-client peer table. Used by `Capture::new` so the
+    /// dispatcher can look up peers for HTTP/3 GETs against
+    /// metadata-only `ClipboardText` events. Cheap (`Rc::clone`).
+    pub(crate) fn peers_handle(
+        &self,
+    ) -> Rc<Mutex<HashMap<SocketAddr, Arc<crate::quic_transport::PeerSession>>>> {
+        self.peers.clone()
+    }
 }
 
 /// Per-handle dial retry state.

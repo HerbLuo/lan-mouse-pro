@@ -198,6 +198,21 @@ impl Emulation {
             .expect("channel closed");
     }
 
+    /// **M1b STEP-1b.2** — look up the `PeerSession` for an
+    /// incoming peer by `SocketAddr`. Returns a clone of the
+    /// `Rc<PeerSession>` (cheap — `Rc::clone` bumps a refcount).
+    ///
+    /// Used by `Service::peer_connection_for_addr` so the inbound
+    /// clipboard dispatcher can issue HTTP/3 GETs against the peer
+    /// that pushed a metadata-only `ClipboardText`. Returns `None`
+    /// when the address is not in the listener-side registry — in
+    /// that case the peer is either outgoing-client-only (caller
+    /// must look up `Capture::peer_for_addr` instead) or has
+    /// already disconnected.
+    pub(crate) fn peer_for_addr(&self, addr: SocketAddr) -> Option<Rc<PeerSession>> {
+        self.quic_conns.borrow().get(&addr).cloned()
+    }
+
     pub(crate) fn reenable(&self) {
         self.request_tx
             .send(EmulationRequest::Reenable)

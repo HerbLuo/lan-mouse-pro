@@ -2,6 +2,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
     rc::Rc,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -204,6 +205,20 @@ pub(crate) struct Capture {
     request_tx: Sender<CaptureRequest>,
     task: JoinHandle<()>,
     event_rx: Receiver<ICaptureEvent>,
+    /// **M1b STEP-1b.2** — handle to the outgoing-client peer
+    /// table, cloned out of [`crate::connect::LanMouseConnection`]
+    /// at construction time. The inbound clipboard dispatcher
+    /// (`Service::peer_connection_for_addr`) uses this to issue
+    /// HTTP/3 GETs against the peer that pushed a metadata-only
+    /// `ClipboardText`.
+    peers: std::rc::Rc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<
+                std::net::SocketAddr,
+                std::sync::Arc<crate::quic_transport::PeerSession>,
+            >,
+        >,
+    >,
 }
 
 pub(crate) enum ICaptureEvent {
@@ -306,6 +321,10 @@ impl Capture {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
         let cancellation_token = CancellationToken::new();
+        // **M1b STEP-1b.2** — pull a handle to the peer table out of
+        // `conn` before it's moved into `CaptureTask`. The dispatcher
+        // uses this to look up peers for HTTP/3 GETs.
+        let peers = conn.peers_handle();
         let capture_task = CaptureTask {
             active_client: None,
             backend,
@@ -336,6 +355,7 @@ impl Capture {
             request_tx,
             task,
             event_rx,
+            peers,
         }
     }
 
@@ -424,6 +444,23 @@ impl Capture {
         let _ = self
             .request_tx
             .send(CaptureRequest::SendClip(event, handle));
+    }
+
+    /// **M1b STEP-1b.2** — look up the `PeerSession` for an
+    /// outgoing client by `SocketAddr` so the inbound clipboard
+    /// dispatcher can issue HTTP/3 GETs against the peer that
+    /// pushed a metadata-only `ClipboardText`. Returns a clone of
+    /// the `Arc<PeerSession>` (cheap).
+    ///
+    /// Returns `None` when no outgoing-client connection is
+    /// registered for `addr` — in that case the peer is either
+    /// incoming-only (caller must look up
+    /// `Emulation::peer_for_addr` instead) or has disconnected.
+    pub(crate) async fn peer_for_addr(
+        &self,
+        addr: std::net::SocketAddr,
+    ) -> Option<Arc<crate::quic_transport::PeerSession>> {
+        self.peers.lock().await.get(&addr).cloned()
     }
 }
 
