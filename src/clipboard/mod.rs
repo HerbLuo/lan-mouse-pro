@@ -159,6 +159,29 @@ pub enum Mime {
     Bmp,
 }
 
+/// **M2b STEP-2b.1** — wire-level MIME label for raw Windows DIB
+/// (Device Independent Bitmap) bytes carried inside the
+/// `ClipboardImage::mime` field on the wire.
+///
+/// **Why a constant rather than a [`Mime`] variant**: DIB is a
+/// platform-specific binary blob (BITMAPV5HEADER + pixel data,
+/// sometimes BITMAPINFOHEADER) — it does not fit the PNG / JPEG /
+/// BMP image-format triad the [`Mime`] enum models. The wire layer
+/// (`lan-mouse-proto::ClipboardImage::mime`) is a `String` that
+/// round-trips any label verbatim, so we keep `Mime` unchanged
+/// (per the STEP-2b.1 boundary "不要触碰 Mime enum") and route the
+/// DIB case through a dedicated [`ClipboardBackend::set_dib_image`]
+/// method instead of [`ClipboardBackend::set_image`].
+///
+/// **Byte-level fidelity semantics**: Windows reads `CF_DIBV5`
+/// pixels losslessly (the bytes are a self-describing
+/// `BITMAPV5HEADER` + RGBA pixel array); macOS / Linux receivers
+/// that natively support DIB can land it losslessly, while
+/// receivers without native DIB support fall back to the `image`
+/// crate decode + re-encode as PNG ("视觉一致" path per PLAN §3
+/// STEP-2b.1 评审 #3 3rd).
+pub const MIME_DIB: &str = "application/x-dib";
+
 impl Mime {
     /// Canonical MIME label for this variant — the bytes that travel
     /// on the wire in `ClipboardImage::mime` and that backends pass to
@@ -173,7 +196,7 @@ impl Mime {
 
     /// Inverse of [`Self::mime_str`]. Returns `None` for any string
     /// that is not exactly one of the three known labels — unknown
-    /// labels (e.g. `"application/x-dib"`) flow through the read path
+    /// labels (e.g. [`MIME_DIB`]) flow through the read path
     /// unchanged without mapping to a [`Mime`] variant.
     pub fn from_label(s: &str) -> Option<Self> {
         match s {
@@ -182,6 +205,14 @@ impl Mime {
             "image/bmp" => Some(Mime::Bmp),
             _ => None,
         }
+    }
+
+    /// `true` if `s` is the canonical DIB wire label.
+    /// Used by [`apply_inbound_image_bytes`](crate::service::apply_inbound_image_bytes)
+    /// (STEP-2b.1) to route DIB bytes to [`ClipboardBackend::set_dib_image`]
+    /// without touching the [`Mime`] enum.
+    pub fn is_dib_label(s: &str) -> bool {
+        s == MIME_DIB
     }
 }
 
@@ -379,6 +410,43 @@ pub trait ClipboardBackend: Send {
     fn set_image(&mut self, _bytes: &[u8], _mime: Mime) -> Result<(), ClipboardError> {
         Err(ClipboardError::Unsupported(
             "image write not implemented for this backend (M2a/M2b in flight)".into(),
+        ))
+    }
+
+    /// **M2b STEP-2b.1** — write raw DIB bytes
+    /// (`BITMAPV5HEADER` / `BITMAPINFOHEADER` + pixel data) to the
+    /// platform clipboard.
+    ///
+    /// DIB is the platform-native Windows clipboard image format
+    /// (`CF_DIBV5`). The wire carries it under the
+    /// [`MIME_DIB`] label; receivers that natively support DIB
+    /// (Windows itself) land the bytes byte-for-byte (preserves
+    /// alpha), while receivers without native DIB support (macOS,
+    /// Linux) fall back to a lossy `image`-crate decode → PNG
+    /// re-encode ("视觉一致" path per PLAN §3 评审 #3 3rd).
+    ///
+    /// **Why a separate method (not extending [`Self::set_image`])**:
+    /// the [`Mime`] enum models PNG / JPEG / BMP only and is
+    /// explicitly not extended in STEP-2b.1 ("不要触碰 Mime enum").
+    /// A dedicated method keeps the [`Mime`] enum stable and lets
+    /// each backend opt-in to DIB support independently of the
+    /// generic image-write path.
+    ///
+    /// **Default returns `Err(Unsupported)`** — backends that
+    /// cannot land raw DIB (e.g. `DummyBackend`) inherit the default.
+    /// The macOS backend's implementation goes through an
+    /// NSImage round-trip spike + `image`-crate fallback
+    /// (see `src/clipboard/macos.rs::set_dib_image`); the Windows
+    /// backend writes the bytes directly via `SetClipboardData(
+    /// CF_DIBV5, dib_bytes)`.
+    ///
+    /// **Caller**:
+    /// [`crate::service::apply_inbound_image_bytes`] routes here
+    /// when the wire `mime` string equals [`MIME_DIB`]; all other
+    /// mimes still flow through [`Self::set_image`].
+    fn set_dib_image(&mut self, _bytes: &[u8]) -> Result<(), ClipboardError> {
+        Err(ClipboardError::Unsupported(
+            "DIB image write not implemented for this backend (M2b STEP-2b.1 in flight)".into(),
         ))
     }
 
@@ -796,6 +864,39 @@ mod tests {
             matches!(result, Err(ClipboardError::Unsupported(_))),
             "DummyBackend::set_image must default to Err(Unsupported); got {result:?}"
         );
+    }
+
+    /// `DummyBackend::set_dib_image` also returns
+    /// `Err(ClipboardError::Unsupported)` via the trait default
+    /// impl. STEP-2b.1 pins the default behaviour for non-DIB-aware
+    /// backends so the dispatcher can rely on a stable error
+    /// variant when the platform backend has not opted in.
+    #[test]
+    fn dummy_backend_set_dib_image_returns_unsupported() {
+        let mut backend = DummyBackend::new();
+        let result = backend.set_dib_image(&[0x00, 0x01, 0x02]);
+        assert!(
+            matches!(result, Err(ClipboardError::Unsupported(_))),
+            "DummyBackend::set_dib_image must default to Err(Unsupported); got {result:?}"
+        );
+    }
+
+    /// `MIME_DIB` is the wire-format label the dispatcher routes to
+    /// [`ClipboardBackend::set_dib_image`]. Pin the exact string
+    /// (`"application/x-dib"`) because `lan-mouse-proto::
+    /// ClipboardImage::mime` carries these bytes verbatim and a
+    /// typo would silently break cross-platform DIB passthrough.
+    #[test]
+    fn mime_dib_constant_is_stable() {
+        assert_eq!(MIME_DIB, "application/x-dib");
+        // `Mime::is_dib_label` is the routing predicate the
+        // dispatcher uses — pin its truth table.
+        assert!(Mime::is_dib_label("application/x-dib"));
+        assert!(!Mime::is_dib_label("image/png"));
+        assert!(!Mime::is_dib_label("image/jpeg"));
+        assert!(!Mime::is_dib_label("image/bmp"));
+        assert!(!Mime::is_dib_label(""));
+        assert!(!Mime::is_dib_label("application/x-DIB"));
     }
 
     /// `Mime::mime_str` returns the exact wire-format label for each
