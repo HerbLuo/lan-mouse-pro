@@ -110,6 +110,19 @@ libc = "0.2.148"
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_DataExchange"] }
 
+# M2a STEP-2a.2 — macOS clipboard image backend (`NSPasteboard` via
+# `objc2` + `image` crate for TIFF→PNG normalization, PLAN §3 评审
+# #2 3rd). Only pulled in when compiling for `target_os = "macos"`.
+# Text path stays on `pbcopy` / `pbpaste` (M1a 1a.2 — no objc2 dep).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+# `image` features: PNG (write) + TIFF (read fallback). Default features
+# include many formats we don't need; explicit feature list keeps the
+# dep tree minimal. See `src/clipboard/macos.rs::tiff_to_png_normalized`.
+image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
+
 [features]
 default = [
     "layer_shell_capture",
