@@ -2117,7 +2117,7 @@ impl Service {
             return;
         }
         // New content — mark + broadcast.
-        log::debug!(
+        log::info!(
             "clipboard change detected: {} bytes (sha={})",
             new_text.len(),
             short_hex(&sha)
@@ -2156,7 +2156,7 @@ impl Service {
                 short_hex(&sha)
             );
         } else {
-            log::debug!(
+            log::info!(
                 "clipboard dispatched to {} peer(s) (sha={})",
                 recipients,
                 short_hex(&sha)
@@ -2810,7 +2810,7 @@ impl Service {
         self.mark_local_image_write(inbound_sha);
         if let Some(written_sha) = result.post_write_sha {
             if &written_sha != &inbound_sha {
-                log::debug!(
+                log::info!(
                     "clipboard inbound image: backend transcoded (inbound sha={} → \
                      on-clipboard sha={}, mime={}); marking transcoded SHA in image LRU",
                     short_hex(&inbound_sha),
