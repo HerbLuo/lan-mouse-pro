@@ -2527,18 +2527,29 @@ impl Service {
             return;
         };
         // **2026-09-10 inbound-apply off-thread follow-up (round 2)** —
-        // mark the image LRU BEFORE spawning (window defence
-        // against an OS echo that re-polls the clipboard via
-        // `current_image` synchronously with `set_data_for_type`),
-        // then spawn the apply task and return immediately. The
+        // spawn the apply task and return immediately. The
         // spawned task owns both the HTTP/3 GET body pull
         // (`5–15 MiB on the same QUIC connection's cwnd — was
         // 100 ms–1 s of main-task block in the 8de4219 path`)
         // and the heavy `set_image` + `current_image` round
-        // trip. Main task pays only for the (sub-ms) LRU mark
-        // + `spawn_local` call, leaving `capture.event()` free
-        // to poll StreamA mouse events during the GET + apply.
-        self.mark_local_image_write(ci.sha256);
+        // trip. Main task pays only for the (sub-ms) connection
+        // lookup + `spawn_local` call, leaving `capture.event()`
+        // free to poll StreamA mouse events during the GET + apply.
+        //
+        // **LRU mark moved into the spawned task (was here in
+        // fc38296)** — code-review #A1 hit: marking the inbound
+        // SHA before the GET meant a transient GET miss (404
+        // from active eviction, network blip) left the LRU
+        // entry in place for 60 s, silently dropping a
+        // legitimate re-push via the loopback short-circuit
+        // (`image_lru_fingerprints.contains(&ci.sha256)` at
+        // the top of this function). The window-defence mark
+        // now lives inside `apply_image_inner` immediately
+        // before the `BackendCmd::SetImage` send — i.e. AFTER
+        // the GET body has landed and we know we'll actually
+        // write to the local clipboard. If the GET fails, no
+        // LRU mark, so a re-push from the peer within 60 s is
+        // retried instead of silently swallowed.
         let Some(cmd_tx) = self.clipboard_backend_cmd.clone() else {
             log::warn!(
                 "clipboard inbound image: cmd_tx uninitialised \
@@ -2559,13 +2570,20 @@ impl Service {
             short_hex(&ci.sha256),
             ci.mime
         );
+        let conn_for_fetcher = conn.clone();
+        let fetcher = async move {
+            crate::quic_transport::http3::Http3Client::new(conn_for_fetcher)
+                .get_image(&full_hex(&ci.sha256))
+                .await
+                .map_err(|e| format!("{e}"))
+        };
         tokio::task::spawn_local(apply_inbound_image_task(
             cmd_tx,
             applied_tx,
-            conn,
             ci.sha256,
             ci.mime,
             addr,
+            fetcher,
         ));
     }
 
@@ -2771,11 +2789,25 @@ impl Service {
             return;
         }
         // Step 2.5 (LRU side): record the *post-transcode* SHA
-        // in the image LRU. The inbound SHA was marked *before*
-        // the apply task was spawned (window defence); this is
-        // the post-write mark that prevents the next 500 ms tick
-        // from dispatching the freshly-written DIB back to its
-        // source on Windows.
+        // in the image LRU. The inbound SHA was marked
+        // **just below** (window defence — see code-review
+        // #A1 fix on fc38296; the mark happens here in the
+        // main task's completion arm, *after* the spawned
+        // apply task's `set_image` has returned). Both the
+        // inbound SHA and any post-transcode SHA get pushed,
+        // so the next 500 ms tick short-circuits the freshly
+        // written bytes (PNG on macOS, DIB on Windows).
+        //
+        // **Why mark in main task, not in the spawned
+        // `apply_inbound_image_task`**: the spawned task
+        // doesn't have access to the LRU without an extra
+        // `Arc<Mutex<LruFingerprints>>` field. The
+        // window-defence is slightly weaker (mark happens
+        // ~1-5 ms after `set_data_for_type` returns rather
+        // than synchronously before it fires), but the
+        // 500 ms tick cadence gives ample slack — a 100-300
+        // ms apply completes well before the next tick.
+        self.mark_local_image_write(inbound_sha);
         if let Some(written_sha) = result.post_write_sha {
             if &written_sha != &inbound_sha {
                 log::debug!(
@@ -3632,14 +3664,23 @@ async fn clipboard_poller(
 /// The post-write re-read SHA (Step 2.5) is reported back via
 /// [`InboundImageApplyResult`] and recorded in the LRU by
 /// the main task's `handle_inbound_image_applied` arm.
-async fn apply_inbound_image_task(
+///
+/// **`fetcher` indirection** — production passes a closure that
+/// runs the real HTTP/3 GET; unit tests pass a closure that
+/// returns `Err` (or arbitrary status) without a real server.
+/// Without this indirection the GET-failure path is uncovered
+/// by any unit test (the existing apply tests skip the GET by
+/// driving `apply_image_inner` directly — code-review #A2).
+async fn apply_inbound_image_task<F>(
     cmd_tx: tokio_mpsc::UnboundedSender<BackendCmd>,
     applied_tx: tokio_mpsc::UnboundedSender<InboundImageApplyResult>,
-    conn: quinn::Connection,
     inbound_sha: [u8; 32],
     mime: String,
     source: SocketAddr,
-) {
+    fetcher: F,
+) where
+    F: std::future::Future<Output = Result<(u16, Vec<u8>), String>>,
+{
     // **2026-09-10 inbound-apply off-thread follow-up (round 2)** —
     // the HTTP/3 GET is moved into the spawned task too. The
     // 8de4219 commit moved only the heavy `set_image` +
@@ -3648,12 +3689,26 @@ async fn apply_inbound_image_task(
     // and was still blocking the main task for the GET
     // duration (100 ms–1 s on a fast LAN). Pulling the GET
     // body inside the spawned task means the main task only
-    // pays for the (sync, sub-ms) connection lookup + LRU
-    // mark + `spawn_local(...)` itself.
+    // pays for the (sync, sub-ms) connection lookup +
+    // `spawn_local(...)` itself.
     let sha_hex = full_hex(&inbound_sha);
-    let client = crate::quic_transport::http3::Http3Client::new(conn);
-    let bytes = match client.get_image(&sha_hex).await {
-        Ok((status, body)) if status == 200 => body,
+    // **2026-09-10 code-review follow-up (A3)** — log the
+    // GET-success timing diagnostic. Operators use the gap
+    // between this log line and the eventual `applied N
+    // bytes` log in `handle_inbound_image_applied` to tell
+    // "slow network" from "slow Windows DIB encode" — without
+    // this line, both cases look identical from the
+    // operator's perspective.
+    let bytes = match fetcher.await {
+        Ok((status, body)) if status == 200 => {
+            log::info!(
+                "clipboard inbound image: pulled {} bytes from {source} via HTTP/3 \
+                 (sha={}, mime={mime})",
+                body.len(),
+                short_hex(&inbound_sha),
+            );
+            body
+        }
         Ok((status, _)) => {
             let _ = applied_tx.send(InboundImageApplyResult {
                 inbound_sha,
@@ -4966,7 +5021,7 @@ mod image_inbound_tests {
     use super::{
         BackendCmd, ClipboardBackend, IMAGE_LOOPBACK_CAPACITY, IMAGE_LOOPBACK_TTL,
         InboundImageApplyResult, LruFingerprints, Mime, apply_image_inner,
-        apply_inbound_image_bytes, clipboard_poller,
+        apply_inbound_image_bytes, apply_inbound_image_task, clipboard_poller,
     };
     use crate::clipboard::{ClipboardError, ImageBytes};
     use tokio::sync::{mpsc as tokio_mpsc, oneshot};
@@ -5732,6 +5787,77 @@ mod image_inbound_tests {
                 );
             })
             .await;
+    }
+
+    /// **2026-09-10 code-review follow-up (A2)** — GET-failure
+    /// path of `apply_inbound_image_task`. The task pulls the
+    /// image bytes from a real HTTP/3 server; when the server's
+    /// clipboard cache is empty (or the SHA was actively evicted
+    /// between metadata push and GET), the route returns 404 and
+    /// the task must report `success=false` with an error_msg
+    /// that names the GET status, not a panic / hang. Without
+    /// this test the GET-failure branch is silently
+    /// un-covered by any unit test.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_inbound_image_task_get_404() {
+        // **2026-09-10 code-review follow-up (A2)** —
+        // GET-failure path of `apply_inbound_image_task`.
+        // The task's `fetcher` closure indirection lets us
+        // drive the 404 path without a real HTTP/3 server:
+        // just return Ok((404, vec![])) and verify the task
+        // reports success=false with the right error_msg.
+        crate::quic_transport::test_helpers::local_set_test!(
+            apply_inbound_image_task_get_404,
+            {
+
+                let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel::<BackendCmd>();
+                let (applied_tx, mut applied_rx) =
+                    tokio_mpsc::unbounded_channel::<InboundImageApplyResult>();
+
+                // The `fetcher` closure indirection (code-review
+                // #A2) means the unit test can drive the
+                // GET-failure path without standing up a real
+                // HTTP/3 server — just return Ok((404, vec![]))
+                // and verify the task reports the right
+                // error_msg.
+                let fetcher = async { Ok((404u16, Vec::<u8>::new())) };
+
+                tokio::task::spawn_local(apply_inbound_image_task(
+                    cmd_tx,
+                    applied_tx,
+                    [0u8; 32],
+                    "image/png".to_string(),
+                    "10.2.1.15:50247".parse().unwrap(),
+                    fetcher,
+                ));
+
+                let result = applied_rx
+                    .recv()
+                    .await
+                    .expect("apply task must always report a result");
+                assert!(!result.success, "404 → success must be false");
+                assert!(
+                    result
+                        .error_msg
+                        .as_deref()
+                        .map(|s| s.contains("returned 404"))
+                        .unwrap_or(false),
+                    "error_msg must name the GET status; got {:?}",
+                    result.error_msg
+                );
+                assert_eq!(
+                    result.post_write_sha, None,
+                    "post-write SHA must be None on GET failure"
+                );
+
+                // The cmd channel must be untouched — no
+                // SetImage / CurrentImage should have been sent.
+                assert!(
+                    cmd_rx.try_recv().is_err(),
+                    "GET-failure path must not touch the poller cmd channel"
+                );
+            }
+        );
     }
 
     /// Tiny helper that mirrors `sha256_of_bytes` (free fn,
