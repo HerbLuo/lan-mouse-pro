@@ -2284,8 +2284,32 @@ impl Service {
     /// 7. Update `last_outbound_image_sha` + `last_image_ts_ms` +
     ///    emit `FrontendEvent::ClipboardState`.
     async fn dispatch_image(&mut self, image: crate::clipboard::ImageBytes) {
-        // Step 1: SHA-256 the image bytes.
-        let sha = sha256_of_bytes(&image.data);
+        // **BUGS-2 fix, 2026-09-12 (M1)** — sha256 + cache insert moved
+        // off the LocalSet. The original implementation did
+        // `sha256_of_bytes(&image.data)` (~100-300 ms for 4 MB,
+        // ~400 ms for 16 MB) and `image.data.clone()` (~50-100 ms for a
+        // 4-16 MB memcpy) directly on the main task, blocking the
+        // entire `Service::run` `select!` for 150-500 ms. During that
+        // window no capture / emulation / inbound event could be
+        // processed, the QUIC Pong heartbeats stalled, and the
+        // watchdog (3.5 s) eventually force-closed the connection —
+        // which is the "screenshot → mouse frame drops → permanently
+        // stuck" failure mode captured in `next/BUGS.md` Bug #2.
+        //
+        // `image.data` is moved into the blocking task, used as the
+        // sha256 input, and then handed back so we can insert it into
+        // the cache without cloning — single pass over the bytes, no
+        // extra allocation. The LocalSet only sees cheap O(1)
+        // bookkeeping afterwards.
+        let mime = image.mime;
+        let size = image.data.len() as u64;
+        let (sha, image_bytes) = tokio::task::spawn_blocking(move || {
+            let sha = sha256_of_bytes(&image.data);
+            (sha, image.data)
+        })
+        .await
+        .expect("dispatch_image: sha256 task panicked");
+
         // Step 2: image LRU loopback check (mirrors the text
         // branch's `clipboard_lru.contains(&sha)` short-circuit).
         // The inbound apply path (`apply_inbound_clipboard_image`)
@@ -2308,7 +2332,7 @@ impl Service {
             log::debug!(
                 "clipboard tick: image LRU loopback hit sha={} ({} bytes), skipping broadcast",
                 short_hex(&sha),
-                image.data.len()
+                image_bytes.len()
             );
             return;
         }
@@ -2324,14 +2348,14 @@ impl Service {
         }
         // Step 4: active eviction (mirrors the text branch).
         self.evict_prev_outbound_image_cache();
-        // Step 5: cache insert. The bytes already passed the
-        // dedup check above, so this is always a fresh sha256
-        // entry. (Overwriting an existing entry with the same
-        // sha256 — which can only happen via direct manipulation
-        // outside this method — would no-op the byte counter; we
-        // don't optimise for that case.)
+        // Step 5: cache insert — MOVE the bytes (no clone). The
+        // bytes already passed the dedup check above, so this is
+        // always a fresh sha256 entry. (Overwriting an existing
+        // entry with the same sha256 — which can only happen via
+        // direct manipulation outside this method — would no-op
+        // the byte counter; we don't optimise for that case.)
         if let Ok(mut guard) = self.clipboard_cache.lock() {
-            guard.insert(sha, image.data.clone());
+            guard.insert(sha, image_bytes);
         } else {
             log::warn!(
                 "clipboard cache mutex poisoned on image insert sha={}; skipping cache write",
@@ -2341,12 +2365,12 @@ impl Service {
         // Step 6: build + broadcast the metadata event. The wire
         // format is `ClipboardImage { fingerprint, mime, sha256,
         // size }` — fingerprint == sha256 by the text-path
-        // convention; size is the byte count of `image.data`.
+        // convention; size is the byte count of the cached bytes.
         let event = ProtoEvent::ClipboardImage(ClipboardImage {
             fingerprint: sha,
-            mime: image.mime.clone(),
+            mime: mime.clone(),
             sha256: sha,
-            size: image.data.len() as u64,
+            size,
         });
         let mut recipients = 0usize;
         self.broadcast_clipboard_event(event, &mut recipients).await;
@@ -2360,8 +2384,8 @@ impl Service {
                  peer gate filtered all clients — check `enable_clipboard_to` in TOML \
                  and that the connection is active",
                 short_hex(&sha),
-                image.mime,
-                image.data.len()
+                mime,
+                size
             );
         } else {
             // Image events are inherently rarer than text events
@@ -2371,8 +2395,8 @@ impl Service {
             // The text path stays at DEBUG to avoid log spam.
             log::info!(
                 "clipboard dispatched image ({} bytes, mime={}, sha={}) to {} peer(s)",
-                image.data.len(),
-                image.mime,
+                size,
+                mime,
                 short_hex(&sha),
                 recipients
             );

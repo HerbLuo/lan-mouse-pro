@@ -95,6 +95,19 @@
 3. **结构性：把大 body transfer 走专用 QUIC 连接**（master 临时为该次 HTTP/3 GET 开一条带独立 cwnd 的连接，用完即关）——彻底隔离 bulk transfer 与 control plane。
 4. **结构性：换 PNG 编码为更快的格式**（WebP / AVIF / 直接传 JPEG passthrough）——平台后端 JPEG passthrough 不需要转码。
 
+---
+
+**M1 修复落地（2026-09-12，`fix(svc): dispatch_image off LocalSet`）**：把 `Service::dispatch_image` 的 sha256 + cache insert 一步用 `spawn_blocking + move` 搬出 LocalSet。改动点：
+
+- `image.data` move 进 blocking task 算 sha256，算完后 `image.data` 整体 move 进 `clipboard_cache.insert(sha, image_bytes)` —— **不再 clone 4-16 MB**。
+- LocalSet 上只剩 cheap 操作：LRU / last_outbound 命中检查、cache lock、broadcast（metadata-only）—— 总耗时 < 5 ms。
+- broadcast 不变（只发 `ClipboardImage { fingerprint, sha256, mime, size }` 元数据，body 走 HTTP/3 GET 拉，所以 metadata 没多占内存）。
+
+**预期效果**：4 MB 截图的 LocalSet 占用从 ~150 ms 降到 < 5 ms；16 MB 截图（png 模式）从 ~500 ms（必触发 watchdog）降到 < 5 ms；Pong watchdog 在 dispatch 期间不会再卡死；BeginPending 不会再有"等 dispatch 完才被 service 处理"的延迟。
+
+**为什么不直接做方案 1（整个 `handle_clipboard_tick` 拆出 select!）**：M0（`a94c249`）已经做了一半 —— poller 已经在 `spawn_local` task 里跑 `current_image_async()`，但 **poller 只生产 ImageBytes，`dispatch_image` 仍在主 `select!` 的 `image_rx.recv() => self.dispatch_image(image).await` 分支上**（`src/service.rs:1034`）。M1 改的就是这个 arm 内部。
+
+
 这是被控端日志：[2026-09-10T22:11:41Z INFO input_capture::windows::event_thread] initial monitors: 1 monitor(s)
 [2026-09-10T22:11:41Z INFO input_capture::windows::event_thread] monitor: id=windows:unknown-\\.\
 DISPLAY1 name="Intel(R) UHD Graphics" pos=(0, 0) size=(1280, 800) primary=true scale=1
