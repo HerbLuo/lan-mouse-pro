@@ -197,6 +197,31 @@ pub(crate) struct LanMouseListener {
     /// parameter rather than of `self.clipboard_cache`.
     #[allow(dead_code)]
     clipboard_cache: Arc<Mutex<crate::clipboard::cache::ClipboardCache>>,
+    /// **M3a STEP-3a.4** — shared handle to the outbound file
+    /// cache. Cloned (cheaply — `Arc`) into every per-peer
+    /// HTTP/3 server to back the `/clipboard/file/{sha256}[?range=...]`
+    /// GET handler so a receiver can pull the file bytes the
+    /// source-side dispatcher just inserted (via
+    /// `Dispatch_files` → `FileCache::insert_owned`).
+    ///
+    /// **Why a separate field from `clipboard_cache` (not a
+    /// single combined cache)**: see the module doc on
+    /// [`crate::clipboard::file_cache::FileCache`] — the file
+    /// cache has a 1 GiB byte budget (vs 200 MiB for the
+    /// text/image cache) **and** is byte-budget-isolated from
+    /// the latter so a 200 MiB file push cannot evict cached
+    /// text or image bytes mid-session. Two `Arc<Mutex<>>`
+    /// instances are cheap (one `HashMap` + one `VecDeque`
+    /// each).
+    ///
+    /// `#[allow(dead_code)]` follows the same pattern as
+    /// [`Self::clipboard_cache`]: the field exists for symmetry
+    /// with the dispatcher and future per-peer readers, but the
+    /// today's only consumer is the accept-task spawn which
+    /// takes its own `clone()` of the constructor-supplied
+    /// parameter rather than of `self.file_cache`.
+    #[allow(dead_code)]
+    file_cache: Arc<Mutex<crate::clipboard::file_cache::FileCache>>,
     /// macOS-only: held for its `Drop` side effect (stops the
     /// CFRunLoop in the power-observer thread). The observer sends
     /// `()` into the wake channel on system-wake; the wake task
@@ -216,6 +241,15 @@ impl LanMouseListener {
         authorized_keys: Arc<RwLock<HashMap<String, String>>>,
         idle_timeout: Duration,
         clipboard_cache: Arc<Mutex<crate::clipboard::cache::ClipboardCache>>,
+        // **M3a STEP-3a.4** — file-cache handle, cloned into
+        // every per-peer HTTP/3 server so the
+        // `/clipboard/file/{sha256}` route can read the same
+        // backing store the dispatcher's `dispatch_files`
+        // writes to via `FileCache::insert_owned`. Independent
+        // from `clipboard_cache` (1 GiB vs 200 MiB byte budget,
+        // isolated eviction domains — see
+        // [`crate::clipboard::file_cache::FileCache`] module doc).
+        file_cache: Arc<Mutex<crate::clipboard::file_cache::FileCache>>,
     ) -> Result<Self, ListenerCreationError> {
         let (listen_tx, listen_rx) = channel();
 
@@ -267,6 +301,7 @@ impl LanMouseListener {
             listen_tx.clone(),
             quic_conns.clone(),
             clipboard_cache.clone(),
+            file_cache.clone(),
         );
 
         Ok(Self {
@@ -277,6 +312,7 @@ impl LanMouseListener {
             wake_task,
             quic_conns,
             clipboard_cache,
+            file_cache,
             #[cfg(target_os = "macos")]
             power_observer,
         })
@@ -485,6 +521,11 @@ fn spawn_quic_accept_task(
     listen_tx: Sender<ListenEvent>,
     quic_conns: Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>>,
     clipboard_cache: Arc<Mutex<crate::clipboard::cache::ClipboardCache>>,
+    // **M3a STEP-3a.4** — file-cache clone passed through to the
+    // per-peer HTTP/3 router so the `/clipboard/file/{sha256}`
+    // GET handler can read from the same backing store the
+    // dispatcher writes to.
+    file_cache: Arc<Mutex<crate::clipboard::file_cache::FileCache>>,
 ) -> JoinHandle<()> {
     spawn_local(async move {
         log::info!("QUIC listener listening on {ep:?}");
@@ -501,6 +542,7 @@ fn spawn_quic_accept_task(
             let tx_clone = listen_tx.clone();
             let quic_conns_for_supervisor = quic_conns.clone();
             let clipboard_cache_for_supervisor = clipboard_cache.clone();
+            let file_cache_for_supervisor = file_cache.clone();
             spawn_local(async move {
                 // The TLS 1.3 handshake runs here, off the accept loop, so a
                 // peer that stalls mid-handshake cannot stop other peers from
@@ -526,6 +568,7 @@ fn spawn_quic_accept_task(
                     tx_clone,
                     quic_conns_for_supervisor,
                     clipboard_cache_for_supervisor,
+                    file_cache_for_supervisor,
                 )
                 .await
                 {
@@ -672,6 +715,10 @@ async fn handle_quic_peer_supervisor(
     listen_tx: Sender<ListenEvent>,
     quic_conns: Rc<RefCell<HashMap<SocketAddr, Rc<PeerSession>>>>,
     clipboard_cache: Arc<Mutex<crate::clipboard::cache::ClipboardCache>>,
+    // **M3a STEP-3a.4** — file-cache handle forwarded into the
+    // per-peer HTTP/3 router so `/clipboard/file/{sha256}[?range=...]`
+    // GETs read from the dispatcher's backing store.
+    file_cache: Arc<Mutex<crate::clipboard::file_cache::FileCache>>,
 ) -> Result<(), quic_transport::Error> {
     let addr = peer.connection().remote_address();
 
@@ -792,7 +839,17 @@ async fn handle_quic_peer_supervisor(
         // `accept_bi()`. See the comment on
         // [`server_accept_bi_task`] and on
         // [`crate::quic_transport::http3::looks_like_http3_request`].
-        crate::quic_transport::http3::default_router_with_cache(clipboard_cache.clone()),
+        //
+        // **M3a STEP-3a.4** — switched from
+        // `default_router_with_cache` (text+image only) to
+        // `default_router_with_caches` so the
+        // `/clipboard/file/{sha256}[?range=...]` GET handler is
+        // wired to the same `file_cache` the dispatcher
+        // populates via `dispatch_files → FileCache::insert_owned`.
+        crate::quic_transport::http3::default_router_with_caches(
+            clipboard_cache.clone(),
+            file_cache.clone(),
+        ),
     ));
 
     // **M1b follow-up** — the standalone
@@ -1330,10 +1387,22 @@ mod tests {
             // construct a private cache so each test starts clean.
             let clipboard_cache =
                 Arc::new(Mutex::new(crate::clipboard::cache::ClipboardCache::new()));
+            // **M3a STEP-3a.4** — file cache. Same rationale as
+            // `clipboard_cache` above: each test starts with a
+            // fresh private cache. The accept task forwards the
+            // clone to `handle_quic_peer_supervisor` (not used by
+            // this `unauthorized` test path, but the call
+            // signature requires it).
+            let file_cache = Arc::new(Mutex::new(crate::clipboard::file_cache::FileCache::new()));
             // Moved by value, exactly as `LanMouseListener::new` does it — if
             // the loop exits, the endpoint is dropped and the socket closes.
-            let _accept_task =
-                spawn_quic_accept_task(server_ep, listen_tx, quic_conns, clipboard_cache);
+            let _accept_task = spawn_quic_accept_task(
+                server_ep,
+                listen_tx,
+                quic_conns,
+                clipboard_cache,
+                file_cache,
+            );
 
             // (1) Unauthorized peer → rejected at the mTLS stage.
             let bad_ep = quic_transport::endpoint(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())

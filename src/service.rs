@@ -805,6 +805,18 @@ impl Service {
         // [`crate::clipboard::cache::ClipboardCache`] for the
         // contract.
         let clipboard_cache = Arc::new(Mutex::new(crate::clipboard::cache::ClipboardCache::new()));
+        // **M3a STEP-3a.4** — file cache (sha256 → bytes),
+        // 1 GiB byte budget. Built up front (not lazily inside
+        // the `Service { ... }` literal) so the same `Arc` can
+        // be cloned into `LanMouseListener::new` (server-side
+        // accept) and `LanMouseConnection::new` (client-side
+        // dial) **before** the `Service` struct is constructed.
+        // The same `Arc` is then moved into the `Service` field
+        // so the dispatcher's `dispatch_files` hot path can
+        // `insert_owned` into it. See
+        // [`crate::clipboard::file_cache::FileCache`] for the
+        // contract and the rationale for the 1 GiB byte budget.
+        let file_cache = Arc::new(Mutex::new(crate::clipboard::file_cache::FileCache::new()));
         let listener = LanMouseListener::new(
             config.port(),
             cert_der.0.clone(),
@@ -812,6 +824,11 @@ impl Service {
             authorized_keys.clone(),
             quic_idle_timeout,
             clipboard_cache.clone(),
+            // **M3a STEP-3a.4** — file cache handle forwarded
+            // into the listener so every accepted peer sees the
+            // same backing store for `/clipboard/file/{sha256}`
+            // GETs.
+            file_cache.clone(),
         )
         .await?;
         let client_endpoint =
@@ -862,6 +879,15 @@ impl Service {
             clipboard_inbound_tx.clone(),
             clipboard_push_notify_tx,
             clipboard_cache.clone(),
+            // **M3a STEP-3a.4** — clone the file cache into the
+            // client-side connection so every per-peer HTTP/3
+            // router built inside `connect_to_handle` (via
+            // `default_router_with_caches`) can serve
+            // `/clipboard/file/{sha256}[?range=...]` GETs from
+            // the same backing store the dispatcher's
+            // `dispatch_files` populates. Independent 1 GiB
+            // byte budget from `clipboard_cache`.
+            file_cache.clone(),
         );
 
         // input capture + emulation
@@ -1014,12 +1040,24 @@ impl Service {
             // `fingerprint_eq(None, &fp) == false`, so the first
             // push always proceeds.
             last_outbound_files_fingerprint: None,
-            // **M3a STEP-3a.2** — 1 GiB file-body cache. Built
-            // independently from `clipboard_cache` so a 200 MiB
-            // file push cannot evict cached text / image bytes
-            // mid-session (see `file_cache.rs` module doc for
-            // the rationale).
-            file_cache: Arc::new(Mutex::new(crate::clipboard::file_cache::FileCache::new())),
+            // **M3a STEP-3a.2 + STEP-3a.4** — 1 GiB file-body
+            // cache. Built up front (before the listener +
+            // connection constructors) so the same `Arc` is
+            // shared with the listener (server-side accept) and
+            // the client-side connection (dial side); only one
+            // instance exists per daemon. Independent from
+            // `clipboard_cache` so a 200 MiB file push cannot
+            // evict cached text / image bytes mid-session (see
+            // `file_cache.rs` module doc for the rationale).
+            //
+            // **STEP-3a.4 update**: this used to be a fresh
+            // `Arc::new(Mutex::new(FileCache::new()))` here, but
+            // STEP-3a.4 needs the same `Arc` to be cloned into
+            // the HTTP/3 server constructor before `self` is
+            // constructed. The pre-built `file_cache` Arc is
+            // moved in here; the per-peer HTTP/3 server reads
+            // from this same store via `FileCache::lookup`.
+            file_cache,
             // **M3a STEP-3a.2** — capacity 64 + 60 s TTL. See
             // `file_lru_fingerprints` field doc for the per-kind
             // capacity rationale (vs text 128, image 32).

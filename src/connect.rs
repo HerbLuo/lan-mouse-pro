@@ -140,6 +140,18 @@ pub(crate) struct LanMouseConnection {
     /// directions see the same backing store and any future
     /// eviction policy is implemented in one place.
     clipboard_cache: Arc<std::sync::Mutex<crate::clipboard::cache::ClipboardCache>>,
+    /// **M3a STEP-3a.4** — file cache (sha256 → bytes), 1 GiB
+    /// byte budget, independent eviction from `clipboard_cache`
+    /// (see [`crate::clipboard::file_cache::FileCache`] module
+    /// doc). Storing the `Arc` here mirrors the listener-side
+    /// `LanMouseListener::file_cache` field; the cloned handle
+    /// is forwarded into every `connect_to_handle` dial so the
+    /// per-peer HTTP/3 router (built via
+    /// [`crate::quic_transport::http3::default_router_with_caches`])
+    /// serves `/clipboard/file/{sha256}[?range=...]` GETs from
+    /// the same backing store the dispatcher's `dispatch_files`
+    /// populates.
+    file_cache: Arc<std::sync::Mutex<crate::clipboard::file_cache::FileCache>>,
 }
 
 impl LanMouseConnection {
@@ -180,6 +192,17 @@ impl LanMouseConnection {
         )>,
         clipboard_push_notify_tx: tokio::sync::mpsc::UnboundedSender<ClientHandle>,
         clipboard_cache: Arc<std::sync::Mutex<crate::clipboard::cache::ClipboardCache>>,
+        // **M3a STEP-3a.4** — file cache. Mirror of
+        // `clipboard_cache`: cloned into every `connect_to_handle`
+        // dial so the per-peer HTTP/3 router (built inside
+        // `connect_to_handle` via `default_router_with_caches`)
+        // serves `/clipboard/file/{sha256}[?range=...]` GETs
+        // from the same backing store the dispatcher's
+        // `dispatch_files` writes to. Distinct from
+        // `clipboard_cache` so a 200 MiB file push cannot evict
+        // text / image bytes mid-session (1 GiB vs 200 MiB byte
+        // budget; see `src/clipboard/file_cache.rs` module doc).
+        file_cache: Arc<std::sync::Mutex<crate::clipboard::file_cache::FileCache>>,
     ) -> Self {
         let (recv_tx, recv_rx) = channel();
         let quic_creds = Rc::new(QuicDialerCreds { cert_chain, key });
@@ -198,6 +221,7 @@ impl LanMouseConnection {
             clipboard_inbound_tx,
             clipboard_push_notify_tx,
             clipboard_cache,
+            file_cache,
         }
     }
 
@@ -265,6 +289,14 @@ impl LanMouseConnection {
                 self.clipboard_inbound_tx.clone(),
                 self.clipboard_push_notify_tx.clone(),
                 self.clipboard_cache.clone(),
+                // **M3a STEP-3a.4** — pass the file cache into
+                // the dial so the per-peer HTTP/3 router built
+                // inside `connect_to_handle` (via
+                // `default_router_with_caches`) can serve
+                // `/clipboard/file/{sha256}[?range=...]` GETs
+                // against the same backing store the dispatcher
+                // writes to.
+                self.file_cache.clone(),
             ));
         }
         Ok(())
@@ -396,6 +428,9 @@ impl LanMouseConnection {
                 self.clipboard_inbound_tx.clone(),
                 self.clipboard_push_notify_tx.clone(),
                 self.clipboard_cache.clone(),
+                // **M3a STEP-3a.4** — see the symmetric
+                // `LanMouseConnection::dial` call site above.
+                self.file_cache.clone(),
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
@@ -637,6 +672,12 @@ async fn connect_to_handle(
     // for metadata-only `ClipboardText` pushes; the HTTP/3 router
     // is the read side of the same cache.
     clipboard_cache: Arc<std::sync::Mutex<crate::clipboard::cache::ClipboardCache>>,
+    // **M3a STEP-3a.4** — file cache. Mirror of `clipboard_cache`
+    // above: cloned per dial into the per-peer HTTP/3 router (built
+    // via `default_router_with_caches` below) so a peer's
+    // `/clipboard/file/{sha256}[?range=...]` GETs read from the
+    // same backing store the local `dispatch_files` populates.
+    file_cache: Arc<std::sync::Mutex<crate::clipboard::file_cache::FileCache>>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     let Some(ips_set) = client_manager.get_ips(handle) else {
@@ -897,6 +938,13 @@ async fn connect_to_handle(
         // unified `accept_bi` dispatcher builds its per-peer HTTP/3
         // router against the same shared cache.
         clipboard_cache.clone(),
+        // **M3a STEP-3a.4** — file cache. Mirror of
+        // `clipboard_cache` above: forwarded to the supervisor's
+        // redial `connect_to_handle` so the redial rebuilds the
+        // per-peer HTTP/3 router (via
+        // `default_router_with_caches`) against the same file
+        // cache the dispatcher's `dispatch_files` populates.
+        file_cache.clone(),
     ));
 
     // **M1a follow-up #2 — client-side accept_bi loop**. Symmetric
@@ -930,7 +978,17 @@ async fn connect_to_handle(
     // here (with the cache the dispatcher writes to) closes the
     // loop. See [`crate::quic_transport::http3::looks_like_http3_request`]
     // for the discriminator.
-    let router = crate::quic_transport::http3::default_router_with_cache(clipboard_cache.clone());
+    //
+    // **M3a STEP-3a.4** — switched from `default_router_with_cache`
+    // (text+image only) to `default_router_with_caches` so the
+    // `/clipboard/file/{sha256}[?range=...]` GET handler reads
+    // from the same `file_cache` the dispatcher populates via
+    // `dispatch_files → FileCache::insert_owned`. Mirror of the
+    // listener-side `handle_quic_peer_supervisor` change.
+    let router = crate::quic_transport::http3::default_router_with_caches(
+        clipboard_cache.clone(),
+        file_cache.clone(),
+    );
     spawn_local(client_accept_bi_task(
         peer,
         client_manager,
@@ -1363,6 +1421,15 @@ async fn spawn_peer_supervisor(
     // `GET /clipboard/text/{sha256}` requests against the same
     // backing store the dispatcher writes to.
     clipboard_cache: Arc<std::sync::Mutex<crate::clipboard::cache::ClipboardCache>>,
+    // **M3a STEP-3a.4** — shared file cache. Mirror of
+    // `clipboard_cache` above: the redial `connect_to_handle`
+    // rebuilds the per-peer HTTP/3 router (via
+    // `default_router_with_caches`) from this cache so the
+    // unified `accept_bi` dispatcher on the new peer can serve
+    // `/clipboard/file/{sha256}[?range=...]` requests against
+    // the same backing store the dispatcher's `dispatch_files`
+    // populates.
+    file_cache: Arc<std::sync::Mutex<crate::clipboard::file_cache::FileCache>>,
 ) {
     log::info!("spawn_peer_supervisor: starting for handle {handle} addr {addr}");
 
@@ -1498,6 +1565,15 @@ async fn spawn_peer_supervisor(
                     // its per-peer HTTP/3 router against the
                     // same shared cache.
                     clipboard_cache.clone(),
+                    // **M3a STEP-3a.4** — file cache. Mirror
+                    // of `clipboard_cache` above: forwarded
+                    // to the redial `connect_to_handle` so
+                    // the new peer's per-peer HTTP/3 router
+                    // (built via `default_router_with_caches`)
+                    // serves `/clipboard/file/{sha256}[?range=...]`
+                    // GETs against the same backing store the
+                    // dispatcher's `dispatch_files` populates.
+                    file_cache.clone(),
                 ));
             } else {
                 log::info!(
