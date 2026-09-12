@@ -14,6 +14,12 @@ mod listen;
 pub(crate) mod clipboard;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_power;
+// **PLAN-2 / M3a STEP-3a.2** — desktop notification "fire-and-forget"
+// wrapper. Lives at the crate root (not under `clipboard`) because
+// it serves both clipboard text/image (M4 STEP-4.4 GeneralPanel) and
+// clipboard file (M3a STEP-3a.2 ExceedsLimit early-reject) callers.
+// See `popup.rs::PopupKind` for the kind taxonomy.
+pub mod popup;
 pub mod quic_transport;
 pub mod service;
 pub mod web;
