@@ -4275,6 +4275,22 @@ async fn clipboard_poller(
                 // `dispatch_files` arm consumes the paths and
                 // runs the heavy sha256 streaming off-thread via
                 // `spawn_blocking`.
+                //
+                // **Why "image-first" suppresses file probe**:
+                // when Phase 1 hits a screenshot, the `continue`
+                // above skips both Phase 2 (text) and Phase 3
+                // (files) for the same tick. This matches macOS
+                // pasteboard semantics where a screenshot app
+                // (Cmd+Shift+4 / `screencapture`) replaces the
+                // clipboard atomically and rarely co-exists with
+                // a file selection. The PLAN §3 STEP-3a.2 contract
+                // doesn't explicitly require independent file
+                // probing, and the practical case (simultaneous
+                // screenshot + file selection) is rare. If a
+                // future use case needs it, restructure this
+                // `select!` arm into a parallel probe (the
+                // fingerprint short-circuit in `dispatch_files`
+                // already de-dupes repeat ticks).
                 if let Some(paths) = backend.current_files() {
                     if files_tx.send(paths).is_err() {
                         // Main task is gone — daemon is shutting
