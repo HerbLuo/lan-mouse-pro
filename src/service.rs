@@ -279,11 +279,12 @@ pub struct Service {
     /// [`crate::clipboard::file_cache::FileCache`] for the
     /// contract (1 GiB byte budget + 5 min TTL).
     ///
-    /// `#[allow(dead_code)]` because STEP-3a.2 only inserts via
-    /// `dispatch_files`; the read path (HTTP/3 server-side) lands
-    /// in STEP-3a.4. Without this attribute the field is a
-    /// "constructed but unread" warning until 3a.4 lands.
-    #[allow(dead_code)]
+    /// `#[allow(dead_code)]` is removed in the P1.1 follow-up —
+    /// `dispatch_files` now inserts into the cache via
+    /// `insert_owned` after the spawn_blocking metadata step,
+    /// so the field has a real writer. The reader
+    /// (HTTP/3 server `/clipboard/file/{sha256}`) lands in
+    /// STEP-3a.4.
     file_cache: Arc<Mutex<crate::clipboard::file_cache::FileCache>>,
     /// **M3a STEP-3a.2** — per-file loopback LRU. Independent
     /// from text + image LRUs so a flood of text / image copies
@@ -2583,8 +2584,8 @@ impl Service {
     /// `tokio::select!` arm in `Service::run` already runs inside
     /// an async context, so this conversion does not change the
     /// dispatcher's runtime requirements.
-    /// **M3a STEP-3a.2** — `dispatch_files`: outbound branch for
-    /// clipboard file selections.
+    /// **M3a STEP-3a.2 + P1 follow-up** — `dispatch_files`:
+    /// outbound branch for clipboard file selections.
     ///
     /// Sibling of [`Self::dispatch_text`] / [`Self::dispatch_image`].
     /// Matches each branch's contract where it makes sense, and
@@ -2618,66 +2619,55 @@ impl Service {
     ///    happy path mirrors `dispatch_image`'s structure
     ///    (active-evict prev, insert new sha256, build + broadcast
     ///    `ClipboardFiles { fingerprint, entries }` metadata over
-    ///    StreamC). File bodies themselves ride HTTP/3
-    ///    `/clipboard/file/{sha256}` in STEP-3a.4 — STEP-3a.2 only
-    ///    stores them in `file_cache` for that future pull.
+    ///    StreamC). After the metadata broadcast succeeds, a
+    ///    second `spawn_blocking` reads each file's bytes off the
+    ///    LocalSet and calls [`FileCache::insert_owned`] — key =
+    ///    sha256. The receiver will then `GET
+    ///    /clipboard/file/{sha256}` in STEP-3a.4 to pull the
+    ///    bytes. MIME_TOO_LARGE entries are skipped at insert
+    ///    time (the receiver's short-circuit refuses them before
+    ///    any HTTP/3 fetch).
     /// 5. **Update `last_outbound_files_fingerprint` +
     ///    `last_file_ts_ms`** + emit `FrontendEvent::ClipboardState`
     ///    on success.
     ///
-    /// **Why `Vec<u8>` not stored here**: the wire metadata event
-    /// carries only the per-file `FileEntry { name, size, mime,
-    /// sha256 }` — the actual file bytes never travel in the
-    /// metadata event (would blow the wire packet). They sit in
-    /// `file_cache` keyed by sha256, retrievable by the receiver's
-    /// `Http3Client::get_file(sha256)` (STEP-3a.4).
+    /// **Decision pipeline**: the 5 early-return branches above
+    /// are decided in [`dispatch_files_decide`], a free function
+    /// that returns a [`DispatchFilesOutcome`] enum. This method
+    /// matches on the outcome to apply the appropriate side
+    /// effects (popup, log, broadcast, cache insert).
     async fn dispatch_files(&mut self, paths: Vec<PathBuf>) {
-        // Step 1: short-circuit on empty selection (defensive —
-        // backend could legitimately return an empty vec).
-        if paths.is_empty() {
-            return;
-        }
-        // Step 2: fingerprint short-circuit. The same Finder
-        // selection tick-after-tick hashes to the same
-        // fingerprint; skip the sha256 + broadcast + cache
-        // insert when nothing changed.
-        let fingerprint = file_selection_fingerprint(&paths);
-        if fingerprint_eq(self.last_outbound_files_fingerprint.as_ref(), &fingerprint) {
-            log::debug!(
-                "clipboard tick: file selection fingerprint {} matches last outbound; skipping",
-                short_hex(&fingerprint)
-            );
-            return;
-        }
-        // Step 3: spawn_blocking — run the heavy collect_files
-        // work off the LocalSet. Mirrors `dispatch_image`'s
-        // `7a57bb3` pattern (sha256 + cache insert moved off
-        // LocalSet because the 16 MB PNG encode held the
-        // dispatcher's main task for 150-500 ms). For files the
-        // same hazard exists: a 200 MiB sha256 streaming
-        // (~5-8 s on SSD) on the LocalSet would starve the Pong
-        // watchdog just like the screenshot bug did.
         let max_size = self.max_file_size;
-        let paths_for_blocking = paths.clone();
-        let blocking_join = tokio::task::spawn_blocking(move || {
-            crate::clipboard::file_meta::collect_files_blocking(&paths_for_blocking, max_size)
-        })
-        .await;
-        let entries = match blocking_join {
-            Ok(Ok(entries)) => entries,
-            Ok(Err(FileMetaError::ExceedsLimit {
+        let last_fingerprint = self.last_outbound_files_fingerprint;
+        let outcome = dispatch_files_decide(paths, last_fingerprint, max_size).await;
+        match outcome {
+            DispatchFilesOutcome::Empty => {
+                // Defensive early-return — backend could
+                // legitimately return an empty vec (e.g.
+                // race between select and deselect).
+            }
+            DispatchFilesOutcome::FingerprintMatch => {
+                log::debug!(
+                    "clipboard tick: file selection fingerprint {} matches last outbound; skipping",
+                    short_hex(
+                        last_fingerprint
+                            .as_ref()
+                            .expect("FingerprintMatch implies Some"),
+                    )
+                );
+            }
+            DispatchFilesOutcome::ExceedsLimit {
                 offending,
                 size,
                 limit,
-            })) => {
+            } => {
                 // **PLAN §3 STEP-3a.2 ② + §5 风险 #25** —
                 // early-reject. Pop the notification NOW (not
                 // after the next 500 ms tick), log the rejection,
                 // update the timestamp + frontend state, and
                 // return. No StreamC push, no file_cache insert,
                 // no HTTP/3 setup. The user's "file copy" silently
-                // stops here, with a clear popup telling them
-                // why.
+                // stops here, with a clear popup telling them why.
                 let offending_name = offending
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -2704,78 +2694,112 @@ impl Service {
                     last_file_ts: self.last_file_ts_ms,
                     last_source: None,
                 });
-                return;
             }
-            Ok(Err(FileMetaError::IsDirectory(p))) => {
+            DispatchFilesOutcome::IsDirectory(p) => {
                 log::warn!(
-                    "clipboard outbound: path is a directory {}; dropping batch (recursive walk out of scope for M3a)",
+                    "clipboard outbound: path is a directory {}; dropping batch \
+                     (recursive walk out of scope for M3a)",
                     p.display()
                 );
-                return;
             }
-            Ok(Err(FileMetaError::Io(e))) => {
+            DispatchFilesOutcome::Io(e) => {
                 log::warn!("clipboard outbound: file metadata IO error {e}; dropping batch");
-                return;
             }
-            Err(e) => {
-                log::error!(
-                    "clipboard outbound: spawn_blocking join error for collect_files_blocking: {e}"
+            DispatchFilesOutcome::Ok {
+                fingerprint,
+                entries,
+                paths,
+            } => {
+                // Step 4: log the entries list at info (matches
+                // dispatch_image's success log line shape; M3a
+                // manual tests grep on the sha256 prefix).
+                log::info!(
+                    "clipboard outbound: collected {} file entries (fingerprint={})",
+                    entries.len(),
+                    short_hex(&fingerprint)
                 );
-                return;
-            }
-        };
-        // Step 4: log the entries list at info (matches
-        // dispatch_image's success log line shape; M3a manual
-        // tests grep on the sha256 prefix).
-        log::info!(
-            "clipboard outbound: collected {} file entries (fingerprint={})",
-            entries.len(),
-            short_hex(&fingerprint)
-        );
-        // Step 5: build + broadcast the metadata event. The
-        // receiver will fetch the file bodies via HTTP/3 GET
-        // `/clipboard/file/{sha256}` in STEP-3a.4 — STEP-3a.2
-        // only stores them in `file_cache` so the receiver's GET
-        // has somewhere to land.
-        let event = ProtoEvent::ClipboardFiles(lan_mouse_proto::ClipboardFiles {
-            fingerprint,
-            entries: entries
-                .into_iter()
-                .map(|fe| lan_mouse_proto::FileEntry {
-                    name: fe.name,
-                    size: fe.size,
-                    mime: fe.mime,
-                    sha256: fe.sha256,
+                // Step 5: build + broadcast the metadata event.
+                let event = ProtoEvent::ClipboardFiles(lan_mouse_proto::ClipboardFiles {
+                    fingerprint,
+                    entries: entries
+                        .iter()
+                        .map(|fe| lan_mouse_proto::FileEntry {
+                            name: fe.name.clone(),
+                            size: fe.size,
+                            mime: fe.mime.clone(),
+                            sha256: fe.sha256,
+                        })
+                        .collect(),
+                });
+                let mut recipients = 0usize;
+                self.broadcast_clipboard_event(event, &mut recipients).await;
+                if recipients == 0 {
+                    log::warn!(
+                        "clipboard dispatched files (fingerprint={}) to 0 peers; \
+                         peer gate filtered all clients — check `enable_clipboard_to` in \
+                         TOML and that the connection is active",
+                        short_hex(&fingerprint)
+                    );
+                } else {
+                    log::info!(
+                        "clipboard dispatched files (fingerprint={}) to {} peer(s)",
+                        short_hex(&fingerprint),
+                        recipients
+                    );
+                }
+                // Step 6: fill file_cache via a second spawn_blocking.
+                // Reads each file's bytes off-LocalSet and calls
+                // `insert_owned` (MOVE, no clone). MIME_TOO_LARGE
+                // entries are skipped — the receiver short-circuits
+                // the HTTP/3 fetch against the mime directly. We
+                // carry the original `paths` through the closure
+                // because `FileEntry` does not retain a path
+                // reference; entries and paths are 1:1 in order.
+                let cache_for_insert = self.file_cache.clone();
+                let insert_result = tokio::task::spawn_blocking(move || {
+                    let mut guard = cache_for_insert
+                        .lock()
+                        .map_err(|e| io::Error::other(format!("file cache mutex poisoned: {e}")))?;
+                    for (entry, path) in entries.iter().zip(paths.iter()) {
+                        if entry.mime == crate::clipboard::file_meta::MIME_TOO_LARGE {
+                            log::debug!(
+                                "file_cache: skipping MIME_TOO_LARGE entry {} ({} bytes)",
+                                entry.name,
+                                entry.size
+                            );
+                            continue;
+                        }
+                        let bytes = std::fs::read(path)?;
+                        guard.insert_owned(entry.sha256, bytes);
+                    }
+                    Ok::<(), io::Error>(())
                 })
-                .collect(),
-        });
-        let mut recipients = 0usize;
-        self.broadcast_clipboard_event(event, &mut recipients).await;
-        if recipients == 0 {
-            log::warn!(
-                "clipboard dispatched files (fingerprint={}) to 0 peers; \
-                 peer gate filtered all clients — check `enable_clipboard_to` in TOML \
-                 and that the connection is active",
-                short_hex(&fingerprint)
-            );
-        } else {
-            log::info!(
-                "clipboard dispatched files (fingerprint={}) to {} peer(s)",
-                short_hex(&fingerprint),
-                recipients
-            );
+                .await;
+                match insert_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        log::warn!("clipboard outbound: file_cache insert IO error: {e}");
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "clipboard outbound: file_cache insert spawn_blocking \
+                             join error: {e}"
+                        );
+                    }
+                }
+                // Step 7: bookkeeping + frontend notification.
+                self.last_outbound_files_fingerprint = Some(fingerprint);
+                let now_ms = unix_now_ms();
+                self.last_file_ts_ms = Some(now_ms);
+                self.last_clipboard_source = None;
+                self.notify_frontend(FrontendEvent::ClipboardState {
+                    last_text_ts: self.last_text_ts_ms,
+                    last_image_ts: self.last_image_ts_ms,
+                    last_file_ts: self.last_file_ts_ms,
+                    last_source: None,
+                });
+            }
         }
-        // Step 6: bookkeeping + frontend notification.
-        self.last_outbound_files_fingerprint = Some(fingerprint);
-        let now_ms = unix_now_ms();
-        self.last_file_ts_ms = Some(now_ms);
-        self.last_clipboard_source = None;
-        self.notify_frontend(FrontendEvent::ClipboardState {
-            last_text_ts: self.last_text_ts_ms,
-            last_image_ts: self.last_image_ts_ms,
-            last_file_ts: self.last_file_ts_ms,
-            last_source: None,
-        });
     }
 
     async fn handle_clipboard_inbound(&mut self, (addr, event): (SocketAddr, ProtoEvent)) {
@@ -3980,6 +4004,120 @@ pub(crate) fn file_selection_fingerprint(paths: &[PathBuf]) -> [u8; 32] {
 /// `as_ref()` pair at every call site.
 fn fingerprint_eq(prev: Option<&[u8; 32]>, next: &[u8; 32]) -> bool {
     prev == Some(next)
+}
+
+/// **M3a STEP-3a.2 + P1 follow-up** — outcome of the
+/// `dispatch_files` decision pipeline. Extracted as a free
+/// function so the 5 early-return branches are unit-testable
+/// without standing up a full `Service` (which would need
+/// `AsyncFrontendListener`, `LanMouseConnection`, certificates,
+/// etc.). Mirrors the pattern of
+/// [`evict_prev_outbound_clipboard_cache`] / [`apply_image_inner`].
+#[derive(Debug)]
+pub(crate) enum DispatchFilesOutcome {
+    /// Empty `paths` Vec — return immediately (defensive).
+    Empty,
+    /// Fingerprint matches `last_outbound_files_fingerprint` —
+    /// same Finder selection tick-after-tick; skip broadcast +
+    /// cache insert.
+    FingerprintMatch,
+    /// `collect_files_blocking` succeeded — broadcast the
+    /// metadata event and fill the `file_cache` via the
+    /// dispatcher's second `spawn_blocking` step.
+    Ok {
+        /// Fingerprint derived from the path list (so the
+        /// caller doesn't need to recompute it for the
+        /// `last_outbound_files_fingerprint` bookkeeping).
+        fingerprint: [u8; 32],
+        entries: Vec<crate::clipboard::file_meta::FileEntry>,
+        /// Original `paths` retained so the caller can re-read
+        /// each file's bytes for the `file_cache` insert
+        /// (FileEntry does not carry a path reference).
+        paths: Vec<PathBuf>,
+    },
+    /// At least one file exceeds `max_size` — fire a popup and
+    /// return (no StreamC push, no cache fill, no HTTP/3
+    /// setup). See PLAN §5 风险 #25.
+    ExceedsLimit {
+        offending: PathBuf,
+        size: u64,
+        limit: u64,
+    },
+    /// Caller passed a directory path — log + return
+    /// (recursive walk is out of scope for M3a).
+    IsDirectory(PathBuf),
+    /// IO error during metadata collection — log + return.
+    Io(io::Error),
+}
+
+/// **M3a STEP-3a.2 + P1 follow-up** — pure decision pipeline
+/// for `dispatch_files`. No `Service` state is touched — the
+/// caller feeds in `last_outbound_files_fingerprint` +
+/// `max_size` and matches on the returned `DispatchFilesOutcome`
+/// to apply side effects (popup fire, broadcast, cache insert,
+/// `last_*_ts_ms` bookkeeping).
+///
+/// **Why extracted**: lets the 5 early-return branches
+/// (empty / fingerprint match / ExceedsLimit / IsDirectory /
+/// Io+Join) be exercised in unit tests with zero
+/// `Service::new()` plumbing. The `Service` method
+/// [`Service::dispatch_files`] wraps this and applies the
+/// corresponding side effects.
+pub(crate) async fn dispatch_files_decide(
+    paths: Vec<PathBuf>,
+    last_outbound_files_fingerprint: Option<[u8; 32]>,
+    max_size: u64,
+) -> DispatchFilesOutcome {
+    // Branch 1: empty paths — defensive early-return.
+    if paths.is_empty() {
+        return DispatchFilesOutcome::Empty;
+    }
+    // Branch 2: fingerprint short-circuit. The same Finder
+    // selection tick-after-tick hashes to the same fingerprint;
+    // skip the sha256 + broadcast + cache insert when nothing
+    // changed.
+    let fingerprint = file_selection_fingerprint(&paths);
+    if fingerprint_eq(last_outbound_files_fingerprint.as_ref(), &fingerprint) {
+        return DispatchFilesOutcome::FingerprintMatch;
+    }
+    // Branch 3: spawn_blocking for collect_files_blocking —
+    // CPU-bound sha256 streaming (200 MiB → ~5-8 s on SSD) must
+    // not block the dispatcher's LocalSet. Clone the paths so the
+    // `Ok` arm below can hand them back to the caller for the
+    // `file_cache` insert (FileEntry does not retain a path
+    // reference).
+    let paths_for_blocking = paths.clone();
+    let blocking_join = tokio::task::spawn_blocking(move || {
+        crate::clipboard::file_meta::collect_files_blocking(&paths_for_blocking, max_size)
+    })
+    .await;
+    match blocking_join {
+        Ok(Ok(entries)) => DispatchFilesOutcome::Ok {
+            fingerprint,
+            entries,
+            // Return the original `paths` (still in scope —
+            // `paths_for_blocking = paths.clone()` did not
+            // consume `paths`). The caller's `file_cache`
+            // insert step uses these to re-read each file's
+            // bytes — `FileEntry` does not retain a path
+            // reference.
+            paths,
+        },
+        Ok(Err(FileMetaError::ExceedsLimit {
+            offending,
+            size,
+            limit,
+        })) => DispatchFilesOutcome::ExceedsLimit {
+            offending,
+            size,
+            limit,
+        },
+        Ok(Err(FileMetaError::IsDirectory(p))) => DispatchFilesOutcome::IsDirectory(p),
+        Ok(Err(FileMetaError::Io(e))) => DispatchFilesOutcome::Io(e),
+        Err(join_err) => DispatchFilesOutcome::Io(io::Error::other(format!(
+            "spawn_blocking join error for collect_files_blocking: {join_err}"
+        ))),
+    }
 }
 
 /// **2026-09-10 inbound-apply off-thread follow-up** —
