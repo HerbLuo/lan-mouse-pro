@@ -6614,3 +6614,216 @@ mod image_inbound_tests {
         }
     }
 }
+
+// ============================================================================
+//  P1.2 follow-up — dispatch_files 5-branch unit tests
+// ============================================================================
+
+#[cfg(test)]
+mod dispatch_files_tests {
+    //! **P1.2 follow-up** — pins the 5 early-return branches of
+    //! `Service::dispatch_files` at the [`dispatch_files_decide`]
+    //! helper level. Standing up a full `Service::new()` for
+    //! these tests would require `AsyncFrontendListener`,
+    //! `LanMouseConnection`, certificate generation, and QUIC
+    //! endpoint bind — the helper-based approach matches the
+    //! pattern of `dispatch_image_cache_step_inserts_new_and_evicts_prev`
+    //! and `evict_prev_outbound_clipboard_cache`.
+    //!
+    //! Coverage:
+    //! 1. Empty `paths` → `DispatchFilesOutcome::Empty`
+    //! 2. Fingerprint short-circuit on repeat selection →
+    //!    `DispatchFilesOutcome::FingerprintMatch`
+    //! 3. `FileMetaError::ExceedsLimit` (file > max_size) →
+    //!    `DispatchFilesOutcome::ExceedsLimit { offending, size, limit }`
+    //! 4. `FileMetaError::IsDirectory` (directory in selection) →
+    //!    `DispatchFilesOutcome::IsDirectory(path)`
+    //! 5. `FileMetaError::Io` (missing path) →
+    //!    `DispatchFilesOutcome::Io(io::Error)`
+
+    use super::{DispatchFilesOutcome, dispatch_files_decide, file_selection_fingerprint};
+    use crate::clipboard::file_meta::FileMetaError;
+    use crate::clipboard::file_meta::collect_files_blocking;
+    use std::path::PathBuf;
+
+    /// **Branch 1 — empty paths early-return**.
+    ///
+    /// `dispatch_files_decide(vec![], None, ...)` returns
+    /// `Empty` immediately, before the fingerprint check or the
+    /// spawn_blocking. Pin: the helper never spawns a
+    /// `spawn_blocking` for an empty input (defensive contract
+    /// — a backend could legitimately return an empty vec).
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_files_decide_empty_paths_returns_empty() {
+        let outcome = dispatch_files_decide(vec![], None, 50 * 1024 * 1024).await;
+        assert!(
+            matches!(outcome, DispatchFilesOutcome::Empty),
+            "empty paths must return Empty (no spawn_blocking, no work) — got {outcome:?}"
+        );
+    }
+
+    /// **Branch 2 — fingerprint short-circuit on repeat selection**.
+    ///
+    /// Two consecutive calls with the same `paths` Vec compute
+    /// the same `file_selection_fingerprint`. After the first
+    /// call, the caller stores the fingerprint in
+    /// `last_outbound_files_fingerprint`; the second call sees
+    /// the match and returns `FingerprintMatch` without
+    /// spawning `collect_files_blocking`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_files_decide_fingerprint_match_returns_short_circuit() {
+        // Two paths, both regular files (we don't actually need
+        // them to exist for the fingerprint short-circuit —
+        // the helper compares fingerprints BEFORE the
+        // spawn_blocking).
+        let paths = vec![
+            PathBuf::from("/tmp/fake_a.txt"),
+            PathBuf::from("/tmp/fake_b.txt"),
+        ];
+        let fp = file_selection_fingerprint(&paths);
+        let outcome = dispatch_files_decide(paths.clone(), Some(fp), 50 * 1024 * 1024).await;
+        assert!(
+            matches!(outcome, DispatchFilesOutcome::FingerprintMatch),
+            "second call with same paths must short-circuit on \
+             fingerprint match — got {outcome:?}"
+        );
+
+        // Sanity: a DIFFERENT last_fingerprint (None vs Some)
+        // does NOT short-circuit (None == "first push ever" →
+        // proceeds to spawn_blocking). We don't have real files
+        // here, so we just verify the helper proceeds past the
+        // fingerprint branch — the next branches will produce
+        // Io(missing path) or similar, NOT FingerprintMatch.
+        let outcome_no_match = dispatch_files_decide(paths, None, 50 * 1024 * 1024).await;
+        assert!(
+            !matches!(
+                outcome_no_match,
+                DispatchFilesOutcome::FingerprintMatch | DispatchFilesOutcome::Empty
+            ),
+            "None last_fingerprint must not short-circuit — got {outcome_no_match:?}"
+        );
+    }
+
+    /// **Branch 3 — `FileMetaError::ExceedsLimit` → popup + return**.
+    ///
+    /// When any file in the batch exceeds `max_size`,
+    /// `collect_files_blocking` returns `Err(ExceedsLimit { ... })`
+    /// and the helper surfaces it as
+    /// `DispatchFilesOutcome::ExceedsLimit { offending, size, limit }`.
+    /// The dispatcher's caller matches this to fire a popup.
+    /// Pin: `offending` / `size` / `limit` carry the values
+    /// `collect_files_blocking` produced (no rewriting).
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_files_decide_oversize_returns_exceeds_limit() {
+        // Create a 10-byte file and cap max_size at 5 bytes so
+        // the file is rejected. `tempfile` crate isn't a dep —
+        // use `std::env::temp_dir()` + a unique suffix.
+        let dir = std::env::temp_dir();
+        let pid_suffix = std::process::id();
+        let path = dir.join(format!("lan-mouse-test-{pid_suffix}.bin"));
+        let payload = vec![0xCCu8; 10];
+        std::fs::write(&path, &payload).expect("write temp file");
+        let max_size: u64 = 5; // 10 bytes > 5 bytes → reject
+
+        let outcome = dispatch_files_decide(vec![path.clone()], None, max_size).await;
+
+        match outcome {
+            DispatchFilesOutcome::ExceedsLimit {
+                offending,
+                size,
+                limit,
+            } => {
+                assert_eq!(offending, path, "offending path must match");
+                assert_eq!(size, 10, "size must be 10 bytes");
+                assert_eq!(limit, max_size, "limit must match max_size");
+            }
+            other => panic!("oversize file must yield ExceedsLimit — got {other:?}"),
+        }
+
+        // Cross-check: the same setup against `collect_files_blocking`
+        // directly returns `FileMetaError::ExceedsLimit` with the
+        // same fields — pins the helper's mapping is a faithful
+        // pass-through.
+        match collect_files_blocking(std::slice::from_ref(&path), max_size) {
+            Err(FileMetaError::ExceedsLimit {
+                offending: e_off,
+                size: e_size,
+                limit: e_limit,
+            }) => {
+                assert_eq!(e_off, path);
+                assert_eq!(e_size, 10);
+                assert_eq!(e_limit, max_size);
+            }
+            other => panic!("collect_files_blocking must return ExceedsLimit — got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **Branch 4 — `FileMetaError::IsDirectory` → log + return**.
+    ///
+    /// When any path in `paths` is a directory,
+    /// `collect_files_blocking` returns `Err(IsDirectory)` and
+    /// the helper surfaces it as
+    /// `DispatchFilesOutcome::IsDirectory(path)`. The
+    /// dispatcher's caller matches this to log + return.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_files_decide_directory_returns_is_directory() {
+        let dir = std::env::temp_dir();
+        let pid_suffix = std::process::id();
+        let subdir = dir.join(format!("lan-mouse-test-{pid_suffix}-subdir"));
+        std::fs::create_dir_all(&subdir).expect("mkdir temp subdir");
+
+        let outcome = dispatch_files_decide(vec![subdir.clone()], None, 50 * 1024 * 1024).await;
+
+        match outcome {
+            DispatchFilesOutcome::IsDirectory(p) => {
+                assert_eq!(p, subdir, "IsDirectory path must match input");
+            }
+            other => panic!("directory path must yield IsDirectory — got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir(&subdir);
+    }
+
+    /// **Branch 5 — `FileMetaError::Io` → log + return**.
+    ///
+    /// When a path in `paths` does not exist,
+    /// `collect_files_blocking` returns `Err(Io(io::Error))` and
+    /// the helper surfaces it as
+    /// `DispatchFilesOutcome::Io(io::Error)`. The dispatcher's
+    /// caller matches this to log + return.
+    ///
+    /// Note: this branch also covers `spawn_blocking` join
+    /// errors — those are mapped to `Io(other(...))` by the
+    /// helper (see the `Err(join_err)` arm in
+    /// `dispatch_files_decide`). The "spawn_blocking panic"
+    /// case is a separate panic-induced path that we don't
+    /// synthesise here (would require poisoning the thread
+    /// pool); the `collect_files_blocking` Io path is the
+    /// everyday variant.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dispatch_files_decide_missing_path_returns_io() {
+        // Construct a path under /tmp that virtually never
+        // exists (PID + nanosecond timestamp = unique).
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let ghost = std::env::temp_dir().join(format!("lan-mouse-ghost-{pid}-{nanos}.bin"));
+
+        let outcome = dispatch_files_decide(vec![ghost.clone()], None, 50 * 1024 * 1024).await;
+
+        match outcome {
+            DispatchFilesOutcome::Io(e) => {
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "missing path must produce NotFound IO error — got {e}"
+                );
+            }
+            other => panic!("missing path must yield Io — got {other:?}"),
+        }
+    }
+}
