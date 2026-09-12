@@ -19,7 +19,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -167,6 +167,20 @@ pub struct Service {
     /// lifetimes obvious and lets the main select! arm pattern-
     /// match on the result type cleanly.
     apply_image_applied_tx: Option<tokio_mpsc::UnboundedSender<InboundImageApplyResult>>,
+    /// **M3a STEP-3a.3** — sender for [`InboundFileApplyResult`]
+    /// events from the spawned
+    /// [`apply_inbound_files_task`] (HTTP/3 GET + spawn_blocking
+    /// write + sha256 verify) back to the main task's `select!`.
+    /// The main task consumes these in a dedicated arm to update
+    /// the file loopback LRU + metrics + frontend notify. `None`
+    /// until [`Self::run`] sets it up.
+    ///
+    /// **Pattern parity with `apply_image_applied_tx`**: spawned
+    /// task → main task, separate channel from `clipboard_backend_cmd`
+    /// (which flows main → poller). The two result channels keep
+    /// their lifetimes obvious and let the main `select!` arm
+    /// pattern-match on the result type cleanly.
+    inbound_files_applied_tx: Option<tokio_mpsc::UnboundedSender<InboundFileApplyResult>>,
     /// **M1a STEP-1a.4** — LRU of recently-written fingerprints.
     /// Loopback defence: a peer-pushed `ClipboardText` whose
     /// `sha256` is in the LRU is treated as our own writeback and
@@ -299,13 +313,18 @@ pub struct Service {
     /// a comfortable headroom — files pushes are rarer than
     /// text pushes in practice).
     ///
-    /// `#[allow(dead_code)]` because STEP-3a.2 constructs the LRU
-    /// but the inbound `handle_clipboard_inbound_files` loopback
-    /// check (the only caller) lands in STEP-3a.3. The LRU
-    /// presence pins the per-kind loopback defence contract
-    /// (text + image + file all have independent LRU instances)
-    /// without forcing STEP-3a.2 to land the full inbound arm.
-    #[allow(dead_code)]
+    /// **M3a STEP-3a.3** — consumer is
+    /// [`Self::handle_clipboard_inbound_files`] (the receiver's
+    /// loopback check: a peer-pushed `ClipboardFiles` whose
+    /// `fingerprint` is in the LRU is treated as our own writeback
+    /// and dropped instead of re-downloading).
+    ///
+    /// **LRU presence from STEP-3a.2**: STEP-3a.2 constructed the
+    /// LRU but marked it `#[allow(dead_code)]` because the inbound
+    /// arm was deferred to STEP-3a.3. The LRU presence pins the
+    /// per-kind loopback defence contract (text + image + file all
+    /// have independent LRU instances). The `#[allow]` is removed
+    /// here in STEP-3a.3 — the consumer now exists.
     file_lru_fingerprints: LruFingerprints,
     /// **M3a STEP-3a.2** — receiver for `current_files()` results
     /// from the spawned `clipboard_poller` task. Populated in
@@ -957,6 +976,12 @@ impl Service {
             // set up alongside `clipboard_backend_cmd` in
             // [`Self::run`]. `None` until then.
             apply_image_applied_tx: None,
+            // **M3a STEP-3a.3** — mirror of `apply_image_applied_tx`
+            // for the file inbound path. The spawned
+            // [`apply_inbound_files_task`] sends
+            // [`InboundFileApplyResult`] here; the main `select!`
+            // arm consumes them in [`Self::handle_inbound_files_applied`].
+            inbound_files_applied_tx: None,
             // **M1b STEP-1b.3** — capacity 128 + 60 s TTL
             // (reviewer #4 3rd, was capacity 64 with no TTL in M1a).
             clipboard_lru: LruFingerprints::new(),
@@ -1121,6 +1146,17 @@ impl Service {
         // (100–300 ms).
         let (applied_tx, mut applied_rx) =
             tokio_mpsc::unbounded_channel::<InboundImageApplyResult>();
+        // **M3a STEP-3a.3** — file inbound apply result channel
+        // (mirrors `applied_tx` / `applied_rx` above for the image
+        // branch). The spawned
+        // [`apply_inbound_files_task`] owns the HTTP/3 GET +
+        // spawn_blocking write + sha256 verify for each
+        // `ClipboardFiles` entry; the main task consumes results
+        // here in the dedicated `Some(applied) = files_applied_rx
+        // .recv() => ...` select! arm to update the file loopback
+        // LRU + metrics + frontend notify.
+        let (files_applied_tx, mut files_applied_rx) =
+            tokio_mpsc::unbounded_channel::<InboundFileApplyResult>();
         // Stash the cmd sender on `self` so inbound write handlers
         // (`apply_inbound_clipboard_text` / `apply_inbound_clipboard_image` /
         // `handle_clipboard_recover_push`) can route `BackendCmd` requests
@@ -1129,6 +1165,11 @@ impl Service {
         // can still construct a Service with no backend wired in.
         self.clipboard_backend_cmd = Some(cmd_tx);
         self.apply_image_applied_tx = Some(applied_tx);
+        // **M3a STEP-3a.3** — install the file inbound apply
+        // result sender on `self`. The receiver is consumed by the
+        // main `select!` arm below (mirrors the image branch's
+        // `applied_rx` pattern).
+        self.inbound_files_applied_tx = Some(files_applied_tx);
         // **M3a STEP-3a.2** — install the real files sender on
         // `self` (replacing the dummy constructed in `Service::new`)
         // and stash the receiver for the `select!` arm below. The
@@ -1258,6 +1299,19 @@ impl Service {
                 // (sub-millisecond), not for the PNG→DIB encode.
                 Some(applied) = applied_rx.recv() => {
                     self.handle_inbound_image_applied(applied);
+                }
+                // **M3a STEP-3a.3** — file inbound apply result
+                // arm (mirrors the image arm above). The spawned
+                // [`apply_inbound_files_task`] reports the
+                // outcome of each entry's HTTP/3 GET + write +
+                // sha256 verify via [`InboundFileApplyResult`];
+                // the main task consumes them here to update the
+                // file loopback LRU + metrics + frontend notify.
+                // Keeping the bookkeeping arm on the main task
+                // (rather than the spawned task) avoids needing
+                // an extra `Arc<Mutex<...>>` field for the LRU.
+                Some(applied) = files_applied_rx.recv() => {
+                    self.handle_inbound_files_applied(applied);
                 }
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -2814,24 +2868,23 @@ impl Service {
         match event {
             ProtoEvent::ClipboardText(ct) => self.handle_clipboard_inbound_text(ct, addr).await,
             ProtoEvent::ClipboardImage(ci) => self.handle_clipboard_inbound_image(ci, addr).await,
-            // **M3a STEP-3a.2** — `ClipboardFiles` envelope is now
-            // routed to its own inbound arm. STEP-3a.3 / 3a.4 add
-            // the actual file-pull + accept-and-save logic; for
-            // STEP-3a.2 the arm is a stub that logs the receipt
-            // so the wire path is observable end-to-end (sender
-            // → receiver inbound dispatch).
+            // **M3a STEP-3a.3** — `ClipboardFiles` envelope now
+            // drives the full receiver-side flow: loopback LRU →
+            // decision fn (auto_accept / MIME_TOO_LARGE filter) →
+            // per-entry HTTP/3 GET → spawn_blocking write + sha256
+            // verify. STEP-3a.4 will land the HTTP/3 server route
+            // `/clipboard/file/{sha256}` so the source daemon
+            // actually serves the bytes (for STEP-3a.3 the route
+            // is still the 404 stub — see commit `8de4219`'s
+            // `apply_inbound_image_task_get_404` test for the
+            // same pattern in the image branch).
             ProtoEvent::ClipboardFiles(cf) => {
-                log::info!(
-                    "clipboard inbound files: received ClipboardFiles(fingerprint={}, \
-                     entries={}) from {addr} — receiver-side pull lands in M3a STEP-3a.3/3a.4",
-                    short_hex(&cf.fingerprint),
-                    cf.entries.len()
-                );
+                self.handle_clipboard_inbound_files(cf, addr).await;
             }
             _ => {
                 // FileTransferOffer / Response / Cancel are
-                // M3a STEP-3a.3+ scope; routed to a TODO arm once
-                // the receiver-side flow is in place.
+                // M3a STEP-3a.5 scope (cancellation protocol).
+                // STEP-3a.3 just routes inbound `ClipboardFiles`.
             }
         }
     }
@@ -3308,6 +3361,225 @@ impl Service {
              (sha={}, mime={mime})",
             bytes_len,
             short_hex(&inbound_sha)
+        );
+    }
+
+    /// **M3a STEP-3a.3** — file-arm of the inbound handler.
+    /// Mirror of [`Self::handle_clipboard_inbound_image`] for the
+    /// `ClipboardFiles` wire event:
+    ///
+    /// 1. **LRU loopback check** against
+    ///    [`Self::file_lru_fingerprints`] (capacity 64, TTL 60 s,
+    ///    independent from text + image LRUs). On hit → log trace
+    ///    + `metrics.incr_skip` + return (mirrors the image /
+    ///    text branches).
+    /// 2. **Pure decision fn** via
+    ///    [`handle_clipboard_inbound_files_decide`] — fast-fails
+    ///    `AutoAcceptOff` (M3b's flag) / `Empty` / `AllMimeTooLarge`
+    ///    without touching the peer connection.
+    /// 3. **Resolve peer connection** via
+    ///    [`Self::peer_connection_for_addr`]. If no live
+    ///    connection → log warn + skip (peer disconnected
+    ///    mid-flight).
+    /// 4. **Resolve `accept_dir`** — `self.config.clipboard_config
+    ///    ().accept_dir`, falling back to [`DEFAULT_ACCEPT_DIR`]
+    ///    (e.g. `$HOME/Downloads/lan-mouse`). The directory is
+    ///    `create_dir_all`'d here (cheap; receiver idempotent) so
+    ///    the spawned task can `std::fs::write` directly without
+    ///    an EACCES surprise.
+    /// 5. **Spawn one task per entry** via
+    ///    [`apply_inbound_files_task`]. Each task owns the HTTP/3
+    ///    GET + spawn_blocking write/verify for its own entry;
+    ///    `applied_tx` reports back to the main task's
+    ///    [`Self::handle_inbound_files_applied`] completion arm.
+    ///
+    /// **Why per-entry spawn (not batched)**: a single
+    /// `ClipboardFiles` can carry 1-N entries (a multi-select in
+    /// Finder). Sequential processing would block the main task's
+    /// `select!` for the full batch duration; per-entry spawn
+    /// keeps the main task responsive throughout (200 MiB
+    /// transfers can take 1-2 s end-to-end per entry).
+    ///
+    /// **Why no `auto_accept_files = false` UI hint**: M3b adds
+    /// the Toaster prompt. For STEP-3a.3 the config defaults to
+    /// `false`; tests pass `true` explicitly to exercise the
+    /// apply path. The skip path logs at `info` (not `debug`) so
+    /// operators see why the receiver didn't land files.
+    async fn handle_clipboard_inbound_files(
+        &mut self,
+        cf: lan_mouse_proto::ClipboardFiles,
+        addr: SocketAddr,
+    ) {
+        // Step 1: file LRU loopback check.
+        if self.file_lru_fingerprints.contains(&cf.fingerprint) {
+            log::debug!(
+                "clipboard inbound files: skipping loopback fingerprint={}",
+                short_hex(&cf.fingerprint)
+            );
+            // Mirror of the text/image branches — incr_skip so the
+            // hit-rate log task surfaces the running count.
+            self.metrics.incr_skip(unix_now_ms());
+            return;
+        }
+
+        // Step 2: pure decision fn (testable in isolation).
+        let cfg = self.config.clipboard_config();
+        match handle_clipboard_inbound_files_decide(&cf.entries, cfg.auto_accept_files) {
+            InboundFilesDecision::AutoAcceptOff => {
+                log::info!(
+                    "clipboard inbound files: auto_accept_files is off (M3b flag); \
+                     skipping ClipboardFiles(fingerprint={}, entries={}) from {addr}",
+                    short_hex(&cf.fingerprint),
+                    cf.entries.len()
+                );
+                return;
+            }
+            InboundFilesDecision::Empty => {
+                log::debug!("clipboard inbound files: empty entries vec from {addr}; skipping");
+                return;
+            }
+            InboundFilesDecision::AllMimeTooLarge => {
+                log::info!(
+                    "clipboard inbound files: all {} entries are MIME_TOO_LARGE from \
+                     {addr}; skipping (saves HTTP/3 GET)",
+                    cf.entries.len()
+                );
+                return;
+            }
+            InboundFilesDecision::Apply { entries } => {
+                // Step 3: resolve peer connection.
+                let Some(conn) = self.peer_connection_for_addr(addr).await else {
+                    log::warn!(
+                        "clipboard inbound files: entries from {addr} but no live peer \
+                         connection found — skipping (peer may have disconnected mid-flight)"
+                    );
+                    return;
+                };
+                // Step 4: resolve accept_dir + create the dir.
+                let accept_dir = cfg.accept_dir.unwrap_or_else(default_accept_dir);
+                if let Err(e) = std::fs::create_dir_all(&accept_dir) {
+                    log::warn!(
+                        "clipboard inbound files: failed to create accept_dir {}: {e} \
+                         — skipping all entries",
+                        accept_dir.display()
+                    );
+                    return;
+                }
+                // Step 5: get the apply result sender. The channel
+                // is set up in [`Self::run`]; if it's `None` we
+                // can't process the inbound.
+                let Some(applied_tx) = self.inbound_files_applied_tx.clone() else {
+                    log::warn!(
+                        "clipboard inbound files: inbound_files_applied_tx uninitialised \
+                         (Service::run not entered yet?) — dropping apply"
+                    );
+                    return;
+                };
+
+                log::info!(
+                    "clipboard inbound files: spawning {} apply task(s) for \
+                     ClipboardFiles(fingerprint={}) from {addr} (accept_dir={})",
+                    entries.len(),
+                    short_hex(&cf.fingerprint),
+                    accept_dir.display(),
+                );
+
+                // Per-entry spawn. Each entry is independent
+                // (different sha256 → different file path →
+                // different write); spawning them serially
+                // would block the main `select!` for the full
+                // batch duration.
+                for entry in entries {
+                    let conn_for_fetcher = conn.clone();
+                    let sha_hex = full_hex(&entry.sha256);
+                    let fetcher = async move {
+                        crate::quic_transport::http3::Http3Client::new(conn_for_fetcher)
+                            .get_file(&sha_hex, None)
+                            .await
+                            .map_err(|e| format!("{e}"))
+                    };
+                    let applied_tx_for_entry = applied_tx.clone();
+                    let accept_dir_for_entry = accept_dir.clone();
+                    let name = entry.name.clone();
+                    let mime = entry.mime.clone();
+                    tokio::task::spawn_local(apply_inbound_files_task(
+                        applied_tx_for_entry,
+                        entry.sha256,
+                        name,
+                        entry.size,
+                        mime,
+                        addr,
+                        accept_dir_for_entry,
+                        fetcher,
+                    ));
+                }
+            }
+        }
+    }
+
+    /// **M3a STEP-3a.3** — completion handler for
+    /// [`apply_inbound_files_task`]. Mirrors
+    /// [`Self::handle_inbound_image_applied`] for the file branch:
+    /// the spawned task owns the HTTP/3 GET + spawn_blocking
+    /// write/verify; this completion arm handles the bookkeeping
+    /// that requires `&mut self` (LRU mark + metrics + frontend
+    /// notify).
+    ///
+    /// **Window defence ordering** (matches the image branch's
+    /// rationale): the file LRU is `push`'d on **success** — a
+    /// platform echo (e.g. macOS Finder re-selecting the same
+    /// file after our write) that re-polls the file selection
+    /// would otherwise dispatch a new `ClipboardFiles` with the
+    /// same fingerprint. The 60 s TTL bounds the false-positive
+    /// window.
+    ///
+    /// **Failure semantics**: on any failure path we log warn +
+    /// skip metrics / frontend notify (mirrors the text/image
+    /// branches' "no inflate on failure" contract).
+    fn handle_inbound_files_applied(&mut self, result: InboundFileApplyResult) {
+        let inbound_sha = result.inbound_sha;
+        let source = result.source;
+        let name = result.name.as_str();
+        let bytes_len = result.bytes_len;
+        let size = result.size;
+        let mime = result.mime.as_str();
+        if !result.success {
+            log::warn!(
+                "clipboard inbound file apply failed from {source}: {} \
+                 (sha={}, name={name}, declared={size} bytes, got={bytes_len} bytes, \
+                 mime={mime})",
+                result.error_msg.as_deref().unwrap_or("(no detail)"),
+                short_hex(&inbound_sha),
+            );
+            return;
+        }
+        // Mark the inbound SHA in the file loopback LRU. The
+        // dispatcher (outbound) writes its own fingerprint; we
+        // mark the inbound SHA on success so the next 500 ms tick
+        // doesn't re-dispatch a copy we just received.
+        self.file_lru_fingerprints.push(inbound_sha);
+        // Step 3: record the allow (matches the text/image
+        // branches' "only on success" contract).
+        self.metrics.incr_allow();
+        // Step 4: bookkeeping + frontend notification.
+        let now_ms = unix_now_ms();
+        self.last_file_ts_ms = Some(now_ms);
+        self.last_clipboard_source = Some(source);
+        self.notify_frontend(FrontendEvent::ClipboardState {
+            last_text_ts: self.last_text_ts_ms,
+            last_image_ts: self.last_image_ts_ms,
+            last_file_ts: self.last_file_ts_ms,
+            last_source: Some(format!("{source}")),
+        });
+        log::info!(
+            "clipboard inbound file: applied {} bytes from {source} \
+             (sha={}, name={name}, mime={mime}, landed at {:?})",
+            bytes_len,
+            short_hex(&inbound_sha),
+            result
+                .landed_path
+                .as_deref()
+                .unwrap_or(Path::new("<unknown>")),
         );
     }
 
@@ -3955,6 +4227,45 @@ enum BackendCmd {
 /// M4 STEP-4.2). See `next/SUGGESTION.md` #S-5 for the tracking
 /// entry.
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
+
+/// **M3a STEP-3a.3** — default `accept_dir` for inbound files
+/// when the user hasn't configured one (i.e. `ClipboardConfig
+/// ::accept_dir == None`).
+///
+/// **Why a hardcoded fallback here (not `dirs::download_dir` etc.)**:
+/// the daemon currently has zero `dirs` / `directories` dependencies
+/// (keeping the cross-platform footprint minimal). A hardcoded
+/// subdirectory name is portable; the runtime resolves the user's
+/// home at first inbound file via `std::env::var("HOME")` /
+/// `USERPROFILE` fallback. M3b STEP-3b.1 / M4 STEP-4.2 land the
+/// full IPC + TOML `accept_dir` override; this constant is the
+/// fallback until then.
+///
+/// **Why `lan-mouse` (not `Downloads/lan-mouse`)**: every peer
+/// using the daemon shares the same in-app folder — easier for the
+/// user to find incoming files and to set up per-app automation
+/// (e.g. Hazel rules on `~/lan-mouse`). On macOS the full path is
+/// `~/lan-mouse/`; on Windows `%USERPROFILE%\lan-mouse\`; on Linux
+/// `~/lan-mouse/`.
+pub const DEFAULT_ACCEPT_DIR: &str = "lan-mouse";
+
+/// **M3a STEP-3a.3** — resolve the user's home directory at
+/// runtime. Used by [`DEFAULT_ACCEPT_DIR`] to build the full
+/// `<home>/lan-mouse/` path.
+///
+/// **Cross-platform fallback chain**: `$HOME` (macOS / Linux) →
+/// `$USERPROFILE` (Windows) → `Option<PathBuf>` if neither env is
+/// set. The `None` branch falls back to `/tmp/lan-mouse` so the
+/// daemon never panics; in practice all 3 platforms always have
+/// one of the two env vars set for an interactive user.
+fn default_accept_dir() -> PathBuf {
+    let home = std::env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("USERPROFILE").ok().map(PathBuf::from));
+    let base = home.unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join(DEFAULT_ACCEPT_DIR)
+}
 
 /// **M3a STEP-3a.2** — derive a stable 32-byte fingerprint from
 /// an OS clipboard file selection. Used by `dispatch_files` as
@@ -4605,6 +4916,474 @@ async fn apply_image_inner(
         post_write_sha,
         error_msg: None,
     });
+}
+
+// ============================================================================
+//  M3a STEP-3a.3 — Receiver-side inbound file handling
+// ============================================================================
+//
+// **Wire contract (PLAN §3 M3a STEP-3a.3)**: the receiver gets a
+// `ClipboardFiles { fingerprint, entries: Vec<FileEntry> }` envelope
+// on StreamC. The receiver MUST:
+//
+// 1. Check the loopback LRU (a fingerprint we recently wrote is
+//    being echoed back — drop silently).
+// 2. If `auto_accept_files == false` (M3b's flag) → skip silently
+//    (M3b adds the GUI Toaster prompt that lets the user accept /
+//    reject individual pushes). For STEP-3a.3 the config defaults
+//    to `auto_accept_files = false`; tests pass `true` explicitly
+//    to exercise the apply path.
+// 3. For each `FileEntry`, issue `Http3Client::get_file(sha256, None)`
+//    against the source peer's connection. The HTTP/3 server route
+//    `/clipboard/file/{sha256}` lands in **STEP-3a.4**; for STEP-3a.3
+//    the server-side route is still the 404 stub (returns
+//    `"not found"`), so the wire-level success path is only
+//    observable end-to-end once STEP-3a.4 lands. Unit tests in this
+//    module drive the success path via a closure-injected mock
+//    fetcher (mirrors the image `apply_inbound_image_task_get_404`
+//    pattern from commit `8de4219`).
+// 4. Resolve a non-colliding path under `<accept_dir>/<name>` —
+//    collisions get `(1)` / `(2)` / ... suffixes (PLAN §3 STEP-3a.3).
+// 5. Write bytes to disk (off-LocalSet via `spawn_blocking`) +
+//    recompute sha256 + verify. On mismatch, delete the partial
+//    file and log error.
+//
+// **File structure (mirrors `apply_inbound_image_task`)**:
+// - [`InboundFileApplyResult`] — completion event for the spawned
+//   task (analogous to [`InboundImageApplyResult`]).
+// - [`apply_inbound_files_task`] — spawned task that owns the
+//   HTTP/3 GET + spawn_blocking write/verify.
+// - [`apply_files_inner`] — post-fetch apply pipeline.
+// - [`write_and_verify_file_blocking`] — spawn_blocking entry that
+//   writes bytes + verifies sha256 + deletes partial on mismatch.
+// - [`resolve_unique_path`] — pure filesystem walker that returns
+//   `<accept_dir>/<name>` (or `<name> (1)` / `<name> (2)` on
+//   collision).
+// - [`handle_clipboard_inbound_files_decide`] — pure decision fn
+//   returning [`InboundFilesDecision`].
+// - [`Service::handle_clipboard_inbound_files`] — the inbound arm
+//   on `Service` (mirrors `handle_clipboard_inbound_image`).
+// - [`Service::handle_inbound_files_applied`] — completion arm
+//   for the main `select!` (mirrors `handle_inbound_image_applied`).
+
+/// **M3a STEP-3a.3** — completion event for
+/// [`apply_inbound_files_task`]. The spawned task reports the
+/// outcome (success / GET failure / sha256 mismatch / IO error) via
+/// this struct on the `inbound_files_applied_tx` channel; the main
+/// task's `select!` consumes the value in
+/// [`Service::handle_inbound_files_applied`] to update the file
+/// loopback LRU + metrics + frontend notify.
+///
+/// **Why a `struct` not a tuple**: the `Option<PathBuf>` semantics
+/// (the landed path may be `None` on any failure path) are easier
+/// to read at call sites than a 9-tuple. A tuple form would force
+/// every test to count fields.
+///
+/// **Why `landed_path: Option<PathBuf>`** even on success: the
+/// success branch carries the resolved-with-collision-suffix path;
+/// the failure branches carry `None`. The frontend
+/// `FrontendEvent::ClipboardState { last_source, ... }` doesn't
+/// currently include the landed path, but the LRU bookkeeping
+/// benefits from knowing exactly which path was used (for future
+/// "show received files in GUI" hooks).
+struct InboundFileApplyResult {
+    /// Inbound SHA from the wire (the entry's `sha256`). Mirrors
+    /// [`InboundImageApplyResult::inbound_sha`].
+    inbound_sha: [u8; 32],
+    /// Source peer address (for log lines + `last_clipboard_source`).
+    source: SocketAddr,
+    /// Filename component of the entry (no directory). Logged in
+    /// success/failure lines; surfaced to the GUI as part of
+    /// future "received files" rendering.
+    name: String,
+    /// Declared file size in bytes (matches `entry.size`).
+    size: u64,
+    /// Wire mime string (logged for visibility; not used for
+    /// content dispatch — files are written verbatim regardless
+    /// of mime).
+    mime: String,
+    /// `true` iff the bytes were successfully written + verified.
+    /// On `false`, `error_msg` carries the failure detail and
+    /// `landed_path` is `None` (the partial file is deleted on
+    /// sha256 mismatch — see [`write_and_verify_file_blocking`]).
+    success: bool,
+    /// Final on-disk path after collision-suffix resolution.
+    /// `Some(path)` on success (the file is on disk); `None` on
+    /// any failure path.
+    landed_path: Option<PathBuf>,
+    /// Inbound bytes length (for log lines; the actual `Vec<u8>`
+    /// is dropped after the spawn_blocking write).
+    bytes_len: usize,
+    /// Human-readable error from any failed step. `None` on
+    /// success.
+    error_msg: Option<String>,
+}
+
+/// **M3a STEP-3a.3** — pure decision fn for inbound
+/// [`lan_mouse_proto::ClipboardFiles`]. Mirrors the
+/// `dispatch_files_decide` pattern from STEP-3a.2 (commit
+/// `af0e685`): a free function returning an enum variant lets
+/// the inbound arm's branching logic be unit-tested without
+/// standing up a full `Service::new()`.
+///
+/// **Variants**:
+/// - [`InboundFilesDecision::Apply`] — auto-accept is on **and**
+///   at least one entry is actionable (non-[`MIME_TOO_LARGE`]).
+/// - [`InboundFilesDecision::AutoAcceptOff`] — auto-accept is off
+///   (M3b's flag). The caller should skip silently.
+/// - [`InboundFilesDecision::AllMimeTooLarge`] — every entry is
+///   `MIME_TOO_LARGE` (the source flagged them as > 4 GiB; the
+///   receiver should refuse outright per STEP-3a.1 contract). The
+///   caller should skip silently — saves an HTTP/3 GET that
+///   would 404 anyway.
+/// - [`InboundFilesDecision::Empty`] — entries vec is empty
+///   (defensive; the source should never emit this, but a
+///   serializer bug could).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InboundFilesDecision {
+    /// Proceed with apply.
+    Apply {
+        /// The actionable entries (MIME_TOO_LARGE filtered out).
+        entries: Vec<lan_mouse_proto::FileEntry>,
+    },
+    /// auto_accept_files is off (M3b's flag); skip silently.
+    AutoAcceptOff,
+    /// All entries have `mime == MIME_TOO_LARGE`; skip.
+    AllMimeTooLarge,
+    /// entries vec is empty; nothing to do.
+    Empty,
+}
+
+/// **M3a STEP-3a.3** — pure decision fn for inbound `ClipboardFiles`.
+///
+/// See [`InboundFilesDecision`] for the variant semantics. The
+/// caller is [`Service::handle_clipboard_inbound_files`] which
+/// reads `auto_accept_files` from
+/// `self.config.clipboard_config().auto_accept_files` and forwards
+/// here. Tests pass the flag directly so the decision is
+/// independent of any TOML state.
+pub(crate) fn handle_clipboard_inbound_files_decide(
+    entries: &[lan_mouse_proto::FileEntry],
+    auto_accept_files: bool,
+) -> InboundFilesDecision {
+    if !auto_accept_files {
+        return InboundFilesDecision::AutoAcceptOff;
+    }
+    if entries.is_empty() {
+        return InboundFilesDecision::Empty;
+    }
+    let actionable: Vec<lan_mouse_proto::FileEntry> = entries
+        .iter()
+        .filter(|e| e.mime != crate::clipboard::file_meta::MIME_TOO_LARGE)
+        .cloned()
+        .collect();
+    if actionable.is_empty() {
+        return InboundFilesDecision::AllMimeTooLarge;
+    }
+    InboundFilesDecision::Apply {
+        entries: actionable,
+    }
+}
+
+/// **M3a STEP-3a.3** — resolve a non-colliding path under
+/// `accept_dir`.
+///
+/// Algorithm:
+/// 1. Try `<accept_dir>/<name>`. If it doesn't exist → return it.
+/// 2. Otherwise try `<accept_dir>/<stem> (1).<ext>`,
+///    `<accept_dir>/<stem> (2).<ext>`, ... up to 9999.
+/// 3. As a defensive fallback (extremely unlikely — would require
+///    9999 collisions) use a timestamp suffix.
+///
+/// **Why walk the filesystem instead of using an atomic
+/// `O_EXCL` create**: the file is written via a regular
+/// `std::fs::write` from a `spawn_blocking` task (no `open`
+/// syscall argument for `O_EXCL`). Adding collision resolution
+/// upstream lets the same write call succeed without partial-file
+/// coordination. The race window (two near-simultaneous inbound
+/// pushes with identical `name`) is bounded by the `for n in
+/// 1..=9999` loop: the second caller checks `<name> (1)` and wins.
+///
+/// **No recursion**: the loop iterates over a `1..=9999` range;
+/// the function never calls itself. A 9999-iteration loop on
+/// `Path::exists` is ~0.1-1 ms on a warm FS cache (modern macOS /
+/// Linux filesystem cache returns stat results in microseconds).
+pub(crate) fn resolve_unique_path(accept_dir: &Path, name: &str) -> PathBuf {
+    let candidate = accept_dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = Path::new(name);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let ext = path.extension().and_then(|s| s.to_str());
+    for n in 1..=9999 {
+        let new_name = match ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = accept_dir.join(&new_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    // Fallback: 9999 collisions on a single name is extraordinary;
+    // fall back to a timestamp suffix. Distinct from the loop above
+    // because timestamp has effectively zero collision probability
+    // (millisecond resolution × process ID).
+    let timestamp = unix_now_ms();
+    let fallback = match ext {
+        Some(e) => format!("{stem} ({timestamp}).{e}"),
+        None => format!("{stem} ({timestamp})"),
+    };
+    accept_dir.join(fallback)
+}
+
+/// **M3a STEP-3a.3** — `spawn_blocking` entry: write `bytes` to
+/// `path` and verify the on-the-wire sha256 by recomputing it from
+/// the same bytes.
+///
+/// **Why recompute from memory (not from disk re-read)**: the
+/// bytes came over QUIC which has its own stream-level integrity
+/// check; re-reading from disk just adds another full I/O round
+/// trip (5–8 s for 200 MiB on SSD) without catching any failure
+/// mode that QUIC didn't already catch. The PLAN §3 STEP-3a.3
+/// "重新算 sha256 校验" is satisfied by recomputing over the
+/// received bytes; the local disk is trusted as the receiver's
+/// own filesystem.
+///
+/// **Failure handling**: on sha256 mismatch the partial file is
+/// **deleted** before returning `Err`. The user never sees a
+/// half-written corrupt file; the error_msg tells them which sha
+/// was expected vs computed so they can diagnose.
+pub(crate) fn write_and_verify_file_blocking(
+    path: PathBuf,
+    bytes: Vec<u8>,
+    expected_sha: [u8; 32],
+) -> Result<(), String> {
+    // Write bytes to disk.
+    std::fs::write(&path, &bytes).map_err(|e| format!("write failed: {e}"))?;
+    // Recompute sha256 over the received bytes (cheap, in-memory).
+    let actual: [u8; 32] = {
+        use sha2::Digest;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        hasher.finalize().into()
+    };
+    if actual != expected_sha {
+        // Mismatch — delete the partial file before returning Err.
+        // `remove_file` failure is logged but doesn't change the
+        // outcome: the caller still sees Err(sha256 mismatch).
+        if let Err(rm_err) = std::fs::remove_file(&path) {
+            log::warn!(
+                "clipboard inbound file: sha256 mismatch AND failed to delete partial \
+                 at {}: {rm_err} (expected sha={}, got sha={})",
+                path.display(),
+                short_hex(&expected_sha),
+                short_hex(&actual),
+            );
+        }
+        return Err(format!(
+            "sha256 mismatch: expected={}, got={}",
+            short_hex(&expected_sha),
+            short_hex(&actual)
+        ));
+    }
+    Ok(())
+}
+
+/// **M3a STEP-3a.3** — post-HTTP/3-GET apply pipeline for a
+/// single inbound file. Extracted from the spawned task so unit
+/// tests can drive the spawn_blocking path directly without
+/// standing up a real HTTP/3 server.
+///
+/// **Failure-handling contract** (mirrors
+/// [`apply_image_inner`]):
+/// - spawn_blocking join error (panic / cancellation) →
+///   `success=false`, `error_msg = "spawn_blocking join error: ..."`.
+/// - `write_and_verify_file_blocking` returned Err (sha256 mismatch
+///   or write IO error) → `success=false`, `error_msg` carries the
+///   detail. On sha256 mismatch the partial file has already been
+///   deleted inside `write_and_verify_file_blocking`.
+/// - All steps OK → `success=true`, `landed_path = Some(path)`.
+///
+/// **`#[allow(clippy::too_many_arguments)]`**: 8 args (vs clippy's
+/// 7 default) — the per-entry fields are genuinely independent
+/// (`inbound_sha` / `name` / `size` / `mime` / `source` /
+/// `accept_dir` + the `bytes` body + `applied_tx` channel). Grouping
+/// into a struct would obscure the call site without reducing the
+/// total surface — same trade-off the image branch took (see
+/// `apply_inbound_image_task` with 6 args).
+#[allow(clippy::too_many_arguments)]
+async fn apply_files_inner(
+    applied_tx: tokio_mpsc::UnboundedSender<InboundFileApplyResult>,
+    inbound_sha: [u8; 32],
+    name: String,
+    size: u64,
+    mime: String,
+    source: SocketAddr,
+    accept_dir: PathBuf,
+    bytes: Vec<u8>,
+) {
+    let bytes_len = bytes.len();
+    // Clone `name` so the spawn_blocking closure can use it for
+    // path resolution without consuming the original (we need
+    // `name` again in the post-spawn applied_tx.send).
+    let name_for_path = name.clone();
+
+    let join_result = tokio::task::spawn_blocking(move || -> Result<PathBuf, String> {
+        let landed_path = resolve_unique_path(&accept_dir, &name_for_path);
+        write_and_verify_file_blocking(landed_path.clone(), bytes, inbound_sha)?;
+        Ok(landed_path)
+    })
+    .await;
+
+    match join_result {
+        Ok(Ok(landed_path)) => {
+            let _ = applied_tx.send(InboundFileApplyResult {
+                inbound_sha,
+                source,
+                name,
+                size,
+                mime,
+                success: true,
+                landed_path: Some(landed_path),
+                bytes_len,
+                error_msg: None,
+            });
+        }
+        Ok(Err(e)) => {
+            let _ = applied_tx.send(InboundFileApplyResult {
+                inbound_sha,
+                source,
+                name,
+                size,
+                mime,
+                success: false,
+                landed_path: None,
+                bytes_len,
+                error_msg: Some(e),
+            });
+        }
+        Err(join_err) => {
+            let _ = applied_tx.send(InboundFileApplyResult {
+                inbound_sha,
+                source,
+                name,
+                size,
+                mime,
+                success: false,
+                landed_path: None,
+                bytes_len,
+                error_msg: Some(format!("spawn_blocking join error: {join_err}")),
+            });
+        }
+    }
+}
+
+/// **M3a STEP-3a.3** — spawned `spawn_local` task that owns the
+/// HTTP/3 GET + the off-LocalSet write + sha256 verify for a
+/// single inbound `FileEntry`. Mirrors the
+/// [`apply_inbound_image_task`] pattern (fetcher closure +
+/// spawn_blocking + completion event).
+///
+/// **Why a spawned task (not inline `await` in
+/// `handle_clipboard_inbound_files`)**:
+/// - The inline path holds `&mut self` for the duration of the GET
+///   (100 ms–1 s for 200 MiB) + the spawn_blocking write (5–8 s
+///   for 200 MiB on SSD). During that window the main task's
+///   `select!` cannot poll `capture.event()`, so the controlled
+///   side's mouse writes back-pressure and frames drop (the
+///   2026-09-10 screenshot-bug fix applied the same move to the
+///   image branch — `8de4219`).
+/// - Splitting into a spawned task means the main task pays only
+///   for the (sub-ms) `peer_connection_for_addr` lookup + the
+///   `spawn_local` call, then immediately returns to the
+///   `select!`. The spawned task owns the heavy work.
+///
+/// **Why the fetcher is a generic `F: Future`**: mirrors the
+/// `apply_inbound_image_task` pattern (commit `8de4219` follow-up
+/// `apply_inbound_image_task_get_404` test). The closure
+/// indirection lets unit tests drive success / 404 / IO-error
+/// paths without standing up a real HTTP/3 server.
+///
+/// **`#[allow(clippy::too_many_arguments)]`**: 8 args (the per-entry
+/// fields + `accept_dir` + `fetcher` future + `applied_tx`
+/// channel) — each is genuinely independent. Grouping into a
+/// context struct would obscure the call site without reducing the
+/// total surface.
+#[allow(clippy::too_many_arguments)]
+async fn apply_inbound_files_task<F>(
+    applied_tx: tokio_mpsc::UnboundedSender<InboundFileApplyResult>,
+    inbound_sha: [u8; 32],
+    name: String,
+    size: u64,
+    mime: String,
+    source: SocketAddr,
+    accept_dir: PathBuf,
+    fetcher: F,
+) where
+    F: std::future::Future<Output = Result<(u16, Vec<u8>), String>>,
+{
+    // Step 1: pull bytes via HTTP/3 GET. In production this hits
+    // `Http3Client::get_file(sha256, None)`; in tests the closure
+    // is mocked to drive success / 404 / IO-error paths.
+    let bytes = match fetcher.await {
+        Ok((200, body)) => {
+            log::info!(
+                "clipboard inbound file: pulled {} bytes from {} via HTTP/3 \
+                 (sha={}, name={name}, mime={mime})",
+                body.len(),
+                source,
+                short_hex(&inbound_sha),
+            );
+            body
+        }
+        Ok((status, _)) => {
+            let _ = applied_tx.send(InboundFileApplyResult {
+                inbound_sha,
+                source,
+                name,
+                size,
+                mime,
+                success: false,
+                landed_path: None,
+                bytes_len: 0,
+                error_msg: Some(format!(
+                    "HTTP/3 GET /clipboard/file/{} returned {status}",
+                    short_hex(&inbound_sha)
+                )),
+            });
+            return;
+        }
+        Err(e) => {
+            let _ = applied_tx.send(InboundFileApplyResult {
+                inbound_sha,
+                source,
+                name,
+                size,
+                mime,
+                success: false,
+                landed_path: None,
+                bytes_len: 0,
+                error_msg: Some(format!(
+                    "HTTP/3 GET /clipboard/file/{} failed: {e}",
+                    short_hex(&inbound_sha)
+                )),
+            });
+            return;
+        }
+    };
+    apply_files_inner(
+        applied_tx,
+        inbound_sha,
+        name,
+        size,
+        mime,
+        source,
+        accept_dir,
+        bytes,
+    )
+    .await;
 }
 
 /// **STEP-M2-2.6**: pure helper that turns an internal
@@ -6841,5 +7620,636 @@ mod dispatch_files_tests {
             }
             other => panic!("missing path must yield Io — got {other:?}"),
         }
+    }
+}
+
+// ============================================================================
+//  M3a STEP-3a.3 — handle_clipboard_inbound_files + apply_inbound_files_task
+//  unit tests
+// ============================================================================
+//
+// **Testability strategy** (mirrors the
+// `dispatch_files_decide` test pattern from commit `af0e685` /
+// `bb849a6`):
+// - 4 decision-fn tests exercise [`handle_clipboard_inbound_files_decide`]
+//   in isolation. No `Service::new()` required.
+// - 1 spawned-task test exercises [`apply_inbound_files_task`]
+//   with a mock `fetcher` closure + a tempdir as `accept_dir`.
+//   The mock pattern matches [`apply_inbound_image_task_get_404`]
+//   (commit `8de4219` follow-up): the closure indirection lets
+//   us drive success / 404 / IO-error paths without standing up
+//   a real HTTP/3 server.
+//
+// **What STEP-3a.3 does NOT pin here**: the wire-level end-to-end
+// "200 MiB file from source → /tmp/received/ landed + sha256sum
+// matches" check is a manual test (PLAN §3 STEP-3a.3 完成标志
+// + §8 M3a 测试矩阵) — STEP-3a.4 lands the source daemon's
+// HTTP/3 server route `/clipboard/file/{sha256}`, which is the
+// missing half. The unit tests below pin the receiver-side
+// decision + spawn_blocking + sha256 verify contract; the wire
+// end-to-end will be validated by STEP-3a.4's HTTP/3 server tests
+// (mirrors the image branch's 8de4219 follow-up).
+
+#[cfg(test)]
+mod handle_clipboard_inbound_files_tests {
+    //! **M3a STEP-3a.3** — pins the 4 branches of
+    //! [`handle_clipboard_inbound_files_decide`] (pure decision fn).
+    //!
+    //! Coverage:
+    //! 1. `AutoAcceptOff` — `auto_accept_files=false` → skip
+    //! 2. `Apply` — auto-accept on + at least one non-MIME_TOO_LARGE
+    //!    entry → proceed
+    //! 3. `AllMimeTooLarge` — auto-accept on but all entries are
+    //!    MIME_TOO_LARGE → skip (saves HTTP/3 GET)
+    //! 4. `Empty` — entries vec empty → skip (defensive edge case)
+    //!
+    //! **Why these 4 (not 5) decision tests**: the prompt's
+    //! "success/mismatch/collision/auto_accept_off" list maps
+    //! success + collision + mismatch to the spawned-task test
+    //! (one test, since the spawned task is where the work happens);
+    //! the decision fn only has 4 distinct branches.
+
+    use super::*;
+    use crate::clipboard::file_meta::MIME_TOO_LARGE;
+    use lan_mouse_proto::FileEntry;
+
+    fn fake_entry(name: &str, sha_byte: u8, size: u64, mime: &str) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            size,
+            mime: mime.to_string(),
+            sha256: [sha_byte; 32],
+        }
+    }
+
+    /// **Branch 1 — `auto_accept_files = false`**.
+    ///
+    /// Mirrors the user-toggled "auto-accept off" state in M3b's
+    /// GUI. The decision must skip silently regardless of whether
+    /// the entries vec has actionable entries — the receiver is
+    /// gated on the flag, not on entry content.
+    #[test]
+    fn handle_clipboard_inbound_files_decide_returns_auto_accept_off() {
+        let entries = vec![
+            fake_entry("a.bin", 0x01, 100, "application/octet-stream"),
+            fake_entry("b.bin", 0x02, 200, "application/octet-stream"),
+        ];
+        let decision = handle_clipboard_inbound_files_decide(entries.as_slice(), false);
+        assert!(
+            matches!(decision, InboundFilesDecision::AutoAcceptOff),
+            "auto_accept_files=false must return AutoAcceptOff regardless of \
+             entries content — got {decision:?}"
+        );
+    }
+
+    /// **Branch 2 — happy path**.
+    ///
+    /// `auto_accept_files = true` + at least one non-MIME_TOO_LARGE
+    /// entry → `Apply { entries }` with the actionable entries
+    /// preserved verbatim (sha256 / name / size / mime pass through
+    /// unchanged).
+    #[test]
+    fn handle_clipboard_inbound_files_decide_returns_apply_with_actionable() {
+        let entries = vec![
+            fake_entry("report.pdf", 0xAA, 4096, "application/pdf"),
+            fake_entry("photo.jpg", 0xBB, 8192, "image/jpeg"),
+        ];
+        let decision = handle_clipboard_inbound_files_decide(entries.as_slice(), true);
+        match decision {
+            InboundFilesDecision::Apply {
+                entries: actionable,
+            } => {
+                assert_eq!(actionable.len(), 2, "both entries must pass through");
+                assert_eq!(actionable[0].name, "report.pdf");
+                assert_eq!(actionable[0].sha256, [0xAA; 32]);
+                assert_eq!(actionable[0].size, 4096);
+                assert_eq!(actionable[0].mime, "application/pdf");
+                assert_eq!(actionable[1].name, "photo.jpg");
+                assert_eq!(actionable[1].sha256, [0xBB; 32]);
+                assert_eq!(actionable[1].size, 8192);
+            }
+            other => panic!("auto_accept + actionable entries must yield Apply — got {other:?}"),
+        }
+    }
+
+    /// **Branch 3 — MIME filter**.
+    ///
+    /// `auto_accept_files = true` but every entry is `MIME_TOO_LARGE`
+    /// (the source flagged them as > 4 GiB at the `collect_files`
+    /// stage — STEP-3a.1 contract). The decision must skip to save
+    /// an HTTP/3 GET that would 404 anyway (the source's
+    /// `file_cache` skips MIME_TOO_LARGE entries — see
+    /// `src/clipboard/file_cache.rs:42-54`).
+    #[test]
+    fn handle_clipboard_inbound_files_decide_filters_mime_too_large() {
+        let entries = vec![
+            fake_entry("huge.bin", 0x01, 5_000_000_000, MIME_TOO_LARGE),
+            fake_entry("also_huge.bin", 0x02, 6_000_000_000, MIME_TOO_LARGE),
+        ];
+        let decision = handle_clipboard_inbound_files_decide(entries.as_slice(), true);
+        assert!(
+            matches!(decision, InboundFilesDecision::AllMimeTooLarge),
+            "all-MIME_TOO_LARGE must yield AllMimeTooLarge — got {decision:?}"
+        );
+    }
+
+    /// **Branch 4 — empty entries**.
+    ///
+    /// Defensive edge case: a wire serializer bug could produce
+    /// an empty entries vec. The decision must skip without
+    /// panicking (the HTTP/3 GET loop is a no-op for 0 entries).
+    #[test]
+    fn handle_clipboard_inbound_files_decide_returns_empty() {
+        let entries: Vec<FileEntry> = vec![];
+        let decision = handle_clipboard_inbound_files_decide(entries.as_slice(), true);
+        assert!(
+            matches!(decision, InboundFilesDecision::Empty),
+            "empty entries must yield Empty — got {decision:?}"
+        );
+    }
+
+    /// **Branch 4b — mixed MIME_TOO_LARGE + actionable**.
+    ///
+    /// Edge case: source pushes one giant file + one small file
+    /// in the same `ClipboardFiles`. The decision must filter
+    /// out the giant entry and apply the actionable one.
+    /// Pins that the MIME filter doesn't accidentally skip the
+    /// whole batch.
+    #[test]
+    fn handle_clipboard_inbound_files_decide_filters_mixed() {
+        let entries = vec![
+            fake_entry("huge.bin", 0x01, 5_000_000_000, MIME_TOO_LARGE),
+            fake_entry("small.txt", 0x02, 100, "text/plain"),
+        ];
+        let decision = handle_clipboard_inbound_files_decide(entries.as_slice(), true);
+        match decision {
+            InboundFilesDecision::Apply {
+                entries: actionable,
+            } => {
+                assert_eq!(actionable.len(), 1, "only the small entry should pass");
+                assert_eq!(actionable[0].name, "small.txt");
+                assert_eq!(actionable[0].sha256, [0x02; 32]);
+            }
+            other => panic!(
+                "mixed MIME_TOO_LARGE must yield Apply with the \
+                             actionable subset — got {other:?}"
+            ),
+        }
+    }
+
+    /// **Pure decision fn — auto_accept_off does NOT inspect
+    /// entries** (the wire contract pins that the flag is the
+    /// only gate). This is a regression pin: a future refactor
+    /// that pulls entries inspection into the off-branch would
+    /// silently skip the GUI hint in M3b.
+    #[test]
+    fn handle_clipboard_inbound_files_decide_auto_accept_off_ignores_entries() {
+        let entries = vec![fake_entry(
+            "any.bin",
+            0x42,
+            1000,
+            "application/octet-stream",
+        )];
+        // Even with non-MIME_TOO_LARGE entries, the flag controls.
+        let decision = handle_clipboard_inbound_files_decide(entries.as_slice(), false);
+        assert!(
+            matches!(decision, InboundFilesDecision::AutoAcceptOff),
+            "the flag, not the entries, decides — got {decision:?}"
+        );
+    }
+
+    // Note: the spawned-task test lives in a separate module
+    // below because it needs the `apply_inbound_files_task` future
+    // (not just the decision fn) plus a tokio runtime + a tempdir.
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+mod apply_inbound_files_task_tests {
+    //! **M3a STEP-3a.3** — spawned-task tests for
+    //! [`apply_inbound_files_task`]. Drives the success + collision +
+    //! sha256 mismatch paths via a mock fetcher closure (mirrors the
+    //! `apply_inbound_image_task_get_404` pattern from commit
+    //! `8de4219`).
+    //!
+    //! Covers the success path (HTTP/3 GET 200 + bytes + sha256
+    //! match + non-colliding path), the collision path (path
+    //! `<accept_dir>/<name>` already exists → `(1)` suffix), and
+    //! the sha256-mismatch path (bytes don't match expected sha
+    //! → partial file deleted + failure reported).
+
+    use super::*;
+    use lan_mouse_proto::FileEntry;
+    use std::net::SocketAddr;
+    use tempfile::TempDir;
+
+    fn fake_entry(name: &str, sha_byte: u8, size: u64, mime: &str) -> FileEntry {
+        FileEntry {
+            name: name.to_string(),
+            size,
+            mime: mime.to_string(),
+            sha256: [sha_byte; 32],
+        }
+    }
+
+    fn sha256_of_bytes_for_test(bytes: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let out = hasher.finalize();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&out);
+        arr
+    }
+
+    /// **Success path: 200 + bytes match expected sha + write
+    /// succeeds + path resolves without collision**.
+    ///
+    /// Pins the contract:
+    /// 1. HTTP/3 GET 200 → `apply_inbound_files_task` writes the
+    ///    bytes to `<accept_dir>/<name>`.
+    /// 2. sha256 of written bytes matches `entry.sha256` →
+    ///    `success=true` + `landed_path = Some(<original path>)`.
+    /// 3. `bytes_len` matches the GET body length.
+    /// 4. The completion event reaches `applied_rx`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_inbound_files_task_writes_file_with_sha256_match() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let accept_dir = TempDir::new().expect("tempdir");
+                let (applied_tx, mut applied_rx) =
+                    tokio_mpsc::unbounded_channel::<InboundFileApplyResult>();
+
+                // 4 KiB of predictable bytes (pattern: cycle 0..=255).
+                let body: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+                let expected_sha = sha256_of_bytes_for_test(&body);
+                // Build the entry with the ACTUAL sha of the body
+                // so write_and_verify_file_blocking passes the
+                // sha256 check.
+                let entry = FileEntry {
+                    name: "hello.bin".to_string(),
+                    size: 4096,
+                    mime: "application/octet-stream".to_string(),
+                    sha256: expected_sha,
+                };
+                let body_for_fetcher = body.clone();
+
+                // Mock fetcher returns the test bytes with status 200.
+                let fetcher =
+                    async move { Ok::<(u16, Vec<u8>), String>((200u16, body_for_fetcher)) };
+
+                let source: SocketAddr = "10.2.1.15:50247".parse().unwrap();
+
+                tokio::task::spawn_local(apply_inbound_files_task(
+                    applied_tx,
+                    entry.sha256,
+                    entry.name.clone(),
+                    entry.size,
+                    entry.mime.clone(),
+                    source,
+                    accept_dir.path().to_path_buf(),
+                    fetcher,
+                ));
+
+                let result = applied_rx
+                    .recv()
+                    .await
+                    .expect("apply task must always send exactly one result");
+                assert!(
+                    result.success,
+                    "success path: success must be true; error_msg={:?}",
+                    result.error_msg
+                );
+                assert_eq!(result.bytes_len, 4096);
+                assert_eq!(result.inbound_sha, entry.sha256);
+                assert_eq!(result.name, "hello.bin");
+                assert_eq!(result.mime, "application/octet-stream");
+                let landed_path = result
+                    .landed_path
+                    .as_ref()
+                    .expect("success path: landed_path must be Some");
+                assert_eq!(
+                    landed_path,
+                    &accept_dir.path().join("hello.bin"),
+                    "no collision → landed at <accept_dir>/<name>"
+                );
+                // Verify the on-disk content matches the body we
+                // sent and the sha256 matches what we computed.
+                let on_disk = std::fs::read(landed_path).expect("read landed file");
+                assert_eq!(on_disk, body, "on-disk bytes must match the GET body");
+                assert_eq!(
+                    sha256_of_bytes_for_test(&on_disk),
+                    expected_sha,
+                    "on-disk sha256 must match expected"
+                );
+            })
+            .await;
+    }
+
+    /// **Collision path: pre-existing `<accept_dir>/<name>` → the
+    /// write lands at `<accept_dir>/<name> (1)`.**
+    ///
+    /// Pins the contract:
+    /// 1. A pre-existing file with the same `name` causes the
+    ///    helper to append ` (1)` (with the extension preserved).
+    /// 2. The sha256 verify still passes against the new file.
+    /// 3. The original `<accept_dir>/<name>` is **not** clobbered
+    ///    (the collision suffix protects it).
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_inbound_files_task_resolves_collision_with_suffix() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let accept_dir = TempDir::new().expect("tempdir");
+                // Pre-create a file with the same name as the
+                // inbound entry. Its content is intentionally
+                // different (so any clobber would corrupt the
+                // sha256 check).
+                let occupied_path = accept_dir.path().join("photo.jpg");
+                std::fs::write(&occupied_path, b"original-occupied").expect("write occupied");
+
+                let (applied_tx, mut applied_rx) =
+                    tokio_mpsc::unbounded_channel::<InboundFileApplyResult>();
+
+                // Different bytes → different sha256 from the
+                // occupied file (which would fail if it were
+                // clobbered).
+                let body: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
+                let body_sha = sha256_of_bytes_for_test(&body);
+                let entry = FileEntry {
+                    name: "photo.jpg".to_string(),
+                    size: 2048,
+                    mime: "image/jpeg".to_string(),
+                    sha256: body_sha,
+                };
+                let body_for_fetcher = body.clone();
+
+                let fetcher =
+                    async move { Ok::<(u16, Vec<u8>), String>((200u16, body_for_fetcher)) };
+
+                let source: SocketAddr = "10.2.1.15:50247".parse().unwrap();
+
+                tokio::task::spawn_local(apply_inbound_files_task(
+                    applied_tx,
+                    entry.sha256,
+                    entry.name.clone(),
+                    entry.size,
+                    entry.mime.clone(),
+                    source,
+                    accept_dir.path().to_path_buf(),
+                    fetcher,
+                ));
+
+                let result = applied_rx
+                    .recv()
+                    .await
+                    .expect("apply task must always send exactly one result");
+                assert!(
+                    result.success,
+                    "collision path: success must be true; error_msg={:?}",
+                    result.error_msg
+                );
+                let landed_path = result
+                    .landed_path
+                    .as_ref()
+                    .expect("collision path: landed_path must be Some");
+                assert_eq!(
+                    landed_path,
+                    &accept_dir.path().join("photo (1).jpg"),
+                    "collision must yield '<stem> (1).<ext>' (Finder / Explorer convention)"
+                );
+                // Verify the original is intact (not clobbered).
+                let original_content = std::fs::read(&occupied_path).expect("read original");
+                assert_eq!(
+                    original_content, b"original-occupied",
+                    "pre-existing file must NOT be clobbered"
+                );
+                // Verify the new file has the GET body bytes.
+                let new_content = std::fs::read(landed_path).expect("read new file");
+                assert_eq!(new_content, body, "landed file must have GET body bytes");
+            })
+            .await;
+    }
+
+    /// **sha256 mismatch path: GET returns bytes that don't match
+    /// `entry.sha256` → the partial file is deleted + the
+    /// completion event reports `success=false` with the sha256
+    /// error detail.**
+    ///
+    /// Pins the contract:
+    /// 1. sha256 mismatch (writer's expected vs received) →
+    ///    `success=false`, `error_msg` mentions both shas.
+    /// 2. The partial file at the resolved path is **deleted**
+    ///    (the user never sees a corrupt half-written file).
+    /// 3. `landed_path` is `None` on failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_inbound_files_task_sha256_mismatch_deletes_partial() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let accept_dir = TempDir::new().expect("tempdir");
+                let (applied_tx, mut applied_rx) =
+                    tokio_mpsc::unbounded_channel::<InboundFileApplyResult>();
+
+                // Body bytes intentionally do NOT match the
+                // entry's declared sha. (The entry says sha = 0xEE
+                // * 32 but the body hashes to something else.)
+                let body: Vec<u8> = b"these bytes will not match the declared sha".to_vec();
+                let entry = fake_entry(
+                    "corrupt.bin",
+                    0xEE,
+                    body.len() as u64,
+                    "application/octet-stream",
+                );
+                let body_for_fetcher = body.clone();
+                let expected_landed_path = accept_dir.path().join("corrupt.bin");
+
+                let fetcher =
+                    async move { Ok::<(u16, Vec<u8>), String>((200u16, body_for_fetcher)) };
+
+                let source: SocketAddr = "10.2.1.15:50247".parse().unwrap();
+
+                tokio::task::spawn_local(apply_inbound_files_task(
+                    applied_tx,
+                    entry.sha256,
+                    entry.name.clone(),
+                    entry.size,
+                    entry.mime.clone(),
+                    source,
+                    accept_dir.path().to_path_buf(),
+                    fetcher,
+                ));
+
+                let result = applied_rx
+                    .recv()
+                    .await
+                    .expect("apply task must always send exactly one result");
+                assert!(
+                    !result.success,
+                    "sha256 mismatch: success must be false; got success=true"
+                );
+                assert!(
+                    result
+                        .error_msg
+                        .as_deref()
+                        .map(|s| s.contains("sha256 mismatch"))
+                        .unwrap_or(false),
+                    "error_msg must name the sha256 mismatch; got {:?}",
+                    result.error_msg
+                );
+                assert!(
+                    result.landed_path.is_none(),
+                    "failure path: landed_path must be None"
+                );
+                // Verify the partial file at the expected path
+                // was deleted (the cleanup contract).
+                assert!(
+                    !expected_landed_path.exists(),
+                    "sha256 mismatch: partial file at {} must be deleted \
+                     — exists, leaving a corrupt file visible to the user",
+                    expected_landed_path.display()
+                );
+            })
+            .await;
+    }
+
+    /// **GET 404 path: source daemon's HTTP/3 server route is
+    /// still a 404 stub (lands in STEP-3a.4) — the receiver must
+    /// report `success=false` with an HTTP/3 GET status error
+    /// (not panic / hang) and must NOT spawn_blocking for the
+    /// write.**
+    ///
+    /// Pins the contract:
+    /// 1. GET non-200 status → `success=false`.
+    /// 2. `error_msg` mentions the GET status code.
+    /// 3. No file is written to `accept_dir`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_inbound_files_task_get_404_reports_failure_without_writing() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let accept_dir = TempDir::new().expect("tempdir");
+                let (applied_tx, mut applied_rx) =
+                    tokio_mpsc::unbounded_channel::<InboundFileApplyResult>();
+
+                let entry = fake_entry("absent.bin", 0x99, 100, "application/octet-stream");
+
+                // Mock fetcher returns 404 (mimics STEP-3a.4
+                // pre-landing: the source daemon's route is a stub
+                // that 404s).
+                let fetcher = async { Ok::<(u16, Vec<u8>), String>((404u16, Vec::<u8>::new())) };
+
+                let source: SocketAddr = "10.2.1.15:50247".parse().unwrap();
+
+                tokio::task::spawn_local(apply_inbound_files_task(
+                    applied_tx,
+                    entry.sha256,
+                    entry.name.clone(),
+                    entry.size,
+                    entry.mime.clone(),
+                    source,
+                    accept_dir.path().to_path_buf(),
+                    fetcher,
+                ));
+
+                let result = applied_rx
+                    .recv()
+                    .await
+                    .expect("apply task must always send exactly one result");
+                assert!(
+                    !result.success,
+                    "GET 404: success must be false; got success=true"
+                );
+                assert!(
+                    result
+                        .error_msg
+                        .as_deref()
+                        .map(|s| s.contains("returned 404"))
+                        .unwrap_or(false),
+                    "error_msg must mention the GET status; got {:?}",
+                    result.error_msg
+                );
+                // Verify no file was written.
+                let expected_landed_path = accept_dir.path().join("absent.bin");
+                assert!(
+                    !expected_landed_path.exists(),
+                    "GET 404: no file must be written — found {}",
+                    expected_landed_path.display()
+                );
+            })
+            .await;
+    }
+
+    /// **Helper unit test — `resolve_unique_path` returns
+    /// `<name>` directly when no collision, appends `(1)` on first
+    /// collision, etc.**
+    ///
+    /// Pins the path-resolution contract independently from the
+    /// full spawned task (so a future bug in path resolution
+    /// surfaces without needing to drive the full pipeline).
+    #[test]
+    fn resolve_unique_path_no_collision_returns_input() {
+        let dir = TempDir::new().expect("tempdir");
+        let resolved = resolve_unique_path(dir.path(), "fresh.bin");
+        assert_eq!(resolved, dir.path().join("fresh.bin"));
+    }
+
+    #[test]
+    fn resolve_unique_path_first_collision_appends_one() {
+        let dir = TempDir::new().expect("tempdir");
+        // Pre-create the file at <name>.
+        std::fs::write(dir.path().join("photo.jpg"), b"occupied").unwrap();
+        let resolved = resolve_unique_path(dir.path(), "photo.jpg");
+        assert_eq!(
+            resolved,
+            dir.path().join("photo (1).jpg"),
+            "first collision must yield '<stem> (1).<ext>' (Finder / Explorer convention)"
+        );
+    }
+
+    #[test]
+    fn resolve_unique_path_two_collisions_appends_two() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("photo.jpg"), b"a").unwrap();
+        std::fs::write(dir.path().join("photo (1).jpg"), b"b").unwrap();
+        let resolved = resolve_unique_path(dir.path(), "photo.jpg");
+        assert_eq!(resolved, dir.path().join("photo (2).jpg"));
+    }
+
+    #[test]
+    fn resolve_unique_path_handles_extensionless_name() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("Makefile"), b"a").unwrap();
+        let resolved = resolve_unique_path(dir.path(), "Makefile");
+        assert_eq!(resolved, dir.path().join("Makefile (1)"));
+    }
+
+    #[test]
+    fn write_and_verify_file_blocking_happy_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("x.bin");
+        let bytes = b"some-bytes".to_vec();
+        let expected = sha256_of_bytes_for_test(&bytes);
+        write_and_verify_file_blocking(path.clone(), bytes.clone(), expected)
+            .expect("happy path must succeed");
+        let on_disk = std::fs::read(&path).expect("read back");
+        assert_eq!(on_disk, bytes);
+    }
+
+    #[test]
+    fn write_and_verify_file_blocking_mismatch_deletes_partial() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("y.bin");
+        let bytes = b"actual-bytes".to_vec();
+        // Wrong expected sha → should Err + delete the partial.
+        let wrong_sha = [0xFFu8; 32];
+        let result = write_and_verify_file_blocking(path.clone(), bytes, wrong_sha);
+        assert!(result.is_err(), "sha mismatch must return Err");
+        assert!(
+            !path.exists(),
+            "mismatch: partial file at {} must be deleted",
+            path.display()
+        );
     }
 }
