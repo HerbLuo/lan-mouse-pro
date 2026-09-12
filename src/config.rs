@@ -97,7 +97,7 @@ struct ConfigToml {
 /// **All fields optional**; missing → compile-time constants in
 /// [`crate::quic_transport::tls`]. `keep_alive_interval` is intentionally
 /// NOT exposed yet: lowering it below `idle_timeout` panics in quinn,
-/// and the 2s default has never been wrong on a LAN.
+/// and the 5s default has never been wrong on a LAN.
 ///
 /// **Why `idle_timeout_secs` is user-tunable**: this is the master
 /// side's only death-detection signal — see the
@@ -105,17 +105,10 @@ struct ConfigToml {
 /// shrink the "mouse stuck during a network blip" window but
 /// increase the chance of a false-positive on a briefly-flaky
 /// link (Wi-Fi roam, USB ethernet reset, etc.).
-///
-/// **2026-09-11 — BUGS-2 default bump**: the default was raised
-/// from 5s to 30s so the bulk conn (no app-layer stream activity in
-/// its steady state) survives the typical 10-20s gap between
-/// clipboard copies without forced re-dial. See
-/// `next/BUGS-2.md` and `tls::MAX_IDLE_TIMEOUT`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct TomlQuic {
-    /// QUIC `max_idle_timeout` in seconds. Default 30
-    /// (see [`crate::quic_transport::tls::MAX_IDLE_TIMEOUT`]).
-    /// Must be ≥ the keep-alive interval (2s) — values below that
+    /// QUIC `max_idle_timeout` in seconds. Default 5.
+    /// Must be ≥ the keep-alive interval (5s) — values below that
     /// will be clamped at the transport-config layer.
     idle_timeout_secs: Option<u64>,
 }
@@ -749,18 +742,17 @@ impl Config {
     }
 
     /// Effective QUIC `max_idle_timeout` (seconds) → [`Duration`].
-    /// Default 30s — see `tls::MAX_IDLE_TIMEOUT`. Was 5s before
-    /// 2026-09-11 (BUGS-2: the 5s/5s combo killed the bulk conn
-    /// after ~10s of symmetric idle because bulk conns carry no
-    /// app-layer streams and keepalive never got a chance to fire).
+    /// Default 5s — lowered from the legacy 10s on 2026-09-04 to
+    /// shrink the master-side death-detection window (see
+    /// [`crate::connect::spawn_peer_supervisor`]).
     ///
     /// **Clamp invariant**: must be ≥ the QUIC keep-alive interval
-    /// (2s) — quinn panics otherwise. Configurations below 5s are
+    /// (5s) — quinn panics otherwise. Configurations below 5s are
     /// clamped up to 5s at this layer so a stale TOML written by
     /// an older daemon (or a misconfigured user) cannot crash the
     /// process.
     pub(crate) fn quic_idle_timeout(&self) -> std::time::Duration {
-        const DEFAULT: u64 = 30;
+        const DEFAULT: u64 = 5;
         const MIN_SECS: u64 = 5;
         let raw = self
             .config_toml

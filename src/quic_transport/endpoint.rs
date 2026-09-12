@@ -97,10 +97,8 @@ pub fn endpoint(addr: SocketAddr) -> Result<Endpoint> {
 ///
 /// **`transport_config`**: chained onto the config via
 /// `server_cfg.transport_config(...)` with
-/// [`super::tls::default_transport_config`] — 2s keepalive /
-/// caller-supplied idle_timeout (default 30s via
-/// `Config::quic_idle_timeout`; see BUGS-2 for why the legacy 5s/5s
-/// combo killed the bulk conn after ~10s).
+/// [`super::tls::default_transport_config`] — 5s keepalive /
+/// caller-supplied idle_timeout.
 ///
 /// **Error normalization**: reuses existing variants — no new ones added:
 /// - `crypto::rustls_server_config` failure → `Error::Crypto(#[from])`
@@ -181,7 +179,7 @@ pub fn endpoint_with_verifier(
 /// internal state and unrelated to the server_cfg.
 ///
 /// **`idle_timeout`**: caller-supplied QUIC `max_idle_timeout` (must be
-/// ≥ 2s — the keep-alive interval). See [`tls::default_transport_config`].
+/// ≥ 5s — the keep-alive interval). See [`tls::default_transport_config`].
 fn endpoint_inner(
     addr: SocketAddr,
     rustls_server_arc: Arc<rustls::ServerConfig>,
