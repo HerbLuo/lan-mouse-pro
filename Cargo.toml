@@ -77,6 +77,11 @@ sha2 = "0.10.8"
 notify = "8.2.0"
 # M0b STEP-0.2: HTTP/3-lite streaming uses `Bytes` for the body buffer.
 bytes = "1"
+# M3a STEP-3a.2: desktop notification wrapper for early-reject
+# (ExceedsLimit) + future M4 STEP-4.4 GeneralPanel "clipboard
+# was just changed by peer" hints. Pulled in here at the workspace
+# level; the popup module itself is `src/popup.rs`.
+notify-rust = "4"
 
 # Web frontend. axum for HTTP/WS, rust-embed for baking the built Vue
 # bundle into the binary, open to launch the user's default browser
