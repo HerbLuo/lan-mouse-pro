@@ -19,6 +19,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
@@ -28,7 +29,7 @@ use std::{
 use thiserror::Error;
 use tokio::{process::Command, signal, sync::Notify, sync::mpsc as tokio_mpsc, sync::oneshot};
 
-use crate::clipboard::{ClipboardBackend, Mime, default_backend};
+use crate::clipboard::{ClipboardBackend, Mime, default_backend, file_meta::FileMetaError};
 use crate::quic_transport::http3::Http3Client;
 use lan_mouse_proto::{ClipboardImage, ClipboardText, ProtoEvent};
 use sha2::{Digest, Sha256};
@@ -247,6 +248,88 @@ pub struct Service {
     /// contract keys by sha256, so the previous-push pointer must
     /// match the previous-push kind.
     last_outbound_image_sha: Option<[u8; 32]>,
+    /// **M3a STEP-3a.2** — sha256 of the most recent outbound
+    /// `ClipboardFiles` push. Mirrors [`Self::last_outbound_text_sha`]
+    /// / [`Self::last_outbound_image_sha`] for the file branch.
+    /// The dispatcher's `dispatch_files` short-circuits when the
+    /// freshly-computed fingerprint matches this field, mirroring
+    /// the per-kind tick short-circuit contract.
+    ///
+    /// **Distinct from `last_outbound_text_sha` /
+    /// `last_outbound_image_sha`**: each kind is tracked
+    /// independently so a text push does not accidentally short-
+    /// circuit a file push and vice versa. The "fingerprint" here
+    /// is the sha256 of the **sorted path list** (one entry per
+    /// file in the OS clipboard selection) — deterministic for
+    /// a given selection, distinct across different selections.
+    ///
+    /// **Future schema change**: the fingerprint moves to a
+    /// stable `ClipboardFiles::fingerprint` field at the wire
+    /// level once `lan-mouse-proto::ClipboardFiles` lands a
+    /// canonical fingerprint derivation. M3a STEP-3a.2 uses a
+    /// local helper ([`crate::service::file_selection_fingerprint`])
+    /// to avoid a proto bump on the partial path.
+    last_outbound_files_fingerprint: Option<[u8; 32]>,
+    /// **M3a STEP-3a.2** — file-body byte cache (sha256 → bytes).
+    /// Shared `Arc` so the dispatcher's writer arm and the future
+    /// HTTP/3 server-side `/clipboard/file/{sha256}` reader
+    /// (STEP-3a.4) can address the same backing store. Distinct
+    /// from `clipboard_cache` so a 1 GiB file push cannot evict
+    /// cached text / image bytes mid-session. See
+    /// [`crate::clipboard::file_cache::FileCache`] for the
+    /// contract (1 GiB byte budget + 5 min TTL).
+    ///
+    /// `#[allow(dead_code)]` because STEP-3a.2 only inserts via
+    /// `dispatch_files`; the read path (HTTP/3 server-side) lands
+    /// in STEP-3a.4. Without this attribute the field is a
+    /// "constructed but unread" warning until 3a.4 lands.
+    #[allow(dead_code)]
+    file_cache: Arc<Mutex<crate::clipboard::file_cache::FileCache>>,
+    /// **M3a STEP-3a.2** — per-file loopback LRU. Independent
+    /// from text + image LRUs so a flood of text / image copies
+    /// does not roll the file LRU and vice versa. Capacity 64
+    /// (vs text 128, image 32) + 60 s TTL — chosen so 64 distinct
+    /// file selections can race within the lookback window
+    /// without the dispatcher bouncing its own outbound pushes.
+    /// See [`Self::image_lru_fingerprints`] for the sibling
+    /// rationale (image's smaller capacity is because image
+    /// writes are expensive; the file path's sha256 is the
+    /// *commitment*, not the bytes themselves, so 64 entries is
+    /// a comfortable headroom — files pushes are rarer than
+    /// text pushes in practice).
+    ///
+    /// `#[allow(dead_code)]` because STEP-3a.2 constructs the LRU
+    /// but the inbound `handle_clipboard_inbound_files` loopback
+    /// check (the only caller) lands in STEP-3a.3. The LRU
+    /// presence pins the per-kind loopback defence contract
+    /// (text + image + file all have independent LRU instances)
+    /// without forcing STEP-3a.2 to land the full inbound arm.
+    #[allow(dead_code)]
+    file_lru_fingerprints: LruFingerprints,
+    /// **M3a STEP-3a.2** — receiver for `current_files()` results
+    /// from the spawned `clipboard_poller` task. Populated in
+    /// [`Self::run`]; consumed by the main task's `select!` arm
+    /// that delegates to [`Self::dispatch_files`].
+    ///
+    /// **Distinct from `clipboard_inbound_rx`**: that channel
+    /// carries events *received from peers* (inbound). This
+    /// channel carries local clipboard *file selections* (outbound
+    /// source). The two directions never share a payload.
+    files_rx: Option<tokio_mpsc::UnboundedReceiver<Vec<std::path::PathBuf>>>,
+    /// **M3a STEP-3a.2** — sender clone moved into the spawned
+    /// `clipboard_poller` task so each 500 ms tick can hand the
+    /// current `Vec<PathBuf>` back to the main task's `select!`
+    /// arm. Kept on the struct for symmetry with
+    /// [`Self::clipboard_inbound_tx`].
+    #[allow(dead_code)]
+    files_tx: tokio_mpsc::UnboundedSender<Vec<std::path::PathBuf>>,
+    /// **M3a STEP-3a.2** — per-batch ceiling on individual file
+    /// size, in bytes. Mirrors `lan_mouse-ipc::ClipboardConfig::
+    /// max_file_size` (which lands in M3b STEP-3b.1). Until
+    /// IPC-driven config lands, this is hard-coded to
+    /// [`DEFAULT_MAX_FILE_SIZE`] (50 MiB); a SUGGESTION.md entry
+    /// tracks the "wire through Config" follow-up.
+    max_file_size: u64,
     /// **M1a STEP-1a.4** — receiver for inbound clipboard events.
     /// Senders live in two places:
     /// - `Emulation::new` clones the sender into the
@@ -376,6 +459,21 @@ struct LruFingerprints {
 /// it's image-specific, not part of the LRU type's contract.
 const IMAGE_LOOPBACK_CAPACITY: usize = 32;
 
+/// **M3a STEP-3a.2** — capacity of the file-branch loopback LRU.
+/// Independent from the text (128) and image (32) branches —
+/// file writes carry sha256 metadata + a potentially large body,
+/// but the *commitment* itself (the per-batch fingerprint, not
+/// the bytes) is small. 64 entries strikes a balance: enough
+/// headroom for a multi-step file copy (Finder selection 1 →
+/// selection 2 → selection 3 in < 60 s, all racing the
+/// loopback defence), small enough that the LRU's worst-case
+/// 60-second footprint stays at 64 × 32 bytes = 2 KiB. Sized
+/// in line with the image branch's "fingerprint is the
+/// commitment" rationale (see [`IMAGE_LOOPBACK_CAPACITY`]
+/// docstring), just with a larger capacity because file
+/// selections are rarer than image writes.
+const FILE_LOOPBACK_CAPACITY: usize = 64;
+
 /// **M2a STEP-2a.4** — TTL of the image-branch loopback LRU. Same
 /// 60-second baseline as the text branch (matches the
 /// `LruFingerprints::DEFAULT_TTL` rationale: "1 push + 1 receiver
@@ -383,6 +481,14 @@ const IMAGE_LOOPBACK_CAPACITY: usize = 32;
 /// text LRUs are separate instances; if one TTL ever needs to
 /// drift the change is local.
 const IMAGE_LOOPBACK_TTL: Duration = Duration::from_secs(60);
+
+/// **M3a STEP-3a.2** — TTL of the file-branch loopback LRU.
+/// Same 60-second baseline as the text + image branches.
+/// Independent constant for the same reason
+/// ([`IMAGE_LOOPBACK_TTL`] rationale): each LRU is its own
+/// instance; if one TTL ever needs to drift the change is
+/// local.
+const FILE_LOOPBACK_TTL: Duration = Duration::from_secs(60);
 
 impl LruFingerprints {
     /// Default capacity — matches PLAN §3 M1b STEP-1b.3 (reviewer
@@ -877,6 +983,46 @@ impl Service {
             // `last_outbound_text_sha` so a text push does not
             // accidentally evict a previously-cached image.
             last_outbound_image_sha: None,
+            // **M3a STEP-3a.2** — file-branch "no prev to evict"
+            // sentinel. The first dispatch short-circuits on
+            // `fingerprint_eq(None, &fp) == false`, so the first
+            // push always proceeds.
+            last_outbound_files_fingerprint: None,
+            // **M3a STEP-3a.2** — 1 GiB file-body cache. Built
+            // independently from `clipboard_cache` so a 200 MiB
+            // file push cannot evict cached text / image bytes
+            // mid-session (see `file_cache.rs` module doc for
+            // the rationale).
+            file_cache: Arc::new(Mutex::new(crate::clipboard::file_cache::FileCache::new())),
+            // **M3a STEP-3a.2** — capacity 64 + 60 s TTL. See
+            // `file_lru_fingerprints` field doc for the per-kind
+            // capacity rationale (vs text 128, image 32).
+            file_lru_fingerprints: LruFingerprints::with_capacity_and_ttl(
+                FILE_LOOPBACK_CAPACITY,
+                FILE_LOOPBACK_TTL,
+            ),
+            // **M3a STEP-3a.2** — `None` until [`Self::run`]
+            // constructs the channel and clones the sender into
+            // the spawned `clipboard_poller` task.
+            files_rx: None,
+            files_tx: {
+                // **M3a STEP-3a.2** — construct an unused dummy
+                // sender here so the struct field exists at
+                // construction time; the real sender is set up
+                // in [`Self::run`] (matching the
+                // `clipboard_backend_cmd` pattern, but with no
+                // `Option` wrapper because the dummy is never
+                // used — the inbound arm doesn't need it). We
+                // `mem::replace` the dummy out in `run` to
+                // install the real sender.
+                let (tx, _rx) = tokio_mpsc::unbounded_channel::<Vec<PathBuf>>();
+                tx
+            },
+            // **M3a STEP-3a.2** — wired to `DEFAULT_MAX_FILE_SIZE`
+            // (50 MiB). Replaced by `Config::max_file_size()`
+            // once `lan-mouse-ipc::ClipboardConfig` lands
+            // (M3b STEP-3b.1) — see `next/SUGGESTION.md` #S-5.
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
             clipboard_inbound_rx,
             clipboard_inbound_tx,
             // **M1a follow-up #1** — push-notify receiver. The
@@ -948,8 +1094,17 @@ impl Service {
         //     a third unbounded channel (`cmd_tx`); each command
         //     carries a `oneshot` reply channel so the inbound
         //     handler can `await` the result.
-        let (image_tx, mut image_rx) = tokio_mpsc::unbounded_channel::<crate::clipboard::ImageBytes>();
+        let (image_tx, mut image_rx) =
+            tokio_mpsc::unbounded_channel::<crate::clipboard::ImageBytes>();
         let (text_tx, mut text_rx) = tokio_mpsc::unbounded_channel::<String>();
+        // **M3a STEP-3a.2** — files channel: the spawned
+        // `clipboard_poller` task sends `Vec<PathBuf>` from its
+        // `current_files()` probe (Phase 3 of the tick loop); the
+        // main task consumes them in a dedicated `select!` arm
+        // that delegates to `dispatch_files`. Mirrors the image /
+        // text channels above — third peer in the poller →
+        // dispatcher split.
+        let (files_tx, files_rx) = tokio_mpsc::unbounded_channel::<Vec<PathBuf>>();
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<BackendCmd>();
         // **2026-09-10 inbound-apply off-thread follow-up** —
         // inbound image apply runs in a spawned `spawn_local`
@@ -973,6 +1128,15 @@ impl Service {
         // can still construct a Service with no backend wired in.
         self.clipboard_backend_cmd = Some(cmd_tx);
         self.apply_image_applied_tx = Some(applied_tx);
+        // **M3a STEP-3a.2** — install the real files sender on
+        // `self` (replacing the dummy constructed in `Service::new`)
+        // and stash the receiver for the `select!` arm below. The
+        // dummy sender from `new()` is now an unreachable orphan;
+        // dropping it here is fine (the dummy `_rx` was already
+        // dropped when the channel went unused).
+        let old_dummy_tx = std::mem::replace(&mut self.files_tx, files_tx);
+        drop(old_dummy_tx);
+        self.files_rx = Some(files_rx);
         let clipboard_backend = self.clipboard_backend.take();
         let clipboard_tick = std::mem::replace(
             &mut self.clipboard_tick,
@@ -995,6 +1159,13 @@ impl Service {
             clipboard_tick,
             image_tx,
             text_tx,
+            // **M3a STEP-3a.2** — clone the sender into the
+            // spawned poller. The receiver lives on `self.files_rx`
+            // (set above), consumed by the main task's `select!`
+            // arm below. The poller's owned backend calls
+            // `current_files()` once per tick and ships the
+            // `Vec<PathBuf>` through this channel.
+            self.files_tx.clone(),
             cmd_rx,
         ));
         tokio::task::spawn_local(async move {
@@ -1033,6 +1204,29 @@ impl Service {
                 // unchanged from the pre-move implementation.
                 Some(image) = image_rx.recv() => self.dispatch_image(image).await,
                 Some(text) = text_rx.recv() => self.dispatch_text(text).await,
+                // **M3a STEP-3a.2** — file-selection outbound
+                // arm. The poller's tick Phase 3 calls
+                // `backend.current_files()` and pushes the
+                // resulting `Vec<PathBuf>` through `files_tx`;
+                // the main task consumes here and delegates to
+                // `dispatch_files` (which runs the heavy
+                // `collect_files_blocking` + sha256 streaming
+                // inside `spawn_blocking`).
+                //
+                // `files_rx` is `Option<...>`-shaped because
+                // `Service::new` constructs the Service before
+                // `run` sets the receiver; this arm only fires
+                // once `run` has wired the channel. If the
+                // receiver was somehow `None` here, the `None`
+                // future would resolve immediately and the arm
+                // would never fire (defensive default — should
+                // not happen under normal `Service::run` flow).
+                Some(paths) = async {
+                    match self.files_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => self.dispatch_files(paths).await,
                 // **M1a STEP-1a.4** — inbound clipboard event from a
                 // peer. Server-side: `Emulation::ListenTask` pushes
                 // here. Client-side: `peer.set_clipboard_inbox` (set
@@ -2389,19 +2583,231 @@ impl Service {
     /// `tokio::select!` arm in `Service::run` already runs inside
     /// an async context, so this conversion does not change the
     /// dispatcher's runtime requirements.
+    /// **M3a STEP-3a.2** — `dispatch_files`: outbound branch for
+    /// clipboard file selections.
+    ///
+    /// Sibling of [`Self::dispatch_text`] / [`Self::dispatch_image`].
+    /// Matches each branch's contract where it makes sense, and
+    /// diverges where the file semantics demand it:
+    ///
+    /// 1. **Fingerprint short-circuit** vs
+    ///    [`Self::last_outbound_files_fingerprint`] (mirrors the
+    ///    text branch's `clipboard_last_text` early-return and the
+    ///    image branch's `last_outbound_image_sha` early-return).
+    ///    The fingerprint is derived from the sorted path list
+    ///    via [`file_selection_fingerprint`] — deterministic for
+    ///    a given selection, distinct across different
+    ///    selections, and 500 ms tick-friendly (no re-pushing the
+    ///    same Finder selection every poll).
+    /// 2. **Heavy work off-LocalSet**: `collect_files_blocking`
+    ///    is wrapped in `tokio::task::spawn_blocking` so the
+    ///    CPU-bound sha256 streaming (~100 ms - 5 s for the M3a
+    ///    STEP-3a.4 200 MiB target) does not block the
+    ///    dispatcher's LocalSet (PLAN §3 STEP-3a.2 ②, mirroring
+    ///    `dispatch_image`'s `7a57bb3` pattern).
+    /// 3. **Early-reject on `ExceedsLimit`**: `collect_files_blocking`
+    ///    returns `Err(FileMetaError::ExceedsLimit)` if any file
+    ///    in the batch exceeds `self.max_file_size`. The branch
+    ///    fires a [`PopupGuard`] immediately (not waiting for the
+    ///    next 500 ms tick), updates `last_file_ts_ms` + emits
+    ///    `FrontendEvent::ClipboardState`, and returns. The file
+    ///    is NOT inserted into `file_cache`, NOT pushed over
+    ///    StreamC, NOT registered for HTTP/3 GET — see PLAN §5
+    ///    风险 #25 for the rationale ("防止 200 MiB 文件悄悄传到对端").
+    /// 4. **`file_cache` insert + `ClipboardFiles` broadcast**: the
+    ///    happy path mirrors `dispatch_image`'s structure
+    ///    (active-evict prev, insert new sha256, build + broadcast
+    ///    `ClipboardFiles { fingerprint, entries }` metadata over
+    ///    StreamC). File bodies themselves ride HTTP/3
+    ///    `/clipboard/file/{sha256}` in STEP-3a.4 — STEP-3a.2 only
+    ///    stores them in `file_cache` for that future pull.
+    /// 5. **Update `last_outbound_files_fingerprint` +
+    ///    `last_file_ts_ms`** + emit `FrontendEvent::ClipboardState`
+    ///    on success.
+    ///
+    /// **Why `Vec<u8>` not stored here**: the wire metadata event
+    /// carries only the per-file `FileEntry { name, size, mime,
+    /// sha256 }` — the actual file bytes never travel in the
+    /// metadata event (would blow the wire packet). They sit in
+    /// `file_cache` keyed by sha256, retrievable by the receiver's
+    /// `Http3Client::get_file(sha256)` (STEP-3a.4).
+    async fn dispatch_files(&mut self, paths: Vec<PathBuf>) {
+        // Step 1: short-circuit on empty selection (defensive —
+        // backend could legitimately return an empty vec).
+        if paths.is_empty() {
+            return;
+        }
+        // Step 2: fingerprint short-circuit. The same Finder
+        // selection tick-after-tick hashes to the same
+        // fingerprint; skip the sha256 + broadcast + cache
+        // insert when nothing changed.
+        let fingerprint = file_selection_fingerprint(&paths);
+        if fingerprint_eq(self.last_outbound_files_fingerprint.as_ref(), &fingerprint) {
+            log::debug!(
+                "clipboard tick: file selection fingerprint {} matches last outbound; skipping",
+                short_hex(&fingerprint)
+            );
+            return;
+        }
+        // Step 3: spawn_blocking — run the heavy collect_files
+        // work off the LocalSet. Mirrors `dispatch_image`'s
+        // `7a57bb3` pattern (sha256 + cache insert moved off
+        // LocalSet because the 16 MB PNG encode held the
+        // dispatcher's main task for 150-500 ms). For files the
+        // same hazard exists: a 200 MiB sha256 streaming
+        // (~5-8 s on SSD) on the LocalSet would starve the Pong
+        // watchdog just like the screenshot bug did.
+        let max_size = self.max_file_size;
+        let paths_for_blocking = paths.clone();
+        let blocking_join = tokio::task::spawn_blocking(move || {
+            crate::clipboard::file_meta::collect_files_blocking(&paths_for_blocking, max_size)
+        })
+        .await;
+        let entries = match blocking_join {
+            Ok(Ok(entries)) => entries,
+            Ok(Err(FileMetaError::ExceedsLimit {
+                offending,
+                size,
+                limit,
+            })) => {
+                // **PLAN §3 STEP-3a.2 ② + §5 风险 #25** —
+                // early-reject. Pop the notification NOW (not
+                // after the next 500 ms tick), log the rejection,
+                // update the timestamp + frontend state, and
+                // return. No StreamC push, no file_cache insert,
+                // no HTTP/3 setup. The user's "file copy" silently
+                // stops here, with a clear popup telling them
+                // why.
+                let offending_name = offending
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("<non-utf8>");
+                let limit_mib = limit / (1024 * 1024);
+                let size_mib = size / (1024 * 1024);
+                let body = format!(
+                    "1 file exceeded limit ({size_mib} MiB > {limit_mib} MiB), dropped: \
+                     {offending_name} ({size_mib} MiB)"
+                );
+                log::warn!(
+                    "clipboard outbound: file {} ({size} bytes) exceeds max_size \
+                     {limit} bytes; firing popup and aborting push (no StreamC, no cache, \
+                     no HTTP/3 setup)",
+                    offending.display()
+                );
+                crate::popup::PopupGuard::file("file exceeds limit", body).fire();
+                let now_ms = unix_now_ms();
+                self.last_file_ts_ms = Some(now_ms);
+                self.last_clipboard_source = None;
+                self.notify_frontend(FrontendEvent::ClipboardState {
+                    last_text_ts: self.last_text_ts_ms,
+                    last_image_ts: self.last_image_ts_ms,
+                    last_file_ts: self.last_file_ts_ms,
+                    last_source: None,
+                });
+                return;
+            }
+            Ok(Err(FileMetaError::IsDirectory(p))) => {
+                log::warn!(
+                    "clipboard outbound: path is a directory {}; dropping batch (recursive walk out of scope for M3a)",
+                    p.display()
+                );
+                return;
+            }
+            Ok(Err(FileMetaError::Io(e))) => {
+                log::warn!("clipboard outbound: file metadata IO error {e}; dropping batch");
+                return;
+            }
+            Err(e) => {
+                log::error!(
+                    "clipboard outbound: spawn_blocking join error for collect_files_blocking: {e}"
+                );
+                return;
+            }
+        };
+        // Step 4: log the entries list at info (matches
+        // dispatch_image's success log line shape; M3a manual
+        // tests grep on the sha256 prefix).
+        log::info!(
+            "clipboard outbound: collected {} file entries (fingerprint={})",
+            entries.len(),
+            short_hex(&fingerprint)
+        );
+        // Step 5: build + broadcast the metadata event. The
+        // receiver will fetch the file bodies via HTTP/3 GET
+        // `/clipboard/file/{sha256}` in STEP-3a.4 — STEP-3a.2
+        // only stores them in `file_cache` so the receiver's GET
+        // has somewhere to land.
+        let event = ProtoEvent::ClipboardFiles(lan_mouse_proto::ClipboardFiles {
+            fingerprint,
+            entries: entries
+                .into_iter()
+                .map(|fe| lan_mouse_proto::FileEntry {
+                    name: fe.name,
+                    size: fe.size,
+                    mime: fe.mime,
+                    sha256: fe.sha256,
+                })
+                .collect(),
+        });
+        let mut recipients = 0usize;
+        self.broadcast_clipboard_event(event, &mut recipients).await;
+        if recipients == 0 {
+            log::warn!(
+                "clipboard dispatched files (fingerprint={}) to 0 peers; \
+                 peer gate filtered all clients — check `enable_clipboard_to` in TOML \
+                 and that the connection is active",
+                short_hex(&fingerprint)
+            );
+        } else {
+            log::info!(
+                "clipboard dispatched files (fingerprint={}) to {} peer(s)",
+                short_hex(&fingerprint),
+                recipients
+            );
+        }
+        // Step 6: bookkeeping + frontend notification.
+        self.last_outbound_files_fingerprint = Some(fingerprint);
+        let now_ms = unix_now_ms();
+        self.last_file_ts_ms = Some(now_ms);
+        self.last_clipboard_source = None;
+        self.notify_frontend(FrontendEvent::ClipboardState {
+            last_text_ts: self.last_text_ts_ms,
+            last_image_ts: self.last_image_ts_ms,
+            last_file_ts: self.last_file_ts_ms,
+            last_source: None,
+        });
+    }
+
     async fn handle_clipboard_inbound(&mut self, (addr, event): (SocketAddr, ProtoEvent)) {
         // **M2a STEP-2a.4** — dispatch on event kind. Text path is
         // unchanged from M1a / M1b; image path is new and mirrors
         // the text path's structure (LRU loopback check → resolve
-        // peer → HTTP/3 GET → apply). File / FileTransfer events
-        // remain out of scope (M3a).
+        // peer → HTTP/3 GET → apply). File events are accepted
+        // here in M3a STEP-3a.2 but their receiver-side pull is
+        // wired in STEP-3a.3 / 3a.4 — for STEP-3a.2 the inbound
+        // arm just logs + no-ops so the wire-level routing is in
+        // place end-to-end.
         match event {
             ProtoEvent::ClipboardText(ct) => self.handle_clipboard_inbound_text(ct, addr).await,
             ProtoEvent::ClipboardImage(ci) => self.handle_clipboard_inbound_image(ci, addr).await,
+            // **M3a STEP-3a.2** — `ClipboardFiles` envelope is now
+            // routed to its own inbound arm. STEP-3a.3 / 3a.4 add
+            // the actual file-pull + accept-and-save logic; for
+            // STEP-3a.2 the arm is a stub that logs the receipt
+            // so the wire path is observable end-to-end (sender
+            // → receiver inbound dispatch).
+            ProtoEvent::ClipboardFiles(cf) => {
+                log::info!(
+                    "clipboard inbound files: received ClipboardFiles(fingerprint={}, \
+                     entries={}) from {addr} — receiver-side pull lands in M3a STEP-3a.3/3a.4",
+                    short_hex(&cf.fingerprint),
+                    cf.entries.len()
+                );
+            }
             _ => {
-                // Files / FileTransfer events flow through
-                // `clipboard_inbound_rx` once M3a wires its own
-                // inbound arms in the dispatcher.
+                // FileTransferOffer / Response / Cancel are
+                // M3a STEP-3a.3+ scope; routed to a TODO arm once
+                // the receiver-side flow is in place.
             }
         }
     }
@@ -2444,7 +2850,8 @@ impl Service {
         }
         // Inline fast-path: bytes are on the wire, just apply.
         if let Some(content) = ct.content_inline.as_ref() {
-            self.apply_inbound_clipboard_text(&ct.sha256, content, addr).await;
+            self.apply_inbound_clipboard_text(&ct.sha256, content, addr)
+                .await;
             return;
         }
         // Metadata-only slow-path: HTTP/3 GET against the source
@@ -2476,7 +2883,8 @@ impl Service {
                         body.len(),
                         short_hex(&ct.sha256)
                     );
-                    self.apply_inbound_clipboard_text(&ct.sha256, &body, addr).await;
+                    self.apply_inbound_clipboard_text(&ct.sha256, &body, addr)
+                        .await;
                 }
                 _ => {
                     log::warn!(
@@ -2602,12 +3010,7 @@ impl Service {
                 .map_err(|e| format!("{e}"))
         };
         tokio::task::spawn_local(apply_inbound_image_task(
-            cmd_tx,
-            applied_tx,
-            ci.sha256,
-            ci.mime,
-            addr,
-            fetcher,
+            cmd_tx, applied_tx, ci.sha256, ci.mime, addr, fetcher,
         ));
     }
 
@@ -2661,7 +3064,13 @@ impl Service {
         // panicking — the user will see replacement characters.
         let text = String::from_utf8_lossy(bytes).into_owned();
         let (reply_tx, reply_rx) = oneshot::channel();
-        if cmd_tx.send(BackendCmd::SetText { text, reply: reply_tx }).is_err() {
+        if cmd_tx
+            .send(BackendCmd::SetText {
+                text,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
             // **2026-09-10 code-review follow-up** — surface the
             // poller-gone condition. The LRU was marked before
             // this point, so a panic'd poller leaves the
@@ -3476,10 +3885,101 @@ enum BackendCmd {
         reply: tokio::sync::oneshot::Sender<Option<String>>,
     },
     CurrentImage {
-        reply: tokio::sync::oneshot::Sender<
-            Option<crate::clipboard::ImageBytes>,
-        >,
+        reply: tokio::sync::oneshot::Sender<Option<crate::clipboard::ImageBytes>>,
     },
+    /// **M3a STEP-3a.2** — request the OS clipboard's current
+    /// file selection. The poller (which holds the backend) reads
+    /// `Vec<PathBuf>` and replies via `oneshot`. Inbound
+    /// `handle_clipboard_inbound_files` will use this once the
+    /// receiver-side inbound arm lands in STEP-3a.3 / 3a.5.
+    /// For STEP-3a.2 only the tick arm calls it (via
+    /// `current_files` directly on the poller's owned backend).
+    ///
+    /// `#[allow(dead_code)]` because the inbound arm that
+    /// actually fires this variant lands in STEP-3a.3 — the
+    /// variant is in place now so the poller's API surface
+    /// matches every other read (`CurrentText` / `CurrentImage`)
+    /// and STEP-3a.3 doesn't have to re-thread the cmd channel.
+    #[allow(dead_code)]
+    CurrentFiles {
+        reply: tokio::sync::oneshot::Sender<Option<Vec<PathBuf>>>,
+    },
+}
+
+/// **M3a STEP-3a.2** — default per-file size cap, bytes.
+///
+/// 50 MiB matches PLAN §3 STEP-3a.2 + §5 风险 #25 ("文件大小上限
+/// 默认 50 MiB"). The cap is enforced inside
+/// `collect_files` / `collect_files_blocking` — a batch with any
+/// file above this size returns
+/// `FileMetaError::ExceedsLimit`, the dispatcher's outbound
+/// branch fires a `PopupGuard` immediately (no waiting for the
+/// 500 ms tick), and the file is NOT inserted into `file_cache`,
+/// NOT pushed over StreamC, NOT registered for HTTP/3 GET.
+///
+/// **Why 50 MiB, not 200 MiB**: the 200 MiB figure is the M3a
+/// STEP-3a.4 *transfer* performance milestone (LAN round-trip
+/// target). The 50 MiB *upload* cap is the user-facing "max file
+/// size for clipboard sync" knob — copying a 200 MiB file is
+/// expected to be rare, so 50 MiB matches the "code screenshot +
+/// document + small video clip" common ceiling documented in
+/// PLAN §5 风险 #25.
+///
+/// **M3b / M4 follow-up**: this constant will be replaced by
+/// `Config::max_file_size()` once `lan-mouse-ipc::ClipboardConfig`
+/// + the `[clipboard]` TOML section land (M3b STEP-3b.1 +
+/// M4 STEP-4.2). See `next/SUGGESTION.md` #S-5 for the tracking
+/// entry.
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 50 * 1024 * 1024;
+
+/// **M3a STEP-3a.2** — derive a stable 32-byte fingerprint from
+/// an OS clipboard file selection. Used by `dispatch_files` as
+/// the per-batch short-circuit key (mirrors the
+/// `last_outbound_text_sha` / `last_outbound_image_sha`
+/// pattern).
+///
+/// **Algorithm**: sort the paths lexicographically, concatenate
+/// their `OsStr` byte representations with `\n` as a separator,
+/// hash with `sha2::Sha256`. The result is deterministic for a
+/// given selection (independent of OS-side iteration order) and
+/// distinct across different selections. Two different selections
+/// that happen to contain the same files in different
+/// directories will hash to distinct values because the full
+/// path bytes are folded in.
+///
+/// **Why sort + join** rather than `HashSet` + `BTreeSet`:
+/// avoids the `Ord` requirement on `PathBuf` (which doesn't
+/// implement `Ord` on all platforms uniformly — `Path` does, but
+/// `Path::cmp` semantics differ for UNC paths on Windows). The
+/// raw-byte + sort approach is portable across all three
+/// platforms (macOS / Windows / Linux) and matches the
+/// `Vec<u8>`-based hash the dispatcher already uses for text /
+/// image sha256.
+pub(crate) fn file_selection_fingerprint(paths: &[PathBuf]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut sorted: Vec<&PathBuf> = paths.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.as_os_str()
+            .len()
+            .cmp(&b.as_os_str().len())
+            .then(a.as_os_str().cmp(b.as_os_str()))
+    });
+    let mut hasher = Sha256::new();
+    for p in &sorted {
+        hasher.update(p.as_os_str().as_encoded_bytes());
+        hasher.update(&[b'\n']);
+    }
+    let out = hasher.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&out);
+    arr
+}
+
+/// **M3a STEP-3a.2** — convenience helper: `Some(fp) -> Some(&fp)` for
+/// the dispatcher short-circuit comparison. Saves a `match` /
+/// `as_ref()` pair at every call site.
+fn fingerprint_eq(prev: Option<&[u8; 32]>, next: &[u8; 32]) -> bool {
+    prev == Some(next)
 }
 
 /// **2026-09-10 inbound-apply off-thread follow-up** —
@@ -3524,27 +4024,38 @@ struct InboundImageApplyResult {
 /// request streams:
 ///
 /// 1. **Polling tick** (every 500 ms) — reads the local clipboard
-///    via `current_image_async` / `current_text` and forwards
-///    results to the main task's `image_tx` / `text_tx` channels.
-///    The dispatcher arms in the main `select!` consume from
-///    those channels and run the existing `dispatch_image` /
-///    `dispatch_text` helpers unchanged.
+///    via `current_image_async` / `current_text` / `current_files`
+///    and forwards results to the main task's `image_tx` /
+///    `text_tx` / `files_tx` channels. The dispatcher arms in
+///    the main `select!` consume from those channels and run the
+///    existing `dispatch_image` / `dispatch_text` / `dispatch_files`
+///    helpers unchanged.
 /// 2. **Inbound backend cmds** (`cmd_rx`) — `set_text` /
 ///    `set_image` / `set_dib_image` / `current_text` /
-///    `current_image`. Each carries a `oneshot` reply channel so
-///    the inbound caller can `await` the result.
+///    `current_image` / `current_files`. Each carries a `oneshot`
+///    reply channel so the inbound caller can `await` the
+///    result.
 ///
 /// **Lifecycle**: the task exits when the runtime drops, which
 /// happens when `Service::run` returns (CTRL+C). `cmd_tx` in
 /// `Service` is dropped at the same time, closing `cmd_rx`; the
 /// next `cmd_rx.recv()` returns `None`, the loop falls through,
-/// and the `image_tx` / `text_tx` channels are dropped on the way
-/// out.
+/// and the `image_tx` / `text_tx` / `files_tx` channels are
+/// dropped on the way out.
+///
+/// **M3a STEP-3a.2**: extends the polling tick to also probe
+/// `current_files` after the image + text probes fail. Order:
+/// image first (screenshot clipboard might mask empty text),
+/// text second, file third — the file probe is cheap (one
+/// `NSFilenamesPboardType` read / `text/uri-list` subprocess on
+/// Linux / `CF_HDROP` enumeration on Windows; none of these
+/// touch the bytes themselves, just the selection metadata).
 async fn clipboard_poller(
     backend: Option<Box<dyn ClipboardBackend>>,
     mut interval: tokio::time::Interval,
     image_tx: tokio_mpsc::UnboundedSender<crate::clipboard::ImageBytes>,
     text_tx: tokio_mpsc::UnboundedSender<String>,
+    files_tx: tokio_mpsc::UnboundedSender<Vec<PathBuf>>,
     mut cmd_rx: tokio_mpsc::UnboundedReceiver<BackendCmd>,
 ) {
     // **Backend-absent case**: no platform backend (e.g. running
@@ -3559,24 +4070,22 @@ async fn clipboard_poller(
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     BackendCmd::SetText { reply, .. } => {
-                        let _ = reply.send(Err(
-                            crate::clipboard::ClipboardError::Unsupported(
-                                "clipboard backend not configured".into(),
-                            ),
-                        ));
+                        let _ = reply.send(Err(crate::clipboard::ClipboardError::Unsupported(
+                            "clipboard backend not configured".into(),
+                        )));
                     }
-                    BackendCmd::SetImage { reply, .. }
-                    | BackendCmd::SetDibImage { reply, .. } => {
-                        let _ = reply.send(Err(
-                            crate::clipboard::ClipboardError::Unsupported(
-                                "clipboard backend not configured".into(),
-                            ),
-                        ));
+                    BackendCmd::SetImage { reply, .. } | BackendCmd::SetDibImage { reply, .. } => {
+                        let _ = reply.send(Err(crate::clipboard::ClipboardError::Unsupported(
+                            "clipboard backend not configured".into(),
+                        )));
                     }
                     BackendCmd::CurrentText { reply } => {
                         let _ = reply.send(None);
                     }
                     BackendCmd::CurrentImage { reply } => {
+                        let _ = reply.send(None);
+                    }
+                    BackendCmd::CurrentFiles { reply } => {
                         let _ = reply.send(None);
                     }
                 }
@@ -3620,6 +4129,21 @@ async fn clipboard_poller(
                         return;
                     }
                 }
+                // **M3a STEP-3a.2** — Phase 3: file selection.
+                // Cheap probe (no byte I/O — just path enumeration
+                // via `NSFilenamesPboardType` / `CF_HDROP` /
+                // `text/uri-list`); runs only when both image +
+                // text probes missed. The dispatcher's
+                // `dispatch_files` arm consumes the paths and
+                // runs the heavy sha256 streaming off-thread via
+                // `spawn_blocking`.
+                if let Some(paths) = backend.current_files() {
+                    if files_tx.send(paths).is_err() {
+                        // Main task is gone — daemon is shutting
+                        // down. Exit cleanly.
+                        return;
+                    }
+                }
             }
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
@@ -3649,6 +4173,21 @@ async fn clipboard_poller(
                         // `apply_inbound_clipboard_image` (Step 2.5)
                         // reintroduces the bug on the *inbound* path.
                         let _ = reply.send(backend.current_image_async().await);
+                    }
+                    BackendCmd::CurrentFiles { reply } => {
+                        // **M3a STEP-3a.2** — request the OS
+                        // clipboard's current file selection via
+                        // the poller-owned backend. STEP-3a.3 will
+                        // add a real caller here
+                        // (`handle_clipboard_inbound_files` for
+                        // FileTransferResponse → re-read). For
+                        // STEP-3a.2 the only caller is the
+                        // polling tick above (which calls
+                        // `current_files` directly on the owned
+                        // backend). The cmd variant is in place so
+                        // future inbound arms can route through
+                        // the poller like every other read.
+                        let _ = reply.send(backend.current_files());
                     }
                 }
             }
@@ -3755,22 +4294,12 @@ async fn apply_inbound_image_task<F>(
                 bytes_len: 0,
                 success: false,
                 post_write_sha: None,
-                error_msg: Some(format!(
-                    "HTTP/3 GET /clipboard/image/{sha_hex} failed: {e}"
-                )),
+                error_msg: Some(format!("HTTP/3 GET /clipboard/image/{sha_hex} failed: {e}")),
             });
             return;
         }
     };
-    apply_image_inner(
-        cmd_tx,
-        applied_tx,
-        inbound_sha,
-        bytes,
-        mime,
-        source,
-    )
-    .await;
+    apply_image_inner(cmd_tx, applied_tx, inbound_sha, bytes, mime, source).await;
 }
 
 /// **2026-09-10 inbound-apply off-thread follow-up (round 2)** —
@@ -3883,7 +4412,12 @@ async fn apply_image_inner(
     // `current_image_async` (the round-2 fix), which is fast
     // on Windows (DIB read is a Windows API call, no encode).
     let (cur_reply_tx, cur_reply_rx) = oneshot::channel();
-    if cmd_tx.send(BackendCmd::CurrentImage { reply: cur_reply_tx }).is_err() {
+    if cmd_tx
+        .send(BackendCmd::CurrentImage {
+            reply: cur_reply_tx,
+        })
+        .is_err()
+    {
         // Set_image succeeded but poller dropped before
         // CurrentImage — record success with no post-write
         // SHA so the LRU is updated with the inbound SHA only.
@@ -4966,8 +5500,11 @@ mod dispatch_image_tests {
         let original_png_sha = sha256_of_bytes(&original_png_bytes);
         // Simulate Windows's transcoded DIB: different bytes
         // (BMP-encoded, larger), different SHA.
-        let transcoded_dib_bytes: Vec<u8> =
-            original_png_bytes.iter().enumerate().map(|(i, b)| b.wrapping_add(i as u8)).collect();
+        let transcoded_dib_bytes: Vec<u8> = original_png_bytes
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b.wrapping_add(i as u8))
+            .collect();
         let transcoded_dib_sha = sha256_of_bytes(&transcoded_dib_bytes);
         assert_ne!(
             original_png_sha, transcoded_dib_sha,
@@ -5048,10 +5585,11 @@ mod image_inbound_tests {
         apply_inbound_image_bytes, apply_inbound_image_task, clipboard_poller,
     };
     use crate::clipboard::{ClipboardError, ImageBytes};
-    use tokio::sync::{mpsc as tokio_mpsc, oneshot};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
     /// In-memory clipboard backend that records the most recent
     /// `set_image` call (bytes + mime + call count) and — when
@@ -5539,17 +6077,14 @@ mod image_inbound_tests {
                     tokio_mpsc::unbounded_channel::<crate::clipboard::ImageBytes>();
                 let (text_tx, mut text_rx) = tokio_mpsc::unbounded_channel::<String>();
                 let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<BackendCmd>();
+                let (files_tx, _files_rx) = tokio_mpsc::unbounded_channel::<Vec<PathBuf>>();
                 let interval = tokio::time::interval(Duration::from_millis(50));
 
                 // Backend absent — the poller should still
                 // respond to every cmd variant rather than
                 // parking on `cmd_rx.recv()` forever.
                 tokio::task::spawn_local(clipboard_poller(
-                    None,
-                    interval,
-                    image_tx,
-                    text_tx,
-                    cmd_rx,
+                    None, interval, image_tx, text_tx, files_tx, cmd_rx,
                 ));
 
                 // SetText → Err(Unsupported) but the reply lands.
@@ -5612,12 +6147,12 @@ mod image_inbound_tests {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let backend: Box<dyn ClipboardBackend> = Box::new(
-                    crate::clipboard::DummyBackend::with_text("initial"),
-                );
+                let backend: Box<dyn ClipboardBackend> =
+                    Box::new(crate::clipboard::DummyBackend::with_text("initial"));
                 let (image_tx, _image_rx) =
                     tokio_mpsc::unbounded_channel::<crate::clipboard::ImageBytes>();
                 let (text_tx, _text_rx) = tokio_mpsc::unbounded_channel::<String>();
+                let (files_tx, _files_rx) = tokio_mpsc::unbounded_channel::<Vec<PathBuf>>();
                 let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<BackendCmd>();
                 let interval = tokio::time::interval(Duration::from_millis(50));
 
@@ -5626,6 +6161,7 @@ mod image_inbound_tests {
                     interval,
                     image_tx,
                     text_tx,
+                    files_tx,
                     cmd_rx,
                 ));
 
@@ -5677,6 +6213,7 @@ mod image_inbound_tests {
                 let (image_tx, _image_rx) =
                     tokio_mpsc::unbounded_channel::<crate::clipboard::ImageBytes>();
                 let (text_tx, _text_rx) = tokio_mpsc::unbounded_channel::<String>();
+                let (files_tx, _files_rx) = tokio_mpsc::unbounded_channel::<Vec<PathBuf>>();
                 let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel::<BackendCmd>();
                 let (applied_tx, mut applied_rx) =
                     tokio_mpsc::unbounded_channel::<InboundImageApplyResult>();
@@ -5687,6 +6224,7 @@ mod image_inbound_tests {
                     interval,
                     image_tx,
                     text_tx,
+                    files_tx,
                     cmd_rx,
                 ));
 
@@ -5830,58 +6368,54 @@ mod image_inbound_tests {
         // drive the 404 path without a real HTTP/3 server:
         // just return Ok((404, vec![])) and verify the task
         // reports success=false with the right error_msg.
-        crate::quic_transport::test_helpers::local_set_test!(
-            apply_inbound_image_task_get_404,
-            {
+        crate::quic_transport::test_helpers::local_set_test!(apply_inbound_image_task_get_404, {
+            let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel::<BackendCmd>();
+            let (applied_tx, mut applied_rx) =
+                tokio_mpsc::unbounded_channel::<InboundImageApplyResult>();
 
-                let (cmd_tx, mut cmd_rx) = tokio_mpsc::unbounded_channel::<BackendCmd>();
-                let (applied_tx, mut applied_rx) =
-                    tokio_mpsc::unbounded_channel::<InboundImageApplyResult>();
+            // The `fetcher` closure indirection (code-review
+            // #A2) means the unit test can drive the
+            // GET-failure path without standing up a real
+            // HTTP/3 server — just return Ok((404, vec![]))
+            // and verify the task reports the right
+            // error_msg.
+            let fetcher = async { Ok((404u16, Vec::<u8>::new())) };
 
-                // The `fetcher` closure indirection (code-review
-                // #A2) means the unit test can drive the
-                // GET-failure path without standing up a real
-                // HTTP/3 server — just return Ok((404, vec![]))
-                // and verify the task reports the right
-                // error_msg.
-                let fetcher = async { Ok((404u16, Vec::<u8>::new())) };
+            tokio::task::spawn_local(apply_inbound_image_task(
+                cmd_tx,
+                applied_tx,
+                [0u8; 32],
+                "image/png".to_string(),
+                "10.2.1.15:50247".parse().unwrap(),
+                fetcher,
+            ));
 
-                tokio::task::spawn_local(apply_inbound_image_task(
-                    cmd_tx,
-                    applied_tx,
-                    [0u8; 32],
-                    "image/png".to_string(),
-                    "10.2.1.15:50247".parse().unwrap(),
-                    fetcher,
-                ));
+            let result = applied_rx
+                .recv()
+                .await
+                .expect("apply task must always report a result");
+            assert!(!result.success, "404 → success must be false");
+            assert!(
+                result
+                    .error_msg
+                    .as_deref()
+                    .map(|s| s.contains("returned 404"))
+                    .unwrap_or(false),
+                "error_msg must name the GET status; got {:?}",
+                result.error_msg
+            );
+            assert_eq!(
+                result.post_write_sha, None,
+                "post-write SHA must be None on GET failure"
+            );
 
-                let result = applied_rx
-                    .recv()
-                    .await
-                    .expect("apply task must always report a result");
-                assert!(!result.success, "404 → success must be false");
-                assert!(
-                    result
-                        .error_msg
-                        .as_deref()
-                        .map(|s| s.contains("returned 404"))
-                        .unwrap_or(false),
-                    "error_msg must name the GET status; got {:?}",
-                    result.error_msg
-                );
-                assert_eq!(
-                    result.post_write_sha, None,
-                    "post-write SHA must be None on GET failure"
-                );
-
-                // The cmd channel must be untouched — no
-                // SetImage / CurrentImage should have been sent.
-                assert!(
-                    cmd_rx.try_recv().is_err(),
-                    "GET-failure path must not touch the poller cmd channel"
-                );
-            }
-        );
+            // The cmd channel must be untouched — no
+            // SetImage / CurrentImage should have been sent.
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "GET-failure path must not touch the poller cmd channel"
+            );
+        });
     }
 
     /// Tiny helper that mirrors `sha256_of_bytes` (free fn,
