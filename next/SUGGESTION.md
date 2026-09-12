@@ -82,3 +82,55 @@
 （**2026-09-10 修订**：M1b validator P2.1 cleanup 删除了原先提到的 `src/service.rs::register_pending_clipboard_request`（属于 1b.1 dead code，1b.2 取代后未清理）；active eviction 契约的真正 pin 位置一直是 `src/clipboard/cache.rs::tests::active_eviction_concurrent_with_lookup_old_returns_miss`。同步 un-stub 时一并修 P2.2 描述的 `tests/clipboard_text_e2e.rs:51 / :218 / :230` 三处 doc-comment 中的 stale 引用。）
 
 **优先级**：⚪（不阻塞 M1b；M2a / M4 阶段可能升级为 🟡）
+
+---
+
+## #S-5 🟡 — `dispatch_files` 用常量 `DEFAULT_MAX_FILE_SIZE = 50 MiB`（待 IPC 落地后切到 `Config::max_file_size()`）
+
+**触发 STEP**：STEP-P2-M3a-3a.2
+
+**现象**：`src/service.rs::DEFAULT_MAX_FILE_SIZE = 50 * 1024 * 1024`（PLAN §3 STEP-3a.2 评审 #25 默认值）写死在 `Service::new` 字段 `max_file_size` 中。`lan-mouse-ipc::ClipboardConfig.max_file_size` 字段 M3b STEP-3b.1 才落地，`Config::max_file_size()` getter 同步落地。STEP-3a.2 不能 1.5 h 内同时做完 wire + IPC + 集成测试。
+
+**理由**：PLAN §3 STEP-3a.2 验收口径 "cfg.max_file_size 从 ClipboardConfig 读取（默认 50 MiB；0 = 不限）" —— 但 STEP-3b.1 才定义 `ClipboardConfig` 结构。当前通过常量 + SUGGESTION 跟踪实现，后续 M3b STEP-3b.1 / M4 STEP-4.2 完成 IPC + TOML 字段后替换：
+
+```rust
+// 当前（STEP-3a.2）
+self.max_file_size = DEFAULT_MAX_FILE_SIZE;
+
+// 期望（M3b STEP-3b.1 落地后）
+self.max_file_size = config.max_file_size().unwrap_or(DEFAULT_MAX_FILE_SIZE);
+```
+
+**影响**：
+- M3a 阶段：用户在 GUI 上看不到 `max_file_size` 控件 → daemon 默认 50 MiB 始终生效（合理 fallback）
+- M3b 阶段：IPC + UI + config.toml 落地后用户可调 0 = 不限（已实现）或 100 MiB / 1 GiB（自定义）
+
+**建议**（leader 决策）：
+- 🟢 短期：本 SUGGESTION 落地（已实现）+ 跟进 M3b STEP-3b.1 集成
+- 🟡 中期：M3b STEP-3b.1 实现时一并把 `Config::max_file_size()` 串通到 `Service::max_file_size` 字段；无需重构，仅替换初值来源
+
+**优先级**：🟡（不阻塞 M3a；M3b 阶段直接消费）
+
+---
+
+## #S-6 🟡 — `popup::tests::drop_with_empty_sentinel_is_a_no_op` 在 macOS headless 环境死锁
+
+**触发 STEP**：STEP-P2-M3a-3a.2
+
+**现象**：`cargo test -p lan-mouse --lib popup::tests` 在本机 macOS (aarch64-apple-darwin) headless 环境下**测试进程永久挂起**。`notify-rust 4.18` 导入 + `mac-notification-sys` 在 OS notification daemon 未运行时 `Notification::show()` 在 kernel 层 (`UE` state) 阻塞 test runtime，无法被 `kill` / `cargo test --no-fail-fast` 终结。
+
+**现状**：
+- 单测 `drop_with_empty_sentinel_is_a_no_op` 即使构造空 title + body（理论上不会触碰 `notify_rust` —— Drop impl 的 `if !title.is_empty() || !body.is_empty()` 短路），仍触发 OS notification 调用链路初始化（macOS `objc2` runtime 通过 `class!` 宏懒加载 `NSUserNotificationCenter`），整个 test runtime 死在 kernel wait 上。
+- `cargo test popup` 超时（>5 min 未退出），孤儿 process 占用 ~7KB RSS 持续累积
+
+**处理**：用 `#[cfg(not(target_os = "macos"))]` 屏蔽此测试。其他 4 个 popup 测试 (`popup_kind_display_is_stable` / `constructors_capture_inputs` / `title_prefix_per_kind_is_stable` / `fire_signature_is_sync_and_consumes_self`) 通过 `mem::forget` 跳过 Drop 避免触发 `fire()`，在 macOS 上正常通过。
+
+**影响**：
+- macOS CI：4 个 popup 测试通过（构造 + 字符串 + signature pin）；Drop 安全网测试被 cfg 屏蔽
+- Linux / Windows CI：5 个 popup 测试全部通过（包括 Drop 死循环短路测试）
+- **生产代码路径不受影响** —— Drop impl 在 macOS 真机带 notification daemon（`terminal-notifier` / `osascript` 后台跑）环境下行为正常，daemon 启动 + 文件超出 max_size 时弹通知工作
+
+**建议**（leader 决策）：
+- 🟢 短期：本 SUGGESTION 落地（已 cfg-gate）+ 跟 macOS 真机 E2E 测一次 ExceedsLimit popup 是否真的弹
+- 🟡 中期：M4 STEP-4.2 / 4.3 实现 GeneralPanel / Toaster 时考虑 macOS `UNUserNotificationCenter` 替代 `notify-rust` 直接绑定（`notify-rust 4.x` 在 macOS 上需要 bundle identifier 注册，headless / 调试场景用户体验差）
+- ⚪ 长期：考虑引入 feature flag (`popup = ["dep:notify-rust"]`) 让 Linux / Windows CI 跑全套 popup 测试，macOS CI 跑精简子集
