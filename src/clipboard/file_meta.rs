@@ -39,7 +39,7 @@ pub struct FileEntry {
     pub sha256: [u8; 32],
 }
 
-/// Errors produced by [`collect_files`].
+/// Errors produced by [`collect_files`] / [`collect_files_blocking`].
 #[derive(Debug, Error)]
 pub enum FileMetaError {
     /// Caller passed a directory path. Recursive walk is out of
@@ -53,6 +53,26 @@ pub enum FileMetaError {
     /// "abort the whole batch".
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// **M3a STEP-3a.2** — at least one file in the batch exceeds
+    /// `cfg.max_file_size`. The dispatcher's outbound branch uses
+    /// this to short-circuit the entire batch (no sha256, no cache
+    /// insert, no StreamC push, no HTTP/3 setup) and immediately
+    /// fire a `PopupGuard` so the user is told *why* their copy was
+    /// dropped — without waiting for the 500 ms tick (PLAN §5
+    /// 风险 #25).
+    ///
+    /// Carries the **first** offending path (later offenders are
+    /// logged at info but not surfaced via this variant — keeping
+    /// the enum non-tuple for forward-compat). `size` is the
+    /// offending entry's `std::fs::Metadata::len()`; `limit` is the
+    /// configured `max_file_size` in bytes (`0` means "no limit",
+    /// in which case this variant is unreachable).
+    #[error("file exceeds limit: {offending} ({size} bytes > limit={limit} bytes)")]
+    ExceedsLimit {
+        offending: PathBuf,
+        size: u64,
+        limit: u64,
+    },
 }
 
 /// Per-file transfer ceiling. Anything strictly larger is marked
@@ -84,11 +104,25 @@ pub const MIME_TOO_LARGE: &str = "application/x-too-large";
 ///   after logging `warn!`; sha256 is **not** computed for these
 ///   (receiver is expected to refuse outright — saves minutes of
 ///   hashing on a file we will never transfer).
+/// - **STEP-3a.2 `max_size` cap**: if `max_size > 0` and any file
+///   exceeds `max_size` bytes, the whole batch is rejected with
+///   [`FileMetaError::ExceedsLimit`] (no sha256, no entry
+///   construction). `max_size == 0` disables the check (PLAN §5
+///   风险 #25: "`0` = 不限").
 ///
 /// **Streaming**: sha256 is computed via 64 KiB reads against a
 /// `tokio::fs::File` — never buffered into a single `Vec<u8>` (the
 /// 200 MiB / 4 GiB targets would blow memory otherwise).
-pub async fn collect_files(paths: &[PathBuf]) -> Result<Vec<FileEntry>, FileMetaError> {
+///
+/// **Why this is async (not `spawn_blocking`-friendly)**: tokio's
+/// file IO yields the LocalSet between reads, so the runtime keeps
+/// making progress on other tasks. The dispatcher's outbound branch
+/// can call this directly with `.await` on the main task — see
+/// [`crate::service::Service::dispatch_files`] for the wiring.
+pub async fn collect_files(
+    paths: &[PathBuf],
+    max_size: u64,
+) -> Result<Vec<FileEntry>, FileMetaError> {
     let mut entries = Vec::with_capacity(paths.len());
     for path in paths {
         let meta = tokio::fs::metadata(path).await?;
@@ -96,6 +130,24 @@ pub async fn collect_files(paths: &[PathBuf]) -> Result<Vec<FileEntry>, FileMeta
             return Err(FileMetaError::IsDirectory(path.clone()));
         }
         let size = meta.len();
+        // **M3a STEP-3a.2** — `max_size` cap. `0` means "no limit"
+        // and is the documented way to bypass the cap (PLAN §5
+        // 风险 #25). Order matters — check `max_size > 0` first to
+        // avoid the `0` case being treated as "every file is too
+        // large".
+        if max_size > 0 && size > max_size {
+            log::warn!(
+                "file {} size {} > max_size {} bytes, rejecting batch (offending)",
+                path.display(),
+                size,
+                max_size
+            );
+            return Err(FileMetaError::ExceedsLimit {
+                offending: path.clone(),
+                size,
+                limit: max_size,
+            });
+        }
         let (mime, sha256) = if should_mark_too_large(size) {
             log::warn!(
                 "file {} size {} > 4 GiB, marking as {}",
@@ -120,6 +172,98 @@ pub async fn collect_files(paths: &[PathBuf]) -> Result<Vec<FileEntry>, FileMeta
         });
     }
     Ok(entries)
+}
+
+/// **M3a STEP-3a.2** — synchronous sibling of [`collect_files`] for
+/// use inside `tokio::task::spawn_blocking`.
+///
+/// The dispatcher's outbound branch wraps this in `spawn_blocking` so
+/// the CPU-bound sha256 streaming (200 MiB → ~5-8 s on a 2014-era
+/// SSD, ~1-3 s on modern NVMe) does not block the daemon's LocalSet
+/// — matching the **`dispatch_image` off-LocalSet pattern** from
+/// commit `7a57bb3` (PLAN §3 M3a STEP-3a.2 ②).
+///
+/// **Why a separate sync entrypoint** (not just
+/// `Handle::current().block_on(collect_files(...))` inside
+/// `spawn_blocking`): the latter is a known tokio anti-pattern —
+/// nesting a runtime on a blocking thread is unsupported and can
+/// deadlock under load. Splitting the sync / async surfaces keeps
+/// both paths idiomatic.
+///
+/// **Behaviour parity with [`collect_files`]**: identical
+/// `max_size` semantics (0 = unlimited), identical error variants,
+/// identical MIME / sha256 wiring (delegates to the same helpers).
+/// The only difference is `std::fs` / `std::io::Read` instead of
+/// `tokio::fs` / `tokio::io::AsyncReadExt` — fine because
+/// `spawn_blocking`'s threadpool is purpose-built for blocking I/O.
+pub fn collect_files_blocking(
+    paths: &[PathBuf],
+    max_size: u64,
+) -> Result<Vec<FileEntry>, FileMetaError> {
+    let mut entries = Vec::with_capacity(paths.len());
+    for path in paths {
+        let meta = std::fs::metadata(path)?;
+        if meta.is_dir() {
+            return Err(FileMetaError::IsDirectory(path.clone()));
+        }
+        let size = meta.len();
+        if max_size > 0 && size > max_size {
+            log::warn!(
+                "file {} size {} > max_size {} bytes, rejecting batch (offending)",
+                path.display(),
+                size,
+                max_size
+            );
+            return Err(FileMetaError::ExceedsLimit {
+                offending: path.clone(),
+                size,
+                limit: max_size,
+            });
+        }
+        let (mime, sha256) = if should_mark_too_large(size) {
+            log::warn!(
+                "file {} size {} > 4 GiB, marking as {}",
+                path.display(),
+                size,
+                MIME_TOO_LARGE
+            );
+            (MIME_TOO_LARGE.to_string(), [0u8; 32])
+        } else {
+            (detect_mime(path), stream_sha256_blocking(path)?)
+        };
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        entries.push(FileEntry {
+            name,
+            size,
+            mime,
+            sha256,
+        });
+    }
+    Ok(entries)
+}
+
+/// **M3a STEP-3a.2** — synchronous sha256 streaming (used by
+/// [`collect_files_blocking`] inside `spawn_blocking`). Mirrors
+/// [`stream_sha256`] exactly, swapping `tokio::fs::File` +
+/// `AsyncReadExt` for `std::fs::File` + `std::io::Read` — the
+/// spawn_blocking pool is purpose-built for blocking I/O.
+fn stream_sha256_blocking(path: &Path) -> Result<[u8; 32], FileMetaError> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().into())
 }
 
 /// `true` iff a file of `size` bytes exceeds [`FOUR_GIB`].
@@ -217,7 +361,10 @@ mod tests {
         let path = dir.path().join("hello.bin");
         let payload = vec![0xAB_u8; 1024];
         write_file(&path, &payload).await;
-        let entries = collect_files(std::slice::from_ref(&path)).await.unwrap();
+        // STEP-3a.2 — explicit `max_size=0` (unlimited) for the
+        // pre-existing happy-path test, so the new param doesn't
+        // regress prior assertions.
+        let entries = collect_files(std::slice::from_ref(&path), 0).await.unwrap();
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
         assert_eq!(e.name, "hello.bin");
@@ -242,7 +389,7 @@ mod tests {
         write_file(&p1, &d1).await;
         write_file(&p2, &d2).await;
         write_file(&p3, &d3).await;
-        let entries = collect_files(&[p1.clone(), p2.clone(), p3.clone()])
+        let entries = collect_files(&[p1.clone(), p2.clone(), p3.clone()], 0)
             .await
             .unwrap();
         assert_eq!(entries.len(), 3);
@@ -261,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn collect_files_returns_error_for_directory() {
         let dir = tempdir().unwrap();
-        let err = collect_files(&[dir.path().to_path_buf()])
+        let err = collect_files(&[dir.path().to_path_buf()], 0)
             .await
             .unwrap_err();
         match err {
@@ -376,6 +523,19 @@ mod tests {
             "Io variant Display must contain 'io error'; got {}",
             io_err
         );
+        // **M3a STEP-3a.2** — `ExceedsLimit` Display carries the
+        // offending path + size + limit (in bytes). The dispatcher's
+        // log line and the PopupGuard's body both grep / display this
+        // string verbatim, so it has to stay stable.
+        let ex = FileMetaError::ExceedsLimit {
+            offending: PathBuf::from("/tmp/big.bin"),
+            size: 60 * 1024 * 1024,
+            limit: 50 * 1024 * 1024,
+        };
+        assert_eq!(
+            ex.to_string(),
+            "file exceeds limit: /tmp/big.bin (62914560 bytes > limit=52428800 bytes)"
+        );
     }
 
     /// Empty path slice returns an empty Vec without touching the
@@ -383,7 +543,7 @@ mod tests {
     /// to collect (e.g. an empty Finder multi-select).
     #[tokio::test]
     async fn collect_files_with_empty_slice_returns_empty_vec() {
-        let entries = collect_files(&[]).await.unwrap();
+        let entries = collect_files(&[], 0).await.unwrap();
         assert!(entries.is_empty());
     }
 
@@ -393,7 +553,191 @@ mod tests {
     #[tokio::test]
     async fn collect_files_missing_path_returns_io_error() {
         let path = PathBuf::from("/nonexistent/lan-mouse-pro-3a.1-test-fixture");
-        let err = collect_files(&[path]).await.unwrap_err();
+        let err = collect_files(&[path], 0).await.unwrap_err();
         assert!(matches!(err, FileMetaError::Io(_)), "got {err:?}");
+    }
+
+    // === M3a STEP-3a.2 — `max_size` parameter + `ExceedsLimit` boundary ===
+
+    /// `max_size = 0` disables the cap entirely (PLAN §5 风险 #25:
+    /// "`0` = 不限"). A file of any size passes through; the legacy
+    /// behaviour of M3a STEP-3a.1 (no cap) is preserved by callers
+    /// who explicitly opt in.
+    #[tokio::test]
+    async fn collect_files_max_size_zero_disables_cap() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("huge.bin");
+        // 5 MiB file — comfortably above any realistic default.
+        let payload = vec![0xABu8; 5 * 1024 * 1024];
+        write_file(&path, &payload).await;
+        let entries = collect_files(std::slice::from_ref(&path), 0).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, payload.len() as u64);
+    }
+
+    /// Boundary: a file of size exactly equal to `max_size` is
+    /// accepted (the `>` comparison is strict, not `>=`). Pins the
+    /// wire-protocol semantics — a file of exactly 50 MiB on a
+    /// 50 MiB cap is NOT rejected.
+    #[tokio::test]
+    async fn collect_files_max_size_boundary_exact_is_accepted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("boundary.bin");
+        let max_size: u64 = 1024; // 1 KiB cap
+        let payload = vec![0xCDu8; max_size as usize];
+        write_file(&path, &payload).await;
+        let entries = collect_files(std::slice::from_ref(&path), max_size)
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, max_size);
+    }
+
+    /// Boundary: a file one byte over `max_size` is rejected. Pins
+    /// the strict `>` comparison.
+    #[tokio::test]
+    async fn collect_files_max_size_boundary_plus_one_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("over.bin");
+        let max_size: u64 = 1024;
+        let payload = vec![0xCDu8; (max_size + 1) as usize];
+        write_file(&path, &payload).await;
+        let err = collect_files(std::slice::from_ref(&path), max_size)
+            .await
+            .unwrap_err();
+        match err {
+            FileMetaError::ExceedsLimit {
+                offending,
+                size,
+                limit,
+            } => {
+                assert_eq!(offending, path);
+                assert_eq!(size, max_size + 1);
+                assert_eq!(limit, max_size);
+            }
+            other => panic!("expected ExceedsLimit, got {other:?}"),
+        }
+    }
+
+    /// A batch where the **first** file fits but a later one
+    /// exceeds `max_size` must reject the whole batch — PLAN §3
+    /// STEP-3a.2 "整批 Err(ExceedsLimit)". The dispatcher surfaces
+    /// the offending path so the user knows which one to drop.
+    #[tokio::test]
+    async fn collect_files_max_size_rejects_batch_when_any_file_exceeds() {
+        let dir = tempdir().unwrap();
+        let ok = dir.path().join("ok.bin");
+        let huge = dir.path().join("huge.bin");
+        write_file(&ok, &vec![0xAAu8; 512]).await; // fits easily
+        write_file(&huge, &vec![0xBBu8; 5 * 1024 * 1024]).await; // 5 MiB
+        let max_size: u64 = 1024 * 1024; // 1 MiB
+        let paths = [ok, huge];
+        let err = collect_files(&paths, max_size).await.unwrap_err();
+        match err {
+            FileMetaError::ExceedsLimit {
+                offending,
+                size,
+                limit,
+            } => {
+                assert_eq!(
+                    offending,
+                    dir.path().join("huge.bin"),
+                    "offending must be the second file"
+                );
+                assert_eq!(size, 5 * 1024 * 1024);
+                assert_eq!(limit, max_size);
+            }
+            other => panic!("expected ExceedsLimit, got {other:?}"),
+        }
+    }
+
+    /// `ExceedsLimit` is returned **before** any sha256 is computed
+    /// — the offending file is rejected on size alone. Pin this
+    /// because the dispatcher's early-reject path relies on it (no
+    /// wasted CPU on a file we will never transfer).
+    #[tokio::test]
+    async fn collect_files_max_size_rejects_before_sha256_compute() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("big.bin");
+        write_file(&path, &vec![0xCDu8; 2048]).await;
+        let max_size: u64 = 1024;
+        // If sha256 had been computed for the offending file, the
+        // sha256 field would be non-zero. The early-reject contract
+        // means we never even enter the per-file loop body that
+        // populates it — `ExceedsLimit` is the **only** payload
+        // that comes back, with the offending path carried.
+        let err = collect_files(std::slice::from_ref(&path), max_size)
+            .await
+            .unwrap_err();
+        match err {
+            FileMetaError::ExceedsLimit { offending, .. } => assert_eq!(offending, path),
+            other => panic!("expected ExceedsLimit, got {other:?}"),
+        }
+    }
+
+    // === M3a STEP-3a.2 — sync `collect_files_blocking` parity tests ===
+
+    /// `collect_files_blocking` mirrors `collect_files` happy path
+    /// with synchronous std::fs I/O — the spawn_blocking entry
+    /// point. 1 KiB sanity check.
+    #[test]
+    fn collect_files_blocking_returns_single_file_with_correct_sha256() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hello.bin");
+        let payload = vec![0xAB_u8; 1024];
+        std::fs::write(&path, &payload).unwrap();
+        let entries = collect_files_blocking(std::slice::from_ref(&path), 0).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sha256, sha256_of(&payload));
+        assert_eq!(entries[0].size, 1024);
+    }
+
+    /// `collect_files_blocking` 1 MiB + multi-entry sha256 parity
+    /// with `collect_files`. Catches a regression where the sync
+    /// version accidentally re-uses hasher state across files (the
+    /// async version had a similar test in STEP-3a.1).
+    #[test]
+    fn collect_files_blocking_multi_file_independent_sha256() {
+        let dir = tempdir().unwrap();
+        let p1 = dir.path().join("a.txt");
+        let p2 = dir.path().join("b.txt");
+        let d1 = b"hello world".to_vec();
+        let d2 = b"goodbye world".to_vec();
+        std::fs::write(&p1, &d1).unwrap();
+        std::fs::write(&p2, &d2).unwrap();
+        let entries = collect_files_blocking(&[p1.clone(), p2.clone()], 0).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sha256, sha256_of(&d1));
+        assert_eq!(entries[1].sha256, sha256_of(&d2));
+    }
+
+    /// `collect_files_blocking` enforces `max_size` the same way
+    /// the async version does.
+    #[test]
+    fn collect_files_blocking_respects_max_size() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("huge.bin");
+        std::fs::write(&path, vec![0u8; 5 * 1024 * 1024]).unwrap();
+        let err = collect_files_blocking(std::slice::from_ref(&path), 1024 * 1024).unwrap_err();
+        match err {
+            FileMetaError::ExceedsLimit {
+                offending,
+                size,
+                limit,
+            } => {
+                assert_eq!(offending, path);
+                assert_eq!(size, 5 * 1024 * 1024);
+                assert_eq!(limit, 1024 * 1024);
+            }
+            other => panic!("expected ExceedsLimit, got {other:?}"),
+        }
+    }
+
+    /// `collect_files_blocking` directory rejection (parity).
+    #[test]
+    fn collect_files_blocking_rejects_directory() {
+        let dir = tempdir().unwrap();
+        let err = collect_files_blocking(&[dir.path().to_path_buf()], 0).unwrap_err();
+        assert!(matches!(err, FileMetaError::IsDirectory(_)), "got {err:?}");
     }
 }
