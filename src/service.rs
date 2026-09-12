@@ -5089,10 +5089,19 @@ pub(crate) fn handle_clipboard_inbound_files_decide(
 /// `accept_dir`.
 ///
 /// Algorithm:
-/// 1. Try `<accept_dir>/<name>`. If it doesn't exist → return it.
-/// 2. Otherwise try `<accept_dir>/<stem> (1).<ext>`,
+/// 1. **Sanitize** `name` via [`sanitize_filename`] — strip `..`
+///    segments and path separators so the result is always a single
+///    filename component under `accept_dir`. Defense-in-depth
+///    against a malicious peer sending `ClipboardFiles` entries
+///    with traversal names (`../private.txt`,
+///    `subdir/file.txt`, etc.). Without sanitization,
+///    `accept_dir.join("../private.txt")` resolves to a path
+///    outside `accept_dir`.
+/// 2. Try `<accept_dir>/<sanitized_name>`. If it doesn't exist →
+///    return it.
+/// 3. Otherwise try `<accept_dir>/<stem> (1).<ext>`,
 ///    `<accept_dir>/<stem> (2).<ext>`, ... up to 9999.
-/// 3. As a defensive fallback (extremely unlikely — would require
+/// 4. As a defensive fallback (extremely unlikely — would require
 ///    9999 collisions) use a timestamp suffix.
 ///
 /// **Why walk the filesystem instead of using an atomic
@@ -5109,12 +5118,13 @@ pub(crate) fn handle_clipboard_inbound_files_decide(
 /// `Path::exists` is ~0.1-1 ms on a warm FS cache (modern macOS /
 /// Linux filesystem cache returns stat results in microseconds).
 pub(crate) fn resolve_unique_path(accept_dir: &Path, name: &str) -> PathBuf {
-    let candidate = accept_dir.join(name);
+    let name = sanitize_filename(name);
+    let candidate = accept_dir.join(&name);
     if !candidate.exists() {
         return candidate;
     }
-    let path = Path::new(name);
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    let path = Path::new(&name);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(&name);
     let ext = path.extension().and_then(|s| s.to_str());
     for n in 1..=9999 {
         let new_name = match ext {
@@ -5137,6 +5147,57 @@ pub(crate) fn resolve_unique_path(accept_dir: &Path, name: &str) -> PathBuf {
     };
     accept_dir.join(fallback)
 }
+
+/// **P1.A followup** — strip path traversal segments from an
+/// inbound filename.
+///
+/// Iterates `Path::new(name).components()` and keeps only the
+/// `Component::Normal(_)` segments — `..` (`Component::ParentDir`),
+/// `.` (`Component::CurDir`), `/` (`Component::RootDir`), and any
+/// Windows drive prefix (`Component::Prefix`) are dropped. Surviving
+/// segments are joined with `_` so the result is guaranteed to be a
+/// single flat filename component (no `/` or `\` separators).
+///
+/// Examples (with `_` as the join char):
+/// - `"../private.txt"` → `"private.txt"`
+/// - `"subdir/file.txt"` → `"subdir_file.txt"` (flattened, NOT a
+///   subdirectory)
+/// - `"../../etc/passwd"` → `"etc_passwd"`
+/// - `"normal.jpg"` → `"normal.jpg"` (unchanged)
+///
+/// **Empty fallback**: if every component is filtered out (e.g.
+/// `name = ".."` or `name = ""`), the result would otherwise be an
+/// empty string → `accept_dir.join("")` returns `accept_dir` itself,
+/// and the subsequent `std::fs::write` would fail with
+/// `IsADirectory`. To avoid that confusing user error, the fallback
+/// name [`SANITIZED_FALLBACK_NAME`] is used instead. The file still
+/// lands inside `accept_dir`.
+///
+/// **Why sanitize rather than reject outright**: a malicious peer
+/// could otherwise trigger an inbound-error path on legitimate
+/// filenames that happen to contain `..` (rare but possible —
+/// extracted archives, `.desktop` files). Sanitization gives a
+/// graceful "save under a flat name" experience while still
+/// preventing filesystem escape.
+fn sanitize_filename(name: &str) -> String {
+    use std::path::Component;
+    let segments: Vec<&str> = Path::new(name)
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect();
+    if segments.is_empty() {
+        return SANITIZED_FALLBACK_NAME.to_string();
+    }
+    segments.join("_")
+}
+
+/// Fallback filename when [`sanitize_filename`] would otherwise
+/// produce an empty string (e.g. `name = ".."` or `name = ""`).
+/// Still lands inside `accept_dir` — never used in path traversal.
+const SANITIZED_FALLBACK_NAME: &str = "untitled";
 
 /// **M3a STEP-3a.3** — `spawn_blocking` entry: write `bytes` to
 /// `path` and verify the on-the-wire sha256 by recomputing it from
@@ -8223,6 +8284,69 @@ mod apply_inbound_files_task_tests {
         std::fs::write(dir.path().join("Makefile"), b"a").unwrap();
         let resolved = resolve_unique_path(dir.path(), "Makefile");
         assert_eq!(resolved, dir.path().join("Makefile (1)"));
+    }
+
+    /// **P1.A followup** — `name = "../private.txt"` must NOT
+    /// escape `accept_dir`. `sanitize_filename` strips the
+    /// `Component::ParentDir` segment, leaving `"private.txt"` —
+    /// the file lands at `<accept_dir>/private.txt`, NOT at
+    /// `<parent>/private.txt`.
+    #[test]
+    fn resolve_unique_path_strips_parent_dir_traversal() {
+        let dir = TempDir::new().expect("tempdir");
+        let resolved = resolve_unique_path(dir.path(), "../private.txt");
+        assert_eq!(
+            resolved,
+            dir.path().join("private.txt"),
+            "`../private.txt` must be flattened to `private.txt` (no escape)"
+        );
+        // Pin: the resolved path's parent must equal accept_dir
+        // (i.e. starts_with the accept_dir prefix), not the
+        // platform-level parent of accept_dir.
+        assert_eq!(resolved.parent(), Some(dir.path()));
+    }
+
+    /// **P1.A followup** — `name = "subdir/file.txt"` is NOT
+    /// allowed to create a subdirectory under `accept_dir`.
+    /// `sanitize_filename` joins surviving `Component::Normal`
+    /// segments with `_`, so the result is the single component
+    /// `subdir_file.txt` (flat).
+    #[test]
+    fn resolve_unique_path_flattens_subdir_separator() {
+        let dir = TempDir::new().expect("tempdir");
+        let resolved = resolve_unique_path(dir.path(), "subdir/file.txt");
+        assert_eq!(
+            resolved,
+            dir.path().join("subdir_file.txt"),
+            "embedded `/` must be flattened via `_` join (no subdir created)"
+        );
+        assert_eq!(resolved.parent(), Some(dir.path()));
+    }
+
+    /// **P1.A followup** — `name = "../../etc/passwd"` must drop
+    /// both `..` segments, leaving `etc_passwd` — the file lands
+    /// inside `accept_dir`, not at `/etc/passwd`.
+    #[test]
+    fn resolve_unique_path_strips_double_parent_dir_traversal() {
+        let dir = TempDir::new().expect("tempdir");
+        let resolved = resolve_unique_path(dir.path(), "../../etc/passwd");
+        assert_eq!(
+            resolved,
+            dir.path().join("etc_passwd"),
+            "double `..` must be stripped to `etc_passwd`"
+        );
+        assert_eq!(resolved.parent(), Some(dir.path()));
+    }
+
+    /// **P1.A followup — regression pin** — `name = "normal.jpg"`
+    /// (no `..` or `/`) must pass through `sanitize_filename`
+    /// unchanged. Pins that the sanitization doesn't mangle
+    /// ordinary filenames.
+    #[test]
+    fn resolve_unique_path_keeps_normal_name_unchanged() {
+        let dir = TempDir::new().expect("tempdir");
+        let resolved = resolve_unique_path(dir.path(), "normal.jpg");
+        assert_eq!(resolved, dir.path().join("normal.jpg"));
     }
 
     #[test]
