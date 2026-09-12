@@ -45,12 +45,13 @@
 //! `mime = "application/x-too-large"` is marked at the
 //! source-side `collect_files` step (see
 //! [`crate::clipboard::file_meta::FOUR_GIB`]). The dispatcher
-//! MUST NOT call `file_cache.insert(...)` for such entries —
-//! the receiver's inbound branch is expected to short-circuit
-//! the HTTP/3 GET against the `MIME_TOO_LARGE` mime directly,
-//! without ever asking for the bytes. This contract is enforced
-//! at the dispatcher level (in [`crate::service::dispatch_files`]),
-//! not here — `FileCache` is a pure byte store.
+//! MUST NOT call `file_cache.insert_owned(...)` for such
+//! entries — it skips them in the spawn_blocking cache-fill
+//! step (see [`crate::service::dispatch_files`]); the receiver's
+//! inbound branch is expected to short-circuit the HTTP/3 GET
+//! against the `MIME_TOO_LARGE` mime directly, without ever
+//! asking for the bytes. This contract is enforced at the
+//! dispatcher level, not here — `FileCache` is a pure byte store.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -136,21 +137,113 @@ impl FileCache {
         }
     }
 
-    /// Insert a file body. Returns the previous value if an entry
-    /// with the same key already existed.
+    /// Insert a file body — MOVE the bytes, no clone, no return.
+    ///
+    /// **Use this from the dispatcher's hot path.** The caller
+    /// has just produced `bytes` (via `std::fs::read` in a
+    /// `spawn_blocking` task) and the bytes are single-use —
+    /// there is no caller that needs the previous value, so
+    /// cloning on the hot path would be a wasted 200 MiB
+    /// allocation for the M3a STEP-3a.4 performance target.
     ///
     /// **Byte-budget enforcement**: if `bytes.len() > byte_budget`,
-    /// the insert is rejected and `None` is returned (the bytes are
-    /// dropped, no cache mutation). The defensive bound covers a
-    /// single entry that could never fit; see the module-level doc
-    /// for the rationale.
+    /// the insert is rejected (the bytes are dropped, no cache
+    /// mutation). The defensive bound covers a single entry that
+    /// could never fit; see the module-level doc for the
+    /// rationale.
     ///
     /// On byte-budget overflow (after a successful insert) the
     /// **oldest** entries are evicted until the budget is met
     /// again. This is a best-effort fallback; the active eviction
     /// in the dispatcher should keep the cache size well under
     /// budget in practice.
-    pub fn insert(&mut self, sha256: [u8; 32], bytes: Vec<u8>) -> Option<Vec<u8>> {
+    ///
+    /// **Why a separate API from `insert_returning_prev`**:
+    /// [`Self::insert_returning_prev`] clones the input `Vec<u8>`
+    /// to return the previous bytes — necessary when a caller
+    /// needs the eviction-feedback signal. The dispatcher does
+    /// not, so it uses this MOVE-only variant to skip the clone.
+    /// See STEP-3a.2 follow-up (P2.3).
+    pub fn insert_owned(&mut self, sha256: [u8; 32], bytes: Vec<u8>) {
+        let new_size = bytes.len();
+        // Single-entry overflow: no way to fit, drop on the floor.
+        // 1 GiB is well above any realistic file payload, so this
+        // branch is defensive — a real `ClipboardFiles` from a
+        // healthy peer never trips it.
+        if new_size > self.byte_budget {
+            log::warn!(
+                "file cache: rejected entry of {new_size} bytes (budget {budget} bytes)",
+                budget = self.byte_budget
+            );
+            return;
+        }
+        let previous_entry = self.entries.insert(
+            sha256,
+            FileCacheEntry {
+                bytes, // MOVE — no clone on the hot path
+                inserted_at: Instant::now(),
+            },
+        );
+        // Subtract the old size BEFORE adding the new size — if
+        // this was an overwrite (same sha256), the net change is
+        // the delta, not the sum.
+        if let Some(prev) = &previous_entry {
+            self.bytes_used -= prev.bytes.len();
+        } else {
+            // Only push onto the LRU deque if this is a fresh
+            // insert. Re-inserting the same key would otherwise
+            // create a phantom second entry in the LRU list,
+            // which would let a stale entry outlive a
+            // budget-evicting insert.
+            self.lru.push_back(sha256);
+        }
+        self.bytes_used += new_size;
+        // Budget eviction — best effort. Walk the LRU from the
+        // front, dropping entries until we're back under budget.
+        while self.bytes_used > self.byte_budget {
+            if let Some(oldest) = self.lru.pop_front() {
+                // The `oldest` might have been removed by an
+                // explicit `remove()` between insert and this
+                // point, so the `HashMap::remove` here is
+                // `Option`-aware.
+                if let Some(removed) = self.entries.remove(&oldest) {
+                    self.bytes_used -= removed.bytes.len();
+                }
+            } else {
+                // Defensive: HashMap and VecDeque should be in
+                // sync, but if we ever drift we stop evicting
+                // rather than spin. (Single-entry overflow check
+                // above guarantees we can never hit this
+                // branch with a single fresh insert.)
+                break;
+            }
+        }
+    }
+
+    /// Insert a file body, returning the previous bytes if an
+    /// entry with the same key already existed.
+    ///
+    /// **Clones the input** `Vec<u8>` — use [`Self::insert_owned`]
+    /// on the dispatcher's hot path (no clone, no return) when
+    /// the caller does not need the eviction-feedback signal.
+    ///
+    /// The clone is a single heap allocation + memcpy. For a
+    /// 200 MiB file this is ~200 ms on NVMe + ~200 MiB peak RSS,
+    /// which is why the dispatcher's `dispatch_files` uses
+    /// [`Self::insert_owned`] instead. This API remains for any
+    /// caller that genuinely needs to observe / re-use the
+    /// previous bytes (none today).
+    ///
+    /// **Byte-budget enforcement**: if `bytes.len() > byte_budget`,
+    /// the insert is rejected and `None` is returned (the bytes
+    /// are dropped, no cache mutation).
+    ///
+    /// On byte-budget overflow (after a successful insert) the
+    /// **oldest** entries are evicted until the budget is met
+    /// again. This is a best-effort fallback; the active eviction
+    /// in the dispatcher should keep the cache size well under
+    /// budget in practice.
+    pub fn insert_returning_prev(&mut self, sha256: [u8; 32], bytes: Vec<u8>) -> Option<Vec<u8>> {
         let new_size = bytes.len();
         // Single-entry overflow: no way to fit, drop on the floor.
         // 1 GiB is well above any realistic file payload, so this
@@ -300,7 +393,7 @@ mod tests {
         let mut cache = FileCache::new();
         let sha = [0xAA; 32];
         let bytes = b"hello world".to_vec();
-        cache.insert(sha, bytes.clone());
+        cache.insert_returning_prev(sha, bytes.clone());
         assert_eq!(cache.lookup(&sha), Some(bytes));
     }
 
@@ -318,8 +411,8 @@ mod tests {
         let mut cache = FileCache::new();
         let sha_x = [0x01; 32];
         let sha_y = [0x02; 32];
-        cache.insert(sha_x, b"X".to_vec());
-        cache.insert(sha_y, b"Y".to_vec());
+        cache.insert_returning_prev(sha_x, b"X".to_vec());
+        cache.insert_returning_prev(sha_y, b"Y".to_vec());
         assert_eq!(cache.lookup(&sha_x), Some(b"X".to_vec()));
         assert_eq!(cache.lookup(&sha_y), Some(b"Y".to_vec()));
     }
@@ -332,8 +425,8 @@ mod tests {
         let mut cache = FileCache::new();
         let sha_x = [0x11; 32];
         let sha_y = [0x22; 32];
-        cache.insert(sha_x, b"X".to_vec());
-        cache.insert(sha_y, b"Y".to_vec());
+        cache.insert_returning_prev(sha_x, b"X".to_vec());
+        cache.insert_returning_prev(sha_y, b"Y".to_vec());
 
         assert!(cache.remove(&sha_x));
         assert_eq!(cache.lookup(&sha_x), None, "X must be evicted");
@@ -354,7 +447,7 @@ mod tests {
     fn expired_entries_are_evicted_on_lookup() {
         let mut cache = FileCache::with_byte_budget_and_ttl(1024, Duration::from_millis(0));
         let sha = [0xCC; 32];
-        cache.insert(sha, b"stale".to_vec());
+        cache.insert_returning_prev(sha, b"stale".to_vec());
         // Any non-zero delay trips the 0-ms TTL.
         std::thread::sleep(Duration::from_millis(2));
         assert_eq!(
@@ -373,12 +466,12 @@ mod tests {
         // (8 bytes total); the third would push total to 12 > 10,
         // triggering eviction of the oldest 4-byte entry.
         let mut cache = FileCache::with_byte_budget_and_ttl(10, Duration::from_secs(60));
-        cache.insert([0x01; 32], b"AAAA".to_vec());
-        cache.insert([0x02; 32], b"BBBB".to_vec());
+        cache.insert_returning_prev([0x01; 32], b"AAAA".to_vec());
+        cache.insert_returning_prev([0x02; 32], b"BBBB".to_vec());
         // Third insert: 4 + 4 (still held) + 4 (new) = 12 > 10.
         // Eviction kicks in: [0x01] (oldest) is dropped, leaving
         // [0x02] + [0x03] = 8 bytes total.
-        cache.insert([0x03; 32], b"CCCC".to_vec());
+        cache.insert_returning_prev([0x03; 32], b"CCCC".to_vec());
         assert_eq!(
             cache.lookup(&[0x01; 32]),
             None,
@@ -402,12 +495,12 @@ mod tests {
         // 5 + 5 = 10 bytes; budget is not exceeded.
         let mut cache = FileCache::with_byte_budget_and_ttl(10, Duration::from_secs(60));
         let sha = [0x99; 32];
-        cache.insert(sha, b"12345".to_vec());
-        cache.insert(sha, b"ABCDE".to_vec());
+        cache.insert_returning_prev(sha, b"12345".to_vec());
+        cache.insert_returning_prev(sha, b"ABCDE".to_vec());
         // After two overwrites the cache holds one entry of 5 bytes;
         // a third distinct 5-byte entry would not trigger eviction
         // if duplicates were counted.
-        cache.insert([0xAA; 32], b"vwxyz".to_vec());
+        cache.insert_returning_prev([0xAA; 32], b"vwxyz".to_vec());
         assert_eq!(cache.lookup(&sha), Some(b"ABCDE".to_vec()));
         assert_eq!(cache.lookup(&[0xAA; 32]), Some(b"vwxyz".to_vec()));
         assert_eq!(
@@ -433,14 +526,14 @@ mod tests {
         let mut cache = FileCache::with_byte_budget_and_ttl(1024, Duration::from_secs(60));
         let sha_x = [0x33; 32];
         let sha_y = [0x44; 32];
-        cache.insert(sha_x, b"X contents (large payload)".to_vec());
+        cache.insert_returning_prev(sha_x, b"X contents (large payload)".to_vec());
 
         // Active eviction path: source pushes new content.
         assert!(
             cache.remove(&sha_x),
             "X must have been present before eviction"
         );
-        cache.insert(sha_y, b"Y contents (different large payload)".to_vec());
+        cache.insert_returning_prev(sha_y, b"Y contents (different large payload)".to_vec());
 
         // A receiver that started pulling X *before* the new
         // push would have raced with the eviction. From now on
@@ -483,15 +576,15 @@ mod tests {
     fn bytes_returns_total_byte_count() {
         let mut cache = FileCache::with_byte_budget_and_ttl(1024, Duration::from_secs(60));
         assert_eq!(cache.bytes(), 0, "fresh cache has zero bytes");
-        cache.insert([0x01; 32], vec![0; 100]);
+        cache.insert_returning_prev([0x01; 32], vec![0; 100]);
         assert_eq!(cache.bytes(), 100);
-        cache.insert([0x02; 32], vec![0; 250]);
+        cache.insert_returning_prev([0x02; 32], vec![0; 250]);
         assert_eq!(cache.bytes(), 350);
         cache.remove(&[0x01; 32]);
         assert_eq!(cache.bytes(), 250, "remove must subtract the entry's bytes");
         // Overwriting the remaining entry with a smaller payload:
         // bytes drop, not accumulate.
-        cache.insert([0x02; 32], vec![0; 50]);
+        cache.insert_returning_prev([0x02; 32], vec![0; 50]);
         assert_eq!(cache.bytes(), 50);
     }
 
@@ -505,7 +598,7 @@ mod tests {
         let sha = [0x42; 32];
         let huge_payload = vec![0; 100];
         assert!(
-            cache.insert(sha, huge_payload).is_none(),
+            cache.insert_returning_prev(sha, huge_payload).is_none(),
             "an entry larger than the byte budget must be rejected"
         );
         assert_eq!(
@@ -536,8 +629,93 @@ mod tests {
     fn default_1_gib_cache_holds_200_mib_insert() {
         let mut cache = FileCache::new();
         let buf_200_mib = vec![0xAAu8; 200 * 1024 * 1024];
-        cache.insert([0x01; 32], buf_200_mib.clone());
+        cache.insert_returning_prev([0x01; 32], buf_200_mib.clone());
         assert_eq!(cache.bytes(), 200 * 1024 * 1024);
         assert_eq!(cache.lookup(&[0x01; 32]), Some(buf_200_mib));
+    }
+
+    // ===== STEP-3a.2 P1 follow-up — `insert_owned` API split =====
+
+    /// `insert_owned` round-trip: a fresh entry is retrievable
+    /// via `lookup` after insertion. Mirrors
+    /// `insert_returning_prev`'s happy-path test but exercises
+    /// the new MOVE-only API the dispatcher's hot path uses.
+    #[test]
+    fn insert_owned_round_trip_returns_bytes() {
+        let mut cache = FileCache::new();
+        let sha = [0xD0; 32];
+        let bytes = b"dispatch_files hot path".to_vec();
+        cache.insert_owned(sha, bytes.clone());
+        assert_eq!(cache.lookup(&sha), Some(bytes));
+        assert_eq!(cache.bytes(), b"dispatch_files hot path".len());
+        assert_eq!(cache.len(), 1);
+    }
+
+    /// `insert_owned` overwriting the same sha256 keeps a single
+    /// entry (no LRU phantom / no double-count) — same contract as
+    /// `insert_returning_prev`, just exercised on the MOVE-only
+    /// path the dispatcher uses.
+    #[test]
+    fn insert_owned_overwrite_does_not_double_count() {
+        let mut cache = FileCache::with_byte_budget_and_ttl(64, Duration::from_secs(60));
+        let sha = [0xD1; 32];
+        cache.insert_owned(sha, b"12345".to_vec());
+        cache.insert_owned(sha, b"ABCDE".to_vec());
+        // After overwrite the cache holds 5 bytes for the one sha;
+        // adding a distinct 5-byte entry fits the 10-byte budget.
+        cache.insert_owned([0xD2; 32], b"vwxyz".to_vec());
+        assert_eq!(cache.lookup(&sha), Some(b"ABCDE".to_vec()));
+        assert_eq!(cache.lookup(&[0xD2; 32]), Some(b"vwxyz".to_vec()));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.bytes(), 10);
+    }
+
+    /// `insert_owned` triggers LRU byte-budget eviction
+    /// identically to `insert_returning_prev` (3rd 4-byte insert
+    /// into a 10-byte budget drops the oldest 4-byte entry).
+    /// Pins that the dispatcher doesn't accidentally bypass
+    /// eviction by using the new API.
+    #[test]
+    fn insert_owned_byte_budget_overflow_evicts_oldest() {
+        let mut cache = FileCache::with_byte_budget_and_ttl(10, Duration::from_secs(60));
+        cache.insert_owned([0xA1; 32], b"AAAA".to_vec());
+        cache.insert_owned([0xA2; 32], b"BBBB".to_vec());
+        cache.insert_owned([0xA3; 32], b"CCCC".to_vec());
+        assert_eq!(
+            cache.lookup(&[0xA1; 32]),
+            None,
+            "first entry must be evicted by byte-budget overflow"
+        );
+        assert_eq!(cache.lookup(&[0xA2; 32]), Some(b"BBBB".to_vec()));
+        assert_eq!(cache.lookup(&[0xA3; 32]), Some(b"CCCC".to_vec()));
+        assert_eq!(cache.bytes(), 8);
+    }
+
+    /// `insert_owned` rejects payloads larger than the byte
+    /// budget — same defensive contract as
+    /// `insert_returning_prev`. The bytes are dropped, no
+    /// cache mutation, byte counter unchanged.
+    #[test]
+    fn insert_owned_oversize_rejected_silently() {
+        let mut cache = FileCache::with_byte_budget_and_ttl(10, Duration::from_secs(60));
+        let huge = vec![0u8; 100];
+        cache.insert_owned([0xD4; 32], huge);
+        assert_eq!(cache.bytes(), 0);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.lookup(&[0xD4; 32]), None);
+    }
+
+    /// 200 MiB MOVE-insert at 1 GiB default budget pins the
+    /// dispatcher's hot path production-scale contract — same as
+    /// the `insert_returning_prev` 200 MiB test but on the new
+    /// API. The 200 MiB test is intentional: it's the M3a
+    /// STEP-3a.4 performance milestone payload size.
+    #[test]
+    fn insert_owned_200_mib_at_1_gib_budget() {
+        let mut cache = FileCache::new();
+        let buf = vec![0xCCu8; 200 * 1024 * 1024];
+        cache.insert_owned([0xD5; 32], buf.clone());
+        assert_eq!(cache.bytes(), 200 * 1024 * 1024);
+        assert_eq!(cache.lookup(&[0xD5; 32]), Some(buf));
     }
 }
