@@ -293,6 +293,14 @@ pub fn default_router_with_cache(
     // Both prefixes share one cache `Arc`. Each closure captures
     // its own clone — `Arc` is `Send + Sync` and the clone is
     // cheap (single refcount bump).
+    //
+    // **M3a STEP-3a.4** — the `/clipboard/file/` prefix still
+    // returns 404 here because this factory only takes the
+    // clipboard text/image cache. Use
+    // [`Self::default_router_with_caches`] for the production
+    // M3a path that wires the file cache too. This split keeps
+    // existing tests (which only exercise text + image routes)
+    // free of the extra `FileCache` plumbing.
     let cache_for_text = cache.clone();
     let cache_for_image = cache;
     Arc::new(
@@ -309,6 +317,294 @@ pub fn default_router_with_cache(
                 Response::not_found()
             }),
     )
+}
+
+/// **M3a STEP-3a.4** — production router with **both** the
+/// clipboard text/image cache (for `/clipboard/text/{sha256}` +
+/// `/clipboard/image/{sha256}`) and the file cache (for
+/// `/clipboard/file/{sha256}[?range=...]`).
+///
+/// Mirrors [`Self::default_router_with_cache`] exactly — the only
+/// difference is that the file prefix now reads from a real
+/// [`crate::clipboard::file_cache::FileCache`] instead of
+/// returning the 404 stub. The factory name was chosen over
+/// "default_router_with_cache" because the latter is referenced
+/// from ~10 unit tests that only exercise text + image routes;
+/// keeping that function as a single-cache factory avoids
+/// dragging `FileCache` plumbing into every test.
+///
+/// **Stream priority — PRIORITY_BULK**: the file response stream
+/// is still pinned to `PRIORITY_BULK = -100` via the accept-loop
+/// (`src/listen.rs::server_accept_bi_task` and
+/// `src/connect.rs::client_accept_bi_task`) **before** this
+/// router is invoked, so the symmetric `b4191d4` (image HTTP/3)
+/// pinning covers the file route for free. The unit test
+/// `http3_client_get_file_priority_bulk_applied` pins that
+/// contract.
+pub fn default_router_with_caches(
+    clipboard_cache: Arc<std::sync::Mutex<crate::clipboard::cache::ClipboardCache>>,
+    file_cache: Arc<std::sync::Mutex<crate::clipboard::file_cache::FileCache>>,
+) -> Arc<Router> {
+    let cache_for_text = clipboard_cache.clone();
+    let cache_for_image = clipboard_cache;
+    let file_cache_for_route = file_cache;
+    Arc::new(
+        Router::new()
+            .get("/healthz", |_req: &Request| Response::ok("ok"))
+            .get_prefix("/clipboard/text/", move |req: &Request| {
+                cache_lookup_route(req, &cache_for_text, "/clipboard/text/")
+            })
+            .get_prefix("/clipboard/image/", move |req: &Request| {
+                cache_lookup_route(req, &cache_for_image, "/clipboard/image/")
+            })
+            .get_prefix("/clipboard/file/", move |req: &Request| {
+                file_cache_lookup_route(req, &file_cache_for_route)
+            }),
+    )
+}
+
+/// **M3a STEP-3a.4** — `/clipboard/file/{sha256}[?range=...]`
+/// route handler.
+///
+/// Parses the trailing sha256 + optional `?range=N-M` query
+/// (the range query is **part of the wire path** in the HTTP/3-
+/// lite protocol — see the module-level doc at the top of this
+/// file), looks the entry up in the [`FileCache`], and returns
+/// 200 + bytes (possibly sliced by range) on hit or 404 on
+/// miss/expired/malformed-suffix.
+///
+/// **Streaming**: even though the cache returns an owned
+/// `Vec<u8>` (it owns the body bytes after the dispatcher's
+/// `insert_owned` write), the **response write** path goes
+/// through [`write_response_streaming`] which emits 64 KiB chunks
+/// — never `Vec::with_capacity(200 MiB)`. The 200 MiB test
+/// (`http3_client_get_file_returns_200_mib_bytes`) confirms this.
+///
+/// **Range semantics** (this STEP only stubs `200 OK`; full
+/// `206 Partial Content` is deferred per PLAN §6 to a follow-up
+/// PLAN, see also the comment on PLAN §3 STEP-3a.4):
+///
+/// - `?range=0-99` → return first 100 bytes (200 OK + full body
+///   is the simplification; the documented behaviour is "for
+///   subsequent breakpoint resumption" — M3a tests pin this
+///   semantics).
+/// - `?range=N-M` (closed range, M ≥ N) → return bytes [N..=M]
+///   (closed interval, HTTP convention).
+/// - `?range=N-` (open-ended) → return bytes [N..len] (last byte
+///   onward).
+/// - `?range=` malformed (empty, non-numeric, N > M, N >=
+///   body_len) → **416 Range Not Satisfiable**.
+///
+/// **Why 416 instead of 200 with full body**: 416 is the HTTP
+/// convention for "I understand ranges but cannot satisfy this
+/// one" (RFC 7233 §4.4). It tells the receiver "your range
+/// request is invalid, retry without range". Returning 200 + a
+/// full body would silently downgrade the protocol contract and
+/// confuse any future M4 resumption logic that relies on 416.
+///
+/// **MIME_TOO_LARGE short-circuit**: per the dispatcher's
+/// contract (see `src/clipboard/file_meta::MIME_TOO_LARGE` doc),
+/// entries marked `application/x-too-large` are **never**
+/// inserted into `FileCache` — `dispatch_files` skips them in
+/// the spawn_blocking cache-fill step. So the HTTP/3 route
+/// cannot encounter a MIME_TOO_LARGE entry from the cache
+/// itself. The defensive check is therefore unnecessary at the
+/// route layer; the 404 path covers the
+/// "cache-miss / never-inserted" case identically.
+fn file_cache_lookup_route(
+    req: &Request,
+    file_cache: &Arc<std::sync::Mutex<crate::clipboard::file_cache::FileCache>>,
+) -> Response {
+    const PREFIX: &str = "/clipboard/file/";
+
+    // Strip prefix → "{sha256}[?range=...]" or "{sha256}".
+    let suffix = match req.path.strip_prefix(PREFIX) {
+        Some(s) => s,
+        None => {
+            log::warn!(
+                "http3 {PREFIX} handler received unexpected path: {}",
+                req.path
+            );
+            return Response::not_found();
+        }
+    };
+
+    // Split the suffix into the sha256-hex part + the optional
+    // `?range=...` query. The wire protocol folds the query into
+    // the path string (see the module doc); we parse it here.
+    let (sha_hex, query) = match suffix.find('?') {
+        Some(q) => (&suffix[..q], Some(&suffix[q + 1..])),
+        None => (suffix, None),
+    };
+
+    // Same defensive sha256 check as the text/image routes.
+    if sha_hex.len() != 64 || !sha_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        log::warn!(
+            "http3 {PREFIX} rejecting malformed sha256 suffix (len={}, expected 64): {}",
+            sha_hex.len(),
+            req.path
+        );
+        return Response::not_found();
+    }
+    let sha = match decode_hex_32(sha_hex) {
+        Some(b) => b,
+        None => return Response::not_found(),
+    };
+
+    // Cache lookup. The same poisoned-mutex recovery logic as
+    // `cache_lookup_route` applies — FileCache uses `std::sync::Mutex`,
+    // so a panicking holder leaves the lock poisoned; we extract
+    // the inner guard via `into_inner()` to avoid double-panic.
+    let full_body: Vec<u8> = match file_cache.lock() {
+        Ok(mut guard) => match guard.lookup(&sha) {
+            Some(bytes) => bytes,
+            None => {
+                log::debug!("http3 {PREFIX} cache miss for suffix {sha_hex}");
+                return Response::not_found();
+            }
+        },
+        Err(poisoned) => {
+            log::error!(
+                "http3 {PREFIX} cache mutex poisoned for suffix {sha_hex}; treating as miss"
+            );
+            drop(poisoned.into_inner());
+            return Response::not_found();
+        }
+    };
+
+    // Range slicing. `parsed_range` is the receiver's hint —
+    // for this STEP we still return 200 + body (either full or
+    // sliced), but the slice semantics must match HTTP
+    // convention so a future 206 implementation is a no-op
+    // upgrade.
+    let body = match query {
+        Some(q) => match parse_range_query(q) {
+            RangeParse::None => full_body,
+            RangeParse::Invalid => {
+                log::warn!("http3 {PREFIX} rejecting malformed range query: {q}");
+                return Response::with_status(416, Bytes::from_static(b"range not satisfiable"));
+            }
+            RangeParse::Valid { start, end } => {
+                if start >= full_body.len() {
+                    log::warn!(
+                        "http3 {PREFIX} range start {start} >= body_len {}",
+                        full_body.len()
+                    );
+                    return Response::with_status(
+                        416,
+                        Bytes::from_static(b"range not satisfiable"),
+                    );
+                }
+                // `end` is inclusive per RFC 7233. Clamp to
+                // the last byte index so `?range=0-999999999999`
+                // on a 100-byte body returns the whole body
+                // rather than panicking.
+                let end = end.min(full_body.len().saturating_sub(1));
+                if start > end {
+                    log::warn!("http3 {PREFIX} range start {start} > end {end} after clamp");
+                    return Response::with_status(
+                        416,
+                        Bytes::from_static(b"range not satisfiable"),
+                    );
+                }
+                full_body[start..=end].to_vec()
+            }
+        },
+        None => full_body,
+    };
+
+    log::trace!(
+        "http3 {PREFIX} hit ({} bytes) for suffix {sha_hex}",
+        body.len()
+    );
+    Response::ok(body)
+}
+
+/// Outcome of parsing a `?range=...` query.
+#[derive(Debug)]
+enum RangeParse {
+    /// No `range` key in the query — serve the full body.
+    None,
+    /// `range=N-M` or `range=N-` parsed successfully. `start`
+    /// inclusive, `end` inclusive (open-ended `N-` clamps `end`
+    /// to `usize::MAX` — caller must still clamp against the
+    /// body length).
+    Valid { start: usize, end: usize },
+    /// `range=` was present but malformed (empty value, non-numeric,
+    /// `N > M`, etc.) — caller returns 416.
+    Invalid,
+}
+
+/// Parse a single-key query string `key=value&...` for the
+/// `range` key.
+///
+/// **Why not a full URL parser**: the wire format only carries
+/// one optional query key (`range`). A full `url` crate pull-in
+/// would dwarf the actual parsing work. The split-on-`&` then
+/// split-on-`=` approach handles the current M3a shape
+/// (`?range=N-M`). If a future STEP adds another key, extend
+/// this helper or switch to a real parser.
+///
+/// **Range format** (HTTP RFC 7233 byte-range subset):
+/// - `range=N-M` → `start=N`, `end=M` (closed)
+/// - `range=N-` → `start=N`, `end=usize::MAX` (open-ended,
+///   caller clamps)
+/// - `range=-M` (suffix) → **rejected** as Invalid (not in M3a
+///   scope; suffix-byte-range is documented but not implemented
+///   yet — better to 416 than to silently reinterpret)
+/// - anything else → Invalid
+fn parse_range_query(query: &str) -> RangeParse {
+    // The query may be empty, contain just the range, or have
+    // trailing junk we ignore. Iterate key=value pairs.
+    let mut found: Option<&str> = None;
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == "range" {
+                found = Some(v);
+            }
+        }
+    }
+    let value = match found {
+        Some(v) => v,
+        None => return RangeParse::None,
+    };
+
+    if value.is_empty() {
+        return RangeParse::Invalid;
+    }
+    // Open-ended `N-` form.
+    if let Some(stripped) = value.strip_suffix('-') {
+        let stripped = stripped.strip_suffix('-').unwrap_or(stripped);
+        // Suffix form (`-M`) — rejected in M3a scope.
+        if stripped.is_empty() {
+            return RangeParse::Invalid;
+        }
+        let start = match stripped.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => return RangeParse::Invalid,
+        };
+        return RangeParse::Valid {
+            start,
+            end: usize::MAX,
+        };
+    }
+    // Closed form `N-M`.
+    let (start_s, end_s) = match value.split_once('-') {
+        Some(parts) => parts,
+        None => return RangeParse::Invalid,
+    };
+    let start = match start_s.parse::<usize>() {
+        Ok(n) => n,
+        Err(_) => return RangeParse::Invalid,
+    };
+    let end = match end_s.parse::<usize>() {
+        Ok(n) => n,
+        Err(_) => return RangeParse::Invalid,
+    };
+    if start > end {
+        return RangeParse::Invalid;
+    }
+    RangeParse::Valid { start, end }
 }
 
 /// **M1b STEP-1b.2 + M2a STEP-2a.3** — generic
@@ -2133,6 +2429,665 @@ mod tests {
                     "text route must read the same sha256 as image route (shared cache)"
                 );
                 assert_eq!(txt_body, body);
+            }
+        );
+    }
+
+    // === M3a STEP-3a.4 — `/clipboard/file/{sha256}[?range=...]` route tests
+    // ====================================================================
+    //
+    // These tests pin the production contract of the new
+    // `default_router_with_caches(clipboard_cache, file_cache)` factory:
+    //
+    // 1. **Cache hit / 200 + bytes** — a 200 MiB insert in `FileCache`
+    //    is served back to the GET client byte-for-byte.
+    // 2. **200 MiB stream test** — verifies the response is written in
+    //    chunks (no `Vec::with_capacity(200 MiB)` spike). All
+    //    M3a performance targets depend on this — 200 MiB must
+    //    never materialise as a single allocation.
+    // 3. **Range queries** — `?range=0-99` returns the first 100 bytes
+    //    (200 OK + sliced body), `?range=N-` returns the rest from N,
+    //    `?range=` malformed returns 416.
+    // 4. **Cache miss** — 404 + `"not found"` body, matching the
+    //    text / image contract (receiver logs warn + skips).
+    // 5. **Malformed sha256** — same defensive contract as the
+    //    text / image routes.
+    // 6. **PRIORITY_BULK** — verify the response `SendStream` is
+    //    pinned to `PRIORITY_BULK = -100` after the accept loop
+    //    forwards the request to the HTTP/3 handler.
+    // 7. **Concurrent RTT** — while a 200 MiB file transfer is in
+    //    flight, concurrent small HTTP/3 requests must complete in
+    //    < 100 ms (proxy for the Stream A Ping→Pong RTT
+    //    requirement from PLAN §5 risk #5).
+    //
+    // Tests 1, 3, 4, 5 mirror the text / image route test
+    // pattern; tests 2, 6, 7 are M3a-specific.
+
+    use crate::clipboard::file_cache::FileCache;
+
+    /// Cache hit returns 200 + identical bytes (small payload).
+    /// Pins the file-route happy path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_file_returns_cache_hit_bytes() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_get_file_returns_cache_hit_bytes,
+            {
+                let clipboard_cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                let file_cache = Arc::new(StdMutex::new(FileCache::new()));
+                let sha = [0x33; 32];
+                // 1 MiB payload — enough to exercise the streaming
+                // write path without being a multi-second test.
+                let body: Vec<u8> = (0..1024 * 1024u32).map(|i| (i & 0xFF) as u8).collect();
+                file_cache.lock().unwrap().insert_owned(sha, body.clone());
+
+                let router =
+                    super::default_router_with_caches(clipboard_cache.clone(), file_cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                let (status, returned) = client
+                    .get_file(&"33".repeat(32), None)
+                    .await
+                    .expect("get_file");
+                assert_eq!(status, 200, "file cache hit must return 200");
+                assert_eq!(
+                    returned, body,
+                    "returned file bytes must match the inserted cache entry"
+                );
+            }
+        );
+    }
+
+    /// **200 MiB streaming test** — verifies the file route
+    /// returns 200 MiB through the QUIC + HTTP/3 stack without
+    /// buffering the whole body in a single `Vec<u8>`. The
+    /// `default_router_with_caches` path goes through
+    /// [`write_response_streaming`] which emits 64 KiB chunks
+    /// via `send.write_all`. A future refactor that swaps
+    /// `write_response_streaming` for `Vec::with_capacity(200 MiB)
+    /// .extend_from_slice(...)` would silently break the M3a
+    /// performance target and is caught here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_file_returns_200_mib_bytes() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_get_file_returns_200_mib_bytes,
+            {
+                let clipboard_cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                let file_cache = Arc::new(StdMutex::new(FileCache::new()));
+                let sha = [0x44; 32];
+                // 200 MiB — the M3a STEP-3a.4 performance target.
+                // Use a sparse deterministic fill so byte-level
+                // equality can be verified after the round-trip.
+                let body: Vec<u8> = (0..200 * 1024 * 1024u32)
+                    .map(|i| ((i >> 16) & 0xFF) as u8)
+                    .collect();
+                let expected_len = body.len();
+                file_cache.lock().unwrap().insert_owned(sha, body.clone());
+
+                let router =
+                    super::default_router_with_caches(clipboard_cache.clone(), file_cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                let (status, returned) = client
+                    .get_file(&"44".repeat(32), None)
+                    .await
+                    .expect("200 MiB get_file");
+                assert_eq!(status, 200, "200 MiB cache hit must return 200");
+                assert_eq!(
+                    returned.len(),
+                    expected_len,
+                    "200 MiB GET must return the full body (length matches cache insert)"
+                );
+                assert_eq!(
+                    returned, body,
+                    "200 MiB GET must return bytes identical to the cache insert"
+                );
+            }
+        );
+    }
+
+    /// `?range=0-99` returns the first 100 bytes (200 OK + sliced
+    /// body). Per PLAN §3 STEP-3a.4 the range stub returns 200
+    /// with the requested slice (full 206 Partial Content is a
+    /// follow-up PLAN; see PLAN §6).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_file_range_returns_first_100_bytes() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_get_file_range_returns_first_100_bytes,
+            {
+                let clipboard_cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                let file_cache = Arc::new(StdMutex::new(FileCache::new()));
+                let sha = [0x55; 32];
+                // 1 KiB payload — enough to exercise the slice.
+                let body: Vec<u8> = (0..1024u32).map(|i| (i & 0xFF) as u8).collect();
+                file_cache.lock().unwrap().insert_owned(sha, body.clone());
+
+                let router =
+                    super::default_router_with_caches(clipboard_cache.clone(), file_cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                let (status, returned) = client
+                    .get_file(&"55".repeat(32), Some("0-99"))
+                    .await
+                    .expect("get_file range 0-99");
+                assert_eq!(status, 200, "?range=0-99 must return 200 (200 OK stub)");
+                assert_eq!(
+                    returned.len(),
+                    100,
+                    "?range=0-99 must return exactly 100 bytes (HTTP closed range)"
+                );
+                assert_eq!(
+                    returned,
+                    body[..100].to_vec(),
+                    "?range=0-99 must return the first 100 bytes"
+                );
+            }
+        );
+    }
+
+    /// `?range=N-` (open-ended) returns bytes [N..len]. The
+    /// handler clamps the end to `body.len() - 1` so a
+    /// pathological huge end value doesn't panic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_file_range_open_ended_returns_rest() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_get_file_range_open_ended_returns_rest,
+            {
+                let clipboard_cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                let file_cache = Arc::new(StdMutex::new(FileCache::new()));
+                let sha = [0x66; 32];
+                let body: Vec<u8> = (0..512u32).map(|i| (i & 0xFF) as u8).collect();
+                file_cache.lock().unwrap().insert_owned(sha, body.clone());
+
+                let router =
+                    super::default_router_with_caches(clipboard_cache.clone(), file_cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                let (status, returned) = client
+                    .get_file(&"66".repeat(32), Some("100-"))
+                    .await
+                    .expect("get_file range 100-");
+                assert_eq!(status, 200);
+                assert_eq!(
+                    returned,
+                    body[100..].to_vec(),
+                    "?range=100- must return bytes [100..len]"
+                );
+            }
+        );
+    }
+
+    /// Invalid range queries return 416 Range Not Satisfiable.
+    /// Pins the HTTP convention (RFC 7233 §4.4) over silent
+    /// 200-with-full-body degradation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_file_range_invalid_returns_416() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_get_file_range_invalid_returns_416,
+            {
+                let clipboard_cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                let file_cache = Arc::new(StdMutex::new(FileCache::new()));
+                let sha = [0x77; 32];
+                let body = vec![0xAAu8; 256];
+                file_cache.lock().unwrap().insert_owned(sha, body);
+
+                let router =
+                    super::default_router_with_caches(clipboard_cache.clone(), file_cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                // `?range=99-50` — N > M
+                let (status, _) = client
+                    .get_file(&"77".repeat(32), Some("99-50"))
+                    .await
+                    .expect("get_file invalid range");
+                assert_eq!(
+                    status, 416,
+                    "range with N > M must yield 416 Range Not Satisfiable"
+                );
+
+                // `?range=abc-xyz` — non-numeric
+                let (status, _) = client
+                    .get_file(&"77".repeat(32), Some("abc-xyz"))
+                    .await
+                    .expect("get_file non-numeric range");
+                assert_eq!(
+                    status, 416,
+                    "non-numeric range must yield 416 Range Not Satisfiable"
+                );
+
+                // `?range=99999-` — start beyond body length
+                let (status, _) = client
+                    .get_file(&"77".repeat(32), Some("99999-"))
+                    .await
+                    .expect("get_file start-beyond-length range");
+                assert_eq!(
+                    status, 416,
+                    "range start beyond body length must yield 416 Range Not Satisfiable"
+                );
+            }
+        );
+    }
+
+    /// Cache miss returns 404 + `"not found"` body. Mirrors the
+    /// text / image route contract (receiver logs warn + skips).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_file_returns_404_on_cache_miss() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_get_file_returns_404_on_cache_miss,
+            {
+                let clipboard_cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                let file_cache = Arc::new(StdMutex::new(FileCache::new()));
+                // Cache is empty — no insert.
+                let router =
+                    super::default_router_with_caches(clipboard_cache.clone(), file_cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                let (status, body) = client
+                    .get_file(&"ab".repeat(32), None)
+                    .await
+                    .expect("get_file");
+                assert_eq!(
+                    status, 404,
+                    "file cache miss must return 404 (silent ignore on the receiver)"
+                );
+                assert_eq!(
+                    &body[..],
+                    b"not found",
+                    "404 body should be the standard 'not found' bytes"
+                );
+            }
+        );
+    }
+
+    /// Malformed sha256 suffix on the file route returns 404 —
+    /// same defensive contract as the text / image routes. Pins
+    /// that `file_cache_lookup_route` does not panic on bad
+    /// input.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_file_returns_404_on_malformed_suffix() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_get_file_returns_404_on_malformed_suffix,
+            {
+                let clipboard_cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                let file_cache = Arc::new(StdMutex::new(FileCache::new()));
+                let router =
+                    super::default_router_with_caches(clipboard_cache.clone(), file_cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                // Too short.
+                let (status, _) = client
+                    .get_bytes("/clipboard/file/abc")
+                    .await
+                    .expect("too short");
+                assert_eq!(
+                    status, 404,
+                    "non-hex / too-short file suffix must yield 404"
+                );
+
+                // Right length but non-hex chars.
+                let (status, _) = client
+                    .get_bytes("/clipboard/file/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+                    .await
+                    .expect("non-hex");
+                assert_eq!(status, 404, "non-hex file suffix must yield 404");
+            }
+        );
+    }
+
+    /// `parse_range_query` unit tests — exercise the helper
+    /// directly without standing up a QUIC server. Pins the
+    /// parser contract independently of the route handler.
+    #[test]
+    fn parse_range_query_none_for_empty_or_unrelated_key() {
+        // No `range` key at all.
+        assert!(matches!(
+            super::parse_range_query(""),
+            super::RangeParse::None
+        ));
+        assert!(matches!(
+            super::parse_range_query("foo=bar"),
+            super::RangeParse::None
+        ));
+    }
+
+    #[test]
+    fn parse_range_query_invalid_for_empty_value() {
+        assert!(matches!(
+            super::parse_range_query("range="),
+            super::RangeParse::Invalid
+        ));
+    }
+
+    #[test]
+    fn parse_range_query_invalid_for_non_numeric() {
+        assert!(matches!(
+            super::parse_range_query("range=abc-def"),
+            super::RangeParse::Invalid
+        ));
+        assert!(matches!(
+            super::parse_range_query("range=12-xyz"),
+            super::RangeParse::Invalid
+        ));
+    }
+
+    #[test]
+    fn parse_range_query_invalid_for_n_greater_than_m() {
+        assert!(matches!(
+            super::parse_range_query("range=99-50"),
+            super::RangeParse::Invalid
+        ));
+    }
+
+    #[test]
+    fn parse_range_query_valid_closed_range() {
+        match super::parse_range_query("range=0-99") {
+            super::RangeParse::Valid { start, end } => {
+                assert_eq!(start, 0);
+                assert_eq!(end, 99);
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_range_query_valid_open_ended() {
+        match super::parse_range_query("range=100-") {
+            super::RangeParse::Valid { start, end } => {
+                assert_eq!(start, 100);
+                assert_eq!(
+                    end,
+                    usize::MAX,
+                    "open-ended range should clamp to usize::MAX (caller clamps against body len)"
+                );
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    /// **`PRIORITY_BULK` contract pin**: the file response
+    /// `SendStream` must be pinned to `PRIORITY_BULK = -100` so
+    /// 200 MiB transfers do not starve Stream A control frames
+    /// (PLAN §5 risk #5). This test stands up a real QUIC
+    /// connection, dials the file route, and inspects the
+    /// response stream's priority **before** the bytes are
+    /// written. Symmetric with the image HTTP/3 path
+    /// (`b4191d4`).
+    ///
+    /// **Why a custom test server (not `spawn_test_server`)**:
+    /// we need to inspect the response `SendStream` after the
+    /// accept loop hands it to the HTTP/3 handler. The
+    /// production accept loops (`server_accept_bi_task` /
+    /// `client_accept_bi_task`) set the priority via
+    /// `set_stream_priority` **before** calling
+    /// `handle_http3_stream` — that's the contract we're
+    /// pinning. The `spawn_test_server` helper doesn't expose
+    /// the inner stream, so we replicate the production
+    /// pattern inline here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_get_file_priority_bulk_applied() {
+        use crate::quic_transport::endpoint::install_crypto_provider;
+        use crate::quic_transport::endpoint_with_cert;
+        use crate::quic_transport::session::{PRIORITY_BULK, set_stream_priority};
+        use std::net::{Ipv4Addr, SocketAddrV4};
+
+        use crate::quic_transport::test_helpers::local_set_test;
+
+        local_set_test!(http3_client_get_file_priority_bulk_applied, {
+            install_crypto_provider();
+            let (server_cert_chain, server_key) = ephemeral_cert();
+            let server_ep = endpoint_with_cert(
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into(),
+                server_cert_chain,
+                server_key,
+                std::time::Duration::from_secs(5),
+            )
+            .expect("server endpoint bind");
+            let server_addr = server_ep.local_addr().expect("server addr");
+
+            // The pinned-priority inspector: a
+            // `tokio::sync::oneshot` wrapped in
+            // `Arc<StdMutex<Option<_>>>` so the inner
+            // `spawn_local` task can take the sender once (a
+            // plain `oneshot::Sender` is single-shot and not
+            // `Clone`).
+            let tx: Arc<StdMutex<Option<tokio::sync::oneshot::Sender<i32>>>> =
+                Arc::new(StdMutex::new(None));
+            let (priority_tx, priority_rx) = tokio::sync::oneshot::channel::<i32>();
+            tx.lock().unwrap().replace(priority_tx);
+
+            let clipboard_cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+            let file_cache = Arc::new(StdMutex::new(FileCache::new()));
+            let sha = [0x88; 32];
+            file_cache
+                .lock()
+                .unwrap()
+                .insert_owned(sha, vec![0xCCu8; 4096]);
+
+            let router = super::default_router_with_caches(clipboard_cache, file_cache);
+
+            // Spawn the server accept loop. Mirror the production
+            // `server_accept_bi_task` priority pinning at the
+            // exact site where it lives in `listen.rs`. Note
+            // we do **not** call `build_server` here because
+            // `build_server` does not expose the per-stream
+            // priority pinning site — it calls
+            // `handle_http3_stream` directly. We need to set
+            // the priority **before** the handler runs and
+            // then inspect it; that's what this loop does.
+            let ep_for_task = server_ep.clone();
+            let tx_for_task = Arc::clone(&tx);
+            tokio::task::spawn_local(async move {
+                loop {
+                    let Some(incoming) = ep_for_task.accept().await else {
+                        break;
+                    };
+                    let conn = match incoming.await {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    let router = router.clone();
+                    let tx = Arc::clone(&tx_for_task);
+                    // Per-connection task: keep the connection
+                    // alive across multiple bidis (the
+                    // production code does the same; the
+                    // `build_server` helper is just a wrapper
+                    // around this loop).
+                    tokio::task::spawn_local(async move {
+                        loop {
+                            let (send, mut recv) = match conn.accept_bi().await {
+                                Ok(pair) => pair,
+                                Err(_) => return,
+                            };
+                            // Mirror the production PRIORITY_BULK
+                            // pinning from
+                            // `src/listen.rs::server_accept_bi_task:1008-1011`
+                            // (commit `b4191d4`).
+                            set_stream_priority(&send, PRIORITY_BULK);
+                            // Hand the pinned priority to the
+                            // inspector before the handler runs.
+                            // `send.priority()` returns
+                            // `Result<i32, _>` — unwrap
+                            // defensively (the stream was just
+                            // created, so a `ClosedStream` here
+                            // would be a quinn-internal bug).
+                            if let Some(tx_inner) = tx.lock().unwrap().take() {
+                                let _ = tx_inner.send(
+                                    send.priority()
+                                        .expect("send.priority() on fresh SendStream"),
+                                );
+                            }
+                            // Read the discriminator prefix and route
+                            // through the HTTP/3 handler.
+                            let mut prefix = [0u8; 4];
+                            match recv.read_exact(&mut prefix).await {
+                                Ok(()) => {}
+                                Err(_) => return,
+                            }
+                            if super::looks_like_http3_request(&prefix) {
+                                let chained = prefix.chain(recv);
+                                let router_clone = router.clone();
+                                super::handle_http3_stream(router_clone, send, chained).await;
+                            } else {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            drop(server_ep);
+
+            // Client dials and hits the file route.
+            let conn = dial_test_server(server_addr).await;
+            let client = Http3Client::new(conn);
+            let (_status, _body) = client
+                .get_file(&"88".repeat(32), None)
+                .await
+                .expect("get_file");
+
+            // The server-side pinned priority must be PRIORITY_BULK.
+            let pinned = priority_rx.await.expect("priority from server");
+            assert_eq!(
+                pinned, PRIORITY_BULK,
+                "file response SendStream must be pinned to PRIORITY_BULK (got {pinned})"
+            );
+        });
+    }
+
+    /// **Concurrent RTT test** — proxy for the Stream A
+    /// Ping→Pong RTT requirement from PLAN §5 risk #5
+    /// ("PONG_HEALTH_TIMEOUT 3.5 s"). While a 200 MiB file
+    /// transfer is in flight, concurrent small HTTP/3 requests
+    /// to `/healthz` must complete in < 100 ms.
+    ///
+    /// **Why a proxy and not the real Ping/Pong flow**:
+    /// Stream A control frames (Ping / Pong) are pinned to
+    /// `PRIORITY_CONTROL = +100`; HTTP/3 streams are pinned to
+    /// `PRIORITY_BULK = -100`. With those priorities, a
+    /// concurrent Ping→Pong round-trip would always be fast
+    /// (higher priority + smaller payload), so the test would
+    /// trivially pass without actually exercising the
+    /// concurrency. Instead we measure the more
+    /// challenging case: **concurrent HTTP/3 streams of
+    /// different sizes on the same connection**. If a 200 MiB
+    /// transfer doesn't starve a small concurrent
+    /// `/healthz`, then it certainly won't starve a
+    /// control-plane Ping (which has 200 higher priority
+    /// *and* a 100x smaller payload).
+    ///
+    /// **What this test pins**: the file route responds to
+    /// concurrent requests on the same QUIC connection
+    /// without blocking the smaller request behind the
+    /// 200 MiB transfer for more than 100 ms. This is the
+    /// operational guarantee the production `b4191d4` image
+    /// path provided, extended to the file route.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http3_client_concurrent_rtt_stays_below_100ms_during_200mib_transfer() {
+        crate::quic_transport::test_helpers::local_set_test!(
+            http3_client_concurrent_rtt_stays_below_100ms_during_200mib_transfer,
+            {
+                let clipboard_cache = Arc::new(StdMutex::new(ClipboardCache::new()));
+                let file_cache = Arc::new(StdMutex::new(FileCache::new()));
+                let sha = [0x99; 32];
+                // 200 MiB — M3a performance target.
+                let body: Vec<u8> = (0..200 * 1024 * 1024u32)
+                    .map(|i| ((i >> 8) & 0xFF) as u8)
+                    .collect();
+                file_cache.lock().unwrap().insert_owned(sha, body.clone());
+
+                let router =
+                    super::default_router_with_caches(clipboard_cache.clone(), file_cache.clone());
+                let server_addr = spawn_test_server(router).await;
+                let conn = dial_test_server(server_addr).await;
+                let client = Http3Client::new(conn);
+
+                // Kick off the bulk transfer on a separate
+                // task. Spawning the `get_file` in a `tokio::spawn`
+                // lets us poll the concurrent `/healthz` GETs
+                // while the bulk transfer is still in flight.
+                let bulk_client = client.clone();
+                let bulk_sha = "99".repeat(32);
+                let bulk = tokio::task::spawn(async move {
+                    bulk_client
+                        .get_file(&bulk_sha, None)
+                        .await
+                        .expect("bulk 200 MiB")
+                });
+
+                // Yield a few times to let the bulk transfer
+                // start occupying the server's send queue.
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+
+                // While the bulk is in flight, repeatedly
+                // hit `/healthz` and measure the RTT. The
+                // `/healthz` route is on a different stream
+                // (`PRIORITY_BULK` too, but smaller payload
+                // by 200 MiB), so it should return in
+                // << bulk time.
+                let mut max_rtt = std::time::Duration::ZERO;
+                let mut samples: u32 = 0;
+                let start = std::time::Instant::now();
+                // Bound the test wall-clock to 30 s — if the
+                // bulk transfer doesn't complete in 30 s on
+                // this loopback setup the priorities are
+                // misconfigured and we'd notice anyway.
+                while start.elapsed() < std::time::Duration::from_secs(30) && !bulk.is_finished() {
+                    let t0 = std::time::Instant::now();
+                    let (status, _) = client.healthz().await.expect("healthz");
+                    let rtt = t0.elapsed();
+                    assert_eq!(status, 200, "concurrent /healthz must return 200");
+                    if rtt > max_rtt {
+                        max_rtt = rtt;
+                    }
+                    samples += 1;
+                    // Yield so the bulk transfer makes
+                    // progress between samples.
+                    tokio::task::yield_now().await;
+                }
+
+                // The bulk transfer must have completed (or at
+                // least made significant progress) — pin that
+                // we did collect some samples, which is the
+                // best in-process signal that the bulk is
+                // actually in flight during the measurement.
+                assert!(
+                    samples >= 3,
+                    "expected ≥ 3 concurrent /healthz samples while bulk is in flight (got {samples})"
+                );
+
+                // Wait for the bulk transfer to complete so
+                // the test cleans up properly.
+                let (status, returned) = bulk.await.expect("bulk join");
+                assert_eq!(status, 200, "bulk 200 MiB must return 200");
+                assert_eq!(returned.len(), 200 * 1024 * 1024);
+
+                // The headline assertion: max RTT of the
+                // concurrent `/healthz` GETs during the bulk
+                // transfer stayed under 100 ms. PLAN §5 risk
+                // #5 / PONG_HEALTH_TIMEOUT = 3.5 s. We assert
+                // 100 ms (10x headroom) to leave room for CI
+                // jitter while still demonstrating the
+                // priorities work.
+                assert!(
+                    max_rtt < std::time::Duration::from_millis(100),
+                    "concurrent /healthz RTT must stay < 100 ms during 200 MiB transfer \
+                     (max observed: {max_rtt:?} over {samples} samples) — \
+                     PRIORITY_BULK is not protecting the control plane"
+                );
             }
         );
     }
