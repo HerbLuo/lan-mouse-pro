@@ -5,7 +5,10 @@
 //! - [`build_quic_client_config`] assembles a `quinn::ClientConfig` (rustls +
 //!   ring + [`TofuVerifier`] + mTLS client cert presentation + ALPN)
 //! - [`default_transport_config`] shared server/client `TransportConfig`
-//!   (5s keepalive / 10s idle)
+//!   (2s keepalive / 30s idle — see BUGS-2: the legacy 5s/5s combo
+//!   killed the bulk conn after ~10s of symmetric idle because bulk
+//!   conns have no app-layer stream activity to push keepalive onto;
+//!   see [`MAX_IDLE_TIMEOUT`])
 //! - [`TofuVerifier`] client-side TOFU (Trust On First Use) fingerprint pinning
 //! - [`PermissiveClientCertVerifier`] placeholder verifier that accepts any
 //!   client cert passing the TLS 1.3 built-in chain check
@@ -31,17 +34,50 @@ use crate::crypto;
 
 use super::{ALPN_LAN_MOUSE, Error, Result};
 
+/// Recommended default for the keep-alive interval on every QUIC conn.
+///
+/// **Tuned alongside [`MAX_IDLE_TIMEOUT`]**: keepalive fires 15 times
+/// before the idle timer expires on the legacy 30s default — that's
+/// the slack the bulk conn (no app-layer stream activity in its
+/// steady state) needs to survive the typical 10-20s gap between
+/// clipboard copies without forced re-dial.
+pub(super) const KEEPALIVE: Duration = Duration::from_secs(2);
+
+/// Recommended default for the `idle_timeout` argument passed to
+/// [`default_transport_config`]. Tuned alongside [`KEEPALIVE`] (2s):
+/// the keepalive fires ≥ 10 times before the idle timer expires,
+/// which is what makes the bulk conn (no app-layer stream activity in
+/// its steady state) survive the gap between clipboard copies. See
+/// `next/BUGS-2.md` for the bug analysis.
+///
+/// The actual default reaches the runtime through
+/// [`crate::config::Config::quic_idle_timeout`] (where `DEFAULT = 30`),
+/// not by being baked into [`default_transport_config`] — this constant
+/// exists so tests can pin the value and so future callers can refer
+/// to a single source of truth instead of duplicating `30` in the
+/// default-quic-idle-timeout and the regression tests below.
+///
+/// **`#[allow(dead_code)]`**: production crates do not consume this
+/// const directly (callers flow through `Config::quic_idle_timeout()`),
+/// so the non-test build sees it as unused. The regression tests
+/// (`default_transport_config_*`) consume it from the `#[cfg(test)]`
+/// sibling module, where it is referenced. Keeping the const visible
+/// is the right tradeoff — it documents the recommended default at the
+/// transport-config layer rather than burying it inside a config-layer
+/// `DEFAULT`.
+#[allow(dead_code)]
+pub(super) const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Shared server/client `TransportConfig`:
 ///
-/// - `keep_alive_interval = 5s` — QUIC active probe.
-/// - `max_idle_timeout` — caller-supplied. Defaults to **5s** at the
-///   config layer (was 10s before 2026-09-04; lowered to shrink the
-///   "mouse stuck during a network blip" window on the master side,
-///   where the only death-detection signal is the QUIC idle timer —
-///   see [`crate::connect::spawn_peer_supervisor`]).
+/// - `keep_alive_interval = 2s` — QUIC active probe.
+/// - `max_idle_timeout` — caller-supplied. Defaults to **30s** at the
+///   config layer (was 5s before 2026-09-11 BUGS-2; raised from the
+///   5s/5s combo that killed the bulk conn after ~10s of symmetric
+///   idle — see [`MAX_IDLE_TIMEOUT`] and `next/BUGS-2.md`).
 ///
 /// **Clamp invariant**: `idle_timeout` MUST be ≥ `keep_alive_interval`
-/// (5s). Quinn panics with `ConfigurationError` on
+/// (2s). Quinn panics with `ConfigurationError` on
 /// `IdleTimeout::try_from(d)` when the resulting VarInt is invalid AND
 /// with `set_max_idle_timeout_before` / `set_keep_alive_before` when
 /// the idle timeout is below the keep-alive interval — the latter is
@@ -49,7 +85,7 @@ use super::{ALPN_LAN_MOUSE, Error, Result};
 /// trace in the offending config layer rather than a runtime panic
 /// buried inside quinn.
 ///
-/// On healthy links the 5s keepalive always fires first, and the idle
+/// On healthy links the 2s keepalive always fires first, and the idle
 /// timeout only applies on edge cases where send/ping force-close
 /// fails.
 ///
@@ -62,7 +98,6 @@ use super::{ALPN_LAN_MOUSE, Error, Result};
 /// needs it for server transport configuration; `build_quic_client_config`
 /// (in this file) calls it directly.
 pub(super) fn default_transport_config(idle_timeout: Duration) -> Arc<TransportConfig> {
-    const KEEPALIVE: Duration = Duration::from_secs(5);
     assert!(
         idle_timeout >= KEEPALIVE,
         "QUIC max_idle_timeout ({:?}) must be >= keep_alive_interval ({:?})",
@@ -718,6 +753,82 @@ mod tests {
     };
 
     use super::*;
+
+    /// Regression for BUGS-2: the QUIC transport config's keepalive and idle
+    /// timeout must satisfy `keepalive * 2 < idle`, and the concrete values
+    /// must be pinned to the 2s / 30s pair chosen in BUGS-2 — otherwise a
+    /// future refactor that quietly widens the keepalive interval (back to
+    /// the legacy 5s) or shrinks the idle timeout (back to the legacy 5s)
+    /// would re-introduce the "bulk conn dies after ~10s" failure mode
+    /// where the keepalive PING never gets a chance to fire on a symmetric
+    /// idle bulk conn.
+    ///
+    /// The legacy values were 5s / 5s — keepalive 5s + idle 5s grace =
+    /// ~10s lifetime on a symmetric-idle bulk conn (no app-layer streams
+    /// to push keepalive onto). The fix widens idle to 30s and tightens
+    /// keepalive to 2s, giving ≥ 10 keepalive opportunities before idle.
+    ///
+    /// Note: we pin the constants directly rather than reading the
+    /// `TransportConfig` fields, because quinn 0.11's `TransportConfig`
+    /// exposes the keepalive / idle knobs only through `&mut self`
+    /// setters — there's no public getter. Asserting on the consts
+    /// that feed the setters is the closest pin we can get without
+    /// restructuring the function to expose values.
+    #[test]
+    fn default_transport_config_keepalive_tighter_than_idle() {
+        // Pin the concrete values — any refactor that changes either of
+        // these constants must update the test + BUGS-2 plan together.
+        assert_eq!(
+            KEEPALIVE,
+            Duration::from_secs(2),
+            "BUGS-2: KEEPALIVE must be 2s (was 5s); see tls::default_transport_config"
+        );
+        assert_eq!(
+            MAX_IDLE_TIMEOUT,
+            Duration::from_secs(30),
+            "BUGS-2: MAX_IDLE_TIMEOUT must be 30s (was 5s); see tls::MAX_IDLE_TIMEOUT"
+        );
+
+        // Invariant — keepalive fires well before idle.
+        assert!(
+            KEEPALIVE.saturating_mul(2) < MAX_IDLE_TIMEOUT,
+            "BUGS-2 invariant violated: keepalive*2 ({:?}) must be < \
+             idle ({:?}) so keepalive PING has room to fire before the \
+             idle timer expires",
+            KEEPALIVE.saturating_mul(2),
+            MAX_IDLE_TIMEOUT,
+        );
+
+        // And the function actually wires the values into a `TransportConfig`
+        // without panicking on the BUGS-2 default — exercises the
+        // `IdleTimeout::try_from` path with the new 30s default.
+        let cfg = default_transport_config(MAX_IDLE_TIMEOUT);
+        // Arc strong count: this is a freshly-returned Arc, so it must
+        // be safe to drop without leak / panic.
+        drop(cfg);
+    }
+
+    /// Regression for BUGS-2: the default idle timeout must comfortably
+    /// exceed the typical user cadence between consecutive clipboard
+    /// copies (10-20s in the BUGS-2 reproduction). A value below that
+    /// forces the 500ms retry path to keep firing (FIX-D1) because the
+    /// bulk conn keeps dying right when the user initiates the next copy,
+    /// producing the "mouse keeps stuttering" symptom.
+    ///
+    /// The hard floor here is 20s — i.e. anything `>= 20s` is acceptable
+    /// for the bulk conn steady-state. We use 30s as the actual default
+    /// (`MAX_IDLE_TIMEOUT`), but the test asserts the invariant rather
+    /// than the specific value so a future bump (40s, 60s) doesn't break
+    /// this check.
+    #[test]
+    fn default_transport_config_supports_long_idle_bulk_conn_use_case() {
+        assert!(
+            MAX_IDLE_TIMEOUT >= Duration::from_secs(20),
+            "BUGS-2: MAX_IDLE_TIMEOUT {MAX_IDLE_TIMEOUT:?} too short for typical user \
+             copy cadence (10-20s gap between consecutive clipboard copies); must be \
+             ≥ 20s so the bulk conn survives the gap without forced re-dial",
+        );
+    }
 
     /// Verifies that assembling a `quinn::ClientConfig` with a test self-signed
     /// cert does not panic.
