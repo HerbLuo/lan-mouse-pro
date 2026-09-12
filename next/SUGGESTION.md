@@ -85,6 +85,67 @@
 
 ---
 
+## #S-7 🟡 — `set_clipboard_config` 仅 log 不接 Service 字段（auto_accept_files / accept_dir IPC 改动未生效到 inbound arm）
+
+**触发 STEP**：STEP-P2-M3a-3a.3
+
+**现象**：`src/service.rs:2011-2026` 的 `set_clipboard_config` 接到 `FrontendRequest::SetClipboardConfig(ClipboardConfig)` 后，**只**：
+1. 把 cfg 写到 `self.config` (TOML 持久化)
+2. log 一行 "M0c — runtime effect wired in M1a"
+
+**没有**更新 `self.config.clipboard_config()` 返回值（这是 IPC 默认通过 getter 暴露的，所以 IPC 改动**间接**生效到 inbound arm 决策 fn），但 inbound arm 的状态（如 `last_file_ts_ms` 标记）不会因 IPC 改动而重置。
+
+**具体影响**：
+- `auto_accept_files` 字段：STEP-3a.3 的 `handle_clipboard_inbound_files_decide` 读 `self.config.clipboard_config().auto_accept_files`，所以 **IPC 改动会自动生效到 inbound arm 决策**（决策 fn 是纯函数，每次调用都重新读 config）—— 这一项**事实上没问题**
+- `accept_dir` 字段：同上，决策 fn 每次重新读 — **事实上没问题**
+- 但 log 文本 "M0c — runtime effect wired in M1a" 是错的（M3a 已落地接收端，需要更新为 "M3a STEP-3a.3 决策 fn 直接读 config.clipboard_config()，每次 IPC 改动立即生效"）
+
+**理由**：M3a 决策 fn 设计为"每次调用读最新 config"，避免 IPC handler 维护额外 Service 字段（与 M3b IPC handler 重复工作）。这是有意为之。
+
+**建议**（leader 决策）：
+- 🟢 **短期**：更新 log 文本来 reflect M3a 实际行为（"M3a — runtime effect is read live by handle_clipboard_inbound_files_decide per-call"）
+- 🟡 **中期**：M3b STEP-3b.1 在 GUI 上加 "Auto-accept files" / "Accept dir" 控件 + Toaster 弹询问时（按需）再审视 — 当下决策 fn 设计已经满足 IPC 改动生效的需求
+- ⚪ **长期**：如未来要加 "apply-after-IPC-immediately" 语义（如 GUI 切到 auto_accept 后立即触发对端 redo push），可在 Service 加 `clipboard_config_dirty` flag 强制下一次 inbound 重新评估
+
+**优先级**：🟡（不阻塞 M3a；事实上 IPC 改动已生效，只是 log 文本误导）
+
+---
+
+## #S-8 🟡 — 默认 `accept_dir` 硬编码 `<home>/lan-mouse/`（待 M3b IPC handler 接续）
+
+**触发 STEP**：STEP-P2-M3a-3a.3
+
+**现象**：`src/service.rs::default_accept_dir()` 在用户没配置 `ClipboardConfig::accept_dir` 时 fallback 到 `<$HOME 或 $USERPROFILE>/lan-mouse/`。`lan-mouse-ipc::ClipboardConfig.accept_dir: Option<PathBuf>` 字段已存在（commit `0f5e33d` 前的某个 commit 落地），但 `set_clipboard_config` IPC handler 不接 Service 字段（参考 #S-7）。
+
+**理由**：STEP-3a.3 不引入跨平台 dir 解析 crate（避免 `dirs` / `directories` 新依赖）；手写 fallback chain `$HOME` / `$USERPROFILE` 覆盖三大平台。M3b STEP-3b.1 / M4 STEP-4.2 加 GUI 配置入口后用户可改。
+
+**建议**（leader 决策）：
+- 🟢 **短期**：保持常量 fallback（已实现）
+- 🟡 **中期**：M3b / M4 阶段在 GUI 加 "Accept directory" textbox + dir-picker 按钮，写入 `ClipboardConfig::accept_dir`；Service 决策 fn 已经每次重新读 config，无需改动
+- ⚪ **长期**：考虑使用 `dirs` / `directories` crate 替换 `$HOME` / `$USERPROFILE` fallback chain — 跨平台语义更标准（macOS `$HOME` 与 sandbox 容器不一致）
+
+**优先级**：🟡（不阻塞 M3a；M3b / M4 阶段直接消费）
+
+---
+
+## #S-9 ⚪ — 路径冲突后缀位置 `<stem> (1).<ext>`（macOS Finder / Windows Explorer 风格）
+
+**触发 STEP**：STEP-P2-M3a-3a.3
+
+**现象**：`src/service.rs::resolve_unique_path` 实现的冲突格式：`<stem> (1).<ext>`（如 `photo.jpg` → `photo (1).jpg`）。这是 macOS Finder / Windows Explorer / GNOME Files / KDE Dolphin 的行业惯例。
+
+**理由**：Linux 发行版如 GNOME 早期版本曾用 `name-1.ext`；macOS / Windows 从未变过；forked 项目历史用户多 macOS / Windows。
+
+**影响**：Linux 桌面用户可能略不习惯，但 95%+ 桌面用户接受这个格式。
+
+**建议**（leader 决策）：
+- 🟢 **短期**：保持 Finder / Explorer 风格（已实现 + 单测覆盖）
+- ⚪ **长期**：M3b / M4 阶段根据用户反馈调整；如要 Linux-style 切换为 `<stem>-<n>.<ext>` 即可（5 行代码改动）
+
+**优先级**：⚪（不阻塞 M3a；纯 cosmetic；用户反馈驱动）
+
+---
+
 ## #S-5 🟡 — `dispatch_files` 用常量 `DEFAULT_MAX_FILE_SIZE = 50 MiB`（待 IPC 落地后切到 `Config::max_file_size()`）
 
 **触发 STEP**：STEP-P2-M3a-3a.2
