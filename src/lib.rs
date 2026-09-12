@@ -12,6 +12,7 @@ mod listen;
 // `mod` (not `pub mod`) until the dispatcher (STEP-1a.4) needs the
 // platform impls re-exported.
 pub(crate) mod clipboard;
+pub(crate) mod popup;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_power;
 pub mod quic_transport;

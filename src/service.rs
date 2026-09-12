@@ -212,6 +212,30 @@ pub struct Service {
     /// See [`Self::mark_local_image_write`] for the inbound apply
     /// helper and `LruFingerprints` for the LRU type.
     image_lru_fingerprints: LruFingerprints,
+    /// **Clipboard popup guards** — keyed by inbound sha256 for the
+    /// receive path (HTTP/3 GET + backend apply), and by outbound
+    /// sha256 for the dispatch path. Inserted at work start, removed
+    /// (RAII drop) at work completion; the popup itself shows after
+    /// a 0.5 s grace period inside `crate::popup::PopupGuard`. Short
+    /// transfers never trigger a notification; transfers over the
+    /// threshold get a transient OS notification that auto-closes
+    /// via `popup::SHOW_DURATION_MS` on Linux/Windows.
+    ///
+    /// **Why two keyed maps and not one** (M-followup): a single
+    /// `HashMap<SocketAddr, _>` would conflate the inbound apply
+    /// (one per inbound sha) with the outbound dispatch (one per
+    /// outbound sha) — both can be in flight simultaneously for
+    /// different peers / different sha values. Keying by sha256
+    /// keeps the two paths independent.
+    ///
+    /// **Why not scoped to the function** (would be cleaner):
+    /// the inbound apply path is split across
+    /// `handle_clipboard_inbound_image` (entry) and
+    /// `handle_inbound_image_applied` (completion, in the main
+    /// task's `select!` arm via the `applied_tx` channel). The
+    /// guard must live across the boundary — easiest done by
+    /// storing it on `Service`.
+    popup_guards: HashMap<[u8; 32], crate::popup::PopupGuard>,
     /// **PLAN-2 / M1b STEP-1b.2** — sha256 of the most recent
     /// outbound `ClipboardText` push. Tracked so the dispatcher's
     /// next push can evict this entry from [`Self::clipboard_cache`]
@@ -863,6 +887,7 @@ impl Service {
                 IMAGE_LOOPBACK_CAPACITY,
                 IMAGE_LOOPBACK_TTL,
             ),
+            popup_guards: Default::default(),
             clipboard_last_text: None,
             // **M1b STEP-1b.2** — shared with the listener so
             // per-peer HTTP/3 servers can read from the same store
@@ -2100,6 +2125,15 @@ impl Service {
     ///    `last_clipboard_source` + emit `FrontendEvent
     ///    ::ClipboardState`.
     async fn dispatch_text(&mut self, new_text: String) {
+        // **Clipboard popup (sender side)** — arm a guard covering
+        // the text dispatch. Text dispatches are typically sub-100 ms
+        // so the 0.5 s gate almost never fires; the guard is still
+        // useful for the (rare) case of very large text payloads
+        // where sha256 + broadcast approach the threshold.
+        let sender_guard = crate::popup::PopupGuard::arm(
+            crate::popup::PopupKind::Text,
+            format!("Sending clipboard text ({} bytes)", new_text.len()),
+        );
         if Some(&new_text) == self.clipboard_last_text.as_ref() {
             return;
         }
@@ -2185,6 +2219,14 @@ impl Service {
             last_file_ts: self.last_file_ts_ms,
             last_source: None,
         });
+        // RAII: drop the sender-side popup guard at end of
+        // dispatch. If the work finished inside 500 ms the popup
+        // never showed; if it took longer, dropping closes the
+        // popup so the user gets a "sent" indicator without it
+        // lingering past the actual work. Early-return paths above
+        // (LRU hit, dedup hit) drop the guard at their own scope
+        // exit — same outcome.
+        drop(sender_guard);
     }
 
     /// **M2a STEP-2a.3** — dispatcher branch for clipboard images.
@@ -2243,6 +2285,21 @@ impl Service {
     /// 7. Update `last_outbound_image_sha` + `last_image_ts_ms` +
     ///    emit `FrontendEvent::ClipboardState`.
     async fn dispatch_image(&mut self, image: crate::clipboard::ImageBytes) {
+        // **Clipboard popup (sender side)** — arm a guard covering
+        // the full dispatch pipeline (sha256 + cache insert +
+        // broadcast). Most dispatches finish inside the 0.5 s grace
+        // period, in which case no popup fires. For very large
+        // images where sha256 + cache insert approaches half a
+        // second, the popup fires briefly to confirm the copy was
+        // sent. Drop at end-of-function (RAII closes the popup).
+        let sender_popup_msg = format!(
+            "Sending clipboard image ({} bytes)",
+            image.data.len()
+        );
+        let sender_guard = crate::popup::PopupGuard::arm(
+            crate::popup::PopupKind::Image,
+            sender_popup_msg,
+        );
         // **BUGS-2 fix, 2026-09-12 (M1)** — sha256 + cache insert moved
         // off the LocalSet. The original implementation did
         // `sha256_of_bytes(&image.data)` (~100-300 ms for 4 MB,
@@ -2367,6 +2424,12 @@ impl Service {
             last_file_ts: self.last_file_ts_ms,
             last_source: None,
         });
+        // Drop the sender-side popup guard explicitly at end of
+        // dispatch (RAII). If the work finished inside 500 ms the
+        // popup never showed; if it took longer, dropping closes
+        // the popup so the user gets a "sent" indicator without it
+        // lingering past the actual work.
+        drop(sender_guard);
     }
 
     /// Clipboard inbound handler for `ClipboardText` from a peer (server or
@@ -2444,6 +2507,10 @@ impl Service {
         }
         // Inline fast-path: bytes are on the wire, just apply.
         if let Some(content) = ct.content_inline.as_ref() {
+            // Inline payloads are tiny (≤ 1 KiB by wire convention),
+            // so the apply completes well inside the 0.5 s popup
+            // grace period — skip the popup guard entirely. Only the
+            // HTTP/3 GET path (below) arms a popup.
             self.apply_inbound_clipboard_text(&ct.sha256, content, addr).await;
             return;
         }
@@ -2467,6 +2534,15 @@ impl Service {
         // full 3261-byte body keyed by the full 32-byte sha256.
         let sha_hex = full_hex(&ct.sha256);
         let client = Http3Client::new(conn);
+        // **Clipboard popup** — arm a guard for the HTTP/3 GET path.
+        // Same shape as the image branch: guard is keyed by sha and
+        // dropped on completion (here, inline at the 200 arm).
+        // Show-then-cancel semantics are handled by `popup::PopupGuard`.
+        let msg = format!(
+            "Receiving clipboard text from {addr} ({} bytes announced)",
+            ct.content_inline.as_ref().map(|b| b.len()).unwrap_or(0)
+        );
+        let guard = crate::popup::PopupGuard::arm(crate::popup::PopupKind::Text, msg);
         let result = client.get_text(&sha_hex).await;
         match result {
             Ok((status, body)) => match status {
@@ -2492,6 +2568,7 @@ impl Service {
                 );
             }
         }
+        drop(guard);
     }
 
     /// **M2a STEP-2a.4** — image-arm of the inbound handler.
@@ -2588,6 +2665,22 @@ impl Service {
             );
             return;
         };
+        // **Clipboard popup** — arm a guard keyed by inbound sha so
+        // the receiving-side "Receiving clipboard image …" popup
+        // shows after the 0.5 s grace period if the HTTP/3 GET +
+        // apply is still in flight. The guard is removed (RAII drop
+        // closes the popup) in `handle_inbound_image_applied` when
+        // the apply completes. If the apply finishes within 500 ms
+        // the guard's delay-show thread observes the cancel flag
+        // and skips showing anything.
+        let msg = format!(
+            "Receiving clipboard image from {addr} ({} bytes)",
+            ci.size
+        );
+        self.popup_guards.insert(
+            ci.sha256,
+            crate::popup::PopupGuard::arm(crate::popup::PopupKind::Image, msg),
+        );
         log::info!(
             "clipboard inbound image: apply kicked off to spawn_local task \
              (sha={}, mime={}) for {addr}",
@@ -2802,6 +2895,17 @@ impl Service {
         let source = result.source;
         let mime = result.mime.as_str();
         let bytes_len = result.bytes_len;
+        // **Clipboard popup** — drop the guard keyed by inbound sha,
+        // closing the "Receiving clipboard image …" popup. Removal
+        // is RAII: the `PopupGuard`'s `Drop` impl sets the cancel
+        // flag, which the delay-show thread observed if it was
+        // still sleeping, and which (if the notification had been
+        // shown) signals the platform impl to tear it down. On
+        // Linux/Windows the notification auto-closes via
+        // `expire_timeout` regardless; macOS stays sticky (notify-
+        // rust NSUserNotification has no programmatic dismiss — see
+        // `crate::popup` module docs).
+        self.popup_guards.remove(&inbound_sha);
         if !result.success {
             log::warn!(
                 "clipboard inbound image apply failed from {source}: {} \

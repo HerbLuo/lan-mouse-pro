@@ -75,6 +75,13 @@ rustls-pemfile.workspace = true
 rcgen = "0.13.1"
 sha2 = "0.10.8"
 notify = "8.2.0"
+# Cross-platform desktop notifications for clipboard-transfer popups
+# (see src/popup.rs). Linux/Windows auto-close via the platform's
+# native expiration mechanism; macOS is sticky (notify-rust's
+# NSUserNotification backend has no programmatic dismiss).
+# NOTE: `notify` (filesystem watcher) and `notify-rust` (desktop
+# notifications) are unrelated crates — both kept on purpose.
+notify-rust = "4"
 # M0b STEP-0.2: HTTP/3-lite streaming uses `Bytes` for the body buffer.
 bytes = "1"
 
