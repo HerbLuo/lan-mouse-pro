@@ -496,14 +496,15 @@ const PING_INTERVAL: Duration = Duration::from_millis(500);
 // independent of the UDP-layer keepalive. Watching Pong arrivals lets us
 // detect death in well under 2s.
 //
-// **Threshold 1.5s**: the heartbeat sends a Ping every 500ms. On a healthy
-// LAN the Pong comes back in < 50ms; 1.5s is ~5× the worst realistic RTT
-// (busy CPU + transient packet loss) and 3× the Ping cadence. Any value
-// above `~3 × PING_INTERVAL` covers 99% of healthy networks while still
-// firing within ~1s of the network actually going down. Lowering below
-// `2 × PING_INTERVAL` (1s) risks false positives on a slow CPU; raising
-// above `5 × PING_INTERVAL` (2.5s) loses the speed advantage over the QUIC
-// idle_timeout.
+// **Threshold 3.5s (relaxed from 1.5s in 2026-09-12 BUGS-2 follow-up)**:
+// the heartbeat sends a Ping every 500ms. On a healthy LAN the Pong comes
+// back in < 50ms; 3.5s is 7 missed Pings (5 × PING_INTERVAL + 1s slack),
+// leaving plenty of room for the LocalSet single-thread runtime to be
+// blocked by transient sync work (macOS IOKit hang, CGEventTap queue,
+// clipboard image encode/decode, etc.). Raising any higher loses the
+// speed advantage over the QUIC idle_timeout (30s after ea5a3b8).
+// Lowering below `5 × PING_INTERVAL` (2.5s) starts inviting false
+// positives again on a stalled LocalSet.
 //
 // **Tick period 500ms**: matches the Ping cadence so the threshold check is
 // never older than the previous Ping. Cheaper ticks (e.g. 100ms) wouldn't
@@ -512,7 +513,7 @@ const PING_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How long [`pong_health_watchdog`] waits after the last Pong before
 /// declaring the peer dead and force-closing the QUIC conn.
-const PONG_HEALTH_TIMEOUT: Duration = Duration::from_millis(1500);
+const PONG_HEALTH_TIMEOUT: Duration = Duration::from_millis(3500);
 
 /// How often the watchdog wakes up to check `last_pong_at`. Matches
 /// [`PING_INTERVAL`] so the check is never older than the previous Ping.
@@ -798,7 +799,7 @@ async fn connect_to_handle(
         lan_mouse_proto::ProtoEvent,
     )>();
     // Pong health watchdog shared state. Initialised to "now" so the
-    // watchdog doesn't fire in the first 1.5s after a fresh connect
+    // watchdog doesn't fire in the first 3.5s after a fresh connect
     // — the peer needs at least one round-trip (Ping → Pong) before
     // the threshold check makes sense. The forwarder updates it on
     // every Pong arrival; the watchdog reads it from
@@ -1077,8 +1078,9 @@ async fn client_accept_bi_task(
             // concurrent Stream A control frames (Ping / Pong / Ack)
             // are scheduled ahead of these bulk bytes. Without this,
             // a large screenshot can starve the Pong watchdog past
-            // its 1.5 s threshold and force-close the connection
-            // (2026-09-10 screenshot bug). Set BEFORE handing the
+            // its 3.5 s threshold and force-close the connection
+            // (2026-09-10 screenshot bug; threshold relaxed in 2026-09-12
+            // BUGS-2 follow-up). Set BEFORE handing the
             // stream to `handle_http3_stream` so the priority is in
             // effect for the very first byte the handler writes.
             crate::quic_transport::session::set_stream_priority(
@@ -1584,8 +1586,9 @@ async fn ping_heartbeat_task(peer: Arc<PeerSession>, addr: SocketAddr) {
 /// (5s), giving up to ~10s on a silent peer. That's the window during
 /// which the master keeps the mouse captured and the user sees the
 /// pointer "disappear". Pong detection collapses that window to
-/// `PONG_HEALTH_TIMEOUT = 1.5s` — the master releases capture long
-/// before the QUIC stack notices anything.
+/// `PONG_HEALTH_TIMEOUT = 3.5s` (relaxed from 1.5s in 2026-09-12
+/// BUGS-2 follow-up) — the master releases capture long before the
+/// QUIC stack notices anything.
 ///
 /// **Coexistence with the QUIC stack**: when the watchdog force-closes
 /// the conn, `peer.run()` returns with `ConnectionError::ApplicationClosed(WAKE_CLOSE_CODE)`
@@ -1595,8 +1598,9 @@ async fn ping_heartbeat_task(peer: Arc<PeerSession>, addr: SocketAddr) {
 /// reason and schedules a fresh dial via RetryState, so no new logic
 /// is needed on the close side.
 ///
-/// **False positives**: 1.5s is `3 × PING_INTERVAL`, so any single
-/// missed Pong triggers the watchdog. On a busy CPU this is the right
+/// **False positives**: 3.5s is `7 × PING_INTERVAL`, so up to 6 missed
+/// Pongs in a row are tolerated before the watchdog fires. On a busy
+/// LocalSet single-thread runtime this is the right
 /// trade-off — the user would rather see "mouse briefly returned" than
 /// "mouse stuck for 10s". False positives are bounded by the next
 /// redial (≤ 500ms retry backoff + dial time, see
@@ -1841,27 +1845,44 @@ mod tests {
         assert!(!retry_state.borrow().contains_key(&handle));
     }
 
-    /// **Pong health threshold** — keeps the 1.5s default under
-    /// guardrail. If a future change lowers this below `2 × PING_INTERVAL`
-    /// a single missed Pong will trip the watchdog, surfacing as
-    /// "mouse briefly returned during a brief pause". Going above
-    /// `5 × PING_INTERVAL` loses the speed advantage over QUIC
-    /// idle_timeout (5s).
+    /// **PONG_HEALTH_TIMEOUT is pinned at 3.5s (relaxed from 1.5s in
+    /// BUGS-2 follow-up 2026-09-12)** — pins the actual const value so
+    /// a future regression that lowers it back to 1.5s would be
+    /// caught at unit-test time.
+    #[test]
+    fn pong_health_timeout_relaxes_to_3_5s() {
+        assert_eq!(
+            PONG_HEALTH_TIMEOUT,
+            Duration::from_millis(3500),
+            "BUGS-2 follow-up 2026-09-12 relaxed PONG_HEALTH_TIMEOUT from 1.5s to 3.5s \
+             to absorb LocalSet single-thread stalls during large clipboard image encodes; \
+             reverting this constant reintroduces the false-positive watchdog fires"
+        );
+    }
+
+    /// **Pong health threshold** — keeps the 3.5s default under
+    /// guardrail. If a future change lowers this below `5 × PING_INTERVAL`
+    /// transient LocalSet stalls (macOS IOKit hang, CGEventTap queue,
+    /// clipboard encode/decode) will start tripping the watchdog again.
+    /// Going above `30 × PING_INTERVAL` (15s) loses the speed advantage
+    /// over QUIC idle_timeout (30s).
     #[test]
     fn pong_health_threshold_in_safe_range() {
         const PING_INTERVAL_NS: u128 = 500_000_000; // 500ms
-        const TIMEOUT_NS: u128 = 1_500_000_000; // 1.5s
-        const LOWER_BOUND_NS: u128 = PING_INTERVAL_NS * 2;
-        const UPPER_BOUND_NS: u128 = PING_INTERVAL_NS * 5;
+        const TIMEOUT_NS: u128 = 3_500_000_000; // 3.5s
+        const LOWER_BOUND_NS: u128 = PING_INTERVAL_NS * 5;
+        const UPPER_BOUND_NS: u128 = PING_INTERVAL_NS * 30;
         assert!(
             TIMEOUT_NS >= LOWER_BOUND_NS,
-            "PONG_HEALTH_TIMEOUT ({}) should be >= 2 × PING_INTERVAL ({})",
+            "PONG_HEALTH_TIMEOUT ({}) should be >= 5 × PING_INTERVAL ({}) \
+             (single-thread LocalSet runtime needs 1s+ slack for sync work)",
             TIMEOUT_NS,
             LOWER_BOUND_NS
         );
         assert!(
             TIMEOUT_NS <= UPPER_BOUND_NS,
-            "PONG_HEALTH_TIMEOUT ({}) should be <= 5 × PING_INTERVAL ({}) to beat QUIC idle_timeout",
+            "PONG_HEALTH_TIMEOUT ({}) should be <= 30 × PING_INTERVAL ({}) \
+             to beat QUIC idle_timeout (30s)",
             TIMEOUT_NS,
             UPPER_BOUND_NS
         );
