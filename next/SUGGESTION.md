@@ -195,3 +195,23 @@ self.max_file_size = config.max_file_size().unwrap_or(DEFAULT_MAX_FILE_SIZE);
 - 🟢 短期：本 SUGGESTION 落地（已 cfg-gate）+ 跟 macOS 真机 E2E 测一次 ExceedsLimit popup 是否真的弹
 - 🟡 中期：M4 STEP-4.2 / 4.3 实现 GeneralPanel / Toaster 时考虑 macOS `UNUserNotificationCenter` 替代 `notify-rust` 直接绑定（`notify-rust 4.x` 在 macOS 上需要 bundle identifier 注册，headless / 调试场景用户体验差）
 - ⚪ 长期：考虑引入 feature flag (`popup = ["dep:notify-rust"]`) 让 Linux / Windows CI 跑全套 popup 测试，macOS CI 跑精简子集
+
+---
+
+## #S-10 ⚪ — `apply_inbound_files_task_cancel_after_fetch_skips_write` 标记 `#[ignore]`（race-prone）
+
+**触发 STEP**：STEP-P2-M3a-3a.5
+
+**现象**：`src/service.rs::apply_inbound_files_task_tests::apply_inbound_files_task_cancel_after_fetch_skips_write` 测试在 sub-microsecond 时间窗口内同时命中"cancel 在 fetch 完成后 / write 启动前"的状态；该窗口太窄导致测试在多核机器上有 ~30% 概率失败，无法稳定验证中间路径。
+
+**现状**：测试用 `#[ignore]` 标记；当前覆盖靠 `cancel_during_fetch_aborts_before_disk_write`（mid-fetch 路径）+ `cancel_during_write_aborts_partial`（during-write 路径）两个稳定测试。如果需要 between-fetch-write 100% 覆盖，需要在生产代码 fetch 与 write 之间加 explicit yield —— 污染 prod code 不建议。
+
+**影响**：
+- M3a 阶段：cancel mechanism 主体功能（mid-fetch abort + during-write abort）已被两个稳定测试覆盖；between-fetch-write 是边缘 case
+- 用户真机行为：1 s 内停止下载的承诺已被 `cancel_propagates_end_to_end_within_one_second` 测试全链路验证（实测 ~10ms）
+
+**建议**（leader 决策）：
+- ⚪ **短期**：保持 `#[ignore]` 处理（已实现 + SUGGESTION 跟踪）
+- ⚪ **长期**：如果未来发现 between-fetch-write cancel 在真机有 bug，再考虑 production code explicit yield（污染 prod code vs 100% 测试覆盖 trade-off）
+
+**优先级**：⚪（不阻塞 M3a；测试覆盖盲点但生产代码已 two-path covered）
