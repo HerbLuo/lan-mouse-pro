@@ -2016,21 +2016,16 @@ mod tests {
             let (server_session_tx, server_session_rx) =
                 tokio::sync::oneshot::channel::<PeerSession>();
             let server_task = tokio::task::spawn_local(async move {
-                let conn = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    accept(&server_ep),
-                )
-                .await
-                .expect("server accept timeout")
-                .expect("server accept");
+                let conn =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
+                        .await
+                        .expect("server accept timeout")
+                        .expect("server accept");
                 let session = PeerSession::from_connection(conn);
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    server_hello(&session),
-                )
-                .await
-                .expect("server hello timeout")
-                .expect("server hello");
+                tokio::time::timeout(std::time::Duration::from_secs(5), server_hello(&session))
+                    .await
+                    .expect("server hello timeout")
+                    .expect("server hello");
                 // Hand ownership to the test thread so it can
                 // inspect `cached_send_a.priority()`.
                 let _ = server_session_tx.send(session);
@@ -2059,13 +2054,10 @@ mod tests {
             .expect("dial");
             let client_arc = Arc::new(PeerSession::from_connection(conn));
 
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client_hello(&client_arc),
-            )
-            .await
-            .expect("client hello timeout")
-            .expect("client hello should succeed");
+            tokio::time::timeout(std::time::Duration::from_secs(5), client_hello(&client_arc))
+                .await
+                .expect("client hello timeout")
+                .expect("client hello should succeed");
 
             // === Assertion 1: client-side cached_send_a priority ===
             // The client side ran `client_hello`, populating
@@ -2100,13 +2092,11 @@ mod tests {
             // frames sent back to the master are scheduled ahead
             // of any concurrent bulk HTTP/3 body transfer the
             // master is writing.
-            let server_session = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                server_session_rx,
-            )
-            .await
-            .expect("server session oneshot timed out")
-            .expect("server session send failed");
+            let server_session =
+                tokio::time::timeout(std::time::Duration::from_secs(5), server_session_rx)
+                    .await
+                    .expect("server session oneshot timed out")
+                    .expect("server session send failed");
             // `SendStream` is not `Clone`, so the priority read
             // has to happen inside the guard's lifetime scope.
             let server_priority = {
@@ -2161,18 +2151,16 @@ mod tests {
             let (server_ep, server_addr) = motion_test_server(server_cert, server_key);
 
             let server_task = tokio::task::spawn_local(async move {
-                let conn = tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
-                    .await
-                    .expect("server accept timeout")
-                    .expect("server accept");
+                let conn =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
+                        .await
+                        .expect("server accept timeout")
+                        .expect("server accept");
                 let session = Arc::new(PeerSession::from_connection(conn));
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    server_hello(&session),
-                )
-                .await
-                .expect("server hello timeout")
-                .expect("server hello");
+                tokio::time::timeout(std::time::Duration::from_secs(5), server_hello(&session))
+                    .await
+                    .expect("server hello timeout")
+                    .expect("server hello");
                 // Keep the session alive while the client exercises
                 // `send_stream_b`. The client closes the conn from its
                 // side, which surfaces as a closed `accept_bi` loop on
@@ -2197,13 +2185,10 @@ mod tests {
             .expect("dial");
             let client_arc = Arc::new(PeerSession::from_connection(conn));
 
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client_hello(&client_arc),
-            )
-            .await
-            .expect("client hello timeout")
-            .expect("client hello should succeed");
+            tokio::time::timeout(std::time::Duration::from_secs(5), client_hello(&client_arc))
+                .await
+                .expect("client hello timeout")
+                .expect("client hello should succeed");
 
             // Lazy-open Stream B with one frame. The internal
             // `open_bi()` populates `cached_send_b` and the fix
@@ -2269,18 +2254,16 @@ mod tests {
             let (server_ep, server_addr) = motion_test_server(server_cert, server_key);
 
             let server_task = tokio::task::spawn_local(async move {
-                let conn = tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
-                    .await
-                    .expect("server accept timeout")
-                    .expect("server accept");
+                let conn =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), accept(&server_ep))
+                        .await
+                        .expect("server accept timeout")
+                        .expect("server accept");
                 let session = Arc::new(PeerSession::from_connection(conn));
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    server_hello(&session),
-                )
-                .await
-                .expect("server hello timeout")
-                .expect("server hello");
+                tokio::time::timeout(std::time::Duration::from_secs(5), server_hello(&session))
+                    .await
+                    .expect("server hello timeout")
+                    .expect("server hello");
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             });
 
@@ -2301,13 +2284,10 @@ mod tests {
             .expect("dial");
             let client_arc = Arc::new(PeerSession::from_connection(conn));
 
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client_hello(&client_arc),
-            )
-            .await
-            .expect("client hello timeout")
-            .expect("client hello should succeed");
+            tokio::time::timeout(std::time::Duration::from_secs(5), client_hello(&client_arc))
+                .await
+                .expect("client hello timeout")
+                .expect("client hello should succeed");
 
             // Lazy-open Stream C with a ClipboardText event.
             let event = ProtoEvent::ClipboardText(ClipboardText {

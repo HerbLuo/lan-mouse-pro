@@ -72,6 +72,19 @@ pub mod cache;
 /// the submodule name.
 pub mod file_meta;
 
+/// **PLAN-2 / M3a STEP-3a.2** — file-body byte cache (sha256 →
+/// bytes), byte-budget 1 GiB + 5 min TTL. Used by
+/// `service::dispatch_files` to make a freshly-pushed file body
+/// retrievable by a remote peer via HTTP/3 GET
+/// `/clipboard/file/{sha256}` (wired in STEP-3a.4).
+///
+/// **Distinct from `cache::ClipboardCache`** — separate cache type
+/// so a 1 GiB file push cannot evict cached text / image bytes
+/// (the smaller `ClipboardCache` budget is sized for screenshots
+/// + text). See `file_cache.rs` module docstring for the full
+/// rationale.
+pub mod file_cache;
+
 // Forward-compat re-export: STEP-3a.2 (`service::clipboard_dispatcher`)
 // will consume `crate::clipboard::FileEntry`; the re-export is staged
 // here so the dispatcher's import path is stable before the file
@@ -440,9 +453,7 @@ pub trait ClipboardBackend: Send {
     /// must `await` it before the borrow ends.
     fn current_image_async<'a>(
         &'a mut self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<ImageBytes>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ImageBytes>> + Send + 'a>> {
         // Default: just wrap the sync impl. Cheap backends
         // (Windows/Linux) hit this path verbatim — no
         // thread-pool dispatch on every quiescent tick.

@@ -401,9 +401,7 @@ impl ClipboardBackend for MacOsPasteboard {
     /// (which the LocalSet is).
     fn current_image_async<'a>(
         &'a mut self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Option<ImageBytes>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ImageBytes>> + Send + 'a>> {
         // Cache hit: synchronous fast path. Clone the cached bytes
         // BEFORE constructing the async block — `cached` borrows
         // `self.image_cache`, which the returned future would carry
@@ -428,50 +426,48 @@ impl ClipboardBackend for MacOsPasteboard {
         let tiff_bytes = read_pasteboard_bytes(&pb, NS_PASTEBOARD_TYPE_TIFF);
 
         Box::pin(async move {
-            let fresh = tokio::task::spawn_blocking(
-                move || -> Option<ImageBytes> {
-                    // PNG passthrough — no CPU work.
-                    if let Some(bytes) = png_bytes {
+            let fresh = tokio::task::spawn_blocking(move || -> Option<ImageBytes> {
+                // PNG passthrough — no CPU work.
+                if let Some(bytes) = png_bytes {
+                    return Some(ImageBytes {
+                        mime: Mime::Png.mime_str().to_string(),
+                        data: bytes,
+                    });
+                }
+                // JPEG → PNG normalisation (the expensive path).
+                if let Some(jpeg) = jpeg_bytes {
+                    if let Ok(png) = jpeg_to_png_normalized(&jpeg) {
+                        log::info!(
+                            "clipboard: JPEG→PNG normalized for cross-platform transfer \
+                                 ({} bytes → {} bytes)",
+                            jpeg.len(),
+                            png.len()
+                        );
                         return Some(ImageBytes {
                             mime: Mime::Png.mime_str().to_string(),
-                            data: bytes,
+                            data: png,
                         });
                     }
-                    // JPEG → PNG normalisation (the expensive path).
-                    if let Some(jpeg) = jpeg_bytes {
-                        if let Ok(png) = jpeg_to_png_normalized(&jpeg) {
-                            log::info!(
-                                "clipboard: JPEG→PNG normalized for cross-platform transfer \
+                    log::warn!("clipboard: JPEG decode failed (will probe TIFF next)");
+                }
+                // TIFF → PNG normalisation.
+                if let Some(tiff) = tiff_bytes {
+                    if let Ok(png) = tiff_to_png_normalized(&tiff) {
+                        log::info!(
+                            "clipboard: TIFF→PNG normalized for cross-platform transfer \
                                  ({} bytes → {} bytes)",
-                                jpeg.len(),
-                                png.len()
-                            );
-                            return Some(ImageBytes {
-                                mime: Mime::Png.mime_str().to_string(),
-                                data: png,
-                            });
-                        }
-                        log::warn!("clipboard: JPEG decode failed (will probe TIFF next)");
+                            tiff.len(),
+                            png.len()
+                        );
+                        return Some(ImageBytes {
+                            mime: Mime::Png.mime_str().to_string(),
+                            data: png,
+                        });
                     }
-                    // TIFF → PNG normalisation.
-                    if let Some(tiff) = tiff_bytes {
-                        if let Ok(png) = tiff_to_png_normalized(&tiff) {
-                            log::info!(
-                                "clipboard: TIFF→PNG normalized for cross-platform transfer \
-                                 ({} bytes → {} bytes)",
-                                tiff.len(),
-                                png.len()
-                            );
-                            return Some(ImageBytes {
-                                mime: Mime::Png.mime_str().to_string(),
-                                data: png,
-                            });
-                        }
-                        log::warn!("clipboard: TIFF decode failed");
-                    }
-                    None
-                },
-            )
+                    log::warn!("clipboard: TIFF decode failed");
+                }
+                None
+            })
             .await
             .ok()
             .flatten();
@@ -690,11 +686,7 @@ impl ClipboardBackend for MacOsPasteboard {
             let s = ns_string.to_string();
             paths.push(PathBuf::from(s));
         }
-        if paths.is_empty() {
-            None
-        } else {
-            Some(paths)
-        }
+        if paths.is_empty() { None } else { Some(paths) }
     }
 }
 
@@ -986,14 +978,12 @@ fn prepend_bmp_file_header(dib_bytes: &[u8]) -> Result<Vec<u8>, ClipboardError> 
             dib_bytes.len()
         )));
     }
-    let file_size = 14u32
-        .checked_add(dib_bytes.len() as u32)
-        .ok_or_else(|| {
-            ClipboardError::Io(format!(
-                "prepend_bmp_file_header: DIB + header overflows u32 (dib={} bytes)",
-                dib_bytes.len()
-            ))
-        })?;
+    let file_size = 14u32.checked_add(dib_bytes.len() as u32).ok_or_else(|| {
+        ClipboardError::Io(format!(
+            "prepend_bmp_file_header: DIB + header overflows u32 (dib={} bytes)",
+            dib_bytes.len()
+        ))
+    })?;
     let pixel_offset = 14u32 + bi_size;
     let mut out = Vec::with_capacity(14 + dib_bytes.len());
     out.extend_from_slice(b"BM");
@@ -1562,10 +1552,10 @@ mod tests {
         let jpeg = test_jpeg_bytes();
         write_pasteboard_bytes(NS_PASTEBOARD_TYPE_JPEG, &jpeg);
 
-        let normalised = backend
-            .current_image()
-            .expect("current_image must return Some after writing JPEG to pasteboard \
-                     (regression: the bug dropped the image and returned None)");
+        let normalised = backend.current_image().expect(
+            "current_image must return Some after writing JPEG to pasteboard \
+                     (regression: the bug dropped the image and returned None)",
+        );
         assert_eq!(
             normalised.mime, "image/png",
             "JPEG input must be normalised to image/png (PLAN §3 评审 #2 3rd — same contract as TIFF)"
@@ -1776,7 +1766,10 @@ mod tests {
         let first_read = backend
             .current_image()
             .expect("current_image returns Some for JPEG-only pasteboard");
-        assert_eq!(first_read.mime, "image/png", "JPEG must normalise to image/png");
+        assert_eq!(
+            first_read.mime, "image/png",
+            "JPEG must normalise to image/png"
+        );
 
         // Post-condition: the cache is now populated for the
         // current `changeCount()`.
@@ -2127,16 +2120,15 @@ mod tests {
         // (otherwise we'd just exercise the BMP-file pass-through
         // path, which is the previous test).
         assert_ne!(
-            &raw_dib[..2], b"BM",
+            &raw_dib[..2],
+            b"BM",
             "raw DIB fixture must not start with BM magic"
         );
 
-        backend
-            .set_dib_image(&raw_dib)
-            .expect(
-                "set_dib_image must accept raw DIB (no BMP file header) — the prepend_bmp_file_header \
+        backend.set_dib_image(&raw_dib).expect(
+            "set_dib_image must accept raw DIB (no BMP file header) — the prepend_bmp_file_header \
                  fallback unblocks the image-crate BMP decoder",
-            );
+        );
 
         // Verify PNG lands on the pasteboard with the right
         // dimensions.

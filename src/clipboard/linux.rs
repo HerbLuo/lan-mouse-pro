@@ -401,13 +401,7 @@ impl ClipboardBackend for LinuxClipboard {
                 .output()
                 .ok()?,
             Tool::Xclip => Command::new("xclip")
-                .args([
-                    "-selection",
-                    "clipboard",
-                    "-t",
-                    "text/uri-list",
-                    "-o",
-                ])
+                .args(["-selection", "clipboard", "-t", "text/uri-list", "-o"])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .output()

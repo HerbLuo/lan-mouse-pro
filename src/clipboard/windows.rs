@@ -64,9 +64,7 @@ use windows_sys::Win32::Foundation::{GetLastError, GlobalFree, HGLOBAL};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
-use windows_sys::Win32::System::Memory::{
-    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
-};
+use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows_sys::Win32::System::Ole::{CF_DIB, CF_DIBV5};
 use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
 
@@ -544,8 +542,8 @@ impl ClipboardBackend for WinClipboard {
         // SAFETY: `DragQueryFileW` with `UINT uFile = 0xFFFFFFFF`
         // returns the file count. NULL-terminated file paths in
         // wide-char UTF-16.
-        let count = unsafe { DragQueryFileW(hdrop, 0xFFFFFFFFu32, std::ptr::null_mut(), 0) }
-            as usize;
+        let count =
+            unsafe { DragQueryFileW(hdrop, 0xFFFFFFFFu32, std::ptr::null_mut(), 0) } as usize;
         if count == 0 {
             unsafe {
                 CloseClipboard();
@@ -569,9 +567,8 @@ impl ClipboardBackend for WinClipboard {
             // returns the wchar count written (excluding the
             // NUL) — we ignore it here because `wchars_needed`
             // already encoded the length.
-            let written = unsafe {
-                DragQueryFileW(hdrop, i as u32, buf.as_mut_ptr(), buf.len() as u32)
-            };
+            let written =
+                unsafe { DragQueryFileW(hdrop, i as u32, buf.as_mut_ptr(), buf.len() as u32) };
             if written == 0 {
                 continue;
             }
@@ -584,11 +581,7 @@ impl ClipboardBackend for WinClipboard {
         unsafe {
             CloseClipboard();
         }
-        if paths.is_empty() {
-            None
-        } else {
-            Some(paths)
-        }
+        if paths.is_empty() { None } else { Some(paths) }
     }
 }
 
