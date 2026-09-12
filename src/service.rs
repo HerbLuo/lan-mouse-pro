@@ -1632,20 +1632,6 @@ impl Service {
     /// supervisor redial 链路自动处理。屏幕唤醒后 `peers[addr]` 可能为空,
     /// 但用户跨屏触发 `send()` 时会走 redial 路径(`active_addr` 仍是 `Some`)。
     ///
-    /// **为什么不总靠 `send()` 触发的被动重连**:现实场景里连接可能在
-    /// detach 之前就死了(例如 BUGS-2 实测日志 2026-09-12 11:47:47
-    /// 17 MB 剪贴板回传饿死 control plane → 双方 watchdog 几乎同时
-    /// 关连接 → `LocallyClosed` 走 no-retry 路径)。此时用户不主动跨
-    /// 屏,`send()` 永远不被调用,连接就再也回不来 — 直到 12:31:16 用户
-    /// 终于动鼠标才触发 dial,中间断档 44 分钟。
-    ///
-    /// **修复**:在 reattach 时主动调 `capture.dial(handle)`,让屏幕唤
-    /// 醒本身就触发一次 redial,而不必等用户动鼠标。`capture.dial` 内
-    /// 部走 `connect_to_handle` 的 `connecting` set dedup(connect.rs:
-    /// 250-268),即便旧 supervisor 还在 backoff 循环里,我们这次 dial
-    /// 也不会和它并发;旧 supervisor 的下一次 spawn 看到
-    /// `connecting.contains(handle)` 为真就跳过,让新 dial 接管。
-    ///
     /// **不调 `active = true`**:`s.active` 在 detach 期间**没被**改过
     ///(detach 只动 barrier),所以这里也是 `true`。
     fn reattach_capture(&mut self, handle: ClientHandle) {
@@ -1661,24 +1647,6 @@ impl Service {
         // mergeClient 在下一个 State 事件里清掉)。注意这不是 State(active=false)
         // 那种广播 —— `s.active` 一直是 `true`,只是清理 UX 标记。
         self.broadcast_client(handle);
-
-        // **Proactive redial on wake** — if the QUIC conn died while the
-        // monitor was detached (e.g. `LocallyClosed` from the Pong watchdog
-        // racing the 17 MB clipboard transfer, see BUGS-2 real-machine logs
-        // 2026-09-12), `peers[active_addr]` is empty and the supervisor is
-        // either in backoff or already gave up (circuit breaker at 5
-        // failures). Fire a fresh dial so the link comes back without
-        // waiting for the user's next mouse-edge crossing.
-        //
-        // Safe vs the existing supervisor: `Capture::dial` → `conn.dial`
-        // checks the `connecting` set, so two concurrent dials for the
-        // same handle never both spawn. The RetryState gate further
-        // suppresses dials while still inside the backoff window.
-        log::info!(
-            "service: monitor-driven reattach handle={handle} — \
-             spawning proactive dial (will dedup via connecting set if supervisor is already dialing)"
-        );
-        self.capture.dial(handle);
     }
 
     fn activate_client(&mut self, handle: ClientHandle) {
@@ -2182,16 +2150,7 @@ impl Service {
         let mut recipients = 0usize;
         self.broadcast_clipboard_event(event, &mut recipients).await;
         if recipients == 0 {
-            // **BUGS-2 follow-up, 2026-09-12**: downgraded from WARN to INFO.
-            // This fires every time the user copies anything while no peer
-            // is connected (e.g. between `LocallyClosed` and the next
-            // `BeginPending`-triggered redial), and the old WARN level
-            // drowned the genuinely-actionable signals (Pong watchdog,
-            // handshake timeout, mTLS reject). The peer-gate filter is the
-            // expected behaviour here, not a misconfiguration — the
-            // `enable_clipboard_to` hint in the message stays for
-            // first-time users who haven't realised the gate exists.
-            log::info!(
+            log::warn!(
                 "clipboard dispatched to 0 peers (sha={}); peer gate filtered all clients — \
                  check `enable_clipboard_to` in TOML and that the connection is active",
                 short_hex(&sha)
@@ -2375,11 +2334,7 @@ impl Service {
         let mut recipients = 0usize;
         self.broadcast_clipboard_event(event, &mut recipients).await;
         if recipients == 0 {
-            // **BUGS-2 follow-up, 2026-09-12**: downgraded from WARN to INFO.
-            // Same rationale as the text-branch WARN above — this is the
-            // expected behaviour when the user copies an image during a
-            // disconnect window, not a misconfiguration.
-            log::info!(
+            log::warn!(
                 "clipboard dispatched image to 0 peers (sha={}, mime={}, size={} bytes); \
                  peer gate filtered all clients — check `enable_clipboard_to` in TOML \
                  and that the connection is active",

@@ -88,20 +88,6 @@ const WATCHDOG_SEND_FAILURES_THRESHOLD: u32 = 3;
 /// window reaches the threshold, recovery fires.
 const WATCHDOG_CROSSING_WINDOW: Duration = Duration::from_secs(5);
 
-/// After a `BeginPending → conn.send(Enter) → Err` failure, drop subsequent
-/// `BeginPending` events for this duration. Without this, screen-wake
-/// cursor re-positioning on macOS fires dozens of `EnterOnly` / `BeginPending`
-/// events per second — each failure does `cancel_pending + state=Idle` and
-/// the next mouse event immediately retries, producing a flood of
-/// `BeginPending send failed: not connected` log lines that hides real
-/// signal.
-///
-/// 200 ms is short enough that a real user mouse-move (typically ≥ 100 ms
-/// between events at human speeds) eventually gets through, but long
-/// enough to coalesce the rapid-fire events that arrive during wake-up
-/// (sometimes < 10 ms apart).
-const BEGIN_PENDING_FAILURE_COOLDOWN: Duration = Duration::from_millis(200);
-
 /// Maximum number of "unsuccessful" crossings permitted in the window.
 /// 5 crossings within 5s means every attempt failed — the state machine is
 /// most likely frozen. Under normal use (the user switching back and forth)
@@ -597,13 +583,6 @@ struct WatchdogState {
     /// active peer (commit `f5f5a30` — see docstring above for the
     /// "静止鼠标触发按键回流" rationale).
     last_progress_at: Instant,
-    /// Timestamp of the most recent `BeginPending → conn.send(Enter)` failure.
-    /// The handler checks this on entry and short-circuits the event if we
-    /// are still inside [`BEGIN_PENDING_FAILURE_COOLDOWN`]. Cleared on the
-    /// first successful send (Pending→Active or release_capture completion).
-    /// **No periodic cleanup needed** — it's an `Instant`, and the cooldown
-    /// check is a single elapsed comparison; we never iterate over it.
-    last_begin_failure_at: Option<Instant>,
 }
 
 impl WatchdogState {
@@ -614,7 +593,6 @@ impl WatchdogState {
             // Initial value is the time `do_capture_session` starts;
             // subsequently kept current at the three refresh points.
             last_progress_at: Instant::now(),
-            last_begin_failure_at: None,
         }
     }
 }
@@ -1428,26 +1406,6 @@ impl CaptureTask {
             // still visible) → emits BeginPending. We send Enter to the peer
             // and wait for the Ack. On send failure, cancel pending directly.
             CaptureEvent::BeginPending => {
-                // **BeginPending failure cooldown** (BUGS-2 follow-up,
-                // 2026-09-12): if a previous BeginPending in the last
-                // [`BEGIN_PENDING_FAILURE_COOLDOWN`] failed, drop this event
-                // without sending. Without this gate, screen-wake cursor
-                // re-positioning on macOS floods the log with one
-                // `BeginPending send failed: not connected` line per event
-                // (sometimes > 100 in a single second, see the 12:31:16
-                // real-machine log). 200 ms is short enough that real user
-                // mouse moves still get through, long enough to coalesce the
-                // rapid-fire synthetic events that arrive during wake.
-                if let Some(t) = self.watchdog.last_begin_failure_at {
-                    if t.elapsed() < BEGIN_PENDING_FAILURE_COOLDOWN {
-                        log::trace!(
-                            "capture: BeginPending (handle={handle:?}) dropped — \
-                             failure cooldown ({:?} remaining)",
-                            BEGIN_PENDING_FAILURE_COOLDOWN - t.elapsed()
-                        );
-                        return Ok(());
-                    }
-                }
                 // STEP-1.3: cache the BarrierKey in Pending so downstream
                 // paths (Ack / timeout / release_capture) don't have to
                 // re-scan `self.captures` by handle. `get_key` clones the
@@ -1491,21 +1449,15 @@ impl CaptureTask {
                     // as a precursor to a crossing storm.
                     self.watchdog.consecutive_send_failures =
                         self.watchdog.consecutive_send_failures.saturating_add(1);
-                    // Arm the BeginPending failure cooldown so the next
-                    // synthetic mouse event during a screen-wake / reconnect
-                    // burst doesn't immediately re-enter this branch.
-                    self.watchdog.last_begin_failure_at = Some(Instant::now());
                     // Do not call capture.release(): in the pending state the
                     // backend was never activated, so there is no Leave to
                     // send.
                     return Ok(());
                 }
-                // Send succeeded → reset the failure count, clear the
-                // BeginPending cooldown, and record progress (Pending is
-                // established; waiting for Ack is the expected next step
-                // and does not count as no-progress).
+                // Send succeeded → reset the failure count and record progress
+                // (Pending is established; waiting for Ack is the expected
+                // next step and does not count as no-progress).
                 self.watchdog.consecutive_send_failures = 0;
-                self.watchdog.last_begin_failure_at = None;
                 self.watchdog.last_progress_at = Instant::now();
                 Ok(())
             }
@@ -2091,59 +2043,5 @@ mod release_skip_tests {
     #[test]
     fn do_not_skip_release_when_sending_with_active_client_cleared() {
         assert!(!should_skip_release(&State::Sending, None));
-    }
-}
-
-#[cfg(test)]
-mod begin_pending_cooldown_tests {
-    //! Regression tests for the BeginPending failure cooldown added in
-    //! the BUGS-2 follow-up (2026-09-12).
-    //!
-    //! **Background**: macOS screen-wake re-positions the cursor and emits
-    //! dozens of `EnterOnly` / `BeginPending` events per second. Each
-    //! failure (`conn.send(Enter) → Err`) used to leave `state = Idle`
-    //! immediately, so the next event retried instantly — flooding the
-    //! log with one `BeginPending send failed: not connected` line per
-    //! event. The fix arms a 200 ms cooldown in `last_begin_failure_at`
-    //! and short-circuits the BeginPending arm if we're still inside it.
-
-    use super::*;
-
-    /// **Default state has no cooldown** — the first `BeginPending` after
-    /// process start must always go through (the user just connected the
-    /// slave and is moving the mouse for the first time).
-    #[test]
-    fn fresh_watchdog_has_no_cooldown() {
-        let ws = WatchdogState::new();
-        assert!(ws.last_begin_failure_at.is_none());
-    }
-
-    /// **Cooldown is a single Option<Instant>**, not a queue. Setting
-    /// it twice (back-to-back BeginPending failures) just refreshes the
-    /// timestamp; the next event within 200 ms is still dropped.
-    #[test]
-    fn cooldown_is_a_single_instant() {
-        let mut ws = WatchdogState::new();
-        ws.last_begin_failure_at = Some(Instant::now());
-        // pretend 50ms passed
-        std::thread::sleep(Duration::from_millis(50));
-        ws.last_begin_failure_at = Some(Instant::now());
-        // Within 200 ms of the second set, the cooldown is still active.
-        assert!(ws.last_begin_failure_at.unwrap().elapsed() < BEGIN_PENDING_FAILURE_COOLDOWN);
-    }
-
-    /// **Cooldown is exactly 200 ms** — pinned in this test so any future
-    /// change to [`BEGIN_PENDING_FAILURE_COOLDOWN`] requires updating the
-    /// assertion (and a corresponding re-verification of real-machine
-    /// behaviour: too short = log flood returns; too long = real user
-    /// mouse-moves get dropped).
-    #[test]
-    fn cooldown_constant_is_pinned_at_200ms() {
-        assert_eq!(
-            BEGIN_PENDING_FAILURE_COOLDOWN,
-            Duration::from_millis(200),
-            "BeginPending failure cooldown was changed — re-verify the \
-             screen-wake storm suppression still works on real hardware."
-        );
     }
 }

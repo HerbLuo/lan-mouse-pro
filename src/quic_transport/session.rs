@@ -250,13 +250,6 @@ pub(crate) const WAKE_CLOSE_CODE: u32 = 0xCAFE;
 ///   → peer-initiated close — **do not retry** (the peer explicitly does
 ///   not want to continue)
 /// - `ConnectionLost(_)` / `TimedOut` → network-layer disconnect — **retry**
-/// - `LocallyClosed` → **retry** (we initiated the close because the Pong
-///   watchdog decided the peer is dead; without retry the user has to move
-///   the mouse into the client region before the link comes back. quinn
-///   reports both watchdog-initiated and peer-observed closes as
-///   `LocallyClosed` on the local side — the close code is only visible to
-///   the remote. RetryState backoff + circuit breaker cap the blast radius
-///   if the peer is genuinely gone.)
 /// - `TransportError(_)` (QUIC-level) → protocol-level error — **do not
 ///   retry** (likely a protocol bug or attack signal)
 /// - `Reset` / `VersionMismatch` / `LocalError(_)` → local error — do not
@@ -268,14 +261,6 @@ pub fn should_retry_after_close(reason: &quinn::ConnectionError) -> bool {
     match reason {
         // Network-layer disconnect / timeout — retry.
         ConnectionError::TimedOut => true,
-        // Local-side close (Pong watchdog, or peer-hangup observed locally).
-        // quinn 0.11 reports watchdog-initiated close as `LocallyClosed` on
-        // the local side; the application close code we sent (WAKE_CLOSE_CODE)
-        // is only visible to the remote. Without retry, the next redial
-        // depends on the user moving the mouse — which won't happen on
-        // wake / sleep or after a 17 MB clipboard transfer that starves the
-        // control plane (see BUGS-2 real-machine logs 2026-09-12).
-        ConnectionError::LocallyClosed => true,
         // Wake-close sentinel: peer close triggered by macOS wake (see the
         // [`WAKE_CLOSE_CODE`] docstring) — retry.
         ConnectionError::ApplicationClosed(frame)
@@ -283,57 +268,15 @@ pub fn should_retry_after_close(reason: &quinn::ConnectionError) -> bool {
         {
             true
         }
-        // quinn 0.11 actual variants: protocol-level error / peer-initiated
-        // close with non-wake code / CID exhaustion — none retry (conservative).
+        // quinn 0.11 actual variants: protocol-level / local error /
+        // peer-initiated close / CID exhaustion — none retry (conservative).
         ConnectionError::ApplicationClosed(_)
         | ConnectionError::TransportError(_)
         | ConnectionError::ConnectionClosed(_)
         | ConnectionError::Reset
         | ConnectionError::VersionMismatch
+        | ConnectionError::LocallyClosed
         | ConnectionError::CidsExhausted => false,
-    }
-}
-
-#[cfg(test)]
-mod should_retry_tests {
-    //! Regression tests for [`should_retry_after_close`].
-    //!
-    //! **BUGS-2 follow-up, 2026-09-12**: `LocallyClosed` is now retried so
-    //! that the master doesn't sit on a dead link until the user happens to
-    //! move the mouse across the screen edge (the 11:47:47 → 12:31:16
-    //! 44-minute gap in the real-machine logs).
-    use quinn::ConnectionError;
-
-    use super::{should_retry_after_close, WAKE_CLOSE_CODE};
-
-    /// **LocallyClosed → retry**. Quinn reports both the master's
-    /// Pong-watchdog-initiated close AND the peer-hangup-observed-locally
-    /// case as `LocallyClosed` on the local side. Without retry, the
-    /// supervisor's `match` arm at `connect.rs:1503-1505` logs
-    /// `"closed gracefully: LocallyClosed — no retry"` and the link is
-    /// dead until the user's next `BeginPending`. With retry, the
-    /// supervisor spawns a fresh `connect_to_handle` and the next dial
-    /// lands within backoff window (≤ 8 s).
-    #[test]
-    fn locally_closed_should_retry_after_bugs2_fix() {
-        assert!(
-            should_retry_after_close(&ConnectionError::LocallyClosed),
-            "LocallyClosed must retry post-BUGS-2 (2026-09-12) — was the `should_retry_after_close` match arm reverted?"
-        );
-    }
-
-    /// `TimedOut` is the network-layer disconnect — retry.
-    #[test]
-    fn timed_out_should_retry() {
-        assert!(should_retry_after_close(&ConnectionError::TimedOut));
-    }
-
-    /// **WAKE_CLOSE_CODE is 0xCAFE** — pinned so a future refactor can't
-    /// silently change the sentinel and break `should_retry_after_close`'s
-    /// wake-branch dispatch.
-    #[test]
-    fn wake_close_code_sentinel_pinned() {
-        assert_eq!(WAKE_CLOSE_CODE, 0xCAFE);
     }
 }
 
