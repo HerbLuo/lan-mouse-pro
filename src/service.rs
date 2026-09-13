@@ -4763,48 +4763,72 @@ async fn clipboard_poller(
                 // routes the heavy encode through `spawn_blocking`
                 // on macOS — see the trait method docstring on
                 // `ClipboardBackend::current_image_async`.
-                match backend.current_image_async().await {
+                let image_hit = match backend.current_image_async().await {
                     Some(image) => {
                         if image_tx.send(image).is_err() {
                             // Main task is gone — daemon is
                             // shutting down. Exit cleanly.
                             return;
                         }
-                        continue;
+                        true
                     }
-                    None => {}
-                }
-                // Phase 2: text. No image on the clipboard →
-                // fall through to the text branch.
-                if let Some(text) = backend.current_text() {
-                    if text_tx.send(text).is_err() {
-                        return;
+                    None => false,
+                };
+                // Phase 2: text. Only runs when Phase 1 missed,
+                // so a macOS screenshot pasteboard (PNG + empty
+                // text) does not dispatch an empty-string
+                // ClipboardText that would clobber the just-pushed
+                // image on the receiver. `dispatch_text`'s own
+                // SHA short-circuit would NOT save us here: an
+                // empty string is a valid different value, so
+                // without this gate the receiver's clipboard would
+                // flip from "image" back to "" on the next tick.
+                if !image_hit {
+                    if let Some(text) = backend.current_text() {
+                        if text_tx.send(text).is_err() {
+                            return;
+                        }
                     }
                 }
-                // **M3a STEP-3a.2** — Phase 3: file selection.
-                // Cheap probe (no byte I/O — just path enumeration
-                // via `NSFilenamesPboardType` / `CF_HDROP` /
-                // `text/uri-list`); runs only when both image +
-                // text probes missed. The dispatcher's
-                // `dispatch_files` arm consumes the paths and
-                // runs the heavy sha256 streaming off-thread via
-                // `spawn_blocking`.
+                // **M3a STEP-3a.2 + 2026-09-13 follow-up** —
+                // Phase 3: file selection. Cheap probe (no byte
+                // I/O — just path enumeration via
+                // `NSFilenamesPboardType` / `CF_HDROP` /
+                // `text/uri-list`). Runs UNCONDITIONALLY every
+                // tick, even when Phase 1 hit.
                 //
-                // **Why "image-first" suppresses file probe**:
-                // when Phase 1 hits a screenshot, the `continue`
-                // above skips both Phase 2 (text) and Phase 3
-                // (files) for the same tick. This matches macOS
-                // pasteboard semantics where a screenshot app
-                // (Cmd+Shift+4 / `screencapture`) replaces the
-                // clipboard atomically and rarely co-exists with
-                // a file selection. The PLAN §3 STEP-3a.2 contract
-                // doesn't explicitly require independent file
-                // probing, and the practical case (simultaneous
-                // screenshot + file selection) is rare. If a
-                // future use case needs it, restructure this
-                // `select!` arm into a parallel probe (the
-                // fingerprint short-circuit in `dispatch_files`
-                // already de-dupes repeat ticks).
+                // **Why this probe runs after a Phase 1 hit**
+                // (follow-up fix to the original
+                // "image-first suppresses file probe" behaviour):
+                // when the user copies a file in Finder (e.g. a
+                // `.jpg` from the Desktop via Cmd+C), the macOS
+                // pasteboard atomically holds BOTH a TIFF preview
+                // (`NSPasteboardTypeTIFF`, which Phase 1 catches
+                // and dispatches as an image) AND the file paths
+                // (`NSFilenamesPboardType`). With the old
+                // `continue` after Phase 1 the file paths were
+                // never probed on the same tick — only the
+                // rendered preview was relayed. The receiver's
+                // clipboard therefore received "a PNG of a file"
+                // but no file reference, so pasting into any
+                // file-aware target produced nothing useful.
+                // Running Phase 3 unconditionally lets the
+                // receiver get both: the image preview (for
+                // image-aware apps) AND the file entry (for
+                // file-aware apps / OS file drop).
+                //
+                // **Why this is safe with the image-first gate on
+                // Phase 2**: Phase 3's content is "files" — it
+                // has no empty-payload semantics that could
+                // clobber the image on the receiver. An
+                // `NSFilenamesPboardType` of `[]` is collapsed to
+                // `None` by `current_files()` itself, so the
+                // probe is a no-op when no files are present
+                // (no `dispatch_files` call, no false-positive
+                // broadcast). The dispatcher's
+                // `last_outbound_files_fingerprint` short-circuit
+                // also de-dupes repeat ticks with the same file
+                // selection.
                 if let Some(paths) = backend.current_files() {
                     if files_tx.send(paths).is_err() {
                         // Main task is gone — daemon is shutting
