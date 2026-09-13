@@ -334,29 +334,27 @@ impl ListenTask {
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
                             // **PLAN-2 / M1a STEP-1a.4 + M2a
-                            // STEP-2a.4** — server-side inbound
-                            // clipboard. The
+                            // STEP-2a.4 + M3a STEP-3a.2/3a.3/3a.5**
+                            // — server-side inbound clipboard. The
                             // `server_stream_c_reader_task` (in
                             // `listen.rs`) pushes every var-codec
                             // frame as `ListenEvent::Msg { event, addr }`;
-                            // we forward `ClipboardText` and
-                            // `ClipboardImage` here so the
+                            // we forward `ClipboardText`,
+                            // `ClipboardImage`, `ClipboardFiles`,
+                            // and `FileTransferCancel` here so the
                             // service-level dispatcher can apply
-                            // them to the local OS clipboard.
+                            // them to the local OS clipboard (or
+                            // signal an in-flight HTTP/3 fetch to
+                            // abort for cancel).
                             //
-                            // **M2a STEP-2a.4** added the
-                            // `ClipboardImage` arm — without it
-                            // the image event landed in the
-                            // `_ => {}` catch-all and was silently
-                            // dropped at the receiver, so the
-                            // metadata arrived but the bytes
-                            // were never fetched or applied.
-                            //
-                            // `ClipboardFiles` / `FileTransfer*`
-                            // are still M3a — they stay dropped in
-                            // the `_ => {}` arm below until those
-                            // milestones wire their own inbound
-                            // handlers.
+                            // **Why each arm exists**: without an
+                            // explicit match the event lands in the
+                            // `_ => {}` catch-all below and is
+                            // silently dropped at the receiver, so
+                            // the metadata arrives on the wire but
+                            // the bytes are never fetched / applied
+                            // (image) or the in-flight fetch is
+                            // never aborted (cancel).
                             //
                             // **Why a `tokio` channel (not the
                             // existing `local_channel` for
@@ -370,6 +368,14 @@ impl ListenTask {
                             // surface explicit and avoids enums-of-events
                             // for what is conceptually a different
                             // subsystem (clipboard vs. emulation).
+                            //
+                            // `FileTransferOffer` /
+                            // `FileTransferResponse` /
+                            // `ClipboardRequest` are still out of
+                            // scope (M3b STEP-3b.2 will wire
+                            // offer/response for GUI-driven
+                            // accept/reject); they fall through
+                            // `_ => {}` for now.
                             ProtoEvent::ClipboardText(ct) => {
                                 let sha_prefix: String = ct
                                     .sha256
@@ -438,6 +444,109 @@ impl ListenTask {
                                     log::debug!(
                                         "ListenTask: clipboard_inbound_tx closed (service gone), \
                                          dropping inbound ClipboardImage from {addr}"
+                                    );
+                                }
+                            }
+                            // **M3a STEP-3a.3** — files branch.
+                            // Mirrors the image path: the bytes
+                            // are NOT on the wire inline (they
+                            // live in the source's `file_cache`
+                            // and are served via the
+                            // `/clipboard/file/{sha256}` HTTP/3
+                            // route — see
+                            // `quic_transport::http3::file_cache_lookup_route`);
+                            // the dispatcher's
+                            // `handle_clipboard_inbound_files`
+                            // issues the HTTP/3 GET(s) after
+                            // receiving this metadata event and
+                            // writes the bytes to `accept_dir/<name>`
+                            // via `apply_inbound_files_task`.
+                            //
+                            // **Without this arm**: the event
+                            // lands in the `_ => {}` catch-all and
+                            // is silently dropped — the receiver
+                            // sees the metadata log line
+                            // ("server stream C reader: ...
+                            // ClipboardFiles(fp=…, entries=N)")
+                            // but the dispatcher is never
+                            // invoked, no HTTP/3 GET is issued,
+                            // and no file is written. This was the
+                            // exact user-visible symptom: files
+                            // copied on the master produced only
+                            // placeholder references on the slave
+                            // with no content. (NOTE: even with
+                            // this forwarding arm in place the
+                            // decision fn
+                            // `handle_clipboard_inbound_files_decide`
+                            // returns `AutoAcceptOff` when
+                            // `clipboard_config.auto_accept_files`
+                            // is false — see
+                            // `lan-mouse-ipc::ClipboardConfig` —
+                            // so the receiving user must opt in
+                            // via `[clipboard] auto_accept_files = true`
+                            // in the slave's `config.toml` for the
+                            // bytes to actually be pulled.)
+                            ProtoEvent::ClipboardFiles(cf) => {
+                                let fp_prefix: String = cf
+                                    .fingerprint
+                                    .iter()
+                                    .take(4)
+                                    .map(|b| format!("{b:02x}"))
+                                    .collect();
+                                log::debug!(
+                                    "ListenTask: forwarding ClipboardFiles (fingerprint={}…, {} entries) \
+                                     from {from_addr} to dispatcher",
+                                    fp_prefix,
+                                    cf.entries.len(),
+                                    from_addr = addr
+                                );
+                                if self
+                                    .clipboard_inbound_tx
+                                    .send((addr, ProtoEvent::ClipboardFiles(cf)))
+                                    .is_err()
+                                {
+                                    log::debug!(
+                                        "ListenTask: clipboard_inbound_tx closed (service gone), \
+                                         dropping inbound ClipboardFiles from {addr}"
+                                    );
+                                }
+                            }
+                            // **M3a STEP-3a.5** — cancel branch.
+                            // The source emits this when its
+                            // outbound file selection is
+                            // superseded (e.g. user copies a new
+                            // file mid-transfer) or on `Ctrl+C`.
+                            // The receiver looks up the in-flight
+                            // HTTP/3 fetch by sha256 in
+                            // `Service::inbound_file_cancel_txs`
+                            // and signals cancellation, which
+                            // closes the stream (quinn
+                            // STOP_SENDING) and skips the
+                            // spawn_blocking write. Without this
+                            // arm the cancel never reaches the
+                            // registry, so a superseded transfer
+                            // continues to completion and clobbers
+                            // the newer selection's apply task.
+                            ProtoEvent::FileTransferCancel(c) => {
+                                let sha_prefix: String = c
+                                    .sha256
+                                    .iter()
+                                    .take(4)
+                                    .map(|b| format!("{b:02x}"))
+                                    .collect();
+                                log::debug!(
+                                    "ListenTask: forwarding FileTransferCancel (sha={}…) from {from_addr} to dispatcher",
+                                    sha_prefix,
+                                    from_addr = addr
+                                );
+                                if self
+                                    .clipboard_inbound_tx
+                                    .send((addr, ProtoEvent::FileTransferCancel(c)))
+                                    .is_err()
+                                {
+                                    log::debug!(
+                                        "ListenTask: clipboard_inbound_tx closed (service gone), \
+                                         dropping inbound FileTransferCancel from {addr}"
                                     );
                                 }
                             }
