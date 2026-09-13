@@ -583,6 +583,75 @@ impl ClipboardBackend for WinClipboard {
         }
         if paths.is_empty() { None } else { Some(paths) }
     }
+
+    /// **M4 STEP-4.2** — write a list of absolute file paths to
+    /// the OS clipboard as `CF_HDROP` (Win32 "file drop" clipboard
+    /// format).
+    ///
+    /// **Wire format**: `DROPFILES` header (20 bytes) +
+    /// double-NUL-terminated UTF-16 LE paths. Win32 consumers
+    /// (Explorer, every app that reads `CF_HDROP`) call
+    /// `DragQueryFileW` to enumerate the entries.
+    ///
+    /// **Why `DROPFILES::fWide = 1`**: paths are encoded as
+    /// UTF-16 LE wide chars (the modern Windows convention; the
+    /// ANSI `fWide = 0` form has been deprecated since Windows
+    /// 95). Each path is NUL-terminated; the entire path list is
+    /// double-NUL-terminated (final two NUL wchars after the
+    /// last path).
+    ///
+    /// **Allocation discipline**: identical to `set_dib_image` —
+    /// `OpenClipboard` + `EmptyClipboard` + `GlobalAlloc(
+    /// GMEM_MOVEABLE, …)` + `GlobalLock` + `copy_nonoverlapping`
+    /// + `GlobalUnlock` + `SetClipboardData(CF_HDROP, …)` +
+    /// `CloseClipboard`. The OS takes ownership of the handle
+    /// on `SetClipboardData` success.
+    ///
+    /// **Empty input**: returns `Ok(())` without touching the
+    /// clipboard (the dispatcher filters empty batches before
+    /// reaching this method, but defensive against a misbehaving
+    /// caller).
+    fn set_files(&mut self, files: &[PathBuf]) -> Result<(), ClipboardError> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        // Build the DROPFILES payload first (this is the pure
+        // bytes-in / bytes-out half; the actual clipboard write
+        // is just a thin wrapper around it).
+        let payload = build_dropfiles_payload(files)?;
+        if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
+            let err = unsafe { GetLastError() };
+            return Err(ClipboardError::Io(format!(
+                "OpenClipboard (set_files) failed: GetLastError={err}"
+            )));
+        }
+        // `EmptyClipboard()` first (Win32 protocol — same as
+        // `set_dib_image` / `set_text`). Wipes any prior
+        // `CF_HDROP` so a subsequent `DragQueryFileW` reads
+        // exactly the freshly-written list.
+        if unsafe { EmptyClipboard() } == 0 {
+            let err = unsafe { GetLastError() };
+            unsafe {
+                CloseClipboard();
+            }
+            return Err(ClipboardError::Io(format!(
+                "EmptyClipboard (set_files) failed: GetLastError={err}"
+            )));
+        }
+        // We delegate to the existing helper for the alloc +
+        // lock + write + SetClipboardData dance (same pattern
+        // as `set_dib_image` for `CF_DIBV5` / `CF_DIB`).
+        if let Err(e) = alloc_dib_handle_and_set(&payload, CF_HDROP_U32) {
+            unsafe {
+                CloseClipboard();
+            }
+            return Err(e);
+        }
+        unsafe {
+            CloseClipboard();
+        }
+        Ok(())
+    }
 }
 
 /// **M2b STEP-2b.1** — `set_image(Mime::Png)` write path:
@@ -614,6 +683,82 @@ impl WinClipboard {
 /// the error wording is consistent across the read / write paths.
 fn err_to_string(op: &str, err: u32) -> String {
     format!("{op} failed: GetLastError={err}")
+}
+
+/// **M4 STEP-4.2** — build a `CF_HDROP` payload (`DROPFILES`
+/// header + double-NUL-terminated UTF-16 LE paths).
+///
+/// **Wire format** (shellapi.h + MSDN `DROPFILES` docs):
+/// - `DROPFILES` struct (20 bytes, little-endian):
+///   | offset | size | field          | value            |
+///   |--------|------|----------------|------------------|
+///   | 0      | 4    | `pFiles`       | `0xFFFFFFFF`     |
+///   | 4      | 4    | `pt.x`         | `0`              |
+///   | 8      | 4    | `pt.y`         | `0`              |
+///   | 12     | 4    | `fNC`          | `0`              |
+///   | 16     | 4    | `fWide`        | `1` (UTF-16 wide)|
+/// - File-list: each path is UTF-16 LE + NUL wchar; the list is
+///   terminated by a second NUL wchar (the double-NUL
+///   convention — `DragQueryFileW` walks the buffer until it
+///   sees two consecutive NUL wchars).
+///
+/// **`pFiles = 0xFFFFFFFF`**: the offset (in bytes) of the
+/// file-list from the start of the structure. The MS-defined
+/// sentinel `0xFFFFFFFF` means "the file list immediately
+/// follows the DROPFILES struct" — every modern Win32 producer
+/// and consumer expects this value. Using `sizeof(DROPFILES) =
+/// 20` is also valid but `0xFFFFFFFF` is the canonical
+/// sentinel (the difference is whether the consumer adds
+/// `pFiles` to the buffer base; with `0xFFFFFFFF` the base
+/// stays at the start of the payload).
+///
+/// **Why a free function (not a method)**: same rationale as
+/// `encode_png_to_dib` — pure bytes-in / bytes-out, no `Self`
+/// state, exercise from unit tests without touching the real
+/// `OpenClipboard` / `SetClipboardData` API (those are Windows
+/// VM-only and would deadlock on macOS / Linux builds; the
+/// cross-platform CI matrix can't reach them).
+///
+/// **Empty input**: returns `Ok(empty_vec)` — the dispatcher
+/// guarantees a non-empty batch before reaching this method,
+/// but the free helper stays total over `&[]` so future
+/// callers can layer their own short-circuits on top.
+fn build_dropfiles_payload(paths: &[PathBuf]) -> Result<Vec<u8>, ClipboardError> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Pre-size: 20 bytes header + UTF-16 bytes per path
+    // (UTF-16 LE = 2 bytes per wchar; OsStrExt yields 1 wchar
+    // per Rust char; each path + NUL terminator).
+    let mut payload_size: usize = 20;
+    let mut wide_paths: Vec<Vec<u16>> = Vec::with_capacity(paths.len());
+    for p in paths {
+        let wide: Vec<u16> = OsString::from(p)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        payload_size += wide.len() * std::mem::size_of::<u16>();
+        wide_paths.push(wide);
+    }
+    // Double-NUL terminator for the path list.
+    payload_size += 2 * std::mem::size_of::<u16>();
+
+    let mut buf = Vec::with_capacity(payload_size);
+    // DROPFILES header.
+    buf.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // pFiles sentinel
+    buf.extend_from_slice(&0i32.to_le_bytes()); // pt.x
+    buf.extend_from_slice(&0i32.to_le_bytes()); // pt.y
+    buf.extend_from_slice(&0u32.to_le_bytes()); // fNC
+    buf.extend_from_slice(&1u32.to_le_bytes()); // fWide = TRUE (UTF-16)
+    // File list (UTF-16 LE per path, double-NUL terminated).
+    for wide in &wide_paths {
+        for w in wide {
+            buf.extend_from_slice(&w.to_le_bytes());
+        }
+    }
+    // Final double-NUL: two zero wchars.
+    buf.extend_from_slice(&[0u8; 4]);
+    Ok(buf)
 }
 
 /// **M2b STEP-2b.1** — decode `png_bytes` via the `image` crate
@@ -941,5 +1086,123 @@ mod tests {
             matches!(result, Err(ClipboardError::Unsupported(_))),
             "set_image(Jpeg) must return Err(Unsupported); got {result:?}"
         );
+    }
+
+    // === M4 STEP-4.2 — set_files / DROPFILES payload tests ===
+
+    /// `build_dropfiles_payload` produces a 20-byte DROPFILES
+    /// header followed by a UTF-16 LE path list. Pin the header
+    /// field values so a future refactor that swaps the byte
+    /// layout (e.g. mistakenly writing big-endian wide chars)
+    /// fails this test rather than silently corrupting the
+    /// receiver's clipboard.
+    #[test]
+    fn build_dropfiles_payload_emits_correct_header_for_single_path() {
+        let paths = vec![PathBuf::from(r"C:\Users\me\file.txt")];
+        let buf = build_dropfiles_payload(&paths).expect("build_dropfiles_payload");
+
+        // DROPFILES header is exactly 20 bytes.
+        assert!(
+            buf.len() >= 20,
+            "DROPFILES payload must be at least 20 bytes (header), got {}",
+            buf.len()
+        );
+
+        // pFiles = 0xFFFFFFFF (sentinel).
+        let p_files = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        assert_eq!(
+            p_files, 0xFFFFFFFF,
+            "pFiles must be the 0xFFFFFFFF sentinel; got {p_files:#x}"
+        );
+
+        // pt.x, pt.y, fNC = 0.
+        let pt_x = i32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let pt_y = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let f_nc = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        assert_eq!(pt_x, 0, "pt.x must be 0");
+        assert_eq!(pt_y, 0, "pt.y must be 0");
+        assert_eq!(f_nc, 0, "fNC must be 0");
+
+        // fWide = 1 (UTF-16 LE; the modern Windows convention).
+        let f_wide = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        assert_eq!(f_wide, 1, "fWide must be 1 (UTF-16 LE paths); got {f_wide}");
+    }
+
+    /// `build_dropfiles_payload` encodes the path list as UTF-16
+    /// LE wchars, each path NUL-terminated, with a double-NUL
+    /// terminator at the end. Pin the byte layout by reconstructing
+    /// each path with `DragQueryFileW`-style parsing (scan wchars
+    /// until NUL, decode UTF-16 → String, expect the original
+    /// path).
+    #[test]
+    fn build_dropfiles_payload_round_trips_paths_via_wide_decode() {
+        let paths = vec![
+            PathBuf::from(r"C:\Users\me\a.bin"),
+            PathBuf::from(r"C:\Users\me\report.pdf"),
+            PathBuf::from(r"D:\downloads\c with space.txt"),
+        ];
+        let buf = build_dropfiles_payload(&paths).expect("build_dropfiles_payload");
+
+        // Skip the 20-byte header; walk the wide-char list.
+        let wide_bytes = &buf[20..];
+        assert!(
+            wide_bytes.len() % 2 == 0,
+            "wide-char list must have even byte count; got {}",
+            wide_bytes.len()
+        );
+        let wide_chars: Vec<u16> = wide_bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+
+        // Decode path-by-path (each path NUL-terminated, list
+        // double-NUL terminated). Mirrors what `DragQueryFileW`
+        // does internally on the read side.
+        let mut recovered = Vec::new();
+        let mut current = Vec::new();
+        for w in wide_chars {
+            if w == 0 {
+                if current.is_empty() {
+                    // Double-NUL terminator.
+                    break;
+                }
+                let s = String::from_utf16(&current).expect("UTF-16 path must be valid");
+                recovered.push(PathBuf::from(s));
+                current.clear();
+            } else {
+                current.push(w);
+            }
+        }
+        assert_eq!(
+            recovered.len(),
+            paths.len(),
+            "round-trip path count (recovered={recovered:?})"
+        );
+        for (orig, rec) in paths.iter().zip(recovered.iter()) {
+            assert_eq!(
+                rec, orig,
+                "round-trip path identity (orig={orig:?}, recovered={rec:?})"
+            );
+        }
+    }
+
+    /// `build_dropfiles_payload(&[])` returns an empty `Vec`. The
+    /// dispatcher's `set_files` short-circuits before reaching
+    /// the helper for empty inputs, but the helper stays total
+    /// over `&[]` so future callers can compose freely.
+    #[test]
+    fn build_dropfiles_payload_empty_input_returns_empty_vec() {
+        let buf = build_dropfiles_payload(&[]).expect("build_dropfiles_payload");
+        assert_eq!(buf.len(), 0, "empty input must produce empty payload");
+    }
+
+    /// `CF_HDROP = 15` is a stable Win32 clipboard format
+    /// constant. Pin it so a future windows-sys bump that
+    /// re-exports the constant does not accidentally change the
+    /// value (some older SDK headers had it at 14 in pre-NT
+    /// builds).
+    #[test]
+    fn cf_hdrop_constant_is_stable() {
+        assert_eq!(CF_HDROP_U32, 15);
     }
 }
