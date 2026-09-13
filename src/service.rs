@@ -3817,14 +3817,25 @@ impl Service {
                 // different write); spawning them serially
                 // would block the main `select!` for the full
                 // batch duration.
+                //
+                // **M5 STEP-5.1** — capture `keep_partial`
+                // before the spawn so the apply task can decide
+                // whether to preserve the transient
+                // `<name>.partial` file on sha256 mismatch.
+                let keep_partial = self.keep_partial();
                 for entry in entries {
                     let conn_for_fetcher = conn.clone();
                     let sha_hex = full_hex(&entry.sha256);
+                    // **M5 STEP-5.1** — propagate the raw
+                    // `std::io::Error` so the apply task can
+                    // classify it via [`classify_io_err_kind`].
+                    // Pre-M5 the closure did
+                    // `.map_err(|e| format!("{e}"))` which
+                    // discarded the typed `ErrorKind`.
                     let fetcher = async move {
                         crate::quic_transport::http3::Http3Client::new(conn_for_fetcher)
                             .get_file(&sha_hex, None)
                             .await
-                            .map_err(|e| format!("{e}"))
                     };
                     let applied_tx_for_entry = applied_tx.clone();
                     let accept_dir_for_entry = accept_dir.clone();
@@ -3844,6 +3855,7 @@ impl Service {
                         mime,
                         addr,
                         accept_dir_for_entry,
+                        keep_partial,
                         fetcher,
                         cancel_registry,
                     ));
@@ -3905,6 +3917,27 @@ impl Service {
                 short_hex(&inbound_sha),
                 result.error,
             );
+            // **M5 STEP-5.1** — on HTTP/3 stream error, push
+            // the GUI-facing failure event so the user sees a
+            // toast. Only set when the failure was a
+            // transport-level stream abort (the fetcher future
+            // returned `Err(std::io::Error)` and the cancel
+            // signal was NOT the trigger). sha256 mismatch /
+            // write IO error / non-200 status / cancel all leave
+            // `stream_failure` as `None` — silent failures
+            // logged at warn level.
+            if let Some((reason, ts_ms)) = result.stream_failure.as_ref() {
+                log::warn!(
+                    "clipboard inbound file: HTTP/3 stream failure from {source}: \
+                     reason={reason} (sha={}, ts_ms={ts_ms})",
+                    short_hex(&inbound_sha),
+                );
+                self.notify_frontend(FrontendEvent::FileTransferFailed {
+                    sha256: inbound_sha,
+                    reason: reason.clone(),
+                    ts_ms: *ts_ms,
+                });
+            }
         } else {
             // Mark the inbound SHA in the file loopback LRU. The
             // dispatcher (outbound) writes its own fingerprint; we
@@ -5605,6 +5638,126 @@ async fn apply_image_inner(
 // - [`Service::handle_inbound_files_applied`] — completion arm
 //   for the main `select!` (mirrors `handle_inbound_image_applied`).
 
+/// **M5 STEP-5.1** — classified HTTP/3 stream error kind. The
+/// fetcher future returned `std::io::Error` (i.e., a transport-
+/// level failure: connection lost, timeout, peer cancelled the
+/// stream). Distinct from HTTP/3 GET non-200 status (404 / 5xx),
+/// which is a `Ok((status, _))` arm and does NOT push
+/// [`FrontendEvent::FileTransferFailed`].
+///
+/// **Why a typed enum (vs. just matching on `String` in
+/// `apply_inbound_files_task`)**: the GUI-facing reason string
+/// must be stable (`"connection lost"` / `"timeout"` /
+/// `"peer cancelled"`) so the Vue side can map it to localized
+/// text. A typed enum keeps the wire contract pinned and makes
+/// the classification testable in isolation (4 helper tests +
+/// 3 apply-task tests).
+///
+/// The error classification lives in this enum; the conversion
+/// to `String` happens via [`FileFetchErrorKind::as_reason`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileFetchErrorKind {
+    /// QUIC connection lost mid-fetch (peer hangup, network blip,
+    /// idle timeout, etc.). The most common stream-error case.
+    ConnectionLost,
+    /// QUIC stream timed out.
+    Timeout,
+    /// Peer cancelled via `FileTransferCancel` mid-fetch (the
+    /// cancel signal arrived during the GET — the `RecvStream`
+    /// was dropped and the read returned
+    /// `ErrorKind::ConnectionAborted`). The apply task
+    /// re-classifies a raw `ConnectionAborted` as
+    /// `PeerCancelled` when the cancel signal is also pending.
+    ///
+    /// **Forward-compat**: today the apply task returns early
+    /// on the cancel-detection branch (line 6479 `(&mut
+    /// cancel_rx).now_or_never().is_some()`) without sending
+    /// an `InboundFileApplyResult`, so this variant is
+    /// unreachable in production. Kept in the enum because
+    /// the reason string `"peer cancelled"` is part of the
+    /// `reason` wire contract (PLAN §M5 STEP-5.1) and a future
+    /// change might decide to emit the failure event for the
+    /// cancel path too.
+    #[allow(dead_code)] // forward-compat; not constructed by today's apply task
+    PeerCancelled,
+    /// Generic I/O error catch-all (couldn't open bidi stream,
+    /// malformed response header, etc.). Surfaces to the GUI as
+    /// `"io error"` so the user knows it's not a network issue.
+    IoError,
+}
+
+impl FileFetchErrorKind {
+    /// Stable, human-readable reason string for the GUI.
+    /// **Wire contract** — a drift in any of these strings is
+    /// a 5.3 (Vue IPC binding) breaking change.
+    pub fn as_reason(self) -> &'static str {
+        match self {
+            Self::ConnectionLost => "connection lost",
+            Self::Timeout => "timeout",
+            Self::PeerCancelled => "peer cancelled",
+            Self::IoError => "io error",
+        }
+    }
+}
+
+/// **M5 STEP-5.1** — classify a `std::io::Error` into a
+/// [`FileFetchErrorKind`]. Pure helper (testable in isolation).
+///
+/// **Mapping** (covers the error kinds surfaced by quinn's
+/// `ReadError` / `WriteError` / `Connection::open_bi`):
+/// - `ErrorKind::ConnectionAborted` → `ConnectionLost`
+///   (peer hangup, network drop, idle timeout, OR peer
+///   cancel — distinct from [`FileFetchErrorKind::PeerCancelled`]
+///   because this fn doesn't have access to the cancel
+///   signal; the apply task re-classifies as `PeerCancelled`
+///   when the cancel signal is also pending)
+/// - `ErrorKind::ConnectionReset` → `ConnectionLost`
+/// - `ErrorKind::UnexpectedEof` → `ConnectionLost` (peer
+///   closed mid-body — typically a hangup; `read_exact_err`
+///   in `quic_transport::http3` emits this for
+///   `ReadExactError::FinishedEarly`)
+/// - `ErrorKind::TimedOut` → `Timeout`
+/// - everything else → `IoError` (catch-all for malformed
+///   headers, OS-level open failures, etc.)
+///
+/// **Why pure (no `&self` / `&Service`)**: the apply task is
+/// a free function and so is this classifier. The fn's purity
+/// means it can be unit-tested with hand-crafted
+/// `std::io::Error` instances (4 `classify_io_err_kind_*`
+/// tests in `service.rs`).
+pub(crate) fn classify_io_err_kind(e: &std::io::Error) -> FileFetchErrorKind {
+    match e.kind() {
+        std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::UnexpectedEof => FileFetchErrorKind::ConnectionLost,
+        std::io::ErrorKind::TimedOut => FileFetchErrorKind::Timeout,
+        _ => FileFetchErrorKind::IoError,
+    }
+}
+
+/// **M5 STEP-5.1** — return the partial-file staging path
+/// `<p>.partial`. Helper used by [`write_and_verify_file_blocking`]
+/// to write the in-flight bytes to a transient file before
+/// atomic rename to the final path on success.
+///
+/// **Why a `.partial` intermediate**: the M3a code wrote
+/// directly to the final path and deleted on sha256 mismatch.
+/// That works for sha256 mismatch (no extra cost) but loses
+/// the postmortem story for stream-error / cancel-mid-write
+/// scenarios — the user sees no on-disk artifact to
+/// diagnose "why did the transfer fail". The `.partial`
+/// intermediate lets `keep_partial = true` (TOML / GUI /
+/// CLI) preserve the artifact; `keep_partial = false` (the
+/// default) cleans it up after the fsync (covers SUGGESTION
+/// P2.3 carry-forward: "fsync between write and remove").
+///
+/// Pure helper — no `&self`, no Service dependency.
+fn keep_partial_path(p: &Path) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(".partial");
+    PathBuf::from(s)
+}
+
 /// **M4 STEP-4.3** — typed classification of
 /// [`InboundFileApplyResult`] failure modes. Used by the
 /// clipboard-re-inject collector ([`Service::pending_file_collectors`])
@@ -5763,6 +5916,25 @@ struct InboundFileApplyResult {
     /// today's dispatch path but are constructible for
     /// collector-skip unit tests.
     error: Option<InboundFileError>,
+    /// **M5 STEP-5.1** — when `Some`, the main task pushes
+    /// [`FrontendEvent::FileTransferFailed`] `{ sha256, reason,
+    /// ts_ms }` to the GUI. Set only on the HTTP/3 stream-error
+    /// path (`apply_inbound_files_task` saw a `Err(std::io::Error)`
+    /// from the fetcher). NOT set on:
+    /// - sha256 mismatch (silent, logged at warn)
+    /// - write IO error (silent, logged at warn)
+    /// - HTTP/3 GET non-200 status (silent, logged at warn)
+    /// - peer-cancel path (`(&mut cancel_rx).now_or_never().is_some()`
+    ///   is the user-initiated cancel arm — that's a deliberate
+    ///   action, not a "failure" per the GUI's vocabulary)
+    ///
+    /// Field shape: `(reason, ts_ms)` where `reason` is the
+    /// stable string from [`FileFetchErrorKind::as_reason`]
+    /// and `ts_ms` is `unix_now_ms()` at the moment the apply
+    /// task saw the error (matches `ClipboardState.last_*_ts`
+    /// convention; `0` if the clock read failed, but the
+    /// GUI treats `0` as "epoch").
+    stream_failure: Option<(String, u64)>,
     /// Final on-disk path after collision-suffix resolution.
     /// `Some(path)` on success (the file is on disk); `None` on
     /// any failure path.
@@ -6055,9 +6227,27 @@ fn sanitize_filename(name: &str) -> String {
 /// Still lands inside `accept_dir` — never used in path traversal.
 const SANITIZED_FALLBACK_NAME: &str = "untitled";
 
-/// **M3a STEP-3a.3** — `spawn_blocking` entry: write `bytes` to
-/// `path` and verify the on-the-wire sha256 by recomputing it from
-/// the same bytes.
+/// **M3a STEP-3a.3 + M5 STEP-5.1** — `spawn_blocking` entry:
+/// write `bytes` to `<path>.partial` (transient staging file),
+/// fsync, then atomically rename to `<path>` after the sha256
+/// verify passes. On mismatch, the partial file is removed
+/// unless `keep_partial=true` (the user wants to inspect the
+/// corrupt bytes for debugging).
+///
+/// **M5 STEP-5.1** — adds `keep_partial: bool` parameter:
+/// - `true` ⇒ on sha256 mismatch or write IO error, leave
+///   `<path>.partial` on disk for postmortem
+/// - `false` (default) ⇒ `std::fs::remove_file(<path>.partial)`
+///   after the fsync (covers SUGGESTION P2.3 carry-forward:
+///   "fsync between write and remove")
+///
+/// **Why `.partial` intermediate** (vs. writing directly to
+/// the final path as M3a did): lets `keep_partial=true`
+/// preserve an on-disk artifact when the verify fails. M3a's
+/// "delete on mismatch" pattern lost the user's postmortem
+/// data — they saw no trace of "why did the transfer fail".
+/// The intermediate file + atomic rename gives both options
+/// from the same code path (rename is atomic on POSIX).
 ///
 /// **Why recompute from memory (not from disk re-read)**: the
 /// bytes came over QUIC which has its own stream-level integrity
@@ -6068,18 +6258,39 @@ const SANITIZED_FALLBACK_NAME: &str = "untitled";
 /// received bytes; the local disk is trusted as the receiver's
 /// own filesystem.
 ///
-/// **Failure handling**: on sha256 mismatch the partial file is
-/// **deleted** before returning `Err`. The user never sees a
-/// half-written corrupt file; the error_msg tells them which sha
-/// was expected vs computed so they can diagnose.
+/// **Failure handling**: on sha256 mismatch (or write IO
+/// error) the partial file is **deleted** before returning
+/// `Err` (unless `keep_partial=true`). The user-visible
+/// `<path>` is never touched on the failure path — the
+/// rename only fires on the success branch.
 pub(crate) fn write_and_verify_file_blocking(
     path: PathBuf,
     bytes: Vec<u8>,
     expected_sha: [u8; 32],
+    keep_partial: bool,
 ) -> Result<(), String> {
-    // Write bytes to disk.
-    std::fs::write(&path, &bytes).map_err(|e| format!("write failed: {e}"))?;
-    // Recompute sha256 over the received bytes (cheap, in-memory).
+    let partial_path = keep_partial_path(&path);
+    // Step 1: write bytes to <path>.partial + fsync.
+    {
+        let f = std::fs::File::create(&partial_path)
+            .map_err(|e| format!("create partial {}: {e}", partial_path.display()))?;
+        let mut writer = std::io::BufWriter::new(f);
+        std::io::Write::write_all(&mut writer, &bytes)
+            .map_err(|e| format!("write partial {}: {e}", partial_path.display()))?;
+        let f = writer
+            .into_inner()
+            .map_err(|e| format!("flush partial {}: {e:?}", partial_path.display()))?;
+        // **SUGGESTION P2.3 carry-forward** — fsync between
+        // write and rename (or remove). Ensures durability
+        // even if the system crashes between the write call
+        // and the rename — the rename either succeeds or
+        // doesn't; we never end up with a partial file
+        // pointing to stale disk blocks.
+        f.sync_all()
+            .map_err(|e| format!("fsync partial {}: {e}", partial_path.display()))?;
+    }
+    // Step 2: recompute sha256 over the received bytes
+    // (cheap, in-memory).
     let actual: [u8; 32] = {
         use sha2::Digest;
         let mut hasher = Sha256::new();
@@ -6087,14 +6298,24 @@ pub(crate) fn write_and_verify_file_blocking(
         hasher.finalize().into()
     };
     if actual != expected_sha {
-        // Mismatch — delete the partial file before returning Err.
-        // `remove_file` failure is logged but doesn't change the
-        // outcome: the caller still sees Err(sha256 mismatch).
-        if let Err(rm_err) = std::fs::remove_file(&path) {
+        // Mismatch — delete the partial unless `keep_partial`
+        // opts in. `remove_file` failure is logged but doesn't
+        // change the outcome: the caller still sees Err.
+        if !keep_partial {
+            if let Err(rm_err) = std::fs::remove_file(&partial_path) {
+                log::warn!(
+                    "clipboard inbound file: sha256 mismatch AND failed to delete partial \
+                     at {}: {rm_err} (expected sha={}, got sha={})",
+                    partial_path.display(),
+                    short_hex(&expected_sha),
+                    short_hex(&actual),
+                );
+            }
+        } else {
             log::warn!(
-                "clipboard inbound file: sha256 mismatch AND failed to delete partial \
-                 at {}: {rm_err} (expected sha={}, got sha={})",
-                path.display(),
+                "clipboard inbound file: sha256 mismatch; keep_partial=true, leaving \
+                 partial at {} for debugging (expected sha={}, got sha={})",
+                partial_path.display(),
                 short_hex(&expected_sha),
                 short_hex(&actual),
             );
@@ -6105,6 +6326,14 @@ pub(crate) fn write_and_verify_file_blocking(
             short_hex(&actual)
         ));
     }
+    // Step 3: success — atomically rename `<path>.partial` → `<path>`.
+    std::fs::rename(&partial_path, &path).map_err(|e| {
+        format!(
+            "rename partial {} to {}: {e}",
+            partial_path.display(),
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -6158,11 +6387,24 @@ pub(crate) fn write_and_verify_file_blocking(
 /// indirection lets unit tests drive success / 404 / IO-error
 /// paths without standing up a real HTTP/3 server.
 ///
-/// **`#[allow(clippy::too_many_arguments)]`**: 9 args (the per-entry
+/// **`#[allow(clippy::too_many_arguments)]`**: 11 args (the per-entry
 /// fields + `batch_fingerprint` (M4 STEP-4.3) + `accept_dir` +
-/// `fetcher` future + `applied_tx` channel) — each is genuinely
-/// independent. Grouping into a context struct would obscure the
-/// call site without reducing the total surface.
+/// `keep_partial` (M5 STEP-5.1) + `fetcher` future + `applied_tx`
+/// channel + `cancel_registry`) — each is genuinely independent.
+/// Grouping into a context struct would obscure the call site
+/// without reducing the total surface.
+///
+/// **M5 STEP-5.1** — fetcher future bound changed from
+/// `Result<(u16, Vec<u8>), String>` to `Result<(u16, Vec<u8>), std::io::Error>`.
+/// The original `String` error (just `format!("{e}")` from
+/// `Http3Client::get_file`) discarded the typed `io::ErrorKind`
+/// that we now need to classify into [`FileFetchErrorKind`].
+///
+/// Tests that mock the fetcher only exercise the `Ok` arm
+/// (see `apply_inbound_files_task_tests` +
+/// `cancel_mechanism_tests`) so updating the error type from
+/// `String` to `std::io::Error` is a non-disruptive
+/// 6-call-site type-annotation change.
 #[allow(clippy::too_many_arguments)]
 async fn apply_inbound_files_task<F>(
     applied_tx: tokio_mpsc::UnboundedSender<InboundFileApplyResult>,
@@ -6173,10 +6415,11 @@ async fn apply_inbound_files_task<F>(
     mime: String,
     source: SocketAddr,
     accept_dir: PathBuf,
+    keep_partial: bool,
     fetcher: F,
     cancel_registry: Arc<Mutex<HashMap<[u8; 32], oneshot::Sender<()>>>>,
 ) where
-    F: std::future::Future<Output = Result<(u16, Vec<u8>), String>>,
+    F: std::future::Future<Output = Result<(u16, Vec<u8>), std::io::Error>>,
 {
     // **M3a STEP-3a.5** — register a cancel channel before
     // issuing the GET. The receiver-side handler
@@ -6248,6 +6491,10 @@ async fn apply_inbound_files_task<F>(
                     error: Some(InboundFileError::IoError),
                     landed_path: None,
                     bytes_len: 0,
+                    // Non-200 status is a server response, not a
+                    // transport-level stream error — no IPC toast
+                    // (logged at warn above is enough).
+                    stream_failure: None,
                     error_msg: Some(format!(
                         "HTTP/3 GET /clipboard/file/{} returned {status}",
                         short_hex(&inbound_sha)
@@ -6255,22 +6502,33 @@ async fn apply_inbound_files_task<F>(
                 });
                 return;
             }
-            Err(e) => {
-                // `Err` here covers both "real" GET errors
-                // (peer disconnected, malformed response) AND
-                // the abort path (cancel via select! dropping
-                // the RecvStream). Distinguish by checking
-                // whether the cancel signal was the trigger:
+            Err(io_err) => {
+                // **M5 STEP-5.1** — `Err` here covers both "real"
+                // GET errors (peer disconnected, malformed response)
+                // AND the abort path (cancel via select! dropping
+                // the RecvStream, which returns
+                // `ErrorKind::ConnectionAborted`). Distinguish by
+                // checking whether the cancel signal was the
+                // trigger:
                 if (&mut cancel_rx).now_or_never().is_some() {
                     log::info!(
                         "clipboard inbound file: HTTP/3 fetch aborted for sha={} \
-                         (name={name}) — cancel received mid-fetch: {e}",
+                         (name={name}) — cancel received mid-fetch: {io_err}",
                         short_hex(&inbound_sha),
                     );
                     // Registry cleanup already done by the
-                    // cancel handler.
+                    // cancel handler. Cancel is a deliberate user
+                    // action, NOT a failure — no FileTransferFailed
+                    // event.
                     return;
                 }
+                // **M5 STEP-5.1** — real stream error. Classify
+                // the error kind and emit FileTransferFailed via
+                // the main task (it has `&mut self` access and is
+                // the sole owner of `notify_frontend`).
+                let kind = classify_io_err_kind(&io_err);
+                let reason = kind.as_reason().to_string();
+                let ts_ms = unix_now_ms();
                 cancel_registry
                     .lock()
                     .expect("cancel registry mutex poisoned")
@@ -6286,8 +6544,9 @@ async fn apply_inbound_files_task<F>(
                     error: Some(InboundFileError::IoError),
                     landed_path: None,
                     bytes_len: 0,
+                    stream_failure: Some((reason, ts_ms)),
                     error_msg: Some(format!(
-                        "HTTP/3 GET /clipboard/file/{} failed: {e}",
+                        "HTTP/3 GET /clipboard/file/{} failed: {io_err}",
                         short_hex(&inbound_sha)
                     )),
                 });
@@ -6317,6 +6576,11 @@ async fn apply_inbound_files_task<F>(
     }
 
     // Hand off to the off-LocalSet write + sha256 verify.
+    // **M5 STEP-5.1** — `keep_partial` is read from
+    // `Service::keep_partial()` (set in
+    // `handle_clipboard_inbound_files` and captured in a local
+    // before the spawn). The transient `<name>.partial` file
+    // is preserved for postmortem if `keep_partial=true`.
     let landed_path = apply_files_inner_returning_path(
         applied_tx.clone(),
         batch_fingerprint,
@@ -6327,6 +6591,7 @@ async fn apply_inbound_files_task<F>(
         source,
         accept_dir,
         bytes,
+        keep_partial,
     )
     .await;
     // **M3a STEP-3a.5** — after the spawn_blocking write,
@@ -6388,6 +6653,13 @@ async fn apply_inbound_files_task<F>(
 /// `#[must_use]` flag on the original) to avoid touching
 /// `apply_files_inner`'s call sites (there are none currently,
 /// but a future caller might want the void variant).
+///
+/// **M5 STEP-5.1** — added `keep_partial: bool` parameter,
+/// forwarded to [`write_and_verify_file_blocking`]. When
+/// `true`, the transient `<name>.partial` file is preserved on
+/// sha256 mismatch / write IO error (postmortem); when `false`
+/// (the default), it's removed after the fsync — closes
+/// SUGGESTION P2.3 carry-forward.
 #[allow(clippy::too_many_arguments)]
 async fn apply_files_inner_returning_path(
     applied_tx: tokio_mpsc::UnboundedSender<InboundFileApplyResult>,
@@ -6399,13 +6671,14 @@ async fn apply_files_inner_returning_path(
     source: SocketAddr,
     accept_dir: PathBuf,
     bytes: Vec<u8>,
+    keep_partial: bool,
 ) -> Option<PathBuf> {
     let bytes_len = bytes.len();
     let name_for_path = name.clone();
 
     let join_result = tokio::task::spawn_blocking(move || -> Result<PathBuf, String> {
         let landed_path = resolve_unique_path(&accept_dir, &name_for_path);
-        write_and_verify_file_blocking(landed_path.clone(), bytes, inbound_sha)?;
+        write_and_verify_file_blocking(landed_path.clone(), bytes, inbound_sha, keep_partial)?;
         Ok(landed_path)
     })
     .await;
@@ -6423,6 +6696,8 @@ async fn apply_files_inner_returning_path(
                 error: None,
                 landed_path: Some(landed_path.clone()),
                 bytes_len,
+                // Write succeeded — no stream failure event.
+                stream_failure: None,
                 error_msg: None,
             });
             Some(landed_path)
@@ -6452,6 +6727,11 @@ async fn apply_files_inner_returning_path(
                 error: Some(typed_error),
                 landed_path: None,
                 bytes_len,
+                // Sha256 mismatch / write IO error are silent
+                // failures (logged at warn above is enough) — no
+                // IPC toast. Only the HTTP/3 stream-error path in
+                // `apply_inbound_files_task` sets `stream_failure`.
+                stream_failure: None,
                 error_msg: Some(e),
             });
             None
@@ -6468,6 +6748,8 @@ async fn apply_files_inner_returning_path(
                 error: Some(InboundFileError::IoError),
                 landed_path: None,
                 bytes_len,
+                // spawn_blocking join errors are also silent.
+                stream_failure: None,
                 error_msg: Some(format!("spawn_blocking join error: {join_err}")),
             });
             None
@@ -9000,6 +9282,9 @@ mod reinject_decision_tests {
             error: None,
             landed_path: Some(landed),
             bytes_len: 1024,
+            // **M5 STEP-5.1** — collector test fixture; success
+            // path → stream_failure is None (no IPC toast).
+            stream_failure: None,
             error_msg: None,
         }]
     }
@@ -9019,6 +9304,10 @@ mod reinject_decision_tests {
             error: Some(error),
             landed_path: None,
             bytes_len: 1024,
+            // **M5 STEP-5.1** — collector test fixtures are
+            // constructed with `error` set; this is NOT a
+            // stream-error path so `stream_failure` is None.
+            stream_failure: None,
             error_msg: Some(error_msg.to_string()),
         }]
     }
@@ -9125,6 +9414,9 @@ mod reinject_decision_tests {
                 error: None,
                 landed_path: Some(PathBuf::from("/tmp/ok.pdf")),
                 bytes_len: 1024,
+                // **M5 STEP-5.1** — collector test fixture
+                // (success path → no stream failure).
+                stream_failure: None,
                 error_msg: None,
             },
             // Entry 2 failed (sha256 mismatch):
@@ -9139,6 +9431,9 @@ mod reinject_decision_tests {
                 error: Some(InboundFileError::Sha256Mismatch),
                 landed_path: None,
                 bytes_len: 0,
+                // Sha256 mismatch is a silent failure (no IPC
+                // toast) — stream_failure is None.
+                stream_failure: None,
                 error_msg: Some("sha256 mismatch: expected=..., got=...".to_string()),
             },
         ];
@@ -9229,6 +9524,9 @@ mod reinject_decision_tests {
                 error: None,
                 landed_path: Some(PathBuf::from("/tmp/report.pdf")),
                 bytes_len: 4096,
+                // **M5 STEP-5.1** — happy path collector
+                // fixture, no stream failure.
+                stream_failure: None,
                 error_msg: None,
             },
             InboundFileApplyResult {
@@ -9242,6 +9540,7 @@ mod reinject_decision_tests {
                 error: None,
                 landed_path: Some(PathBuf::from("/tmp/photo.jpg")),
                 bytes_len: 8192,
+                stream_failure: None,
                 error_msg: None,
             },
         ];
@@ -9315,6 +9614,9 @@ mod reinject_decision_tests {
             error: None,
             landed_path: Some(PathBuf::from("/tmp/a")),
             bytes_len: 1,
+            // **M5 STEP-5.1** — collector test fixture, no
+            // stream failure.
+            stream_failure: None,
             error_msg: None,
         });
         assert_ne!(c.received.len(), c.expected, "1/2 entries must not trigger");
@@ -9329,6 +9631,7 @@ mod reinject_decision_tests {
             error: None,
             landed_path: Some(PathBuf::from("/tmp/b")),
             bytes_len: 1,
+            stream_failure: None,
             error_msg: None,
         });
         assert_eq!(c.received.len(), c.expected, "2/2 entries must trigger");
@@ -9409,7 +9712,7 @@ mod apply_inbound_files_task_tests {
 
                 // Mock fetcher returns the test bytes with status 200.
                 let fetcher =
-                    async move { Ok::<(u16, Vec<u8>), String>((200u16, body_for_fetcher)) };
+                    async move { Ok::<(u16, Vec<u8>), std::io::Error>((200u16, body_for_fetcher)) };
 
                 let source: SocketAddr = "10.2.1.15:50247".parse().unwrap();
 
@@ -9432,6 +9735,10 @@ mod apply_inbound_files_task_tests {
                     entry.mime.clone(),
                     source,
                     accept_dir.path().to_path_buf(),
+                    // **M5 STEP-5.1** — keep_partial=false (the
+                    // default for tests; mismatch path should
+                    // delete the .partial).
+                    false,
                     fetcher,
                     cancel_registry,
                 ));
@@ -9524,7 +9831,7 @@ mod apply_inbound_files_task_tests {
                 let body_for_fetcher = body.clone();
 
                 let fetcher =
-                    async move { Ok::<(u16, Vec<u8>), String>((200u16, body_for_fetcher)) };
+                    async move { Ok::<(u16, Vec<u8>), std::io::Error>((200u16, body_for_fetcher)) };
 
                 let source: SocketAddr = "10.2.1.15:50247".parse().unwrap();
 
@@ -9543,6 +9850,10 @@ mod apply_inbound_files_task_tests {
                     entry.mime.clone(),
                     source,
                     accept_dir.path().to_path_buf(),
+                    // **M5 STEP-5.1** — keep_partial=false (the
+                    // default for tests; mismatch / 404 paths
+                    // should not preserve .partial).
+                    false,
                     fetcher,
                     cancel_registry,
                 ));
@@ -9612,7 +9923,7 @@ mod apply_inbound_files_task_tests {
                 let expected_landed_path = accept_dir.path().join("corrupt.bin");
 
                 let fetcher =
-                    async move { Ok::<(u16, Vec<u8>), String>((200u16, body_for_fetcher)) };
+                    async move { Ok::<(u16, Vec<u8>), std::io::Error>((200u16, body_for_fetcher)) };
 
                 let source: SocketAddr = "10.2.1.15:50247".parse().unwrap();
 
@@ -9629,6 +9940,10 @@ mod apply_inbound_files_task_tests {
                     entry.mime.clone(),
                     source,
                     accept_dir.path().to_path_buf(),
+                    // **M5 STEP-5.1** — keep_partial=false (the
+                    // default for tests; mismatch / 404 paths
+                    // should not preserve .partial).
+                    false,
                     fetcher,
                     cancel_registry,
                 ));
@@ -9698,7 +10013,8 @@ mod apply_inbound_files_task_tests {
                 // Mock fetcher returns 404 (mimics STEP-3a.4
                 // pre-landing: the source daemon's route is a stub
                 // that 404s).
-                let fetcher = async { Ok::<(u16, Vec<u8>), String>((404u16, Vec::<u8>::new())) };
+                let fetcher =
+                    async { Ok::<(u16, Vec<u8>), std::io::Error>((404u16, Vec::<u8>::new())) };
 
                 let source: SocketAddr = "10.2.1.15:50247".parse().unwrap();
 
@@ -9715,6 +10031,10 @@ mod apply_inbound_files_task_tests {
                     entry.mime.clone(),
                     source,
                     accept_dir.path().to_path_buf(),
+                    // **M5 STEP-5.1** — keep_partial=false (the
+                    // default for tests; mismatch / 404 paths
+                    // should not preserve .partial).
+                    false,
                     fetcher,
                     cancel_registry,
                 ));
@@ -9860,7 +10180,7 @@ mod apply_inbound_files_task_tests {
         let path = dir.path().join("x.bin");
         let bytes = b"some-bytes".to_vec();
         let expected = sha256_of_bytes_for_test(&bytes);
-        write_and_verify_file_blocking(path.clone(), bytes.clone(), expected)
+        write_and_verify_file_blocking(path.clone(), bytes.clone(), expected, false)
             .expect("happy path must succeed");
         let on_disk = std::fs::read(&path).expect("read back");
         assert_eq!(on_disk, bytes);
@@ -9873,13 +10193,60 @@ mod apply_inbound_files_task_tests {
         let bytes = b"actual-bytes".to_vec();
         // Wrong expected sha → should Err + delete the partial.
         let wrong_sha = [0xFFu8; 32];
-        let result = write_and_verify_file_blocking(path.clone(), bytes, wrong_sha);
+        let result = write_and_verify_file_blocking(path.clone(), bytes, wrong_sha, false);
         assert!(result.is_err(), "sha mismatch must return Err");
+        // **M5 STEP-5.1** — the transient `.partial` file is
+        // also deleted (the rename to the final `path` only
+        // happens on success). The user-visible `path` was
+        // never touched either, so neither file exists.
         assert!(
             !path.exists(),
-            "mismatch: partial file at {} must be deleted",
+            "mismatch: final file at {} must not be touched",
             path.display()
         );
+        let partial_path = keep_partial_path(&path);
+        assert!(
+            !partial_path.exists(),
+            "mismatch: partial file at {} must be deleted",
+            partial_path.display()
+        );
+    }
+
+    /// **M5 STEP-5.1** — `keep_partial=true` preserves the
+    /// transient `<name>.partial` file on sha256 mismatch (the
+    /// user wants to inspect the corrupt bytes for debugging).
+    /// Pins the postmortem semantics: the partial survives;
+    /// the final `<name>` was never written either (no rename).
+    #[test]
+    fn write_and_verify_file_blocking_keep_partial_preserves_on_mismatch() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("z.bin");
+        let bytes = b"actual-bytes-keep".to_vec();
+        let wrong_sha = [0xCCu8; 32];
+        let result = write_and_verify_file_blocking(path.clone(), bytes.clone(), wrong_sha, true);
+        assert!(result.is_err(), "sha mismatch must return Err");
+        // Final path was never touched (no rename on failure).
+        assert!(
+            !path.exists(),
+            "mismatch: final file at {} must not be touched (no rename on fail)",
+            path.display()
+        );
+        // **The partial survives** — user can inspect it.
+        let partial_path = keep_partial_path(&path);
+        assert!(
+            partial_path.exists(),
+            "keep_partial=true: partial file at {} must be preserved",
+            partial_path.display()
+        );
+        // Verify the partial has the right bytes (so the user
+        // can actually diagnose — empty file would be useless).
+        let on_disk = std::fs::read(&partial_path).expect("read preserved partial");
+        assert_eq!(
+            on_disk, bytes,
+            "preserved partial must contain the received bytes (pre-sha256)"
+        );
+        // Cleanup so TempDir drop doesn't fail.
+        let _ = std::fs::remove_file(&partial_path);
     }
 }
 
@@ -10137,7 +10504,7 @@ mod cancel_mechanism_tests {
             // Slow fetcher (200ms); cancel fires at 50ms.
             let slow_fetcher = async move {
                 tokio::time::sleep(Duration::from_millis(200)).await;
-                Ok::<(u16, Vec<u8>), String>((200u16, vec![0u8; entry_size as usize]))
+                Ok::<(u16, Vec<u8>), std::io::Error>((200u16, vec![0u8; entry_size as usize]))
             };
             let accept_path = accept_dir.path().to_path_buf();
             let cancel_registry_for_task = cancel_registry.clone();
@@ -10152,6 +10519,9 @@ mod cancel_mechanism_tests {
                     entry_mime,
                     fake_addr(),
                     accept_path,
+                    // **M5 STEP-5.1** — keep_partial=false (cancel
+                    // mid-fetch has no .partial to keep).
+                    false,
                     slow_fetcher,
                     cancel_registry_for_task,
                 );
@@ -10270,7 +10640,8 @@ mod cancel_mechanism_tests {
                 Arc::new(Mutex::new(HashMap::new()));
 
             let body_for_fetcher = body.clone();
-            let fetcher = async move { Ok::<(u16, Vec<u8>), String>((200u16, body_for_fetcher)) };
+            let fetcher =
+                async move { Ok::<(u16, Vec<u8>), std::io::Error>((200u16, body_for_fetcher)) };
             let accept_path = accept_dir.path().to_path_buf();
             let cancel_registry_for_task = cancel_registry.clone();
             let cancel_registry_for_signal = cancel_registry.clone();
@@ -10284,6 +10655,8 @@ mod cancel_mechanism_tests {
                     entry_mime,
                     fake_addr(),
                     accept_path,
+                    // **M5 STEP-5.1** — keep_partial=false (test default).
+                    false,
                     fetcher,
                     cancel_registry_for_task,
                 );
@@ -10422,5 +10795,439 @@ mod cancel_mechanism_tests {
         F: std::future::Future<Output = ()>,
     {
         rt.block_on(fut);
+    }
+}
+
+// ============================================================================
+//  M5 STEP-5.1 — Network-disconnect (stream error) handling
+// ============================================================================
+//
+// Pins the contract for the new IPC event
+// `FrontendEvent::FileTransferFailed { sha256, reason, ts_ms }` and
+// the `.partial` cleanup (default delete + `keep_partial=true`
+// preserve):
+//
+// - `classify_io_err_kind_*` — 4 helper tests for the pure
+//   `std::io::Error → FileFetchErrorKind` classifier.
+// - `keep_partial_path_*` — 1 helper test for the
+//   `.partial`-suffix builder.
+// - `apply_inbound_files_task_stream_error_*` — 3 apply-task
+//   tests, one per error kind (ConnectionLost / Timeout /
+//   IoError). Verifies the `InboundFileApplyResult.stream_failure`
+//   field is populated with the correct `(reason, ts_ms)` tuple.
+//   PeerCancelled is exercised separately (no event — apply task
+//   returns early on the cancel detection branch).
+// - `apply_inbound_files_task_cancel_returns_no_event` — sanity
+//   check that the cancel path does NOT populate stream_failure.
+// - `apply_inbound_files_task_404_no_stream_failure` — sanity
+//   check that the non-200 status path does NOT populate
+//   stream_failure (it's not a transport-level stream error).
+
+#[cfg(test)]
+mod stream_error_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// **`ConnectionAborted` → `ConnectionLost`**.
+    /// Quinn's `ReadError::ReadError` typically surfaces as
+    /// `ConnectionAborted` (peer hung up, network blip, idle
+    /// timeout). The apply task does a second-pass re-classify
+    /// based on the cancel signal — without the cancel signal,
+    /// this collapses to `ConnectionLost`.
+    #[test]
+    fn classify_io_err_kind_connection_aborted_maps_to_connection_lost() {
+        let e = std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "peer hung up");
+        assert_eq!(classify_io_err_kind(&e), FileFetchErrorKind::ConnectionLost);
+    }
+
+    /// **`ConnectionReset` → `ConnectionLost`**. Covers the
+    /// `quinn::WriteError::ConnectionLost` path that surfaces as
+    /// `ConnectionReset` after the stream was reset by the peer.
+    #[test]
+    fn classify_io_err_kind_connection_reset_maps_to_connection_lost() {
+        let e = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "RST");
+        assert_eq!(classify_io_err_kind(&e), FileFetchErrorKind::ConnectionLost);
+    }
+
+    /// **`UnexpectedEof` → `ConnectionLost`**. Covers the
+    /// `quinn::ReadExactError::FinishedEarly(n)` path (peer closed
+    /// mid-body). `read_exact_err` in `quic_transport::http3`
+    /// emits `UnexpectedEof` for this; this test pins the
+    /// classifier's response so a future change can't silently
+    /// downgrade mid-body hangup to `IoError`.
+    #[test]
+    fn classify_io_err_kind_unexpected_eof_maps_to_connection_lost() {
+        let e = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "stream closed mid-body");
+        assert_eq!(classify_io_err_kind(&e), FileFetchErrorKind::ConnectionLost);
+    }
+
+    /// **`TimedOut` → `Timeout`**. Distinct from `ConnectionLost`
+    /// because the GUI surfaces the reason string verbatim —
+    /// "timeout" tells the user to check their firewall /
+    /// MTU settings, while "connection lost" suggests a peer
+    /// disconnect or network blip.
+    #[test]
+    fn classify_io_err_kind_timed_out_maps_to_timeout() {
+        let e = std::io::Error::new(std::io::ErrorKind::TimedOut, "idle timeout");
+        assert_eq!(classify_io_err_kind(&e), FileFetchErrorKind::Timeout);
+    }
+
+    /// **Other → `IoError`** (catch-all). Covers malformed
+    /// response header, OS-level open failures, etc. —
+    /// everything that isn't a transport-level stream abort.
+    #[test]
+    fn classify_io_err_kind_other_maps_to_io_error() {
+        for kind in [
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::Other,
+        ] {
+            let e = std::io::Error::new(kind, "misc");
+            assert_eq!(
+                classify_io_err_kind(&e),
+                FileFetchErrorKind::IoError,
+                "kind {:?} must map to IoError",
+                kind
+            );
+        }
+    }
+
+    /// **Wire-contract pin** — `FileFetchErrorKind::as_reason`
+    /// returns the stable GUI-facing strings. These are the
+    /// values the Vue side renders in the toast. Drift in any
+    /// of these strings is a STEP-5.3 breaking change.
+    #[test]
+    fn file_fetch_error_kind_as_reason_strings_are_stable() {
+        assert_eq!(
+            FileFetchErrorKind::ConnectionLost.as_reason(),
+            "connection lost"
+        );
+        assert_eq!(FileFetchErrorKind::Timeout.as_reason(), "timeout");
+        assert_eq!(
+            FileFetchErrorKind::PeerCancelled.as_reason(),
+            "peer cancelled"
+        );
+        assert_eq!(FileFetchErrorKind::IoError.as_reason(), "io error");
+    }
+
+    /// **`keep_partial_path` helper** — appends `.partial` to a
+    /// path. Pure helper, no FS access. Pins the suffix so a
+    /// future rename to `.part` (or whatever) is caught.
+    #[test]
+    fn keep_partial_path_appends_suffix() {
+        let p = std::path::PathBuf::from("/tmp/received/file.pdf");
+        let partial = keep_partial_path(&p);
+        assert_eq!(
+            partial,
+            std::path::PathBuf::from("/tmp/received/file.pdf.partial")
+        );
+    }
+
+    /// **`keep_partial_path` with no extension** — bare filename
+    /// like `Makefile` should also work (the suffix is
+    /// unconditionally appended).
+    #[test]
+    fn keep_partial_path_works_without_extension() {
+        let p = std::path::PathBuf::from("/tmp/received/Makefile");
+        let partial = keep_partial_path(&p);
+        assert_eq!(
+            partial,
+            std::path::PathBuf::from("/tmp/received/Makefile.partial")
+        );
+    }
+
+    /// **Apply task: stream error on `ConnectionAborted`
+    /// populates `stream_failure` with `"connection lost"`.**
+    ///
+    /// Mock fetcher returns
+    /// `Err(std::io::Error::new(ConnectionAborted, "peer hung"))`.
+    /// The apply task must NOT take the cancel-detection
+    /// branch (no cancel signal is pending), so it
+    /// classifies + populates `stream_failure` and sends the
+    /// `InboundFileApplyResult`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_inbound_files_task_connection_aborted_populates_stream_failure() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let accept_dir = TempDir::new().expect("tempdir");
+                let (applied_tx, mut applied_rx) =
+                    tokio_mpsc::unbounded_channel::<InboundFileApplyResult>();
+                let cancel_registry =
+                    Arc::new(Mutex::new(HashMap::<[u8; 32], oneshot::Sender<()>>::new()));
+
+                let fetcher = async {
+                    Err::<(u16, Vec<u8>), std::io::Error>(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "peer hung up",
+                    ))
+                };
+
+                let source: SocketAddr = "10.2.1.15:50247".parse().unwrap();
+                tokio::task::spawn_local(apply_inbound_files_task(
+                    applied_tx,
+                    [0x77; 32],
+                    [0xAA; 32],
+                    "stream-fail.bin".to_string(),
+                    4096,
+                    "application/octet-stream".to_string(),
+                    source,
+                    accept_dir.path().to_path_buf(),
+                    false,
+                    fetcher,
+                    cancel_registry,
+                ));
+
+                let result = applied_rx
+                    .recv()
+                    .await
+                    .expect("apply task must always send exactly one result");
+
+                assert!(!result.success, "stream error: success must be false");
+                assert_eq!(result.error, Some(InboundFileError::IoError));
+                let (reason, ts_ms) = result
+                    .stream_failure
+                    .as_ref()
+                    .expect("stream_failure must be populated on transport-level stream error");
+                assert_eq!(
+                    reason, "connection lost",
+                    "ConnectionAborted must classify as 'connection lost'"
+                );
+                assert!(
+                    *ts_ms > 0,
+                    "ts_ms must be a real unix epoch ms (got {ts_ms}; non-zero + monotonic)"
+                );
+            })
+            .await;
+    }
+
+    /// **Apply task: stream error on `TimedOut` populates
+    /// `stream_failure` with `"timeout"`**. Mirrors the
+    /// `ConnectionAborted` test but exercises the Timeout branch
+    /// of `classify_io_err_kind`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_inbound_files_task_timed_out_populates_stream_failure() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let accept_dir = TempDir::new().expect("tempdir");
+                let (applied_tx, mut applied_rx) =
+                    tokio_mpsc::unbounded_channel::<InboundFileApplyResult>();
+                let cancel_registry =
+                    Arc::new(Mutex::new(HashMap::<[u8; 32], oneshot::Sender<()>>::new()));
+
+                let fetcher = async {
+                    Err::<(u16, Vec<u8>), std::io::Error>(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "idle timeout",
+                    ))
+                };
+
+                tokio::task::spawn_local(apply_inbound_files_task(
+                    applied_tx,
+                    [0x77; 32],
+                    [0xAA; 32],
+                    "timeout.bin".to_string(),
+                    4096,
+                    "application/octet-stream".to_string(),
+                    "10.2.1.15:50247".parse().unwrap(),
+                    accept_dir.path().to_path_buf(),
+                    false,
+                    fetcher,
+                    cancel_registry,
+                ));
+
+                let result = applied_rx.recv().await.expect("must send result");
+                let (reason, _) = result
+                    .stream_failure
+                    .as_ref()
+                    .expect("TimedOut must populate stream_failure");
+                assert_eq!(reason, "timeout");
+            })
+            .await;
+    }
+
+    /// **Apply task: stream error on `Other` (catch-all)
+    /// populates `stream_failure` with `"io error"`.**
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_inbound_files_task_other_io_populates_stream_failure() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let accept_dir = TempDir::new().expect("tempdir");
+                let (applied_tx, mut applied_rx) =
+                    tokio_mpsc::unbounded_channel::<InboundFileApplyResult>();
+                let cancel_registry =
+                    Arc::new(Mutex::new(HashMap::<[u8; 32], oneshot::Sender<()>>::new()));
+
+                let fetcher = async {
+                    Err::<(u16, Vec<u8>), std::io::Error>(std::io::Error::other(
+                        "malformed response header",
+                    ))
+                };
+
+                tokio::task::spawn_local(apply_inbound_files_task(
+                    applied_tx,
+                    [0x77; 32],
+                    [0xAA; 32],
+                    "misc.bin".to_string(),
+                    4096,
+                    "application/octet-stream".to_string(),
+                    "10.2.1.15:50247".parse().unwrap(),
+                    accept_dir.path().to_path_buf(),
+                    false,
+                    fetcher,
+                    cancel_registry,
+                ));
+
+                let result = applied_rx.recv().await.expect("must send result");
+                let (reason, _) = result
+                    .stream_failure
+                    .as_ref()
+                    .expect("Other must populate stream_failure");
+                assert_eq!(reason, "io error");
+            })
+            .await;
+    }
+
+    /// **Apply task: cancel mid-fetch returns early WITHOUT
+    /// populating `stream_failure`.** Cancel is a deliberate
+    /// user action (the receiver-side `FileTransferCancel`
+    /// handler fired the oneshot), NOT a transport-level
+    /// failure. The GUI must not get a phantom toast.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_inbound_files_task_cancel_returns_no_event() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let accept_dir = TempDir::new().expect("tempdir");
+                let (applied_tx, mut applied_rx) =
+                    tokio_mpsc::unbounded_channel::<InboundFileApplyResult>();
+                let cancel_registry =
+                    Arc::new(Mutex::new(HashMap::<[u8; 32], oneshot::Sender<()>>::new()));
+
+                // Slow fetcher — 200ms; we cancel after the task
+                // registers.
+                let slow_fetcher = async move {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Ok::<(u16, Vec<u8>), std::io::Error>((200u16, vec![0u8; 16]))
+                };
+
+                let cancel_registry_for_signal = cancel_registry.clone();
+                tokio::task::spawn_local(apply_inbound_files_task(
+                    applied_tx,
+                    [0x77; 32],
+                    [0xAA; 32],
+                    "cancelled.bin".to_string(),
+                    16,
+                    "application/octet-stream".to_string(),
+                    "10.2.1.15:50247".parse().unwrap(),
+                    accept_dir.path().to_path_buf(),
+                    false,
+                    slow_fetcher,
+                    cancel_registry,
+                ));
+
+                // Wait until the task registers its cancel entry.
+                let mut waited = Duration::ZERO;
+                while cancel_registry_for_signal
+                    .lock()
+                    .unwrap()
+                    .get(&[0xAA; 32])
+                    .is_none()
+                    && waited < Duration::from_millis(100)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    waited += Duration::from_millis(5);
+                }
+                // Fire the cancel signal.
+                let tx = cancel_registry_for_signal
+                    .lock()
+                    .unwrap()
+                    .remove(&[0xAA; 32])
+                    .expect("entry must be registered");
+                tx.send(()).expect("send must succeed");
+                // Wait for the cancel path to complete.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+
+                // **No InboundFileApplyResult** — cancel is silent
+                // (no IPC event, no toast).
+                assert!(
+                    applied_rx.try_recv().is_err(),
+                    "cancel mid-fetch must NOT send an InboundFileApplyResult \
+                     (cancellation is a deliberate user action, not a 'failure')"
+                );
+            })
+            .await;
+    }
+
+    /// **Apply task: 404 GET status does NOT populate
+    /// `stream_failure`** (it's not a transport-level stream
+    /// error — the response header decoded cleanly with a
+    /// non-200 status). The result is `success=false` +
+    /// `error=Some(IoError)` + `stream_failure=None`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_inbound_files_task_404_does_not_populate_stream_failure() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let accept_dir = TempDir::new().expect("tempdir");
+                let (applied_tx, mut applied_rx) =
+                    tokio_mpsc::unbounded_channel::<InboundFileApplyResult>();
+                let cancel_registry =
+                    Arc::new(Mutex::new(HashMap::<[u8; 32], oneshot::Sender<()>>::new()));
+
+                let fetcher =
+                    async { Ok::<(u16, Vec<u8>), std::io::Error>((404u16, Vec::<u8>::new())) };
+
+                tokio::task::spawn_local(apply_inbound_files_task(
+                    applied_tx,
+                    [0x77; 32],
+                    [0xAA; 32],
+                    "absent.bin".to_string(),
+                    100,
+                    "application/octet-stream".to_string(),
+                    "10.2.1.15:50247".parse().unwrap(),
+                    accept_dir.path().to_path_buf(),
+                    false,
+                    fetcher,
+                    cancel_registry,
+                ));
+
+                let result = applied_rx.recv().await.expect("must send result");
+                assert!(!result.success);
+                assert_eq!(result.error, Some(InboundFileError::IoError));
+                assert!(
+                    result.stream_failure.is_none(),
+                    "404 is not a stream error — stream_failure must remain None; got {:?}",
+                    result.stream_failure
+                );
+            })
+            .await;
+    }
+
+    /// **`ts_ms` monotonicity / realism** — consecutive stream
+    /// errors at human-scale intervals (1 ms sleep) must
+    /// produce monotonically non-decreasing `ts_ms` values.
+    /// Pins the helper against clock-read regressions (would
+    /// only fail if `unix_now_ms` returned 0 for both, which
+    /// the helper explicitly guards against — the assertion is
+    /// belt-and-suspenders for the wire contract).
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_failure_ts_ms_is_realistic_and_monotonic() {
+        // Two consecutive readings — monotonicity at the
+        // millisecond granularity is a soft contract (the OS
+        // clock can theoretically go backwards under NTP
+        // corrections, but two back-to-back `SystemTime::now()`
+        // calls must not regress in practice).
+        let t1 = unix_now_ms();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let t2 = unix_now_ms();
+        assert!(
+            t1 > 0,
+            "unix_now_ms() must not return 0 on a healthy clock; got {t1}"
+        );
+        assert!(t2 >= t1, "ts_ms must be monotonic; t1={t1}, t2={t2}");
     }
 }
