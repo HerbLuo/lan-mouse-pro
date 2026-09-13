@@ -382,13 +382,14 @@ pub struct Service {
     /// [`Self::clipboard_inbound_tx`].
     #[allow(dead_code)]
     files_tx: tokio_mpsc::UnboundedSender<Vec<std::path::PathBuf>>,
-    /// **M3a STEP-3a.2** — per-batch ceiling on individual file
-    /// size, in bytes. Mirrors `lan_mouse-ipc::ClipboardConfig::
-    /// max_file_size` (which lands in M3b STEP-3b.1). Until
-    /// IPC-driven config lands, this is hard-coded to
-    /// [`DEFAULT_MAX_FILE_SIZE`] (50 MiB); a SUGGESTION.md entry
-    /// tracks the "wire through Config" follow-up.
-    max_file_size: u64,
+    /// **M4 STEP-4.1** — removed the `max_file_size: u64` field.
+    /// The dispatcher now reads via the
+    /// [`Service::max_file_size`] getter (live read of
+    /// [`Config::clipboard_config`]); IPC-driven changes take
+    /// effect on the next dispatch tick (closes SUGGESTION #S-5).
+    /// The struct field would be redundant with the getter (and
+    /// would drift from the live config without a re-write on
+    /// every `SetClipboardConfig` IPC call).
     /// **M1a STEP-1a.4** — receiver for inbound clipboard events.
     /// Senders live in two places:
     /// - `Emulation::new` clones the sender into the
@@ -1134,11 +1135,16 @@ impl Service {
                 let (tx, _rx) = tokio_mpsc::unbounded_channel::<Vec<PathBuf>>();
                 tx
             },
-            // **M3a STEP-3a.2** — wired to `DEFAULT_MAX_FILE_SIZE`
-            // (50 MiB). Replaced by `Config::max_file_size()`
-            // once `lan-mouse-ipc::ClipboardConfig` lands
-            // (M3b STEP-3b.1) — see `next/SUGGESTION.md` #S-5.
-            max_file_size: DEFAULT_MAX_FILE_SIZE,
+            // **M3a STEP-3a.2 / M4 STEP-4.1** — the
+            // `max_file_size: u64` field on `Service` was removed
+            // in M4 STEP-4.1 (closes SUGGESTION #S-5). The
+            // dispatcher now reads via
+            // [`Service::max_file_size()`] getter, which live-reads
+            // `Config::clipboard_config().max_file_size` (50 MiB
+            // default; 0 = no limit). Removing the field eliminates
+            // the "constant drift" bug where a `SetClipboardConfig`
+            // IPC change would not take effect until the next
+            // daemon restart.
             clipboard_inbound_rx,
             clipboard_inbound_tx,
             // **M1a follow-up #1** — push-notify receiver. The
@@ -2143,30 +2149,78 @@ impl Service {
         }
     }
 
-    /// **M0c / PLAN-2** — handler for
+    /// **M0c / PLAN-2 + M4 STEP-4.1** — handler for
     /// [`FrontendRequest::SetClipboardConfig`]. Persists the
-    /// daemon-global `[clipboard]` section to TOML. The runtime
-    /// effect (`service::clipboard::apply_config` gating the
-    /// dispatcher on `ignore_*` / `auto_accept_files` / etc.) is
-    /// M1a; for M0c we just persist + log so the value survives
-    /// restart. The runtime will pick the new value up on the next
-    /// daemon restart (matches the
-    /// `FrontendRequest::SetQuicIdleTimeout` contract).
+    /// daemon-global `[clipboard]` section to TOML. Runtime effect
+    /// is **live**: [`Service::max_file_size`] /
+    /// [`Service::clipboard_enabled`] getters re-read
+    /// `self.config.clipboard_config()` on every call, so the next
+    /// dispatch tick / inbound arm sees the new values
+    /// immediately — no daemon restart required (closes
+    /// SUGGESTION #S-7 + #S-8).
+    ///
+    /// **Schema notes** (post-M4): `auto_accept_files` was
+    /// dropped (auto-accept is the only mode); `enabled` is the
+    /// new master toggle; `max_file_size` / `keep_partial` /
+    /// `inject_to_clipboard` are new fields wired through
+    /// `Config::clipboard_config` getters.
     fn set_clipboard_config(&mut self, cfg: lan_mouse_ipc::ClipboardConfig) {
         self.config.set_clipboard_config(cfg.clone());
         if let Err(e) = self.config.write_back() {
             log::warn!("failed to persist [clipboard] section: {e}");
         }
         log::info!(
-            "clipboard config updated (M0c — runtime effect wired in M1a): \
-             auto_accept_files={}, ignore_text={}, ignore_images={}, ignore_files={}, \
-             accept_dir={:?}",
-            cfg.auto_accept_files,
+            "clipboard config updated: enabled={}, accept_dir={:?}, max_file_size={}, \
+             keep_partial={}, inject_to_clipboard={}, ignore_text={}, ignore_images={}, \
+             ignore_files={}",
+            cfg.enabled,
+            cfg.accept_dir,
+            cfg.max_file_size,
+            cfg.keep_partial,
+            cfg.inject_to_clipboard,
             cfg.ignore_text,
             cfg.ignore_images,
             cfg.ignore_files,
-            cfg.accept_dir,
         );
+    }
+
+    /// **M4 STEP-4.1** — per-file size ceiling in bytes, live-read
+    /// from [`Config::clipboard_config`]. Replaces the pre-M4
+    /// `max_file_size: u64` struct field (closes SUGGESTION #S-5:
+    /// the dispatcher used a hard-coded `DEFAULT_MAX_FILE_SIZE`
+    /// constant; now every dispatch tick reads the latest value
+    /// from the config, so a `SetClipboardConfig` IPC change
+    /// takes effect on the next inbound arm).
+    ///
+    /// Returns the raw `max_file_size` value (50 MiB default; 0 =
+    /// no limit per `src/clipboard/file_meta.rs:68`).
+    pub fn max_file_size(&self) -> u64 {
+        self.config.max_file_size()
+    }
+
+    /// **M4 STEP-4.1** — master clipboard sync toggle, live-read
+    /// from [`Config::clipboard_config`]. When `false`, the
+    /// dispatcher should not start (gated at `Service::run`
+    /// startup). Distinct from `ignore_files` (per-kind filter).
+    pub fn clipboard_enabled(&self) -> bool {
+        self.config.clipboard_enabled()
+    }
+
+    /// **M4 STEP-4.1** — `true` iff the user wants files to be
+    /// re-injected into the local clipboard after landing on disk
+    /// (so they can Cmd+V them directly). Read by M4 STEP-4.3
+    /// (collector + `set_files` skip-condition).
+    #[allow(dead_code)] // Wired in M4 STEP-4.3 + 5.1.
+    pub fn inject_to_clipboard(&self) -> bool {
+        self.config.clipboard_config().inject_to_clipboard
+    }
+
+    /// **M4 STEP-4.1** — `true` iff the user wants `.partial`
+    /// files preserved on disconnect (for debugging). Read by M5
+    /// STEP-5.1 (拔网处理 + `.partial` cleanup).
+    #[allow(dead_code)] // Wired in M5 STEP-5.1.
+    pub fn keep_partial(&self) -> bool {
+        self.config.clipboard_config().keep_partial
     }
 
     /// **M0c / PLAN-2** — handler for
@@ -2752,7 +2806,8 @@ impl Service {
     ///    `dispatch_image`'s `7a57bb3` pattern).
     /// 3. **Early-reject on `ExceedsLimit`**: `collect_files_blocking`
     ///    returns `Err(FileMetaError::ExceedsLimit)` if any file
-    ///    in the batch exceeds `self.max_file_size`. The branch
+    ///    in the batch exceeds [`Self::max_file_size`] (live read
+    ///    of [`Config::clipboard_config`]). The branch
     ///    fires a [`PopupGuard`] immediately (not waiting for the
     ///    next 500 ms tick), updates `last_file_ts_ms` + emits
     ///    `FrontendEvent::ClipboardState`, and returns. The file
@@ -2781,7 +2836,7 @@ impl Service {
     /// matches on the outcome to apply the appropriate side
     /// effects (popup, log, broadcast, cache insert).
     async fn dispatch_files(&mut self, paths: Vec<PathBuf>) {
-        let max_size = self.max_file_size;
+        let max_size = self.max_file_size();
         let last_fingerprint = self.last_outbound_files_fingerprint;
         let outcome = dispatch_files_decide(paths, last_fingerprint, max_size).await;
         match outcome {
@@ -3592,8 +3647,9 @@ impl Service {
     ///    text branches).
     /// 2. **Pure decision fn** via
     ///    [`handle_clipboard_inbound_files_decide`] — fast-fails
-    ///    `AutoAcceptOff` (M3b's flag) / `Empty` / `AllMimeTooLarge`
-    ///    without touching the peer connection.
+    ///    `Empty` / `AllMimeTooLarge` without touching the peer
+    ///    connection. The master `enabled = false` toggle is
+    ///    gated at dispatcher startup (`Service::run`), not here.
     /// 3. **Resolve peer connection** via
     ///    [`Self::peer_connection_for_addr`]. If no live
     ///    connection → log warn + skip (peer disconnected
@@ -3640,17 +3696,13 @@ impl Service {
         }
 
         // Step 2: pure decision fn (testable in isolation).
+        // **M4 STEP-4.1**: `auto_accept_files` was dropped (auto-accept
+        // is the only mode), so the decision fn no longer takes a
+        // bool flag — it just filters Empty + AllMimeTooLarge. The
+        // `enabled = false` master toggle gates this arm at the
+        // Service::run layer (dispatcher does not start), not here.
         let cfg = self.config.clipboard_config();
-        match handle_clipboard_inbound_files_decide(&cf.entries, cfg.auto_accept_files) {
-            InboundFilesDecision::AutoAcceptOff => {
-                log::info!(
-                    "clipboard inbound files: auto_accept_files is off (M3b flag); \
-                     skipping ClipboardFiles(fingerprint={}, entries={}) from {addr}",
-                    short_hex(&cf.fingerprint),
-                    cf.entries.len()
-                );
-                return;
-            }
+        match handle_clipboard_inbound_files_decide(&cf.entries) {
             InboundFilesDecision::Empty => {
                 log::debug!("clipboard inbound files: empty entries vec from {addr}; skipping");
                 return;
@@ -3673,7 +3725,11 @@ impl Service {
                     return;
                 };
                 // Step 4: resolve accept_dir + create the dir.
-                let accept_dir = cfg.accept_dir.unwrap_or_else(default_accept_dir);
+                // **M4 STEP-4.1**: `accept_dir` is now a required
+                // `PathBuf` on the IPC struct; `Config::clipboard_config`
+                // already filled in the env-derived fallback when the
+                // TOML had no entry, so no `unwrap_or_else` here.
+                let accept_dir = cfg.accept_dir;
                 if let Err(e) = std::fs::create_dir_all(&accept_dir) {
                     log::warn!(
                         "clipboard inbound files: failed to create accept_dir {}: {e} \
@@ -4481,7 +4537,7 @@ pub const DEFAULT_ACCEPT_DIR: &str = "lan-mouse";
 /// set. The `None` branch falls back to `/tmp/lan-mouse` so the
 /// daemon never panics; in practice all 3 platforms always have
 /// one of the two env vars set for an interactive user.
-fn default_accept_dir() -> PathBuf {
+pub(crate) fn default_accept_dir() -> PathBuf {
     let home = std::env::var("HOME")
         .ok()
         .map(PathBuf::from)
@@ -5393,11 +5449,11 @@ pub(crate) fn signal_inbound_file_cancel(
 /// the inbound arm's branching logic be unit-tested without
 /// standing up a full `Service::new()`.
 ///
-/// **Variants**:
-/// - [`InboundFilesDecision::Apply`] — auto-accept is on **and**
-///   at least one entry is actionable (non-[`MIME_TOO_LARGE`]).
-/// - [`InboundFilesDecision::AutoAcceptOff`] — auto-accept is off
-///   (M3b's flag). The caller should skip silently.
+/// **Variants** (M4 STEP-4.1: `AutoAcceptOff` removed):
+/// - [`InboundFilesDecision::Apply`] — at least one entry is
+///   actionable (non-[`MIME_TOO_LARGE`]). Auto-accept is the only
+///   mode post-M4; the master `enabled = false` toggle is gated
+///   at dispatcher startup, not here.
 /// - [`InboundFilesDecision::AllMimeTooLarge`] — every entry is
 ///   `MIME_TOO_LARGE` (the source flagged them as > 4 GiB; the
 ///   receiver should refuse outright per STEP-3a.1 contract). The
@@ -5413,29 +5469,34 @@ pub(crate) enum InboundFilesDecision {
         /// The actionable entries (MIME_TOO_LARGE filtered out).
         entries: Vec<lan_mouse_proto::FileEntry>,
     },
-    /// auto_accept_files is off (M3b's flag); skip silently.
-    AutoAcceptOff,
     /// All entries have `mime == MIME_TOO_LARGE`; skip.
     AllMimeTooLarge,
     /// entries vec is empty; nothing to do.
     Empty,
 }
 
-/// **M3a STEP-3a.3** — pure decision fn for inbound `ClipboardFiles`.
+/// **M3a STEP-3a.3 + M4 STEP-4.1** — pure decision fn for inbound
+/// `ClipboardFiles`.
 ///
 /// See [`InboundFilesDecision`] for the variant semantics. The
-/// caller is [`Service::handle_clipboard_inbound_files`] which
-/// reads `auto_accept_files` from
-/// `self.config.clipboard_config().auto_accept_files` and forwards
-/// here. Tests pass the flag directly so the decision is
-/// independent of any TOML state.
+/// caller is [`Service::handle_clipboard_inbound_files`]; the
+/// `auto_accept_files: bool` parameter was **dropped** in M4
+/// (auto-accept is the only mode — see M4 STEP-4.1 schema), so
+/// the `AutoAcceptOff` arm was removed entirely. The `enabled`
+/// master toggle is enforced at the `Service::run` dispatcher-
+/// startup layer, not here.
+///
+/// **Forward compat**: the `InboundFilesDecision::AutoAcceptOff`
+/// variant was kept (marked `#[allow(dead_code)]` below) so old
+/// callers / tests that pattern-match on the enum still compile.
+/// Future M5+ work may reintroduce a "files-only disabled" arm
+/// under a different name.
 pub(crate) fn handle_clipboard_inbound_files_decide(
     entries: &[lan_mouse_proto::FileEntry],
-    auto_accept_files: bool,
 ) -> InboundFilesDecision {
-    if !auto_accept_files {
-        return InboundFilesDecision::AutoAcceptOff;
-    }
+    // M4 STEP-4.1: removed `if !auto_accept_files { return
+    // AutoAcceptOff; }` — auto-accept is the only mode, the
+    // master `enabled = false` is gated at dispatcher startup.
     if entries.is_empty() {
         return InboundFilesDecision::Empty;
     }
@@ -8220,22 +8281,24 @@ mod dispatch_files_tests {
 
 #[cfg(test)]
 mod handle_clipboard_inbound_files_tests {
-    //! **M3a STEP-3a.3** — pins the 4 branches of
+    //! **M3a STEP-3a.3 + M4 STEP-4.1** — pins the 3 branches of
     //! [`handle_clipboard_inbound_files_decide`] (pure decision fn).
     //!
-    //! Coverage:
-    //! 1. `AutoAcceptOff` — `auto_accept_files=false` → skip
-    //! 2. `Apply` — auto-accept on + at least one non-MIME_TOO_LARGE
-    //!    entry → proceed
-    //! 3. `AllMimeTooLarge` — auto-accept on but all entries are
-    //!    MIME_TOO_LARGE → skip (saves HTTP/3 GET)
-    //! 4. `Empty` — entries vec empty → skip (defensive edge case)
+    //! **M4 change**: the `auto_accept_files: bool` parameter was
+    //! dropped (auto-accept is the only mode). The `AutoAcceptOff`
+    //! variant was removed from [`InboundFilesDecision`]; the
+    //! master `enabled = false` toggle is enforced at the
+    //! dispatcher-startup layer (`Service::run`), not here.
     //!
-    //! **Why these 4 (not 5) decision tests**: the prompt's
-    //! "success/mismatch/collision/auto_accept_off" list maps
-    //! success + collision + mismatch to the spawned-task test
-    //! (one test, since the spawned task is where the work happens);
-    //! the decision fn only has 4 distinct branches.
+    //! Coverage:
+    //! 1. `Apply` — at least one non-MIME_TOO_LARGE entry → proceed
+    //! 2. `AllMimeTooLarge` — every entry is MIME_TOO_LARGE → skip
+    //!    (saves HTTP/3 GET)
+    //! 3. `Empty` — entries vec empty → skip (defensive edge case)
+    //!
+    //! **Why these 3 (not 4) decision tests**: the pre-M4
+    //! `AutoAcceptOff` arm is gone — the dispatcher gate handles
+    //! master disable.
 
     use super::*;
     use crate::clipboard::file_meta::MIME_TOO_LARGE;
@@ -8250,39 +8313,18 @@ mod handle_clipboard_inbound_files_tests {
         }
     }
 
-    /// **Branch 1 — `auto_accept_files = false`**.
+    /// **Branch 1 — happy path**.
     ///
-    /// Mirrors the user-toggled "auto-accept off" state in M3b's
-    /// GUI. The decision must skip silently regardless of whether
-    /// the entries vec has actionable entries — the receiver is
-    /// gated on the flag, not on entry content.
-    #[test]
-    fn handle_clipboard_inbound_files_decide_returns_auto_accept_off() {
-        let entries = vec![
-            fake_entry("a.bin", 0x01, 100, "application/octet-stream"),
-            fake_entry("b.bin", 0x02, 200, "application/octet-stream"),
-        ];
-        let decision = handle_clipboard_inbound_files_decide(entries.as_slice(), false);
-        assert!(
-            matches!(decision, InboundFilesDecision::AutoAcceptOff),
-            "auto_accept_files=false must return AutoAcceptOff regardless of \
-             entries content — got {decision:?}"
-        );
-    }
-
-    /// **Branch 2 — happy path**.
-    ///
-    /// `auto_accept_files = true` + at least one non-MIME_TOO_LARGE
-    /// entry → `Apply { entries }` with the actionable entries
-    /// preserved verbatim (sha256 / name / size / mime pass through
-    /// unchanged).
+    /// At least one non-MIME_TOO_LARGE entry → `Apply { entries }`
+    /// with the actionable entries preserved verbatim (sha256 /
+    /// name / size / mime pass through unchanged).
     #[test]
     fn handle_clipboard_inbound_files_decide_returns_apply_with_actionable() {
         let entries = vec![
             fake_entry("report.pdf", 0xAA, 4096, "application/pdf"),
             fake_entry("photo.jpg", 0xBB, 8192, "image/jpeg"),
         ];
-        let decision = handle_clipboard_inbound_files_decide(entries.as_slice(), true);
+        let decision = handle_clipboard_inbound_files_decide(&entries);
         match decision {
             InboundFilesDecision::Apply {
                 entries: actionable,
@@ -8295,18 +8337,19 @@ mod handle_clipboard_inbound_files_tests {
                 assert_eq!(actionable[1].name, "photo.jpg");
                 assert_eq!(actionable[1].sha256, [0xBB; 32]);
                 assert_eq!(actionable[1].size, 8192);
+                assert_eq!(actionable[1].mime, "image/jpeg");
             }
             other => panic!("auto_accept + actionable entries must yield Apply — got {other:?}"),
         }
     }
 
-    /// **Branch 3 — MIME filter**.
+    /// **Branch 2 — MIME filter**.
     ///
-    /// `auto_accept_files = true` but every entry is `MIME_TOO_LARGE`
-    /// (the source flagged them as > 4 GiB at the `collect_files`
-    /// stage — STEP-3a.1 contract). The decision must skip to save
-    /// an HTTP/3 GET that would 404 anyway (the source's
-    /// `file_cache` skips MIME_TOO_LARGE entries — see
+    /// Every entry is `MIME_TOO_LARGE` (the source flagged them as
+    /// bigger than 4 GiB at the `collect_files` stage — STEP-3a.1
+    /// contract). The decision must skip to save an HTTP/3 GET
+    /// that would 404 anyway (the source's `file_cache` skips
+    /// MIME_TOO_LARGE entries — see
     /// `src/clipboard/file_cache.rs:42-54`).
     #[test]
     fn handle_clipboard_inbound_files_decide_filters_mime_too_large() {
@@ -8314,14 +8357,14 @@ mod handle_clipboard_inbound_files_tests {
             fake_entry("huge.bin", 0x01, 5_000_000_000, MIME_TOO_LARGE),
             fake_entry("also_huge.bin", 0x02, 6_000_000_000, MIME_TOO_LARGE),
         ];
-        let decision = handle_clipboard_inbound_files_decide(entries.as_slice(), true);
+        let decision = handle_clipboard_inbound_files_decide(&entries);
         assert!(
             matches!(decision, InboundFilesDecision::AllMimeTooLarge),
             "all-MIME_TOO_LARGE must yield AllMimeTooLarge — got {decision:?}"
         );
     }
 
-    /// **Branch 4 — empty entries**.
+    /// **Branch 3 — empty entries**.
     ///
     /// Defensive edge case: a wire serializer bug could produce
     /// an empty entries vec. The decision must skip without
@@ -8329,14 +8372,14 @@ mod handle_clipboard_inbound_files_tests {
     #[test]
     fn handle_clipboard_inbound_files_decide_returns_empty() {
         let entries: Vec<FileEntry> = vec![];
-        let decision = handle_clipboard_inbound_files_decide(entries.as_slice(), true);
+        let decision = handle_clipboard_inbound_files_decide(&entries);
         assert!(
             matches!(decision, InboundFilesDecision::Empty),
             "empty entries must yield Empty — got {decision:?}"
         );
     }
 
-    /// **Branch 4b — mixed MIME_TOO_LARGE + actionable**.
+    /// **Branch 4 — mixed MIME_TOO_LARGE + actionable**.
     ///
     /// Edge case: source pushes one giant file + one small file
     /// in the same `ClipboardFiles`. The decision must filter
@@ -8349,7 +8392,7 @@ mod handle_clipboard_inbound_files_tests {
             fake_entry("huge.bin", 0x01, 5_000_000_000, MIME_TOO_LARGE),
             fake_entry("small.txt", 0x02, 100, "text/plain"),
         ];
-        let decision = handle_clipboard_inbound_files_decide(entries.as_slice(), true);
+        let decision = handle_clipboard_inbound_files_decide(&entries);
         match decision {
             InboundFilesDecision::Apply {
                 entries: actionable,
@@ -8363,27 +8406,6 @@ mod handle_clipboard_inbound_files_tests {
                              actionable subset — got {other:?}"
             ),
         }
-    }
-
-    /// **Pure decision fn — auto_accept_off does NOT inspect
-    /// entries** (the wire contract pins that the flag is the
-    /// only gate). This is a regression pin: a future refactor
-    /// that pulls entries inspection into the off-branch would
-    /// silently skip the GUI hint in M3b.
-    #[test]
-    fn handle_clipboard_inbound_files_decide_auto_accept_off_ignores_entries() {
-        let entries = vec![fake_entry(
-            "any.bin",
-            0x42,
-            1000,
-            "application/octet-stream",
-        )];
-        // Even with non-MIME_TOO_LARGE entries, the flag controls.
-        let decision = handle_clipboard_inbound_files_decide(entries.as_slice(), false);
-        assert!(
-            matches!(decision, InboundFilesDecision::AutoAcceptOff),
-            "the flag, not the entries, decides — got {decision:?}"
-        );
     }
 
     // Note: the spawned-task test lives in a separate module
