@@ -283,3 +283,23 @@
     - 现有 `write_and_verify_file_blocking_mismatch_deletes_partial` 加 `<name>.partial` 路径断言
 - **结果**：fsync-then-rename 模式同时闭合 validator P2.3（fsync 缺失）+ 提供 atomic replace + 默认 .partial 删除（除非用户开 keep_partial）
 - **解决 STEP**：M5 / STEP-P2-M5-5.1
+
+---
+
+## #S-7 — `set_clipboard_config` 仅 log 不接 Service 字段（auto_accept_files / accept_dir IPC 改动未生效到 inbound arm）
+
+- **触发 STEP**：STEP-P2-M3a-3a.3
+- **现象**：`src/service.rs:2011-2026` 的 `set_clipboard_config` 接到 `FrontendRequest::SetClipboardConfig(ClipboardConfig)` 后**只**做两件事 —— 把 cfg 写到 `self.config`（TOML 持久化）+ log 一行 `"M0c — runtime effect wired in M1a"`。决策 fn 实际 live-read `self.config.clipboard_config()`，所以 IPC 改动**间接**生效，但 log 文本误导；`inject_to_clipboard` 之类新字段也没接入 GUI 配置入口。
+- **解决**（M4 STEP-4.1 + M5 STEP-5.4 联合落地）：
+  - **M4 STEP-4.1**：
+    - `src/service.rs::set_clipboard_config` log 文本更新为 `"clipboard config updated: enabled={}, accept_dir={:?}, max_file_size={}, keep_partial={}, inject_to_clipboard={}, ignore_text={}, ignore_images={}, ignore_files={}"`（8 字段完整）
+    - 新字段 `enabled` / `max_file_size` / `keep_partial` / `inject_to_clipboard` 通过 `Config::clipboard_config()` live-read getter 立即生效
+    - `auto_accept_files` 字段已 drop（auto-accept 是唯一模式），`accept_dir` 升级为 required `PathBuf`
+  - **M5 STEP-5.4**：
+    - `lan-mouse-vue/src/components/GeneralPanel.vue` 加 8 控件剪贴板区块：`enabled` / `accept_dir` / `ignore_text` / `ignore_images` / `ignore_files` / `max_file_size` MiB ↔ bytes / `keep_partial` / `inject_to_clipboard`
+    - `lan-mouse-vue/src/components/ConnectionRow.vue` 加 per-peer `enable_clipboard_to` checkbox（label "Push clipboard to this peer"）
+    - `lan-mouse-vue/src/store/index.ts` 新增 `setClipboardConfig()` / `setEnableClipboardTo()` IPC helper（包装 `FrontendRequest::SetClipboardConfig` / `SetEnableClipboardTo`）
+    - `lan-mouse-vue/src/api/ipc.ts` `FrontendRequest` union 加 `SetClipboardConfig` / `SetEnableClipboardTo` 两个 variant
+    - 每个控件 onChange 调 helper → IPC → daemon handler 写 TOML + live-read getter 立即生效到下次 inbound arm
+- **结果**：GUI 改 checkbox / input 立即生效；TOML `[clipboard]` 段 + 每个 `[[clients]]` 内 `enable_clipboard_to` 落盘正确
+- **解决 STEP**：M4 / STEP-P2-M4-4.1 + M5 / STEP-P2-M5-5.4

@@ -89,27 +89,7 @@
 
 **触发 STEP**：STEP-P2-M3a-3a.3
 
-**现象**：`src/service.rs:2011-2026` 的 `set_clipboard_config` 接到 `FrontendRequest::SetClipboardConfig(ClipboardConfig)` 后，**只**：
-1. 把 cfg 写到 `self.config` (TOML 持久化)
-2. log 一行 "M0c — runtime effect wired in M1a"
-
-**没有**更新 `self.config.clipboard_config()` 返回值（这是 IPC 默认通过 getter 暴露的，所以 IPC 改动**间接**生效到 inbound arm 决策 fn），但 inbound arm 的状态（如 `last_file_ts_ms` 标记）不会因 IPC 改动而重置。
-
-**具体影响**：
-- `auto_accept_files` 字段：STEP-3a.3 的 `handle_clipboard_inbound_files_decide` 读 `self.config.clipboard_config().auto_accept_files`，所以 **IPC 改动会自动生效到 inbound arm 决策**（决策 fn 是纯函数，每次调用都重新读 config）—— 这一项**事实上没问题**
-- `accept_dir` 字段：同上，决策 fn 每次重新读 — **事实上没问题**
-- 但 log 文本 "M0c — runtime effect wired in M1a" 是错的（M3a 已落地接收端，需要更新为 "M3a STEP-3a.3 决策 fn 直接读 config.clipboard_config()，每次 IPC 改动立即生效"）
-
-**理由**：M3a 决策 fn 设计为"每次调用读最新 config"，避免 IPC handler 维护额外 Service 字段（与 M3b IPC handler 重复工作）。这是有意为之。
-
-**建议**（leader 决策）：
-- 🟢 **短期**：更新 log 文本来 reflect M3a 实际行为（"M3a — runtime effect is read live by handle_clipboard_inbound_files_decide per-call"）
-- 🟡 **中期**：M3b STEP-3b.1 在 GUI 上加 "Auto-accept files" / "Accept dir" 控件 + Toaster 弹询问时（按需）再审视 — 当下决策 fn 设计已经满足 IPC 改动生效的需求
-- ⚪ **长期**：如未来要加 "apply-after-IPC-immediately" 语义（如 GUI 切到 auto_accept 后立即触发对端 redo push），可在 Service 加 `clipboard_config_dirty` flag 强制下一次 inbound 重新评估
-
-**优先级**：🟡（不阻塞 M3a；事实上 IPC 改动已生效，只是 log 文本误导）
-
-**Status update 2026-09-13 / STEP-P2-M4-4.1**：log 文本已更新（`set_clipboard_config` handler 现在 log `enabled={}, accept_dir={:?}, max_file_size={}, ...`）；新字段 `enabled` / `max_file_size` / `keep_partial` / `inject_to_clipboard` 通过 `Config::clipboard_config()` live-read 立即生效；`auto_accept_files` 字段已 drop（auto-accept 是唯一模式），`accept_dir` 升级为 required `PathBuf`。`set_clipboard_config` 现在实质上是 "log + TOML write-back + 触发 live getter re-read"，**SUGGESTION #S-7 的 🟢 短期 + 🟡 中期 建议已落地**；建议 leader 移到 `SUGGESTION-FIXED.md`。
+**✅ 已关闭（2026-09-13 / STEP-P2-M4-4.1 + STEP-P2-M5-5.4 联合落地）**：详见 `SUGGESTION-FIXED.md #S-7` 条目。M4 STEP-4.1 完成 log 文本更新 + live-read getter 化；M5 STEP-5.4 完成 GUI 8 控件 + per-peer checkbox + IPC 接线。每个控件 onChange 调 IPC → daemon handler 写 TOML + live-read getter 立即生效到下次 inbound arm。
 
 ---
 
