@@ -179,42 +179,6 @@
 
 **触发 STEP**：STEP-P2-M4-4.2（`src/clipboard/windows.rs::set_files` 实现 + 4 个新单测）+ STEP-P2-M4-4.3（`src/service.rs::maybe_inject_files_to_clipboard` 接线）
 
-**现象**（用户 2026-09-13 真机 Windows 被控端反馈）：
-1. **场景 1**：daemon 启动 → 如果主控端初始剪贴板含文件 → daemon 立即 segfault (STATUS_ACCESS_VIOLATION, 0xc0000005)
-2. **场景 2**：daemon 启动 → 复制文件 → 文件落盘成功 → `clipboard re-inject: dispatching set_files(1 path(s)) ... (pre-stamped last_outbound_files_fingerprint)` 这条 log 之后 segfault
+**Status update 2026-09-13 / 用户 hotfix 已修复**：见 `next/SUGGESTION-FIXED.md` 同步条目。
 
-**详细调研**（已落地）：
-- `next/BUG-INVESTIGATION-WINDOWS-STARTUP-SEGFAULT.md`（场景 1 静态分析）
-- `next/BUG-INVESTIGATION-WINDOWS-SET-FILES-CRASH.md`（场景 2 静态分析；9 个候选点全部排除）
-
-**根因状态**：未结案。静态分析无法精准定位。
-
-**最可能根因**（按可疑度排序）：
-1. **test coverage gap** —— M4 STEP-4.2 的 4 个新单测全部是 `build_dropfiles_payload` **pure helper**（无 Windows API 调用），**0 个单测覆盖 `set_files` 本身的 Win32 API 路径**。pre-M4 `set_dib_image` / `set_image` 在 macOS / Windows 真机矩阵中已 work，但 M4 set_files Win32 路径**首次进入 production 即 segfault**，无任何真机 / 单测验证。
-2. **platform-specific behavior** —— Windows `SetClipboardData(CF_HDROP, ...)` 在本进程 prior clipboard ownership（CF_DIBV5 + CF_DIB）的状态下的平台特定行为差异；前置 image apply 已让本进程 own CF_DIBV5，set_files EmptyClipboard + SetClipboardData(CF_HDROP) 可能触发 native exception。
-3. **debug build panic unwind** —— debug 默认 `unwind`；Windows 上 unwind 经过 native frame（Win32 API / notify-rust）可能 STATUS_ACCESS_VIOLATION（次要候选）。
-
-**已知 working vs crashing 对比**（关键观察）：
-| 步骤 | `set_dib_image` (work OK) | `set_files` (segfault) |
-|---|---|---|
-| 1 | OpenClipboard | OpenClipboard |
-| 2 | EmptyClipboard | EmptyClipboard |
-| 3 | `alloc_dib_handle_and_set(bytes, CF_DIBV5=17)` | `alloc_dib_handle_and_set(&payload, CF_HDROP=15)` |
-| 4 | `alloc_dib_handle_and_set(bytes, CF_DIB=8)` | — |
-| 5 | CloseClipboard | CloseClipboard |
-
-helper 对 format 参数无差异处理（仅透传 `SetClipboardData(format, ...)`）。
-
-**影响**：
-- **Windows 真机不可用**（set_files 在剪贴板回灌路径 100% 触发 crash）
-- **macOS / Linux 真机**未验证（理论上不受影响 —— windows-specific API 路径）
-- **M4 整批 validator** PASS-with-followup（0 P0 / 0 P1 / 2 P2；测试覆盖盲点未被 grep 抓出）
-- **M4 里程碑交付**部分未达成（剪贴板回灌是 M4 核心 UX；Windows 平台未通）
-
-**建议**（leader 决策 / 用户介入）：
-- 🟢 **短期（诊断）**：用户跑 `cargo build --release` + `target\release\lan-mouse.exe`（隔离 unwind vs native crash）；如 release OK → 确认是 pre-existing platform issue（非 M4 bug）
-- 🟠 **中期（诊断）**：如 release 也 crash → 用户加 1 行 `std::panic::set_hook` 重测（hook 打印 panic info 后 unwind → STATUS_ACCESS_VIOLATION 仍会触发，但 panic 信息保留到 stderr）
-- 🔴 **深度诊断**：用户抓 crash dump（`procdump -ma -e 1 <pid>` / WER）+ WinDbg 解码 stack trace → 提供给 bug-investigator 重分析
-- ⚪ **派 executor 返工**（**不推荐** —— 静态分析无法精准定位；任何"修复"都是猜测；可能引入新 regression）
-
-**优先级**：🟠（**M4 核心 UX 在 Windows 平台不可用**；M4 真机验证 gate 暂停；M5 启动阻塞）
+真根因是 **loopback pre-stamp 用 batch_fingerprint 而非 local fingerprint** —— receiver's next 500ms tick 算 fingerprint 用本地 paths（含 `resolve_unique_path` collision suffix ` (1)` ` (2)`），与 sender's batch_fingerprint 不匹配 → loop short-circuit 永不触发 → A→B→A'→B' 死循环 → 3.5s 无 pong 强制断连 → segfault。修复在 commit `608e51a` + windows.rs DROPFILES 清理 `6de48cc` + debug instrumentation `0c9ae6c`。

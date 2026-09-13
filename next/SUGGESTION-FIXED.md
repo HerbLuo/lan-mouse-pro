@@ -233,3 +233,33 @@
 - **结果**：行为兼容 pre-M4（缺 TOML 字段 → fallback 到 `<home>/lan-mouse/`），IPC schema 收紧（`accept_dir` 必填 wire），M5 STEP-5.4 加 GUI textbox + dir-picker 时用户可显式覆盖
 - **解决 STEP**：M4 / STEP-P2-M4-4.1
 
+
+---
+
+## #S-12 — Windows `set_files` 真机 segfault（loopback pre-stamp mismatch → 死循环 → 3.5s 无 pong → 强制断连 → STATUS_ACCESS_VIOLATION）
+
+- **触发 STEP**：STEP-P2-M4-4.2（`src/clipboard/windows.rs::set_files`）+ STEP-P2-M4-4.3（`src/service.rs::maybe_inject_files_to_clipboard` + pre-stamp）
+- **现象**（用户 2026-09-13 真机 Windows 被控端）：
+  1. **场景 1**：daemon 启动 → 主控端初始剪贴板含文件 → daemon 立即 segfault (STATUS_ACCESS_VIOLATION, 0xc0000005)
+  2. **场景 2**：daemon 启动 → 复制文件 → 文件落盘成功 → `clipboard re-inject: dispatching set_files(1 path(s)) ... (pre-stamped last_outbound_files_fingerprint)` 这条 log 之后 segfault
+- **调研**（leader sub-agent 派 2 个独立 bug-investigator）：
+  - `next/BUG-INVESTIGATION-WINDOWS-STARTUP-SEGFAULT.md`（场景 1 静态分析；14 候选点排除）
+  - `next/BUG-INVESTIGATION-WINDOWS-SET-FILES-CRASH.md`（场景 2 静态分析；9 候选点排除；test coverage gap 是 best guess）
+  - 用户跑 release build 也崩 → 确认是 native crash（非 debug unwind）
+- **真根因**（用户 2026-09-13 hotfix 发现）：
+  - **loopback pre-stamp 用 `batch_fingerprint`（sender 算的）而非 `file_selection_fingerprint(&paths)`（receiver 本地算的）**
+  - M3a STEP-3a.4 / 3a.5 的 `dispatch_files` 在 `src/service.rs:2946 / 3106` 一直用 **local fingerprint**（基于本地 paths），所以 outbound loopback short-circuit 一直工作
+  - M4 STEP-4.3 的 `maybe_inject_files_to_clipboard` 错误地复用了 envelope 的 `batch_fingerprint`（sender 算的）做 pre-stamp
+  - Receiver 的 next 500ms tick 算 fingerprint 用本地 paths（含 `resolve_unique_path` collision suffix ` (1)` ` (2)` 当 sender basename 已存在 accept_dir）—— 与 sender's batch_fingerprint 不匹配
+  - Loop short-circuit 在 `dispatch_files_decide` 永不触发 → A → B → A' → B' → A'' 死循环
+  - 3.5s 无 pong → pong watchdog 强制断连 → STATUS_ACCESS_VIOLATION 触底崩溃
+- **解决方案**（用户 hotfix，3 commit）：
+  - `0c9ae6c debug` — `src/main.rs` 加 debug instrumentation（panic hook + lifecycle trace）+20 行（用户调试用）
+  - `6de48cc fix` — `src/clipboard/windows.rs::set_files` DROPFILES payload 清理 / `alloc_dib_handle_and_set` helper 重构 / +41/-20 行（user fix 的 windows-specific 部分 —— 静态分析未抓出的 Win32 path bug；与 #S-12 主根因 loopback 无关，但是 set_files 真机第一次入 production 时的 Win32 path 配套修复）
+  - `608e51a fix(service): stamp re-inject fingerprint with local paths, not batch_fingerprint` — `src/service.rs::maybe_inject_files_to_clipboard` 把 pre-stamp 从 `last_outbound_files_fingerprint.insert(batch_fingerprint)` 改为 `last_outbound_files_fingerprint.insert(file_selection_fingerprint(&paths))`；+19/-1 行
+- **结果**：用户 2026-09-13 18:30 真机确认 "现在不崩了，已经解决了"；Windows 剪贴板回灌 100% 通路
+- **测试覆盖盲点教训**（**SUGGESTION #S-12 后续预防建议**）：
+  - M4 STEP-4.2 的 4 个新单测全部是 `build_dropfiles_payload` pure helper，无任何 set_files Win32 API 路径测试；M4 STEP-4.3 的 11 个 reinject_decision_tests 全部是 `decide_reinject_skip` 纯函数测试，**0 个测试覆盖 `maybe_inject_files_to_clipboard` 实际调 `backend.set_files` 的 integration 路径**
+  - 建议 M5 / post-M5 hotfix 阶段加 `maybe_inject_files_to_clipboard_e2e_loopback_short_circuits_after_one_round_trip` 测试（mock backend + 模拟 batch_fingerprint vs local fingerprint 不匹配场景）
+- **Plan 偏差**：无 M4 STEP-4.3 偏差条目；这是 4.3 / 4.2 协同引入的真机 integration bug（4.3 loopback pre-stamp fingerprint 选择 + 4.2 set_files Win32 真机首次入 production 的 Win32 path 副作用），单 STEP 内静态分析无法精准定位
+- **解决 STEP**：M4 hotfix（用户 2026-09-13 18:12 - 18:30 直接修复；不在 PLAN STEP 内；M5 STEP-5.1+ 之后无需重做）
