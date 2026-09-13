@@ -714,6 +714,78 @@ mod clipboard_config_tests {
             other => panic!("expected ClipboardState, got {other:?}"),
         }
     }
+
+    /// **M5 STEP-5.1** — `FrontendEvent::FileTransferFailed` round-trip.
+    /// Pins the JSON shape `"FileTransferFailed":{"sha256":[...],"reason":"...","ts_ms":N}`
+    /// so the Vue frontend's `FrontendEvent` union has a stable wire
+    /// contract. `sha256` is `[u8; 32]` (a 32-element JSON number
+    /// array, not a hex string — the Vue side converts in STEP-5.3).
+    #[test]
+    fn event_file_transfer_failed_round_trip() {
+        let sha: [u8; 32] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54,
+            0x32, 0x10, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+            0xDD, 0xEE, 0xFF, 0x00,
+        ];
+        let event = FrontendEvent::FileTransferFailed {
+            sha256: sha,
+            reason: "connection lost".into(),
+            ts_ms: 1700000000123,
+        };
+        let s = serde_json::to_string(&event).unwrap();
+        // JSON shape — pinned so a frontend TypeScript type drift is
+        // caught at the IPC layer.
+        assert!(s.contains("\"FileTransferFailed\""));
+        assert!(s.contains("\"reason\":\"connection lost\""));
+        assert!(s.contains("\"ts_ms\":1700000000123"));
+        // sha256 is a 32-element JSON number array, NOT a hex string.
+        assert!(
+            s.contains("\"sha256\":["),
+            "sha256 must serialize as a 32-element JSON array; got {s}"
+        );
+        let back: FrontendEvent = serde_json::from_str(&s).unwrap();
+        match back {
+            FrontendEvent::FileTransferFailed {
+                sha256: back_sha,
+                reason: back_reason,
+                ts_ms: back_ts_ms,
+            } => {
+                assert_eq!(back_sha, sha);
+                assert_eq!(back_reason, "connection lost");
+                assert_eq!(back_ts_ms, 1700000000123);
+            }
+            other => panic!("expected FileTransferFailed, got {other:?}"),
+        }
+    }
+
+    /// **M5 STEP-5.1** — all three reason strings
+    /// (`"connection lost"` / `"timeout"` / `"peer cancelled"`)
+    /// round-trip cleanly. Pins the GUI-facing vocabulary so a
+    /// future string typo on either end (daemon vs. Vue) fails
+    /// the wire contract loudly.
+    #[test]
+    fn event_file_transfer_failed_reason_strings_round_trip() {
+        for reason in [
+            "connection lost".to_string(),
+            "timeout".to_string(),
+            "peer cancelled".to_string(),
+        ] {
+            let event = FrontendEvent::FileTransferFailed {
+                sha256: [0u8; 32],
+                reason: reason.clone(),
+                ts_ms: 1,
+            };
+            let s = serde_json::to_string(&event).unwrap();
+            let back: FrontendEvent = serde_json::from_str(&s).unwrap();
+            match back {
+                FrontendEvent::FileTransferFailed {
+                    reason: back_reason,
+                    ..
+                } => assert_eq!(back_reason, reason),
+                other => panic!("expected FileTransferFailed, got {other:?}"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1157,6 +1229,40 @@ pub enum FrontendEvent {
         last_image_ts: Option<u64>,
         last_file_ts: Option<u64>,
         last_source: Option<String>,
+    },
+    /// **M5 STEP-5.1** — fires when an inbound file transfer is
+    /// aborted because the HTTP/3 stream closed mid-fetch
+    /// (connection lost / timeout / peer cancelled). The GUI
+    /// surfaces this as a one-way notification toast — no
+    /// accept/reject actions (auto-accept only, per the
+    /// 2026-09-13 user decision).
+    ///
+    /// `sha256` is the inbound entry's expected sha256
+    /// (`[u8; 32]` serializes as a JSON array of 32 numbers
+    /// over the wire; the Vue side converts to lowercase hex
+    /// for display in STEP-5.3).
+    ///
+    /// `reason` is a free-form short human-readable string
+    /// (`"connection lost"` / `"timeout"` / `"peer cancelled"`)
+    /// — the GUI surfaces it raw (no enum mapping needed).
+    ///
+    /// `ts_ms` is the unix epoch ms at which the daemon
+    /// detected the failure (matches the
+    /// `ClipboardState::last_*_ts` convention).
+    ///
+    /// **Not emitted on**: sha256 mismatch, write IO error, or
+    /// HTTP/3 GET non-200 status (404 / 5xx) — those are silent
+    /// failures logged at warn level. Only the transport-level
+    /// stream-error path (the fetcher future returned
+    /// `Err(std::io::Error)`) triggers this event. The peer-
+    /// cancelled variant only fires when the cancel was
+    /// triggered by something other than the local
+    /// `FileTransferCancel` arm (which is a deliberate user
+    /// action and is handled silently).
+    FileTransferFailed {
+        sha256: [u8; 32],
+        reason: String,
+        ts_ms: u64,
     },
 }
 
