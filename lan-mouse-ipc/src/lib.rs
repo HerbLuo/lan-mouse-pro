@@ -786,6 +786,39 @@ mod clipboard_config_tests {
             }
         }
     }
+
+    /// **M5 STEP-5.3** — `FrontendEvent::ClipboardConfigChanged`
+    /// round-trip. Pins the wire shape
+    /// `"ClipboardConfigChanged":{"enabled":..., "accept_dir":"...", ...}`
+    /// (single-key object holding the full [`ClipboardConfig`]) so
+    /// the Vue `FrontendEvent` union stays exhaustive and the
+    /// store's `state.clipboardConfig` re-write is byte-stable.
+    #[test]
+    fn event_clipboard_config_changed_round_trip() {
+        let cfg = ClipboardConfig {
+            enabled: false,
+            accept_dir: PathBuf::from("/Users/me/Downloads/lan-mouse"),
+            ignore_text: true,
+            ignore_images: false,
+            ignore_files: true,
+            max_file_size: 100 * 1024 * 1024,
+            keep_partial: true,
+            inject_to_clipboard: false,
+        };
+        let event = FrontendEvent::ClipboardConfigChanged(cfg.clone());
+        let s = serde_json::to_string(&event).unwrap();
+        assert!(
+            s.contains("\"ClipboardConfigChanged\""),
+            "expected ClipboardConfigChanged tag in serialized payload; got {s}"
+        );
+        assert!(s.contains("\"inject_to_clipboard\":false"));
+        assert!(s.contains("\"keep_partial\":true"));
+        let back: FrontendEvent = serde_json::from_str(&s).unwrap();
+        match back {
+            FrontendEvent::ClipboardConfigChanged(back_cfg) => assert_eq!(back_cfg, cfg),
+            other => panic!("expected ClipboardConfigChanged, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1264,6 +1297,20 @@ pub enum FrontendEvent {
         reason: String,
         ts_ms: u64,
     },
+    /// **M5 STEP-5.3** — echoes the current daemon-global
+    /// [`ClipboardConfig`] back to the GUI. Pushed:
+    /// 1. After every [`FrontendRequest::SetClipboardConfig`] write
+    ///    (so the GUI re-syncs to the post-write shape);
+    /// 2. On every `Sync` / WS reconnect so the GUI gets the
+    ///    authoritative snapshot regardless of which side started
+    ///    the session.
+    ///
+    /// Carries the full [`ClipboardConfig`] payload (not a delta)
+    /// — matching the same pattern as [`FrontendEvent::QuicConfig`]
+    /// which echoes the post-write idle timeout. The GUI treats the
+    /// most recent payload as the source of truth for
+    /// `state.clipboardConfig` (replaced, not patched).
+    ClipboardConfigChanged(ClipboardConfig),
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
