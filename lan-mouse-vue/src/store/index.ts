@@ -1,10 +1,13 @@
 import { reactive, ref, type Ref as VRef } from 'vue'
 import type {
+  ClipboardConfig,
+  ClipboardState,
   ClientConfig,
   ClientHandle,
   ClientState,
   ConnState,
   DaemonSocket,
+  FileTransferFailed,
   FrontendEvent,
   FrontendRequest,
   InitialInfo,
@@ -68,6 +71,48 @@ export interface DaemonStore {
    *  `Array.from(state.monitors)` watchers in the templates pick up
    *  the change cheaply. */
   monitors: MonitorInfo[]
+  /** **M5 / STEP-5.3 — daemon-global clipboard config mirror**.
+   *  Initialised from the first `ClipboardConfigChanged` event after
+   *  WS open (or a fresh `Sync`), then updated in place on every
+   *  subsequent event. Templates bind to individual fields
+   *  (e.g. `state.clipboardConfig.inject_to_clipboard`); the store
+   *  is the single source of truth, the daemon just echoes the
+   *  authoritative snapshot. */
+  clipboardConfig: ClipboardConfig
+  /** **M5 / STEP-5.3 — last text clipboard sync metadata**. Updated
+   *  by the `ClipboardState` event; carries the originating peer's
+   *  hostname / fingerprint so the UI can render "clipboard was
+   *  just changed by <peer>". The actual text payload never crosses
+   *  IPC — only metadata (timestamps + source). */
+  lastClipboardText: string
+  /** Unix epoch ms of the last text clipboard sync; mirrors
+   *  `ClipboardState.last_text_ts`. `0` means "never received a
+   *  ClipboardState event yet" (the daemon uses `null`; we
+   *  collapse to `0` for ergonomic UI comparisons). */
+  lastClipboardAt: number
+  /** Peer hostname / fingerprint that pushed the most recent text
+   *  clipboard sync; empty string means "the change originated
+   *  locally" (daemon emits `null`, collapsed to `""` here). */
+  lastClipboardSource: string
+}
+
+/** Initial value for `state.clipboardConfig` before the first
+ *  `ClipboardConfigChanged` event lands. Mirrors the
+ *  `lan_mouse_ipc::ClipboardConfig::default()` shape so a Vue
+ *  template reading `state.clipboardConfig.max_file_size` never
+ *  throws on first render (before the daemon's first WS sync).
+ *  The placeholder `accept_dir` is the same env-derived fallback
+ *  the IPC crate uses; once the daemon echoes the real value it
+ *  replaces this in `applyEvent`. */
+const PLACEHOLDER_CLIPBOARD_CONFIG: ClipboardConfig = {
+  enabled: true,
+  accept_dir: '',
+  ignore_text: false,
+  ignore_images: false,
+  ignore_files: false,
+  max_file_size: 50 * 1024 * 1024,
+  keep_partial: false,
+  inject_to_clipboard: true,
 }
 
 const state = reactive<DaemonStore>({
@@ -83,6 +128,10 @@ const state = reactive<DaemonStore>({
   info: null,
   quicIdleTimeoutSecs: 5,
   monitors: [],
+  clipboardConfig: { ...PLACEHOLDER_CLIPBOARD_CONFIG },
+  lastClipboardText: '',
+  lastClipboardAt: 0,
+  lastClipboardSource: '',
 })
 
 /** Mirrors the daemon connectivity state for the AppHeader pill.
@@ -263,6 +312,51 @@ export function applyEvent(event: FrontendEvent) {
         // landed. Log + drop.
         console.warn(`BindingInvalid for unknown handle ${handle} (reason: ${reason}); ignoring`)
       }
+      break
+    }
+    case 'ClipboardState': {
+      // M5 / STEP-5.3: mirror the clipboard-state snapshot into
+      // the store. The daemon never sends the actual text bytes
+      // over IPC — only the timestamps + the originating peer.
+      // We collapse `null` → empty / 0 so the Vue template can
+      // read the fields without optional-chaining noise. The
+      // `last_text_ts` arm drives `lastClipboardAt` because the
+      // field naming emphasises "text" tracking; image / file
+      // timestamps are dropped on the floor (the store only
+      // exposes the text-tracking triple per the M5 STEP-5.3
+      // spec).
+      const cs = value as ClipboardState
+      state.lastClipboardAt = cs.last_text_ts ?? 0
+      state.lastClipboardSource = cs.last_source ?? ''
+      // `lastClipboardText` stays empty — the IPC event carries
+      // no payload bytes by design (text already crossed StreamC
+      // before this event fired).
+      break
+    }
+    case 'FileTransferFailed': {
+      // M5 / STEP-5.1: outbound file transfer aborted at the
+      // transport layer (connection lost / timeout / peer
+      // cancelled). Surface as a one-way warning toast — no
+      // accept/reject buttons per the 2026-09-13 user decision.
+      // The `reason` string comes from the daemon's
+      // `FileFetchErrorKind::as_reason()` wire contract; we trust
+      // it verbatim. The sha256 is left un-decoded here (we
+      // don't need to hex-format it for the toast; the full
+      // event payload is preserved on `state.lastClipboardAt`
+      // for any future "history" UI).
+      const evt = value as FileTransferFailed
+      pushToast('warning', `file transfer failed: ${evt.reason}`)
+      break
+    }
+    case 'ClipboardConfigChanged': {
+      // M5 / STEP-5.3: daemon-global clipboard config snapshot.
+      // Replace the cached config wholesale — the payload is
+      // authoritative (the daemon is the source of truth). Fires
+      // after every `SetClipboardConfig` IPC write and on every
+      // WS-reconnect `Sync` so the GUI re-syncs no matter which
+      // side started the session.
+      const cfg = value as ClipboardConfig
+      state.clipboardConfig = cfg
       break
     }
   }
