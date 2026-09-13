@@ -5,6 +5,11 @@ import { daemonStore, diffClientConfigPatch } from '@/store'
 import type { Connection } from '@/store'
 import type { ClientConfig, ClientState, MonitorInfo, ClientHandle } from '@/api/ipc'
 
+// M5 STEP-5.4 — also need to spy on the IPC helper to verify the
+// checkbox wires through to `FrontendRequest::SetEnableClipboardTo`.
+import * as storeModule from '@/store'
+import { vi } from 'vitest'
+
 /** STEP-M3-3.2 snapshot / structural tests for the monitor `<select>`.
  *
  *  Three cases from the §8 test matrix:
@@ -33,6 +38,7 @@ function makeConnection(monitor: string | null): Connection {
     cmd: null,
     input_channels: { mouse_button: 'datagram', keyboard: 'stream' },
     monitor,
+    enable_clipboard_to: true,
   }
   const state: ClientState = {
     active: false,
@@ -200,5 +206,63 @@ describe('ConnectionRow monitor dropdown', () => {
     const opts = sel.findAll('option')
     expect(opts).toHaveLength(1)
     expect(opts[0]!.text()).toMatch(/Any \(back-compat\)/)
+  })
+})
+
+// ---------- M5 STEP-5.4: per-peer enable_clipboard_to checkbox ----
+
+/** Returns the "Push clipboard to this peer" checkbox from the
+ *  expanded connection-body. There are two checkboxes in the
+ *  row (the connection-toggle at the top of the summary, and
+ *  the clipboard one in the body), so we drill into the body
+ *  to disambiguate. */
+function getEnableClipboardCheckbox(wrapper: ReturnType<typeof mount>) {
+  const checkboxes = wrapper.findAll('input[type="checkbox"]')
+  // 1st = connection-toggle (always); 2nd = enable_clipboard_to.
+  const cb = checkboxes[1]
+  if (!cb) {
+    throw new Error('enable_clipboard_to checkbox not found in row')
+  }
+  return cb
+}
+
+describe('ConnectionRow enable_clipboard_to checkbox', () => {
+  beforeEach(() => {
+    daemonStore.monitors = []
+  })
+
+  it('renders the checkbox checked when config.enable_clipboard_to is true', () => {
+    const wrapper = mount(ConnectionRow, {
+      props: { connection: makeConnection(null) },
+    })
+    const cb = getEnableClipboardCheckbox(wrapper)
+    expect((cb.element as HTMLInputElement).checked).toBe(true)
+  })
+
+  it('renders the checkbox unchecked when config.enable_clipboard_to is false', () => {
+    const conn = makeConnection(null)
+    conn.config.enable_clipboard_to = false
+    const wrapper = mount(ConnectionRow, { props: { connection: conn } })
+    const cb = getEnableClipboardCheckbox(wrapper)
+    expect((cb.element as HTMLInputElement).checked).toBe(false)
+  })
+
+  it('sends SetEnableClipboardTo(handle, true|false) on toggle', async () => {
+    const spy = vi.spyOn(storeModule, 'setEnableClipboardTo').mockImplementation(() => {})
+    try {
+      const conn = makeConnection(null)
+      conn.config.enable_clipboard_to = true
+      const wrapper = mount(ConnectionRow, { props: { connection: conn } })
+
+      // Untick → emits SetEnableClipboardTo(handle, false).
+      await getEnableClipboardCheckbox(wrapper).setValue(false)
+      expect(spy).toHaveBeenLastCalledWith(7, false)
+
+      // Tick → emits SetEnableClipboardTo(handle, true).
+      await getEnableClipboardCheckbox(wrapper).setValue(true)
+      expect(spy).toHaveBeenLastCalledWith(7, true)
+    } finally {
+      spy.mockRestore()
+    }
   })
 })

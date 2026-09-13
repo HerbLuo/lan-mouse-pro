@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach } from 'vitest'
+import { vi } from 'vitest'
 import { daemonStore, diffClientConfigPatch } from './index'
 import type {
   ClipboardConfig,
@@ -39,6 +40,7 @@ function baseConfig(): ClientConfig {
     cmd: null,
     input_channels: { mouse_button: 'datagram', keyboard: 'stream' },
     monitor: null,
+    enable_clipboard_to: true,
   }
 }
 
@@ -412,6 +414,69 @@ describe('FileTransferFailed event → warning toast', () => {
       })
       expect(daemonStore.toasts).toHaveLength(1)
       expect(daemonStore.toasts[0]!.message).toContain(reason)
+    }
+  })
+})
+
+// ---------- M5 STEP-5.4: setClipboardConfig / setEnableClipboardTo IPC helpers ----
+
+/** Inject a fake socket into the module-private singleton via the
+ *  `_setSocketForTest` seam. Returns a `request` spy we can
+ *  introspect. Each call gets a fresh mock so previous tests
+ *  don't leak. */
+async function mockSocket() {
+  const requests: any[] = []
+  // `request` is the only method the IPC helpers actually call.
+  // We type-cast to `any` to dodge the rest of the `DaemonSocket`
+  // surface (private ws / connState / reconnectTimer etc. the
+  // test doesn't need to satisfy).
+  const fakeSocket = { request: vi.fn((req: any) => requests.push(req)) } as any
+  // Reach into the module via a re-import — vitest's ESM loader
+  // gives us the same singleton instance every time.
+  const store = (await import('./index')) as typeof import('./index')
+  store._setSocketForTest!(fakeSocket)
+  return {
+    requests,
+    restore: () => store._setSocketForTest!(null),
+  }
+}
+
+describe('setClipboardConfig / setEnableClipboardTo IPC helpers', () => {
+  it('setClipboardConfig emits SetClipboardConfig with the full 8-field payload', async () => {
+    const { requests, restore } = await mockSocket()
+    try {
+      const { setClipboardConfig } = await import('./index')
+      const cfg: ClipboardConfig = {
+        enabled: true,
+        accept_dir: '/Users/me/Downloads/lan-mouse',
+        ignore_text: false,
+        ignore_images: true,
+        ignore_files: false,
+        max_file_size: 100 * 1024 * 1024, // 100 MiB
+        keep_partial: true,
+        inject_to_clipboard: false,
+      }
+      setClipboardConfig(cfg)
+      expect(requests).toHaveLength(1)
+      expect(requests[0]).toEqual({ SetClipboardConfig: cfg })
+    } finally {
+      restore()
+    }
+  })
+
+  it('setEnableClipboardTo emits SetEnableClipboardTo(handle, bool)', async () => {
+    const { requests, restore } = await mockSocket()
+    try {
+      const { setEnableClipboardTo } = await import('./index')
+      setEnableClipboardTo(7 as ClientHandle, false)
+      expect(requests).toEqual([{ SetEnableClipboardTo: [7, false] }])
+      setEnableClipboardTo(7 as ClientHandle, true)
+      expect(requests).toEqual([
+        { SetEnableClipboardTo: [7, false] },
+        { SetEnableClipboardTo: [7, true] },
+      ])
+    } finally {
+      restore()
     }
   })
 })
