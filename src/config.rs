@@ -19,6 +19,24 @@ use toml_edit::{self, DocumentMut};
 use lan_mouse_cli::CliArgs;
 use lan_mouse_ipc::{ClipboardConfig, DEFAULT_PORT, InputChannelConfig, Position};
 
+/// Resolve the user's home directory at runtime. Mirrors the
+/// `service::default_accept_dir` free fn (re-exported here so
+/// [`Config::clipboard_config`] can fall back when the TOML has
+/// no `accept_dir` entry).
+pub(crate) use crate::service::default_accept_dir;
+
+/// Default ceiling for [`Config::max_file_size`] / the post-M4
+/// `ClipboardConfig.max_file_size` field (matches the wire-level
+/// default helper in `lan_mouse_ipc::default_max_file_size`).
+///
+/// Re-exported from `service::DEFAULT_MAX_FILE_SIZE` (where it
+/// lived pre-M4) so the IPC + config + service layers all share
+/// a single source of truth. The `dispatch_files` outbound arm
+/// reads this constant via [`Config::max_file_size`]; the IPC
+/// layer's `default_max_file_size` helper hardcodes the same value
+/// to keep the wire schema self-contained.
+pub(crate) use crate::service::DEFAULT_MAX_FILE_SIZE;
+
 use input_event::scancode::{
     self,
     Linux::{KeyLeftAlt, KeyLeftCtrl, KeyLeftMeta, KeyLeftShift},
@@ -113,21 +131,35 @@ struct TomlQuic {
     idle_timeout_secs: Option<u64>,
 }
 
-/// **M0c / PLAN-2** — daemon-global clipboard config (TOML side).
-/// Mirrors the subset of [`lan_mouse_ipc::ClipboardConfig`] the
-/// daemon persists. Carries no `ClientHandle` because the clipboard
-/// listener is daemon-global.
+/// **M0c / PLAN-2 + M4 STEP-4.1** — daemon-global clipboard
+/// config (TOML side). Mirrors the subset of
+/// [`lan_mouse_ipc::ClipboardConfig`] the daemon persists. Carries
+/// no `ClientHandle` because the clipboard listener is
+/// daemon-global.
 ///
 /// **Wire compat**: every field is `Option<T>` + `#[serde(default)]`
-/// so a pre-M0c TOML (no `[clipboard]` section, or a section missing
-/// some fields) deserializes cleanly into the legacy default
-/// (auto-accept off / ignore-* off / accept_dir = None).
+/// so a pre-M0c TOML (no `[clipboard]` section, or a section
+/// missing some fields) deserializes cleanly into the legacy
+/// defaults. Pre-M4 sections only carry `auto_accept_files` /
+/// `ignore_*` / `accept_dir` — those keys are silently ignored by
+/// the post-M4 deserializer (serde drops unknown fields by
+/// default), so old `config.toml` files load without error. The
+/// missing `enabled` / `max_file_size` / `keep_partial` /
+/// `inject_to_clipboard` fields land on `None`, and
+/// [`Config::clipboard_config`] fills them in from the M4 defaults.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct TomlClipboard {
-    /// See [`lan_mouse_ipc::ClipboardConfig::auto_accept_files`].
+    /// See [`lan_mouse_ipc::ClipboardConfig::enabled`].
+    /// Missing → `None` → [`Config::clipboard_config`] falls back
+    /// to `true` (M4 default).
     #[serde(default)]
-    auto_accept_files: Option<bool>,
+    enabled: Option<bool>,
     /// See [`lan_mouse_ipc::ClipboardConfig::accept_dir`].
+    /// Missing → `None` → [`Config::clipboard_config`] falls back
+    /// to `default_accept_dir()` (post-M4 `accept_dir` is required
+    /// on the wire but the TOML layer still keeps `Option` so an
+    /// old config.toml without the key loads — we then write it
+    /// back on the next save).
     #[serde(default)]
     accept_dir: Option<PathBuf>,
     /// See [`lan_mouse_ipc::ClipboardConfig::ignore_text`].
@@ -139,6 +171,21 @@ struct TomlClipboard {
     /// See [`lan_mouse_ipc::ClipboardConfig::ignore_files`].
     #[serde(default)]
     ignore_files: Option<bool>,
+    /// See [`lan_mouse_ipc::ClipboardConfig::max_file_size`].
+    /// Missing → `None` → [`Config::clipboard_config`] falls back
+    /// to [`DEFAULT_MAX_FILE_SIZE`] (50 MiB).
+    #[serde(default)]
+    max_file_size: Option<u64>,
+    /// See [`lan_mouse_ipc::ClipboardConfig::keep_partial`].
+    /// Missing → `None` → `false` (default — partial files removed
+    /// on disconnect, M5 STEP-5.1).
+    #[serde(default)]
+    keep_partial: Option<bool>,
+    /// See [`lan_mouse_ipc::ClipboardConfig::inject_to_clipboard`].
+    /// Missing → `None` → `true` (default — files auto-injected
+    /// into local clipboard after landing).
+    #[serde(default)]
+    inject_to_clipboard: Option<bool>,
 }
 
 /// **FIX 4 — config 侧 watchdog 配置**：
@@ -808,12 +855,18 @@ impl Config {
         q.idle_timeout_secs = Some(secs);
     }
 
-    /// **M0c / PLAN-2** — get the persisted clipboard config. Reads
-    /// the TOML `[clipboard]` section; missing section → default
-    /// (auto-accept ON / ignore-* off / accept_dir = None — the
-    /// 2026-09-13 new-default, see `lan_mouse_ipc::ClipboardConfig`
-    /// doc). Used by `Service::set_clipboard_config` and (in M1a+)
-    /// by the clipboard backend to seed its runtime state.
+    /// **M0c / PLAN-2 + M4 STEP-4.1** — get the persisted
+    /// clipboard config. Reads the TOML `[clipboard]` section;
+    /// missing section → `ClipboardConfig::default()` (the
+    /// post-M4 shape: `enabled = true`, `accept_dir` from env,
+    /// `max_file_size = 50 MiB`, `inject_to_clipboard = true`,
+    /// `keep_partial = false`).
+    ///
+    /// Used by [`Service::max_file_size`] +
+    /// [`Service::clipboard_enabled`] getters (live read — every
+    /// IPC `SetClipboardConfig` call mutates `config_toml` via
+    /// [`Config::set_clipboard_config`] and the next
+    /// `clipboard_config()` call sees the new values immediately).
     pub fn clipboard_config(&self) -> ClipboardConfig {
         let Some(toml) = self.config_toml.as_ref() else {
             return ClipboardConfig::default();
@@ -822,42 +875,90 @@ impl Config {
             return ClipboardConfig::default();
         };
         ClipboardConfig {
-            // 2026-09-13: was `unwrap_or(false)` — flipped to `true`
-            // so cross-machine file copy works without the user
-            // hand-editing `config.toml`. An explicit
-            // `auto_accept_files = false` in `[clipboard]` still
-            // wins because `unwrap_or` only fires on `None`.
-            auto_accept_files: cb.auto_accept_files.unwrap_or(true),
-            accept_dir: cb.accept_dir.clone(),
+            // M4 STEP-4.1: replaced `auto_accept_files` with the
+            // master `enabled` toggle. The dispatcher does not
+            // start when `enabled = false`. Pre-M4 TOML files
+            // still carry `auto_accept_files` (silently dropped by
+            // serde on the way through `TomlClipboard`) — for those
+            // configs we land on `enabled = true` which matches the
+            // pre-M4 default of `auto_accept_files = true` (so the
+            // transition is invisible to the user).
+            enabled: cb.enabled.unwrap_or(true),
+            // Post-M4 `accept_dir` is required on the IPC wire, but
+            // the TOML layer keeps `Option<PathBuf>` so a missing
+            // key in an old `config.toml` deserializes to `None`
+            // → we fall back to `default_accept_dir()` (matches
+            // the M3a behavior in `handle_clipboard_inbound_files`).
+            accept_dir: cb.accept_dir.clone().unwrap_or_else(default_accept_dir),
             ignore_text: cb.ignore_text.unwrap_or(false),
             ignore_images: cb.ignore_images.unwrap_or(false),
             ignore_files: cb.ignore_files.unwrap_or(false),
+            max_file_size: cb.max_file_size.unwrap_or(DEFAULT_MAX_FILE_SIZE),
+            keep_partial: cb.keep_partial.unwrap_or(false),
+            inject_to_clipboard: cb.inject_to_clipboard.unwrap_or(true),
         }
     }
 
-    /// **M0c / PLAN-2** — persist a clipboard config. Mirrors
-    /// [`Config::set_quic_idle_timeout`] — the actual runtime effect
-    /// is wired up in M1a (clipboard backend reads via
-    /// [`Config::clipboard_config`] at startup; per-write refresh is
-    /// future work).
+    /// **M4 STEP-4.1** — per-file size ceiling in bytes, live read
+    /// from [`Config::clipboard_config`]. Used by
+    /// [`Service::max_file_size`] getter (which feeds
+    /// `dispatch_files_decide`'s `max_size` parameter). Returns
+    /// the `max_file_size` field directly; `0` means "no limit" per
+    /// `src/clipboard/file_meta.rs:68` contract.
+    ///
+    /// **Why a dedicated getter**: callers want a `u64`, not a
+    /// full [`ClipboardConfig`]. Lives next to
+    /// [`Config::clipboard_config`] so the live-read contract is
+    /// symmetric.
+    pub fn max_file_size(&self) -> u64 {
+        self.clipboard_config().max_file_size
+    }
+
+    /// **M4 STEP-4.1** — `true` when the daemon-global clipboard
+    /// sync is enabled. Live read from
+    /// [`Config::clipboard_config`]; `false` ⇒ dispatcher should
+    /// not start (M4 STEP-4.3 wires this into the
+    /// `Service::run` startup gate).
+    pub fn clipboard_enabled(&self) -> bool {
+        self.clipboard_config().enabled
+    }
+
+    /// **M0c / PLAN-2 + M4 STEP-4.1** — persist a clipboard config.
+    /// Mirrors [`Config::set_quic_idle_timeout`] — the actual
+    /// runtime effect is wired up in `Service::max_file_size` /
+    /// `Service::clipboard_enabled` getters (which live-read via
+    /// [`Config::clipboard_config`]). Per-write refresh happens
+    /// automatically because the getters re-read on every call;
+    /// no Service field maintenance required.
     pub fn set_clipboard_config(&mut self, cfg: ClipboardConfig) {
         if self.config_toml.is_none() {
             self.config_toml = Some(Default::default());
         }
         let toml = self.config_toml.as_mut().expect("config");
         let cb = toml.clipboard.get_or_insert_with(TomlClipboard::default);
-        // Omit-on-default pattern — true / false / `None` write back as
-        // `None` so legacy defaults don't grow spurious `[clipboard]`
-        // section entries on the next save.
-        cb.auto_accept_files = if cfg.auto_accept_files {
+        // Omit-on-default pattern — true / false / `None` write
+        // back as `None` so legacy defaults don't grow spurious
+        // `[clipboard]` section entries on the next save. Mirrors
+        // the `input_channels` / `monitor` / `enable_clipboard_to`
+        // contract on `TomlClient`.
+        cb.enabled = if cfg.enabled { None } else { Some(false) };
+        cb.accept_dir = Some(cfg.accept_dir);
+        cb.ignore_text = if cfg.ignore_text { None } else { Some(false) };
+        cb.ignore_images = if cfg.ignore_images { None } else { Some(false) };
+        cb.ignore_files = if cfg.ignore_files { None } else { Some(false) };
+        // `max_file_size` is a numeric — omit when it equals the
+        // 50 MiB default (keeps a vanilla config.toml clean).
+        cb.max_file_size = if cfg.max_file_size == DEFAULT_MAX_FILE_SIZE {
+            None
+        } else {
+            Some(cfg.max_file_size)
+        };
+        cb.keep_partial = if cfg.keep_partial { None } else { Some(false) };
+        cb.inject_to_clipboard = if cfg.inject_to_clipboard {
             None
         } else {
             Some(false)
         };
-        cb.accept_dir = cfg.accept_dir;
-        cb.ignore_text = if cfg.ignore_text { None } else { Some(false) };
-        cb.ignore_images = if cfg.ignore_images { None } else { Some(false) };
-        cb.ignore_files = if cfg.ignore_files { None } else { Some(false) };
     }
 
     pub fn read_from_disk(&mut self) -> Result<bool, io::Error> {
@@ -1137,5 +1238,192 @@ position = "right"
             cfg.enable_clipboard_to,
             "missing enable_clipboard_to key must default to true"
         );
+    }
+}
+
+// === M4 STEP-4.1 — TOML [clipboard] section round-trip ===========================
+
+#[cfg(test)]
+mod config_clipboard_section_tests {
+    use super::*;
+
+    /// **M4 STEP-4.1** — the TOML `[clipboard]` section round-trips
+    /// cleanly through `Config::clipboard_config()` for a fully-
+    /// populated config. Pins every post-M4 field
+    /// (`enabled` / `accept_dir` / `ignore_*` ×3 / `max_file_size`
+    /// / `keep_partial` / `inject_to_clipboard`) including the new
+    /// `inject_to_clipboard` field that landed in this STEP.
+    #[test]
+    fn config_clipboard_round_trip_populated() {
+        let toml = r#"
+            [clipboard]
+            enabled = false
+            accept_dir = "/tmp/recv"
+            ignore_text = true
+            ignore_images = true
+            ignore_files = false
+            max_file_size = 104857600
+            keep_partial = true
+            inject_to_clipboard = false
+        "#;
+        let parsed: ConfigToml = toml::from_str(toml).unwrap();
+        let mut config = Config {
+            args: Args::parse_from(["lan-mouse"]),
+            cert_path: PathBuf::from("lan-mouse.pem"),
+            config_path: PathBuf::from("config.toml"),
+            config_dir: PathBuf::from("."),
+            config_toml: Some(parsed),
+            watcher: RecommendedWatcher::new(|_| {}, notify::Config::default()).unwrap(),
+            watch_rx: tokio::sync::mpsc::channel(1).1,
+        };
+        let cfg = config.clipboard_config();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.accept_dir, PathBuf::from("/tmp/recv"));
+        assert!(cfg.ignore_text);
+        assert!(cfg.ignore_images);
+        assert!(!cfg.ignore_files);
+        assert_eq!(cfg.max_file_size, 104_857_600);
+        assert!(cfg.keep_partial);
+        assert!(!cfg.inject_to_clipboard);
+        // Round-trip back: write to TOML, re-parse, fields preserved.
+        config.set_clipboard_config(cfg.clone());
+        let s = toml::to_string_pretty(config.config_toml.as_ref().unwrap()).unwrap();
+        let re_parsed: ConfigToml = toml::from_str(&s).unwrap();
+        assert_eq!(
+            re_parsed.clipboard,
+            config.config_toml.as_ref().unwrap().clipboard
+        );
+    }
+
+    /// **M4 STEP-4.1** — the TOML `[clipboard]` section is missing
+    /// entirely (pre-M4 / pre-M0c config.toml) — `Config::clipboard_config()`
+    /// must return the post-M4 default shape (every field lands on
+    /// the `unwrap_or(_)` fallback path). Pins the
+    /// "missing section → `ClipboardConfig::default()`" contract.
+    #[test]
+    fn config_clipboard_missing_section_defaults_to_post_m4() {
+        let parsed: ConfigToml = toml::from_str("").unwrap();
+        let config = Config {
+            args: Args::parse_from(["lan-mouse"]),
+            cert_path: PathBuf::from("lan-mouse.pem"),
+            config_path: PathBuf::from("config.toml"),
+            config_dir: PathBuf::from("."),
+            config_toml: Some(parsed),
+            watcher: RecommendedWatcher::new(|_| {}, notify::Config::default()).unwrap(),
+            watch_rx: tokio::sync::mpsc::channel(1).1,
+        };
+        let cfg = config.clipboard_config();
+        // Post-M4 defaults
+        assert!(cfg.enabled);
+        assert!(!cfg.ignore_text && !cfg.ignore_images && !cfg.ignore_files);
+        assert_eq!(cfg.max_file_size, DEFAULT_MAX_FILE_SIZE);
+        assert!(!cfg.keep_partial);
+        assert!(cfg.inject_to_clipboard);
+    }
+
+    /// **M4 STEP-4.1** — `Config::max_file_size()` getter returns
+    /// the live `max_file_size` value. Default 50 MiB; a TOML
+    /// override takes effect immediately. Closes SUGGESTION #S-5
+    /// (`dispatch_files` was using a hardcoded
+    /// `DEFAULT_MAX_FILE_SIZE` constant and a SUGGESTION was
+    /// tracking the "wire through Config" follow-up).
+    #[test]
+    fn config_max_file_size_getter_tracks_toml_changes() {
+        let parsed: ConfigToml = toml::from_str(
+            r#"
+                [clipboard]
+                max_file_size = 104857600
+            "#,
+        )
+        .unwrap();
+        let mut config = Config {
+            args: Args::parse_from(["lan-mouse"]),
+            cert_path: PathBuf::from("lan-mouse.pem"),
+            config_path: PathBuf::from("config.toml"),
+            config_dir: PathBuf::from("."),
+            config_toml: Some(parsed),
+            watcher: RecommendedWatcher::new(|_| {}, notify::Config::default()).unwrap(),
+            watch_rx: tokio::sync::mpsc::channel(1).1,
+        };
+        // TOML override: 100 MiB
+        assert_eq!(config.max_file_size(), 104_857_600);
+        // Now set via set_clipboard_config → 0 (no limit)
+        config.set_clipboard_config(ClipboardConfig {
+            max_file_size: 0,
+            ..ClipboardConfig::default()
+        });
+        assert_eq!(config.max_file_size(), 0);
+        // And back to 50 MiB via the default
+        config.set_clipboard_config(ClipboardConfig {
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
+            ..ClipboardConfig::default()
+        });
+        assert_eq!(config.max_file_size(), DEFAULT_MAX_FILE_SIZE);
+    }
+
+    /// **M4 STEP-4.1** — drop `auto_accept_files` TOML compat. A
+    /// pre-M4 `[clipboard]` section that carries
+    /// `auto_accept_files = true` (or `false`) is gracefully
+    /// accepted — the unknown field is silently ignored by serde,
+    /// and `Config::clipboard_config()` returns the post-M4 shape
+    /// (`enabled = true` matches the pre-M4 default of
+    /// `auto_accept_files = true`, so the transition is invisible
+    /// to users who had auto-accept on).
+    #[test]
+    fn config_clipboard_drop_auto_accept_files_compat() {
+        let parsed: ConfigToml = toml::from_str(
+            r#"
+                [clipboard]
+                accept_dir = "/tmp/legacy"
+                auto_accept_files = true
+                ignore_text = false
+            "#,
+        )
+        .unwrap();
+        let config = Config {
+            args: Args::parse_from(["lan-mouse"]),
+            cert_path: PathBuf::from("lan-mouse.pem"),
+            config_path: PathBuf::from("config.toml"),
+            config_dir: PathBuf::from("."),
+            config_toml: Some(parsed),
+            watcher: RecommendedWatcher::new(|_| {}, notify::Config::default()).unwrap(),
+            watch_rx: tokio::sync::mpsc::channel(1).1,
+        };
+        let cfg = config.clipboard_config();
+        // Unknown `auto_accept_files` is silently dropped by serde;
+        // the rest of the section parses cleanly. `enabled` lands
+        // on the post-M4 default of `true` (which matches the
+        // pre-M4 default `auto_accept_files = true`).
+        assert!(cfg.enabled);
+        assert_eq!(cfg.accept_dir, PathBuf::from("/tmp/legacy"));
+        assert!(!cfg.ignore_text);
+    }
+
+    /// **M4 STEP-4.1** — `inject_to_clipboard` round-trips. Pins
+    /// the new field's write-back contract: a user setting
+    /// `inject_to_clipboard = false` (e.g. to keep their local
+    /// clipboard untouched while files land on disk) persists
+    /// across save → re-parse.
+    #[test]
+    fn config_clipboard_inject_to_clipboard_round_trip() {
+        let toml = r#"
+            [clipboard]
+            accept_dir = "/tmp/x"
+            inject_to_clipboard = false
+        "#;
+        let parsed: ConfigToml = toml::from_str(toml).unwrap();
+        let mut config = Config {
+            args: Args::parse_from(["lan-mouse"]),
+            cert_path: PathBuf::from("lan-mouse.pem"),
+            config_path: PathBuf::from("config.toml"),
+            config_dir: PathBuf::from("."),
+            config_toml: Some(parsed),
+            watcher: RecommendedWatcher::new(|_| {}, notify::Config::default()).unwrap(),
+            watch_rx: tokio::sync::mpsc::channel(1).1,
+        };
+        assert!(!config.clipboard_config().inject_to_clipboard);
+        // Round-trip: re-set + re-read.
+        config.set_clipboard_config(config.clipboard_config());
+        assert!(!config.clipboard_config().inject_to_clipboard);
     }
 }
