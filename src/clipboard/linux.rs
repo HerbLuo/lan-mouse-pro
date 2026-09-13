@@ -388,10 +388,6 @@ impl ClipboardBackend for LinuxClipboard {
     /// to a `PathBuf` via `urlencoding`-free percent-decoding
     /// (most filesystem paths don't need percent-decoding; we
     /// fall back to the raw string if the parse fails).
-    ///
-    /// **No file-write path on Linux**: M3a only needs the
-    /// **read** path; `set_files` is out of scope (PLAN §3
-    /// M3a STEP-3a.2 / 3a.3 boundary).
     fn current_files(&mut self) -> Option<Vec<PathBuf>> {
         let output = match self.tool {
             Tool::WlPaste => Command::new("wl-paste")
@@ -414,6 +410,92 @@ impl ClipboardBackend for LinuxClipboard {
             return None;
         }
         Some(parse_uri_list(&output.stdout))
+    }
+
+    /// **M4 STEP-4.2** — write a list of absolute file paths to
+    /// the OS clipboard as `text/uri-list` (RFC 2483).
+    ///
+    /// **Wire format**: one `file:///abs/path` URI per line, CRLF
+    /// terminated. Mirrors what [`Self::current_files`] reads on
+    /// the dispatcher's outbound arm, so the round-trip is
+    /// symmetric (`wl-paste --type text/uri-list` after a
+    /// `set_files` call returns the same paths back).
+    ///
+    /// **X11 path**: `xclip -selection clipboard -t text/uri-list -i`
+    /// reads the URI list from stdin until EOF.
+    ///
+    /// **Wayland path**: `wl-copy --type text/uri-list` reads from
+    /// stdin until EOF (unlike `wl-copy` for PNG / text, which
+    /// auto-detects the MIME — the URI-list MIME must be passed
+    /// explicitly so the compositor routes it to file-selection
+    /// consumers).
+    ///
+    /// **Empty input**: returns `Ok(())` without spawning a
+    /// subprocess (no work to do; matches the dispatcher's "no
+    /// paths → no `set_files` call" pre-filter, but defensive
+    /// against a misbehaving caller).
+    ///
+    /// **Failure handling**: `xclip` / `wl-copy` non-zero exit or
+    /// spawn failure surfaces as
+    /// [`ClipboardError::ToolFailed`] / [`ClipboardError::Io`]
+    /// (same pattern as `set_text` / `set_image`).
+    fn set_files(&mut self, files: &[PathBuf]) -> Result<(), ClipboardError> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let payload = build_uri_list(files);
+        let payload_bytes = payload.as_bytes();
+        let mut cmd = match self.tool {
+            // wl-copy --type text/uri-list reads from stdin until
+            // EOF and advertises the text/uri-list MIME so the
+            // compositor routes the paste to file-selection
+            // consumers (GTK / Qt apps).
+            Tool::WlPaste => {
+                let mut c = Command::new("wl-copy");
+                c.args(["--type", "text/uri-list"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                c
+            }
+            // xclip -selection clipboard -t text/uri-list -i reads
+            // from stdin and writes to the X11 CLIPBOARD selection
+            // under the text/uri-list type.
+            Tool::Xclip => {
+                let mut c = Command::new("xclip");
+                c.args(["-selection", "clipboard", "-t", "text/uri-list", "-i"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                c
+            }
+        };
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ClipboardError::Io(format!("spawn {}: {e}", self.tool_binary_name())))?;
+        // SAFETY: just spawned with `Stdio::piped`; `stdin` is
+        // `Some(_)`. Mirrors `set_text` / `set_image` discipline.
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin must be piped (just spawned with Stdio::piped)")
+            .write_all(payload_bytes)
+            .map_err(|e| {
+                ClipboardError::Io(format!("write {} stdin: {e}", self.tool_binary_name()))
+            })?;
+        // Drop stdin explicitly to send EOF — both tools read
+        // until EOF.
+        drop(child.stdin.take());
+        let status = child
+            .wait()
+            .map_err(|e| ClipboardError::Io(format!("wait {}: {e}", self.tool_binary_name())))?;
+        if !status.success() {
+            return Err(ClipboardError::ToolFailed(format!(
+                "{} exited {status}",
+                self.tool_binary_name()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -554,6 +636,52 @@ fn hex_val(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+// ============================================================================
+//  M4 STEP-4.2 — URI list builder (write path; RFC 2483)
+// ============================================================================
+
+/// **M4 STEP-4.2** — build the `text/uri-list` byte stream that
+/// [`LinuxClipboard::set_files`] pipes to `xclip` / `wl-copy`
+/// stdin. Inverse of [`parse_uri_list`] — together they pin the
+/// Linux clipboard file-selection round-trip contract.
+///
+/// **Format** (RFC 2483 §3):
+/// - One URI per line.
+/// - CRLF (`\r\n`) line terminator — the RFC "preferred"
+///   separator. Both `xclip` and `wl-paste` also accept LF, but
+///   CRLF is what `wl-paste` emits on read, so writing CRLF
+///   makes the round-trip byte-symmetric.
+/// - Each URI is `file://` + absolute path (relative paths are
+///   not meaningful for a file-selection paste).
+/// - We do NOT percent-encode the path. The Linux file URIs in
+///   the wild are typically verbatim paths — `gvfs` /
+///   `xdg-open` do not percent-encode typical ASCII paths, and
+///   the receiving `parse_uri_list` mirrors that with
+///   percent-decoding-as-needed. A future improvement could
+///   percent-encode `Uri::escape`-style, but it is not required
+///   by RFC 2483 §3 (`The file URI scheme allows characters that
+///   must be escaped` is RFC 8089, not RFC 2483 itself).
+///
+/// **Why a free function (not a method)**: same rationale as
+/// `parse_uri_list` / `dib_to_png_via_image_crate` — pure
+/// bytes-in / bytes-out, no `Self` state, exercise from unit
+/// tests without mocking `xclip` / `wl-copy`.
+fn build_uri_list(paths: &[PathBuf]) -> String {
+    let mut out = String::new();
+    for p in paths {
+        // `Path::display()` renders the path with the platform's
+        // separator (forward slash on Unix, backslash on
+        // Windows). On Linux this is exactly the verbatim path
+        // — `file:///tmp/foo bar` includes the space verbatim
+        // and is parsed back via `parse_uri_list` (which
+        // percent-decodes if needed).
+        out.push_str("file://");
+        out.push_str(&p.display().to_string());
+        out.push_str("\r\n");
+    }
+    out
 }
 
 // ============================================================================
@@ -909,5 +1037,68 @@ mod tests {
         assert!(parse_uri_list(b"").is_empty());
         assert!(parse_uri_list(b"# only comment\n").is_empty());
         assert!(parse_uri_list(b"\n\n\n").is_empty());
+    }
+
+    // === M4 STEP-4.2 — URI list builder + write-path round-trip ===
+
+    /// `build_uri_list` emits the canonical RFC 2483 form:
+    /// one `file:///abs/path` URI per line, CRLF terminated.
+    /// Pins the wire-format string the dispatcher's `set_files`
+    /// call pipes into `xclip` / `wl-copy` stdin — a regression
+    /// here would silently break Linux file injection.
+    #[test]
+    fn build_uri_list_emits_crlf_separated_file_uris() {
+        let paths = vec![
+            PathBuf::from("/tmp/a.bin"),
+            PathBuf::from("/tmp/b.bin"),
+            PathBuf::from("/home/user/Downloads/c.pdf"),
+        ];
+        let s = build_uri_list(&paths);
+        assert_eq!(
+            s,
+            "file:///tmp/a.bin\r\nfile:///tmp/b.bin\r\nfile:///home/user/Downloads/c.pdf\r\n"
+        );
+        // CRLF is the separator (not bare LF).
+        assert!(s.contains("\r\n"), "URI list must use CRLF separators");
+        assert!(
+            !s.split("\r\n")
+                .any(|line| line.ends_with('\n') && !line.ends_with("\r\n")),
+            "URI list must not have stray LF-only lines"
+        );
+    }
+
+    /// `build_uri_list(&[])` returns an empty string. Mirrors the
+    /// `set_files` empty-slice short-circuit — `xclip` / `wl-copy`
+    /// are not invoked for an empty input.
+    #[test]
+    fn build_uri_list_empty_input_returns_empty_string() {
+        let s = build_uri_list(&[]);
+        assert_eq!(s, "");
+    }
+
+    /// **`build_uri_list` ∘ `parse_uri_list` round-trip** —
+    /// builds a URI list from a `Vec<PathBuf>`, parses it back,
+    /// and asserts the recovered paths match the originals.
+    /// This is the contract that pins the Linux file-selection
+    /// round-trip: a `current_files` → `set_files` cycle on the
+    /// dispatcher preserves path identity (modulo
+    /// percent-encoding, which neither end applies for ASCII
+    /// paths).
+    #[test]
+    fn build_then_parse_uri_list_round_trips_paths() {
+        let original = vec![
+            PathBuf::from("/tmp/a.bin"),
+            PathBuf::from("/home/user/Downloads/report.pdf"),
+            PathBuf::from("/var/log/app.log"),
+        ];
+        let payload = build_uri_list(&original);
+        let recovered = parse_uri_list(payload.as_bytes());
+        assert_eq!(recovered.len(), original.len(), "round-trip path count");
+        for (orig, rec) in original.iter().zip(recovered.iter()) {
+            assert_eq!(
+                rec, orig,
+                "round-trip path identity (orig={orig:?}, recovered={rec:?})"
+            );
+        }
     }
 }
