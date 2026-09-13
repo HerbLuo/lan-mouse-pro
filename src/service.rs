@@ -1844,6 +1844,16 @@ impl Service {
             let ipc_list = monitors.iter().map(geometry_to_ipc_monitor_info).collect();
             self.notify_frontend(FrontendEvent::MonitorsChanged(ipc_list));
         }
+        // **M5 STEP-5.3** — initial clipboard config snapshot. The
+        // seed `SetClipboardConfig` write happens after WS open
+        // (or never, if the user never tweaks it), so without this
+        // line the GUI's `state.clipboardConfig` would stay `null`
+        // until the first user-driven write. Mirror the
+        // `QuicConfig` push above (the daemon is the source of
+        // truth and the GUI just listens).
+        self.notify_frontend(FrontendEvent::ClipboardConfigChanged(
+            self.config.clipboard_config(),
+        ));
     }
 
     const ENTER_HANDLE_BEGIN: u64 = u64::MAX / 2 + 1;
@@ -2201,6 +2211,14 @@ impl Service {
     /// new master toggle; `max_file_size` / `keep_partial` /
     /// `inject_to_clipboard` are new fields wired through
     /// `Config::clipboard_config` getters.
+    ///
+    /// **M5 STEP-5.3** — also broadcasts
+    /// [`FrontendEvent::ClipboardConfigChanged`] so the GUI can
+    /// re-sync its `state.clipboardConfig` mirror (e.g. when a CLI
+    /// `SetClipboardConfig` write from another shell changes the
+    /// config). The payload is the post-write [`ClipboardConfig`],
+    /// not a delta — matches the same echo pattern as
+    /// [`FrontendEvent::QuicConfig`].
     fn set_clipboard_config(&mut self, cfg: lan_mouse_ipc::ClipboardConfig) {
         self.config.set_clipboard_config(cfg.clone());
         if let Err(e) = self.config.write_back() {
@@ -2219,6 +2237,9 @@ impl Service {
             cfg.ignore_images,
             cfg.ignore_files,
         );
+        // Echo the post-write config so the GUI re-syncs. Same
+        // pattern as `set_quic_idle_timeout` → `QuicConfig` push.
+        self.notify_frontend(FrontendEvent::ClipboardConfigChanged(cfg));
     }
 
     /// **M4 STEP-4.1** — per-file size ceiling in bytes, live-read
