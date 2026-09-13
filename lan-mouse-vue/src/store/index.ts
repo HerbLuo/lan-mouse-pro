@@ -393,6 +393,17 @@ export function getSocket(): DaemonSocket {
   return socket
 }
 
+/** **Test-only seam** — replaces the module-private socket
+ *  singleton with a supplied fake (or `null` to restore).
+ *  Mirrors the same `export` pattern used for `applyEvent` /
+ *  `diffClientConfigPatch` — gives vitest a way to drive the
+ *  IPC helper tests (`setClipboardConfig` /
+ *  `setEnableClipboardTo`) without spinning up a real
+ *  WebSocket. Pass `null` to clear the seam. */
+export function _setSocketForTest(s: DaemonSocket | null) {
+  socket = s
+}
+
 export const daemonStore = state
 export const connStateRef = connState
 
@@ -419,6 +430,26 @@ export function changePort(port: number) {
  *  running endpoint is not rebuilt until the daemon restarts. */
 export function setQuicIdleTimeout(secs: number) {
   getSocket().request({ SetQuicIdleTimeout: secs })
+}
+
+/** Persist the daemon-global clipboard config. Mirrors
+ *  `lan_mouse_ipc::FrontendRequest::SetClipboardConfig` — the
+ *  daemon writes the payload to TOML `[clipboard]` and echoes it
+ *  back via `ClipboardConfigChanged`. Called from `GeneralPanel`
+ *  on every checkbox / input change. The store's reactive
+ *  `state.clipboardConfig` is overwritten by the echo, so callers
+ *  should not bother updating it locally. */
+export function setClipboardConfig(cfg: ClipboardConfig) {
+  getSocket().request({ SetClipboardConfig: cfg })
+}
+
+/** Persist a per-peer `enable_clipboard_to` toggle. Mirrors
+ *  `lan_mouse_ipc::FrontendRequest::SetEnableClipboardTo`; the
+ *  daemon writes to TOML `[[clients]]` and echoes via `State`.
+ *  Called from `ConnectionRow` on the "Push clipboard to this
+ *  peer" checkbox change. */
+export function setEnableClipboardTo(handle: ClientHandle, enable: boolean) {
+  getSocket().request({ SetEnableClipboardTo: [handle, enable] })
 }
 
 export function enableCapture() {
