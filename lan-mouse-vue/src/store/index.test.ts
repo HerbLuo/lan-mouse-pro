@@ -1,9 +1,11 @@
 import { describe, expect, it, beforeEach } from 'vitest'
 import { daemonStore, diffClientConfigPatch } from './index'
 import type {
+  ClipboardConfig,
   ClientConfig,
   ClientHandle,
   ClientState,
+  FileTransferFailed,
   FrontendRequest,
   MonitorInfo,
 } from '../api/ipc'
@@ -218,5 +220,198 @@ describe('daemonStore.monitors initial state', () => {
     // (other tests may have run first) but the field MUST be
     // an array, and reading it cannot throw.
     expect(Array.isArray(daemonStore.monitors)).toBe(true)
+  })
+})
+
+// ---------- M5 STEP-5.3: ClipboardConfigChanged → state.clipboardConfig ----------
+
+const SAMPLE_CLIPBOARD_CONFIG: ClipboardConfig = {
+  enabled: true,
+  accept_dir: '/Users/me/Downloads/lan-mouse',
+  ignore_text: false,
+  ignore_images: false,
+  ignore_files: true,
+  max_file_size: 100 * 1024 * 1024,
+  keep_partial: false,
+  inject_to_clipboard: true,
+}
+
+describe('ClipboardConfigChanged event → state.clipboardConfig', () => {
+  beforeEach(() => {
+    // Reset to the placeholder shape between tests so a stale
+    // carry-over from a sibling describe() can't pollute the
+    // assertions. The placeholder matches the IPC default
+    // shape (enabled / 50 MiB / inject_to_clipboard = true).
+    daemonStore.clipboardConfig = {
+      enabled: true,
+      accept_dir: '',
+      ignore_text: false,
+      ignore_images: false,
+      ignore_files: false,
+      max_file_size: 50 * 1024 * 1024,
+      keep_partial: false,
+      inject_to_clipboard: true,
+    }
+  })
+
+  it('replaces state.clipboardConfig wholesale on a ClipboardConfigChanged event', async () => {
+    const { applyEvent } = await import('./index')
+    applyEvent({ ClipboardConfigChanged: SAMPLE_CLIPBOARD_CONFIG })
+    expect(daemonStore.clipboardConfig).toEqual(SAMPLE_CLIPBOARD_CONFIG)
+    expect(daemonStore.clipboardConfig.max_file_size).toBe(100 * 1024 * 1024)
+    expect(daemonStore.clipboardConfig.inject_to_clipboard).toBe(true)
+  })
+
+  it('replaces state.clipboardConfig on subsequent events (no stale merge)', async () => {
+    const { applyEvent } = await import('./index')
+    applyEvent({ ClipboardConfigChanged: SAMPLE_CLIPBOARD_CONFIG })
+    expect(daemonStore.clipboardConfig.ignore_files).toBe(true)
+
+    // A later event with different values must fully replace —
+    // not merge — the cached config (the daemon is the source
+    // of truth, no client-side diffing).
+    const updated: ClipboardConfig = {
+      ...SAMPLE_CLIPBOARD_CONFIG,
+      enabled: false,
+      inject_to_clipboard: false,
+    }
+    applyEvent({ ClipboardConfigChanged: updated })
+    expect(daemonStore.clipboardConfig.enabled).toBe(false)
+    expect(daemonStore.clipboardConfig.inject_to_clipboard).toBe(false)
+    // ignore_files was true in the first payload and remains true
+    // in the second (we carry it forward via the spread), but the
+    // point is that the second payload's values are authoritative
+    // — the first payload's `ignore_files = true` did NOT get
+    // silently re-applied on top.
+    expect(daemonStore.clipboardConfig.ignore_files).toBe(true)
+  })
+})
+
+// ---------- M5 STEP-5.3: clipboardConfig initial placeholder ----------
+
+describe('daemonStore.clipboardConfig initial state', () => {
+  beforeEach(() => {
+    // The previous describe() may have left `enabled: false` on
+    // the singleton; reset so this assertion reads the true
+    // placeholder shape.
+    daemonStore.clipboardConfig = {
+      enabled: true,
+      accept_dir: '',
+      ignore_text: false,
+      ignore_images: false,
+      ignore_files: false,
+      max_file_size: 50 * 1024 * 1024,
+      keep_partial: false,
+      inject_to_clipboard: true,
+    }
+  })
+
+  it('starts with the post-M4 IPC default shape (placeholder)', () => {
+    // Before the first `ClipboardConfigChanged` event lands the
+    // store must hand templates a usable shape — reading
+    // `state.clipboardConfig.max_file_size` cannot throw, the
+    // `inject_to_clipboard` checkbox must already be on, etc.
+    expect(daemonStore.clipboardConfig.enabled).toBe(true)
+    expect(daemonStore.clipboardConfig.max_file_size).toBe(50 * 1024 * 1024)
+    expect(daemonStore.clipboardConfig.inject_to_clipboard).toBe(true)
+    expect(daemonStore.clipboardConfig.keep_partial).toBe(false)
+  })
+})
+
+// ---------- M5 STEP-5.3: ClipboardState → state.lastClipboard* ----------
+
+describe('ClipboardState event → state.lastClipboard*', () => {
+  beforeEach(() => {
+    daemonStore.lastClipboardText = ''
+    daemonStore.lastClipboardAt = 0
+    daemonStore.lastClipboardSource = ''
+  })
+
+  it('populates the three lastClipboard fields from a ClipboardState event', async () => {
+    const { applyEvent } = await import('./index')
+    applyEvent({
+      ClipboardState: {
+        last_text_ts: 1700000000000,
+        last_image_ts: null,
+        last_file_ts: null,
+        last_source: 'peer-west',
+      },
+    })
+    expect(daemonStore.lastClipboardAt).toBe(1700000000000)
+    expect(daemonStore.lastClipboardSource).toBe('peer-west')
+    // text payload never crosses the IPC; field stays empty.
+    expect(daemonStore.lastClipboardText).toBe('')
+  })
+
+  it('collapses null timestamps and source to sentinel values (0 / "")', async () => {
+    const { applyEvent } = await import('./index')
+    applyEvent({
+      ClipboardState: {
+        last_text_ts: null,
+        last_image_ts: null,
+        last_file_ts: null,
+        last_source: null,
+      },
+    })
+    expect(daemonStore.lastClipboardAt).toBe(0)
+    expect(daemonStore.lastClipboardSource).toBe('')
+  })
+
+  it('uses last_text_ts specifically (not the file/image timestamps)', async () => {
+    const { applyEvent } = await import('./index')
+    applyEvent({
+      ClipboardState: {
+        last_text_ts: 1000,
+        last_image_ts: 5000, // different, should be ignored
+        last_file_ts: 9000, // different, should be ignored
+        last_source: 'peer-east',
+      },
+    })
+    expect(daemonStore.lastClipboardAt).toBe(1000)
+    expect(daemonStore.lastClipboardSource).toBe('peer-east')
+  })
+})
+
+// ---------- M5 STEP-5.1: FileTransferFailed → toast (one-way, no actions) ----------
+
+describe('FileTransferFailed event → warning toast', () => {
+  beforeEach(() => {
+    daemonStore.toasts = []
+  })
+
+  it('pushes a warning toast with the raw reason string', async () => {
+    const { applyEvent } = await import('./index')
+    const evt: FileTransferFailed = {
+      sha256: [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+        0x32, 0x10, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+        0xdd, 0xee, 0xff, 0x00,
+      ],
+      reason: 'connection lost',
+      ts_ms: 1700000000123,
+    }
+    applyEvent({ FileTransferFailed: evt })
+    // Single toast — auto-dismissed on a 4s timer (success /
+    // info / warning kinds are timed; only error is sticky).
+    expect(daemonStore.toasts).toHaveLength(1)
+    const toast = daemonStore.toasts[0]!
+    expect(toast.kind).toBe('warning')
+    expect(toast.message).toContain('connection lost')
+  })
+
+  it('surfaces all three reason strings verbatim', async () => {
+    const { applyEvent } = await import('./index')
+    for (const reason of ['connection lost', 'timeout', 'peer cancelled']) {
+      daemonStore.toasts = []
+      applyEvent({
+        FileTransferFailed: {
+          sha256: new Array(32).fill(0),
+          reason,
+          ts_ms: 1,
+        },
+      })
+      expect(daemonStore.toasts).toHaveLength(1)
+      expect(daemonStore.toasts[0]!.message).toContain(reason)
+    }
   })
 })
