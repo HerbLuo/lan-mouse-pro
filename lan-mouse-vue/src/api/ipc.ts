@@ -123,6 +123,24 @@ export type FrontendEvent =
    *  string such as `monitor "DP-2" disconnected` — surfaced
    *  verbatim as a tooltip on the ConnectionRow. */
   | { BindingInvalid: [ClientHandle, string] }
+  /** M0c — clipboard state snapshot. Carries only timestamps and
+   *  the originating peer (never the actual clipboard payload — the
+   *  text/image bytes already travel through StreamC). `None` on
+   *  each timestamp means "never". The store mirrors this into
+   *  `state.lastClipboardAt` / `state.lastClipboardSource` so the
+   *  GUI can show the most recent text sync. */
+  | { ClipboardState: ClipboardState }
+  /** M5 STEP-5.1 — outbound file transfer failed (network dropped,
+   *  peer cancelled, timeout). The GUI surfaces this as a one-way
+   *  warning toast — no accept/reject actions (auto-accept only,
+   *  per the 2026-09-13 user decision). */
+  | { FileTransferFailed: FileTransferFailed }
+  /** M5 STEP-5.3 — echoes the daemon-global [`ClipboardConfig`]
+   *  after a `SetClipboardConfig` IPC write, or on every WS
+   *  reconnect as the authoritative initial snapshot. The store
+   *  replaces (not patches) `state.clipboardConfig` with the
+   *  payload. */
+  | { ClipboardConfigChanged: ClipboardConfig }
 
 /** STEP-M2-2.6: mirrors `lan_mouse_ipc::MonitorInfo` (and the
  *  geometry crate's internal `MonitorInfo` — the two are
@@ -135,6 +153,59 @@ export interface MonitorInfo {
   size: [number, number]
   primary: boolean
   scale: number
+}
+
+/** M4 / M5 — daemon-global clipboard configuration, mirrors
+ *  `lan_mouse_ipc::ClipboardConfig` 1:1 (8 fields, post-M4
+ *  expansion). The store caches the latest snapshot and re-syncs
+ *  it on every `ClipboardConfigChanged` event. */
+export interface ClipboardConfig {
+  enabled: boolean
+  /** Absolute path. Required since auto-accept is the only mode
+   *  (M4 dropped `auto_accept_files`); a missing field on the
+   *  wire fails to deserialize. */
+  accept_dir: string
+  ignore_text: boolean
+  ignore_images: boolean
+  ignore_files: boolean
+  /** Per-file ceiling in bytes; `0` means "no limit". */
+  max_file_size: number
+  /** Keep `.partial` files on disconnect (postmortem aid). */
+  keep_partial: boolean
+  /** Auto-push landed file paths into the local OS clipboard so
+   *  the user can Cmd+V directly (default `true`). */
+  inject_to_clipboard: boolean
+}
+
+/** M0c — clipboard state snapshot. Mirrors
+ *  `lan_mouse_ipc::FrontendEvent::ClipboardState`. The actual
+ *  clipboard payload (text / image bytes) travels over StreamC,
+ *  not over this IPC event — only the metadata crosses. */
+export interface ClipboardState {
+  /** Unix epoch ms of the last text sync; `null` means "never". */
+  last_text_ts: number | null
+  last_image_ts: number | null
+  last_file_ts: number | null
+  /** Peer hostname / fingerprint that pushed the most recent
+   *  change; `null` means "the change originated locally". */
+  last_source: string | null
+}
+
+/** M5 STEP-5.1 — outbound file transfer failure. The Vue store
+ *  surfaces this as a one-way warning toast with the raw reason
+ *  string (e.g. `"connection lost"` / `"timeout"` /
+ *  `"peer cancelled"`); no accept/reject actions per the
+ *  2026-09-13 user decision (auto-accept only). */
+export interface FileTransferFailed {
+  /** 32-byte sha256; the wire carries a JSON number array
+   *  `[u8; 32]`, so we represent it as `number[]` here and the
+   *  store converts to lowercase hex for display. */
+  sha256: number[]
+  /** Stable wire contract — matches `FileFetchErrorKind::as_reason()`
+   *  in `service.rs`. */
+  reason: string
+  /** Unix epoch ms at which the daemon detected the failure. */
+  ts_ms: number
 }
 
 export type FrontendRequest =
