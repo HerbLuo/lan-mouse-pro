@@ -1,6 +1,13 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { daemonStore, deleteClient, resolveDns, toggleClient, updateClientConfig } from '@/store'
+import {
+  daemonStore,
+  deleteClient,
+  resolveDns,
+  setEnableClipboardTo,
+  toggleClient,
+  updateClientConfig,
+} from '@/store'
 import type { Connection } from '@/store'
 import type { ChannelMode, ClientConfig, MonitorInfo, Position } from '@/api/ipc'
 import IconChevron from '@/components/icons/IconChevron.vue'
@@ -14,6 +21,17 @@ const { connection } = defineProps<{ connection: Connection }>()
 // the value actually changed, so callers don't need to guard repeats.
 function setField(patch: Partial<ClientConfig>) {
   updateClientConfig(connection.handle, patch)
+}
+
+// Per-peer clipboard push opt-in. Reads
+// `connection.config.enable_clipboard_to` (default `true`); on
+// change the row dispatches `FrontendRequest::SetEnableClipboardTo(handle, bool)`
+// which persists to TOML `[[clients]]` `enable_clipboard_to` and
+// echoes back via `FrontendEvent::State`. Distinct from the
+// daemon-global `inject_to_clipboard` toggle on GeneralPanel
+// (this one is per-peer).
+function setEnableClipboard(enable: boolean) {
+  setEnableClipboardTo(connection.handle, enable)
 }
 
 // Mouse/keyboard channel selectors share an identical structure:
@@ -245,6 +263,23 @@ function setMonitor(ev: Event) {
           <span
             class="desc"
             tooltip="Stream is reliable (no dropped keys); Datagram is the game-friendly low-latency choice if you tolerate occasional lost keystrokes."
+            >?</span
+          >
+        </label>
+        <!-- M5 STEP-5.4: per-peer clipboard push opt-in. Distinct
+             from the daemon-global `inject_to_clipboard` toggle
+             (in GeneralPanel): this checkbox controls whether this
+             peer receives clipboard pushes at all. -->
+        <label class="full">
+          <span class="lbl">Push clipboard to this peer</span>
+          <input
+            type="checkbox"
+            :checked="connection.config.enable_clipboard_to"
+            @change="setEnableClipboard(($event.target as HTMLInputElement).checked)"
+          />
+          <span
+            class="desc"
+            tooltip="Untick to stop pushing clipboard updates (text / image / file) to this peer. The daemon-global 'Inject to clipboard' setting still controls the reverse direction (files landing locally → local clipboard)."
             >?</span
           >
         </label>
