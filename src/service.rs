@@ -2801,6 +2801,7 @@ impl Service {
                 );
             }
             DispatchFilesOutcome::ExceedsLimit {
+                fingerprint,
                 offending,
                 size,
                 limit,
@@ -2832,6 +2833,25 @@ impl Service {
                 let now_ms = unix_now_ms();
                 self.last_file_ts_ms = Some(now_ms);
                 self.last_clipboard_source = None;
+                // **2026-09-13 fix** — record the offending
+                // file's selection fingerprint so the NEXT poller
+                // tick with the SAME clipboard state short-circuits
+                // at `dispatch_files_decide`'s `fingerprint_eq`
+                // check (`service.rs:4594`) and never reaches
+                // `spawn_blocking` or fires another popup. Without
+                // this, an oversized file left sitting on the
+                // clipboard produces a popup storm every 500 ms
+                // tick (and the synchronous `notify_rust::show()`
+                // + repeated `spawn_blocking` calls back-pressure
+                // the runtime enough that `tokio::select!`'s
+                // `signal::ctrl_c()` arm can no longer fire — the
+                // user reports the daemon becomes unresponsive to
+                // Ctrl+C while the storm is running). The
+                // fingerprint value is recomputed at the top of
+                // `dispatch_files_decide` from the live `paths` so
+                // it is identical to what the short-circuit would
+                // have seen had it been set.
+                self.last_outbound_files_fingerprint = Some(fingerprint);
                 self.notify_frontend(FrontendEvent::ClipboardState {
                     last_text_ts: self.last_text_ts_ms,
                     last_image_ts: self.last_image_ts_ms,
@@ -4552,7 +4572,24 @@ pub(crate) enum DispatchFilesOutcome {
     /// At least one file exceeds `max_size` — fire a popup and
     /// return (no StreamC push, no cache fill, no HTTP/3
     /// setup). See PLAN §5 风险 #25.
+    ///
+    /// **Carries `fingerprint`** (2026-09-13): so the dispatcher
+    /// arm can stamp `last_outbound_files_fingerprint` and stop
+    /// the per-tick popup storm when the same oversized file
+    /// sits on the clipboard across multiple poller ticks.
+    /// Without this, an oversized file selection produced a
+    /// popup every 500 ms tick and the synchronous popup +
+    /// repeated `spawn_blocking` calls back-pressured the
+    /// runtime enough that `signal::ctrl_c()` could no longer
+    /// fire (the user reported the daemon became unresponsive
+    /// to Ctrl+C while the storm was running).
     ExceedsLimit {
+        /// Fingerprint of the offending path list — see the
+        /// `Ok` variant for the same field. The dispatcher
+        /// copies this into `last_outbound_files_fingerprint`
+        /// so the next tick with the same selection short-
+        /// circuits at the `fingerprint_eq` guard above.
+        fingerprint: [u8; 32],
         offending: PathBuf,
         size: u64,
         limit: u64,
@@ -4622,6 +4659,14 @@ pub(crate) async fn dispatch_files_decide(
             size,
             limit,
         })) => DispatchFilesOutcome::ExceedsLimit {
+            // 2026-09-13 fix: carry the already-computed
+            // `fingerprint` (line 4593 above) into the
+            // outcome so the dispatcher arm can stamp
+            // `last_outbound_files_fingerprint` and stop the
+            // per-tick popup storm when the same oversized
+            // file sits on the clipboard across multiple
+            // poller ticks.
+            fingerprint,
             offending,
             size,
             limit,
@@ -8046,6 +8091,7 @@ mod dispatch_files_tests {
 
         match outcome {
             DispatchFilesOutcome::ExceedsLimit {
+                fingerprint: _fingerprint,
                 offending,
                 size,
                 limit,
