@@ -690,27 +690,35 @@ fn err_to_string(op: &str, err: u32) -> String {
 ///
 /// **Wire format** (shellapi.h + MSDN `DROPFILES` docs):
 /// - `DROPFILES` struct (20 bytes, little-endian):
-///   | offset | size | field          | value            |
-///   |--------|------|----------------|------------------|
-///   | 0      | 4    | `pFiles`       | `0xFFFFFFFF`     |
-///   | 4      | 4    | `pt.x`         | `0`              |
-///   | 8      | 4    | `pt.y`         | `0`              |
-///   | 12     | 4    | `fNC`          | `0`              |
-///   | 16     | 4    | `fWide`        | `1` (UTF-16 wide)|
+///   | offset | size | field          | value                          |
+///   |--------|------|----------------|--------------------------------|
+///   | 0      | 4    | `pFiles`       | `20` (`sizeof(DROPFILES)`)     |
+///   | 4      | 4    | `pt.x`         | `0`                            |
+///   | 8      | 4    | `pt.y`         | `0`                            |
+///   | 12     | 4    | `fNC`          | `0`                            |
+///   | 16     | 4    | `fWide`        | `1` (UTF-16 wide)              |
 /// - File-list: each path is UTF-16 LE + NUL wchar; the list is
 ///   terminated by a second NUL wchar (the double-NUL
 ///   convention — `DragQueryFileW` walks the buffer until it
 ///   sees two consecutive NUL wchars).
 ///
-/// **`pFiles = 0xFFFFFFFF`**: the offset (in bytes) of the
-/// file-list from the start of the structure. The MS-defined
-/// sentinel `0xFFFFFFFF` means "the file list immediately
-/// follows the DROPFILES struct" — every modern Win32 producer
-/// and consumer expects this value. Using `sizeof(DROPFILES) =
-/// 20` is also valid but `0xFFFFFFFF` is the canonical
-/// sentinel (the difference is whether the consumer adds
-/// `pFiles` to the buffer base; with `0xFFFFFFFF` the base
-/// stays at the start of the payload).
+/// **`pFiles = sizeof(DROPFILES) = 20`** is the byte offset from
+/// the start of the structure to the file list. **This is the
+/// only correct value for a non-empty CF_HDROP payload.**
+///
+/// **SUGGESTION #S-12 (2026-09-13)**: prior to this commit the
+/// helper wrote `pFiles = 0xFFFFFFFF`, a value taken from a
+/// misreading of MS literature. `0xFFFFFFFF` is the `uFile`
+/// parameter sentinel for `DragQueryFileW(_query_count_)`, **not**
+/// a valid value for the `pFiles` field. Every other Win32
+/// producer and consumer (Explorer, `DragQueryFileW`, Python
+/// `ctypes` examples, MFC drop targets, etc.) treats `pFiles` as
+/// a literal byte offset — `0xFFFFFFFF` produces
+/// `buffer + 0xFFFFFFFF = wild pointer` and crashes the consumer
+/// with STATUS_ACCESS_VIOLATION. Confirmed by WeChat (and our
+/// own `current_files` reading back the stale handle from
+/// Clipboard History) segfaulting on the malformed payload. The
+/// fix is simply `pFiles = sizeof(DROPFILES) = 20`.
 ///
 /// **Why a free function (not a method)**: same rationale as
 /// `encode_png_to_dib` — pure bytes-in / bytes-out, no `Self`
@@ -745,7 +753,13 @@ fn build_dropfiles_payload(paths: &[PathBuf]) -> Result<Vec<u8>, ClipboardError>
 
     let mut buf = Vec::with_capacity(payload_size);
     // DROPFILES header.
-    buf.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes()); // pFiles sentinel
+    // **SUGGESTION #S-12 fix (2026-09-13)**: pFiles must be
+    // `sizeof(DROPFILES) = 20`, the actual offset from the start
+    // of the struct to the file list. The previous `0xFFFFFFFF`
+    // value was a misread of MS literature (it's the `uFile` arg
+    // sentinel for `DragQueryFileW`, not a `pFiles` value).
+    // See the doc comment above for the full rationale.
+    buf.extend_from_slice(&20u32.to_le_bytes()); // pFiles = sizeof(DROPFILES)
     buf.extend_from_slice(&0i32.to_le_bytes()); // pt.x
     buf.extend_from_slice(&0i32.to_le_bytes()); // pt.y
     buf.extend_from_slice(&0u32.to_le_bytes()); // fNC
@@ -1108,11 +1122,18 @@ mod tests {
             buf.len()
         );
 
-        // pFiles = 0xFFFFFFFF (sentinel).
+        // pFiles = sizeof(DROPFILES) = 20 (the byte offset from the
+        // start of the struct to the file list). SUGGESTION #S-12
+        // (2026-09-13): the previous `0xFFFFFFFF` value was wrong
+        // — it's the `uFile` sentinel for `DragQueryFileW(_query
+        // _count_)`, not a `pFiles` value. WeChat + our own
+        // `current_files` both segfaulted on the malformed
+        // payload because consumers treat `pFiles` as a literal
+        // byte offset.
         let p_files = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         assert_eq!(
-            p_files, 0xFFFFFFFF,
-            "pFiles must be the 0xFFFFFFFF sentinel; got {p_files:#x}"
+            p_files, 20,
+            "pFiles must be sizeof(DROPFILES) = 20 (offset to file list); got {p_files:#x}"
         );
 
         // pt.x, pt.y, fNC = 0.
