@@ -36,6 +36,14 @@ export interface ClientConfig {
    *  same null contract here so the dropdown's "Any (back-compat)"
    *  option is naturally the empty / missing case. */
   monitor: string | null
+  /** M0c / PLAN-2 — whether this peer should receive clipboard
+   *  pushes from the local daemon. Default `true` (legacy
+   *  behavior; matches the `#[serde(default =
+   *  "default_enable_clipboard_to")]` on the Rust side). The
+   *  per-row checkbox in `ConnectionRow` (label "Push clipboard
+   *  to this peer") writes `false` here via
+   *  `setEnableClipboardTo(handle, bool)`. */
+  enable_clipboard_to: boolean
 }
 
 export interface ClientState {
@@ -237,6 +245,20 @@ export type FrontendRequest =
   | { SetClientInputChannels: [ClientHandle, InputChannelConfig] }
   | { SaveConfiguration: null }
   | { SetQuicIdleTimeout: number }
+  /** M0c — per-peer clipboard push opt-in. Mirrors
+   *  `lan_mouse_ipc::FrontendRequest::SetEnableClipboardTo`. The
+   *  per-row checkbox in `ConnectionRow` writes this on toggle
+   *  (label "Push clipboard to this peer"); the daemon persists
+   *  to TOML `[[clients]]` and echoes back via `State`. */
+  | { SetEnableClipboardTo: [ClientHandle, boolean] }
+  /** M4 STEP-4.1 / M5 STEP-5.4 — daemon-global clipboard config
+   *  write. Carries the full [`ClipboardConfig`] payload (8
+   *  fields); the daemon persists to TOML `[clipboard]` and
+   *  echoes back via `ClipboardConfigChanged`. The GeneralPanel
+   *  template binds each checkbox / input to a sub-field, then
+   *  debounces / commits via `setClipboardConfig(...)` on
+   *  change. */
+  | { SetClipboardConfig: ClipboardConfig }
 
 /**
  * Reactive WebSocket connection to the daemon's `/ws` endpoint.
