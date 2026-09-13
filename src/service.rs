@@ -4058,7 +4058,25 @@ impl Service {
         // tick that re-reads the file selection sees the
         // matching fingerprint and short-circuits at
         // `dispatch_files_decide` (mirrors commit `d6fb1d8`).
-        self.last_outbound_files_fingerprint = Some(batch_fingerprint);
+        //
+        // **SUGGESTION #S-12 follow-up (2026-09-13)**: stamp with
+        // the **local** fingerprint computed from the
+        // re-injected `paths` — NOT with `batch_fingerprint`
+        // (which is the inbound envelope fingerprint, computed
+        // on the sender side from the sender's path strings).
+        // The two diverge because the receiver's `resolve_unique_path`
+        // appends a collision suffix (` (1)`, ` (2)`, ...) when the
+        // sender's basename already exists in `accept_dir`, so the
+        // receiver's re-injected path list hashes to a different
+        // fingerprint. Stamping with `batch_fingerprint` left the
+        // next tick's `fingerprint_eq` check failing every cycle,
+        // producing an infinite A → B → A' → B' → A'' loop until the
+        // pong watchdog killed the connection. The local fingerprint
+        // is what `dispatch_files_decide` will recompute on the next
+        // tick from the same `paths` we just wrote, so the check now
+        // succeeds and the loop short-circuits.
+        let local_fingerprint = file_selection_fingerprint(&paths);
+        self.last_outbound_files_fingerprint = Some(local_fingerprint);
         // Send to the poller-owned backend via the cmd channel.
         let Some(cmd_tx) = self.clipboard_backend_cmd.as_ref() else {
             log::warn!(
