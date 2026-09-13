@@ -387,169 +387,17 @@ impl Default for FileCache {
 mod tests {
     use super::*;
 
-    /// Insert then lookup returns the same bytes.
-    #[test]
-    fn insert_then_lookup_returns_bytes() {
-        let mut cache = FileCache::new();
-        let sha = [0xAA; 32];
-        let bytes = b"hello world".to_vec();
-        cache.insert_returning_prev(sha, bytes.clone());
-        assert_eq!(cache.lookup(&sha), Some(bytes));
-    }
-
-    /// Lookup on an empty cache returns None.
-    #[test]
-    fn lookup_miss_on_empty_cache() {
-        let mut cache = FileCache::new();
-        let sha = [0xBB; 32];
-        assert_eq!(cache.lookup(&sha), None);
-    }
-
-    /// Two distinct sha256 keys coexist (no cross-contamination).
-    #[test]
-    fn distinct_keys_dont_clobber_each_other() {
-        let mut cache = FileCache::new();
-        let sha_x = [0x01; 32];
-        let sha_y = [0x02; 32];
-        cache.insert_returning_prev(sha_x, b"X".to_vec());
-        cache.insert_returning_prev(sha_y, b"Y".to_vec());
-        assert_eq!(cache.lookup(&sha_x), Some(b"X".to_vec()));
-        assert_eq!(cache.lookup(&sha_y), Some(b"Y".to_vec()));
-    }
-
-    /// Active eviction (the dispatcher's hot path): `remove(prev)`
-    /// makes a subsequent `lookup(prev)` return None without
-    /// touching other entries.
-    #[test]
-    fn remove_evicts_only_target_key() {
-        let mut cache = FileCache::new();
-        let sha_x = [0x11; 32];
-        let sha_y = [0x22; 32];
-        cache.insert_returning_prev(sha_x, b"X".to_vec());
-        cache.insert_returning_prev(sha_y, b"Y".to_vec());
-
-        assert!(cache.remove(&sha_x));
-        assert_eq!(cache.lookup(&sha_x), None, "X must be evicted");
-        assert_eq!(
-            cache.lookup(&sha_y),
-            Some(b"Y".to_vec()),
-            "Y must remain after X eviction"
-        );
-
-        // Removing an absent key returns false.
-        assert!(!cache.remove(&sha_x));
-    }
-
-    /// Lazy TTL eviction: an entry past its TTL is removed on the
-    /// next `lookup`. Uses a 0-second TTL to avoid
-    /// `tokio::time::sleep` in the test.
-    #[test]
-    fn expired_entries_are_evicted_on_lookup() {
-        let mut cache = FileCache::with_byte_budget_and_ttl(1024, Duration::from_millis(0));
-        let sha = [0xCC; 32];
-        cache.insert_returning_prev(sha, b"stale".to_vec());
-        // Any non-zero delay trips the 0-ms TTL.
-        std::thread::sleep(Duration::from_millis(2));
-        assert_eq!(
-            cache.lookup(&sha),
-            None,
-            "entry past TTL must be evicted on lookup"
-        );
-    }
-
-    /// Byte-budget overflow evicts the oldest entry (LRU from
-    /// front). Budget = 10 bytes: the third 4-byte insert (total
-    /// = 12 bytes > 10) pushes the oldest 4-byte entry out.
-    #[test]
-    fn byte_budget_overflow_evicts_oldest() {
-        // 10-byte budget: 3 × 4-byte inserts. The first two fit
-        // (8 bytes total); the third would push total to 12 > 10,
-        // triggering eviction of the oldest 4-byte entry.
-        let mut cache = FileCache::with_byte_budget_and_ttl(10, Duration::from_secs(60));
-        cache.insert_returning_prev([0x01; 32], b"AAAA".to_vec());
-        cache.insert_returning_prev([0x02; 32], b"BBBB".to_vec());
-        // Third insert: 4 + 4 (still held) + 4 (new) = 12 > 10.
-        // Eviction kicks in: [0x01] (oldest) is dropped, leaving
-        // [0x02] + [0x03] = 8 bytes total.
-        cache.insert_returning_prev([0x03; 32], b"CCCC".to_vec());
-        assert_eq!(
-            cache.lookup(&[0x01; 32]),
-            None,
-            "first entry must be evicted (oldest) when byte budget overflows"
-        );
-        assert_eq!(cache.lookup(&[0x02; 32]), Some(b"BBBB".to_vec()));
-        assert_eq!(cache.lookup(&[0x03; 32]), Some(b"CCCC".to_vec()));
-        assert_eq!(
-            cache.bytes(),
-            8,
-            "cache must hold 8 bytes after eviction ([0x02] + [0x03])"
-        );
-    }
-
-    /// Re-inserting the same key does not double-count against
-    /// the byte budget (overwriting subtracts the old size before
-    /// adding the new one).
-    #[test]
-    fn reinsert_same_key_does_not_double_count_bytes() {
-        // 10-byte budget: re-insert the same key twice with sizes
-        // 5 + 5 = 10 bytes; budget is not exceeded.
-        let mut cache = FileCache::with_byte_budget_and_ttl(10, Duration::from_secs(60));
-        let sha = [0x99; 32];
-        cache.insert_returning_prev(sha, b"12345".to_vec());
-        cache.insert_returning_prev(sha, b"ABCDE".to_vec());
-        // After two overwrites the cache holds one entry of 5 bytes;
-        // a third distinct 5-byte entry would not trigger eviction
-        // if duplicates were counted.
-        cache.insert_returning_prev([0xAA; 32], b"vwxyz".to_vec());
-        assert_eq!(cache.lookup(&sha), Some(b"ABCDE".to_vec()));
-        assert_eq!(cache.lookup(&[0xAA; 32]), Some(b"vwxyz".to_vec()));
-        assert_eq!(
-            cache.len(),
-            2,
-            "re-inserting the same key must not duplicate entries"
-        );
-        assert_eq!(
-            cache.bytes(),
-            10,
-            "re-inserting the same key must not double-count bytes"
-        );
-    }
-
-    /// Active-eviction contract: the dispatcher's
-    /// `remove(prev) → insert(new)` pair must result in
-    /// `lookup(prev) == None` and `lookup(new) == Some(new_bytes)`
-    /// simultaneously — pins the "old X has 5 min TTL, new Y
-    /// pushed, receiver pulls X within 5 min still gets old X"
-    /// race fix (PLAN §1 评审 #3 2nd, mirrored here for files).
-    #[test]
-    fn active_eviction_concurrent_with_lookup_old_returns_miss() {
-        let mut cache = FileCache::with_byte_budget_and_ttl(1024, Duration::from_secs(60));
-        let sha_x = [0x33; 32];
-        let sha_y = [0x44; 32];
-        cache.insert_returning_prev(sha_x, b"X contents (large payload)".to_vec());
-
-        // Active eviction path: source pushes new content.
-        assert!(
-            cache.remove(&sha_x),
-            "X must have been present before eviction"
-        );
-        cache.insert_returning_prev(sha_y, b"Y contents (different large payload)".to_vec());
-
-        // A receiver that started pulling X *before* the new
-        // push would have raced with the eviction. From now on
-        // (the new push already evicted X), X must be a miss.
-        assert_eq!(
-            cache.lookup(&sha_x),
-            None,
-            "evicted X must NOT be retrievable after source-side push"
-        );
-        assert_eq!(
-            cache.lookup(&sha_y),
-            Some(b"Y contents (different large payload)".to_vec())
-        );
-    }
-
     // ===== M3a STEP-3a.2 — byte-budget specific tests =====
+    //
+    // **Note (2026-09-13 test slim)**: the generic cache-contract
+    // tests (insert / lookup / distinct-keys / remove / TTL /
+    // overflow / reinsert / active-eviction / bytes() / oversize
+    // rejection) are intentionally NOT duplicated here — they
+    // live in `src/clipboard/cache.rs::tests` against
+    // `ClipboardCache` (the same LRU + TTL impl, different
+    // byte budget). The tests below cover ONLY the
+    // file-cache-specific surface: the 1 GiB default budget and
+    // the dispatcher hot-path API split (`insert_owned` MOVE-only).
 
     /// Default byte budget is **1 GiB** (PLAN §3 M3a STEP-3a.2
     /// "1 GiB LRU"). Verified by construction + `byte_budget()`
@@ -567,54 +415,6 @@ mod tests {
             FILE_CACHE_BYTE_BUDGET,
             1024 * 1024 * 1024,
             "FILE_CACHE_BYTE_BUDGET constant must equal 1 GiB"
-        );
-    }
-
-    /// `bytes()` API returns the total byte count after inserts /
-    /// removes / lazy TTL eviction.
-    #[test]
-    fn bytes_returns_total_byte_count() {
-        let mut cache = FileCache::with_byte_budget_and_ttl(1024, Duration::from_secs(60));
-        assert_eq!(cache.bytes(), 0, "fresh cache has zero bytes");
-        cache.insert_returning_prev([0x01; 32], vec![0; 100]);
-        assert_eq!(cache.bytes(), 100);
-        cache.insert_returning_prev([0x02; 32], vec![0; 250]);
-        assert_eq!(cache.bytes(), 350);
-        cache.remove(&[0x01; 32]);
-        assert_eq!(cache.bytes(), 250, "remove must subtract the entry's bytes");
-        // Overwriting the remaining entry with a smaller payload:
-        // bytes drop, not accumulate.
-        cache.insert_returning_prev([0x02; 32], vec![0; 50]);
-        assert_eq!(cache.bytes(), 50);
-    }
-
-    /// Single-entry overflow rejection: a payload larger than the
-    /// entire byte budget is rejected — `insert` returns `None`,
-    /// does not mutate the cache, and the byte counter is
-    /// unchanged.
-    #[test]
-    fn insert_larger_than_budget_is_rejected() {
-        let mut cache = FileCache::with_byte_budget_and_ttl(10, Duration::from_secs(60));
-        let sha = [0x42; 32];
-        let huge_payload = vec![0; 100];
-        assert!(
-            cache.insert_returning_prev(sha, huge_payload).is_none(),
-            "an entry larger than the byte budget must be rejected"
-        );
-        assert_eq!(
-            cache.bytes(),
-            0,
-            "rejected insert must not affect the byte counter"
-        );
-        assert_eq!(
-            cache.len(),
-            0,
-            "rejected insert must not add an entry to the cache"
-        );
-        assert_eq!(
-            cache.lookup(&sha),
-            None,
-            "rejected payload must not be retrievable"
         );
     }
 

@@ -1219,6 +1219,7 @@ mod tests {
     /// are usually due to a missing / misconfigured `/usr/bin/pbpaste`
     /// (very rare on standard macOS) rather than a logic bug.
     #[test]
+    #[ignore = "touches live NSPasteboard via pbcopy/pbpaste; run via tests/manual/clipboard-text.md"]
     fn set_text_then_current_text_round_trip() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -1242,6 +1243,7 @@ mod tests {
     /// clears the clipboard). This is the legitimate "user pressed
     /// Cmd+C on nothing / cleared the clipboard" state.
     #[test]
+    #[ignore = "touches live NSPasteboard via pbcopy/pbpaste; run via tests/manual/clipboard-text.md"]
     fn set_text_empty_string_clears_clipboard() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -1267,6 +1269,7 @@ mod tests {
     /// `pbcopy`. Tests with CJK + emoji + combining accents to catch
     /// any byte-vs-char confusion.
     #[test]
+    #[ignore = "touches live NSPasteboard via pbcopy/pbpaste; run via tests/manual/clipboard-text.md"]
     fn set_text_multibyte_utf8_round_trip() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -1449,6 +1452,7 @@ mod tests {
     /// into a known-empty state. The `ImageClipboardGuard` restores
     /// whatever the user had before the test ran.
     #[test]
+    #[ignore = "touches live NSPasteboard; run via tests/manual/clipboard-image.md"]
     fn current_image_returns_none_on_empty_pasteboard() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -1492,6 +1496,7 @@ mod tests {
     /// `ImageClipboardGuard` restores whatever the user had
     /// before the test ran.
     #[test]
+    #[ignore = "touches live NSPasteboard; run via tests/manual/clipboard-image.md"]
     fn current_text_on_image_only_pasteboard_returns_some_empty_string() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -1533,6 +1538,7 @@ mod tests {
     /// (`screencapture -x -t png`, `Cmd+Shift+4`, Preview.app
     /// exports, …).
     #[test]
+    #[ignore = "touches live NSPasteboard; run via tests/manual/clipboard-image.md"]
     fn current_image_reads_png_bytes_directly() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -1568,6 +1574,7 @@ mod tests {
     /// `load_from_memory` round-trips losslessly for our test
     /// image).
     #[test]
+    #[ignore = "touches live NSPasteboard; run via tests/manual/clipboard-image.md"]
     fn current_image_normalizes_tiff_to_png() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -1634,6 +1641,7 @@ mod tests {
     /// this test would clobber any JPEG the user happened to
     /// have on their pasteboard.
     #[test]
+    #[ignore = "touches live NSPasteboard; run via tests/manual/clipboard-image.md"]
     fn current_image_normalizes_jpeg_to_png() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -1701,6 +1709,7 @@ mod tests {
     /// representations). `current_image` must return the PNG
     /// bytes verbatim.
     #[test]
+    #[ignore = "touches live NSPasteboard; run via tests/manual/clipboard-image.md"]
     fn current_image_prefers_png_over_jpeg_when_both_present() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -1761,6 +1770,7 @@ mod tests {
     /// `set_image` write path in isolation from the read path's
     /// PNG-first preference logic.
     #[test]
+    #[ignore = "touches live NSPasteboard; run via tests/manual/clipboard-image.md"]
     fn set_image_writes_png_bytes_to_pasteboard() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -1803,6 +1813,7 @@ mod tests {
     /// do not reject, so a future M2b backend that *does* support
     /// JPEG can override `set_image` to honour the mime.
     #[test]
+    #[ignore = "touches live NSPasteboard; run via tests/manual/clipboard-image.md"]
     fn set_image_with_non_png_mime_writes_but_logs_warning() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -1838,6 +1849,7 @@ mod tests {
     /// expensive TIFF/JPEG → PNG normalisation step that was
     /// spamming the log ~2× per second before this fix).
     #[test]
+    #[ignore = "touches live NSPasteboard; run via tests/manual/clipboard-image.md"]
     fn current_image_populates_change_count_cache() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -1892,6 +1904,7 @@ mod tests {
     /// re-normalises and returns fresh bytes (which would equal
     /// `first.data`, not the mutated value).
     #[test]
+    #[ignore = "touches live NSPasteboard; run via tests/manual/clipboard-image.md"]
     fn current_image_short_circuits_on_stable_change_count() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -1934,6 +1947,7 @@ mod tests {
     /// invalidation the next `current_image` call would return the
     /// pre-write bytes instead of the freshly-written ones.
     #[test]
+    #[ignore = "touches live NSPasteboard; run via tests/manual/clipboard-image.md"]
     fn set_image_invalidates_change_count_cache() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -1981,6 +1995,7 @@ mod tests {
     /// `set_dib_image` here on macOS) writes a fresh PNG, so the
     /// cache from any previous outbound dispatch must be dropped.
     #[test]
+    #[ignore = "touches live NSPasteboard; run via tests/manual/clipboard-image.md"]
     fn set_dib_image_invalidates_change_count_cache() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -2134,6 +2149,7 @@ mod tests {
     /// `image`-crate decode → PNG re-encode → NSPasteboard
     /// `setData(_:forType: .png)`.
     #[test]
+    #[ignore = "touches live NSPasteboard; run via tests/manual/clipboard-image.md"]
     fn set_dib_image_falls_back_to_png_via_image_crate() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -2181,6 +2197,7 @@ mod tests {
     /// **Build a raw DIB fixture**: take the existing BMP
     /// fixture (`test_dib_bytes`) and drop the first 14 bytes.
     #[test]
+    #[ignore = "touches live NSPasteboard; run via tests/manual/clipboard-image.md"]
     fn set_dib_image_handles_raw_dib_without_bmp_header() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
@@ -2335,6 +2352,7 @@ mod tests {
     /// existence is not required — the daemon advertises the
     /// URL, the receiving app opens it later).
     #[test]
+    #[ignore = "touches live NSPasteboard; run via tests/manual/clipboard-text.md"]
     fn set_files_writes_paths_to_pasteboard_and_round_trips_via_current_files() {
         let _lock = lock_for_test();
         let mut backend = MacOsPasteboard::new().expect("new");
