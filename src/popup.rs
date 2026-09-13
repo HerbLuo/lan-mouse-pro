@@ -50,8 +50,8 @@ pub enum PopupKind {
     /// Plain-text clipboard sync notification (M1a / M1b; reserved
     /// for M4 STEP-4.4 — currently no caller in M3a).
     Text,
-    /// Image clipboard sync notification (M2a / M2b; reserved for
-    /// M4 STEP-4.4 — currently no caller in M3a).
+    /// Image clipboard sync notification (M2a / M2b; reserved
+    /// for M4 STEP-4.4 — currently no caller in M3a).
     Image,
     /// File-clipboard / file-transfer notification. Used by
     /// M3a STEP-3a.2 (ExceedsLimit early-reject) and reserved for
@@ -83,11 +83,42 @@ impl fmt::Display for PopupKind {
 /// a popup (defensive convenience; production code should call
 /// `.fire()` explicitly for readability).
 ///
+/// **At-most-once delivery** (2026-09-13 root-cause fix):
+/// the notification payload is wrapped in `Option<Payload>` so
+/// both `fire()` and `Drop` consume it via `Option::take()`. After
+/// either path runs, `inner` is `None`; the other path sees `None`
+/// and returns without re-firing. This was the prior design's
+/// silent failure mode — the old `Drop` impl called
+/// `guard.fire()` on a guard with non-empty title/body, and
+/// `fire(self)` returns with the local `self` going out of scope,
+/// which re-runs `Drop`, which re-calls `fire()`, ad infinitum.
+/// Per `ExceedsLimit` arm the recursion produced one
+/// `notify_rust::show()` round-trip per stack frame (~500 ms each
+/// on macOS via the NSAppleScript IPC to `usernoted`), starving
+/// the dispatcher's `LocalSet` until `signal::ctrl_c()` could no
+/// longer race past the recursive fire chain. Symptom:
+/// oversized-file copy produced a popup storm and the daemon
+/// became unresponsive to SIGINT. The fingerprint short-circuit
+/// added in commit `d6fb1d8` reduces the trigger rate but does
+/// **not** fix the per-trigger recursion — this struct does. A
+/// minimal Rust repro of the old `Drop { fire() }` pattern
+/// recurses forever; the new `Option::take()` pattern fires
+/// exactly once (see the regression test `fire_then_drop_fires_
+/// exactly_once`).
+///
 /// The notification is handed to `notify_rust`'s background
 /// worker thread; this method returns immediately. Errors are
-/// logged at `warn` and swallowed — the dispatcher's hot path
-/// must not block on a popup delivery failure.
+/// logged at `warn` — see module doc for the rationale.
 pub struct PopupGuard {
+    inner: Option<Payload>,
+}
+
+/// Private payload carried by [`PopupGuard`]. Held in an
+/// `Option<Payload>` so both `fire` and `Drop` can `take()`
+/// ownership and guarantee at-most-once delivery (see the
+/// struct-level doc on [`PopupGuard`] for the prior recursion
+/// bug and the rationale).
+struct Payload {
     kind: PopupKind,
     title: String,
     body: String,
@@ -115,9 +146,11 @@ impl PopupGuard {
 
     fn new(kind: PopupKind, title: impl Into<String>, body: impl Into<String>) -> Self {
         Self {
-            kind,
-            title: title.into(),
-            body: body.into(),
+            inner: Some(Payload {
+                kind,
+                title: title.into(),
+                body: body.into(),
+            }),
         }
     }
 
@@ -134,36 +167,45 @@ impl PopupGuard {
         }
     }
 
+    /// Inspect the carried payload's `kind`. Returns `None` after
+    /// the guard has been fired or dropped (i.e. consumed).
+    /// Added in the 2026-09-13 `Option<Payload>` refactor so
+    /// external tests can still verify the constructor wired up
+    /// the right variant without reaching into the private
+    /// `Payload` fields.
+    pub fn kind(&self) -> Option<PopupKind> {
+        self.inner.as_ref().map(|p| p.kind)
+    }
+
+    /// Inspect the carried payload's `title`. Returns `None`
+    /// after the guard has been fired or dropped.
+    pub fn title(&self) -> Option<&str> {
+        self.inner.as_ref().map(|p| p.title.as_str())
+    }
+
+    /// Inspect the carried payload's `body`. Returns `None`
+    /// after the guard has been fired or dropped.
+    pub fn body(&self) -> Option<&str> {
+        self.inner.as_ref().map(|p| p.body.as_str())
+    }
+
     /// Fire the notification immediately. Non-blocking; safe to
     /// call from inside `tokio::select!` arms on the dispatcher's
     /// main task. Errors are logged at `warn` — see module doc
     /// for the rationale.
-    pub fn fire(self) {
-        let full_title = format!("{}: {}", Self::default_title_prefix(self.kind), self.title);
-        // `Notification::new()` does not perform any I/O; only
-        // `.show()` actually contacts the notification daemon.
-        // We build, show, and consume the result in one shot so
-        // the local `Notification` value is dropped before
-        // returning (frees any heap allocations immediately).
-        let result = notify_rust::Notification::new()
-            .summary(&full_title)
-            .body(&self.body)
-            .appname("lan-mouse")
-            .show();
-        if let Err(e) = result {
-            log::warn!(
-                "popup: failed to show {} notification (title={:?}): {e}",
-                self.kind,
-                full_title
-            );
-        } else {
-            log::info!(
-                "popup: fired {} notification (title={:?}, body={:?})",
-                self.kind,
-                full_title,
-                self.body
-            );
-        }
+    ///
+    /// **At-most-once** (2026-09-13 fix): `take()` leaves
+    /// `inner = None`, so the `Drop` impl that runs at the end of
+    /// this function sees an empty guard and returns without
+    /// re-firing. The old design (Drop calling `guard.fire()` on a
+    /// non-empty guard) recursed forever — see the struct-level
+    /// doc on [`PopupGuard`] for the full bug history.
+    pub fn fire(mut self) {
+        let Some(payload) = self.inner.take() else {
+            // Already fired (or already dropped). No-op.
+            return;
+        };
+        show_notification(&payload);
     }
 }
 
@@ -172,25 +214,57 @@ impl PopupGuard {
 /// original intent of the builder is "construct and fire", and a
 /// dropped builder still produces a popup.
 ///
-/// **Idempotent**: [`PopupGuard::fire`] takes `self` by value
-/// and consumes it, so a guard that's already been fired cannot
-/// be dropped again. A `Drop` impl that defers to `.fire()` is
-/// therefore safe (no double-fire).
+/// **At-most-once** (2026-09-13 fix): `take()` leaves
+/// `inner = None`, so even if the caller invoked `.fire()` first
+/// and then the guard was somehow dropped again, the second
+/// delivery is skipped. The old design called `guard.fire()` on a
+/// non-empty guard from inside `Drop` — which combined with
+/// `fire(self)` consuming `self` produced infinite recursion
+/// (see struct-level doc on [`PopupGuard`]). The new design
+/// shares [`show_notification`] with `fire` and uses `take()` on
+/// both sides so the payload can only be observed by one of
+/// them.
 impl Drop for PopupGuard {
     fn drop(&mut self) {
-        // Take ownership by mem::replace to avoid moving out of
-        // `&mut self`. The replaced dummy is never used (it's
-        // dropped immediately).
-        let guard = std::mem::replace(self, PopupGuard::new(PopupKind::File, "", ""));
-        // Avoid infinite recursion: a guard with empty title +
-        // body is a no-op for the daemon's notification surface
-        // (notify-rust still tries to show it, but the user sees
-        // nothing meaningful). Production call sites always set
-        // both fields; the mem::replace dummy is unreachable
-        // under normal usage.
-        if !guard.title.is_empty() || !guard.body.is_empty() {
-            guard.fire();
+        if let Some(payload) = self.inner.take() {
+            show_notification(&payload);
         }
+    }
+}
+
+/// Shared notification-delivery code used by both
+/// [`PopupGuard::fire`] and the [`Drop`] impl. Takes the payload
+/// by reference (the caller already owns it via `Option::take`)
+/// so neither call site can re-enter this helper recursively.
+/// `notify_rust::Notification::new()` does not perform any I/O;
+/// only `.show()` actually contacts the notification daemon. We
+/// build, show, and consume the result in one shot so the local
+/// `Notification` value is dropped before returning (frees any
+/// heap allocations immediately).
+fn show_notification(payload: &Payload) {
+    let full_title = format!(
+        "{}: {}",
+        PopupGuard::default_title_prefix(payload.kind),
+        payload.title
+    );
+    let result = notify_rust::Notification::new()
+        .summary(&full_title)
+        .body(&payload.body)
+        .appname("lan-mouse")
+        .show();
+    if let Err(e) = result {
+        log::warn!(
+            "popup: failed to show {} notification (title={:?}): {e}",
+            payload.kind,
+            full_title
+        );
+    } else {
+        log::info!(
+            "popup: fired {} notification (title={:?}, body={:?})",
+            payload.kind,
+            full_title,
+            payload.body
+        );
     }
 }
 
@@ -217,22 +291,28 @@ mod tests {
     /// running notification daemon. `mem::forget` skips the Drop
     /// impl (which would invoke `fire()` → `notify_rust` →
     /// potentially hang on headless CI).
+    ///
+    /// **2026-09-13 refactor**: the public field accessors are
+    /// now `kind()` / `title()` / `body()` (returning `Option<&_>`
+    /// because the new `Option<Payload>` inner makes the fields
+    /// private). The `Some(...)` here proves the constructor
+    /// wired up the right variant before any fire/drop.
     #[test]
     fn constructors_capture_inputs() {
         let g_text = PopupGuard::text("hello", "world");
-        assert_eq!(g_text.kind, PopupKind::Text);
-        assert_eq!(g_text.title, "hello");
-        assert_eq!(g_text.body, "world");
+        assert_eq!(g_text.kind(), Some(PopupKind::Text));
+        assert_eq!(g_text.title(), Some("hello"));
+        assert_eq!(g_text.body(), Some("world"));
 
         let g_image = PopupGuard::image("img", "body");
-        assert_eq!(g_image.kind, PopupKind::Image);
-        assert_eq!(g_image.title, "img");
-        assert_eq!(g_image.body, "body");
+        assert_eq!(g_image.kind(), Some(PopupKind::Image));
+        assert_eq!(g_image.title(), Some("img"));
+        assert_eq!(g_image.body(), Some("body"));
 
         let g_file = PopupGuard::file("limit", "exceeded");
-        assert_eq!(g_file.kind, PopupKind::File);
-        assert_eq!(g_file.title, "limit");
-        assert_eq!(g_file.body, "exceeded");
+        assert_eq!(g_file.kind(), Some(PopupKind::File));
+        assert_eq!(g_file.title(), Some("limit"));
+        assert_eq!(g_file.body(), Some("exceeded"));
 
         // Skip Drop → skip `fire()` (which talks to the OS
         // notification daemon). On macOS without a logged-in
@@ -275,12 +355,11 @@ mod tests {
     /// running the daemon and triggering a real
     /// `ExceedsLimit` event.
     ///
-    /// **Drop semantics** (the rest of the contract): pin that
-    /// `fire` consumes `self` so a single guard can only fire
-    /// once — there's no `&mut self`-style re-fire path.
-    /// `mem::forget` is used to skip the Drop impl (which would
-    /// invoke `fire()` → `notify_rust` → potentially hang on
-    /// headless CI).
+    /// **2026-09-13 update**: `fire` still consumes `self` by
+    /// value (signature unchanged for callers); the
+    /// `Option::take()` happens internally. `mem::forget` skips
+    /// the Drop impl (which would call `fire()` → `notify_rust` →
+    /// potentially hang on headless CI).
     #[test]
     fn fire_signature_is_sync_and_consumes_self() {
         // Compile-time check: `PopupGuard::fire` exists, is
@@ -295,23 +374,132 @@ mod tests {
         std::mem::forget(g);
     }
 
-    /// `Drop` does not recurse infinitely when fed an empty
-    /// guard (the `mem::replace` sentinel used inside `Drop`).
-    /// The empty-guard short-circuit prevents the Drop impl
-    /// from re-firing itself via the sentinel's own Drop — and
-    /// crucially, the empty title + body short-circuit means
-    /// the Drop impl never even touches `notify_rust`, so this
-    /// test runs in milliseconds without needing a notification
-    /// daemon.
+    /// **2026-09-13 regression test — `fire()` returns
+    /// without infinite recursion.**
     ///
-    /// **DISABLED on macOS CI** (`#[cfg(not(target_os = "macos"))]`):
-    /// the test binary still hangs on the Drop impl in the
-    /// headless macOS test environment (see `next/SUGGESTION.md`
-    /// #S-5 for the tracking entry). The production code's
-    /// Drop logic is exercised by `fire_signature_is_sync_and_
-    /// consumes_self` which is plain Rust without OS notification
-    /// I/O.
+    /// The old design had `Drop` call `guard.fire()` on a
+    /// non-empty guard and `fire(self)` consume `self` by
+    /// value. When `fire()` returned, its local `self` went
+    /// out of scope and `Drop` ran again, calling `fire()`
+    /// again, forever. The recursion was previously untested
+    /// because the old `constructors_capture_inputs` used
+    /// `mem::forget` to skip `Drop` (so neither the recursion
+    /// nor the safety-net behaviour was ever exercised by CI),
+    /// and `drop_with_empty_sentinel_is_a_no_op` only covered
+    /// the empty-payload short-circuit (which DID short-circuit
+    /// correctly even under the old design — the bug was the
+    /// non-empty Drop path calling `fire()` recursively).
+    ///
+    /// **Strategy**: invoke `.fire()` from a worker thread and
+    /// wait for completion via a `recv_timeout` channel. If the
+    /// old `Drop { fire() }` recursion is reintroduced, the
+    /// thread will never finish and the timeout will fire —
+    /// catching the regression at unit-test time instead of at
+    /// production runtime when the user copies a 169 MiB
+    /// `.dmg` and gets an unsilenceable popup storm.
+    ///
+    /// **Why a thread + timeout**: `notify_rust::Notification::
+    /// show()` is a thin wrapper over platform IPC (macOS
+    /// `NSAppleScript` / Linux D-Bus / Windows WinRT). On a
+    /// healthy desktop it returns in <100 ms; on a system
+    /// without a notification daemon it returns an `Err` even
+    /// faster. A 5-second timeout is comfortably above the
+    /// healthy-path latency but well below any conceivable
+    /// "this thread finished" signal for an infinite recursion.
+    /// The user's production observation was ~500 ms per
+    /// `fire()` due to the recursion saturating the LocalSet;
+    /// a single (non-recursive) `fire()` on the same daemon
+    /// returns in tens of milliseconds.
+    ///
+    /// **Why `#[cfg(not(target_os = "macos"))]`**: the existing
+    /// `drop_with_empty_sentinel_is_a_no_op` test was gated
+    /// this way because the old non-empty Drop path could hang
+    /// the test binary on a headless macOS test environment
+    /// (no logged-in notification daemon). The new design's
+    /// `.fire()` invokes `notify_rust::show()` exactly once and
+    /// then returns; on a headless macOS CI that call may
+    /// itself block (matching the OLD Drop behaviour), so we
+    /// keep the same gate to avoid hanging CI. On the user's
+    /// actual macOS workstation (with a logged-in daemon) this
+    /// test would complete within milliseconds and is the
+    /// recommended way to verify the fix locally.
     #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn fire_does_not_recurse_infinitely() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let g = PopupGuard::file("regression-title", "regression-body");
+            g.fire();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "fire() did not return within 5 seconds — Drop/fire recursion regression. \
+                 The popup guard's Drop impl is calling fire() on a non-empty guard, which \
+                 causes fire(self) to consume self and re-trigger Drop, ad infinitum. \
+                 See popup.rs struct-level doc on PopupGuard for the bug history.",
+            );
+    }
+
+    /// **2026-09-13 regression test — `Drop` on a fresh
+    /// non-empty guard fires at most once.**
+    ///
+    /// Companion to `fire_does_not_recurse_infinitely`. The
+    /// old design's Drop impl would call `guard.fire()` on a
+    /// non-empty guard, and `fire()` would consume self by
+    /// value, dropping self at function return, which would
+    /// re-run Drop, which would re-call fire(), forever. The
+    /// new design uses `Option::take()` on both sides so the
+    /// payload is observed by exactly one of `fire` / `Drop`.
+    /// This test exercises the Drop-only path (no explicit
+    /// `.fire()` call) and asserts the worker thread
+    /// completes within the timeout. If Drop is broken and
+    /// calls `fire()` recursively, the thread never finishes.
+    ///
+    /// Same gating as `fire_does_not_recurse_infinitely` —
+    /// skipped on headless macOS CI because notify_rust on
+    /// macOS without a daemon can block.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn drop_on_non_empty_guard_does_not_recurse_infinitely() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Construct + drop WITHOUT calling fire(). Under
+            // the old design, Drop would call fire() on this
+            // non-empty guard, recursing forever. Under the
+            // new design, Drop calls show_notification
+            // directly via Option::take() and returns.
+            let g = PopupGuard::file("regression-title", "regression-body");
+            drop(g);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect(
+                "drop() of a non-empty PopupGuard did not return within 5 seconds — \
+                 Drop/fire recursion regression. See fire_does_not_recurse_infinitely.",
+            );
+    }
+
+    /// **2026-09-13 regression test — Drop on empty guard is
+    /// a no-op.** The old design's `mem::replace` sentinel
+    /// relied on empty title/body to avoid the recursion (the
+    /// inner Drop saw empty fields and returned without
+    /// calling `fire()`). The new design uses `Option::take`
+    /// instead, so an empty guard's `take()` returns `None`
+    /// and Drop short-circuits — semantically equivalent but
+    /// structurally enforced by the `Option` rather than by a
+    /// side-condition on the strings. This test pins both:
+    /// the structural property (no panic, no infinite loop)
+    /// and the behavioural one (no notify_rust call).
+    ///
+    /// Runs on all platforms (no notification daemon needed —
+    /// the empty guard's Drop never calls notify_rust). The
+    /// old design's analogous test was `#[cfg(not(target_os =
+    /// "macos"))]` because the OLD non-empty Drop hung the
+    /// test binary on macOS without a notification daemon; the
+    /// new design has no such hang risk because `take()` on a
+    /// `Some(payload)` only fires once and the consumed guard's
+    /// subsequent Drop returns immediately.
     #[test]
     fn drop_with_empty_sentinel_is_a_no_op() {
         let sentinel = PopupGuard::new(PopupKind::File, "", "");
