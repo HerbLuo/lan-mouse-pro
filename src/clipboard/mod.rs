@@ -583,6 +583,72 @@ pub trait ClipboardBackend: Send {
     fn watch_files(&mut self) -> futures::stream::BoxStream<'static, Vec<PathBuf>> {
         Box::pin(futures::stream::empty())
     }
+
+    // === M4 STEP-4.2 — set_files (file-write path) ===
+
+    /// Replace the OS clipboard's file selection with `files` (a
+    /// list of absolute filesystem paths).
+    ///
+    /// **M4 STEP-4.2** — the receive-side counterpart of
+    /// [`Self::current_files`]. Used by the post-M4 inbound
+    /// dispatcher (STEP-4.3) to land a remote peer's file
+    /// selection in the local clipboard after the bytes have
+    /// already been written to disk and SHA-256 verified — so a
+    /// subsequent local Cmd+V / Ctrl+V / X11 paste emits the
+    /// paths as a file-selection paste.
+    ///
+    /// **Contract**:
+    /// - `files` is non-empty (the dispatcher filters empty
+    ///   batches before reaching this method). Per-platform
+    ///   implementations may panic / no-op on an empty slice —
+    ///   the trait does not promise behaviour for `&[]`.
+    /// - Every path is **absolute** (the dispatcher has already
+    ///   prepended `accept_dir` to relative paths). The backend
+    ///   does NOT validate that the paths exist — they may be
+    ///   queued for landing without yet being on disk in the
+    ///   file-write implementation; each backend's pasteboard
+    ///   contract is "advertise these paths to apps that read
+    ///   the file-selection type", which is independent of
+    ///   filesystem state.
+    /// - The function returns `Ok(())` on success and a
+    ///   [`ClipboardError`] on failure. The caller logs warn
+    ///   and continues — `set_files` failure is not fatal for
+    ///   the daemon loop.
+    ///
+    /// **Platform encoding**:
+    /// - macOS → `NSPasteboard.writeObjects(_:)` of NSURL file
+    ///   URLs (so Finder reads them as a file-selection paste
+    ///   via `NSFilenamesPboardType`).
+    /// - Windows → `CF_HDROP` (`DROPFILES` struct + double-NUL
+    ///   terminated UTF-16 paths) so Explorer / every Win32
+    ///   "paste file" consumer reads them.
+    /// - Linux → `text/uri-list` MIME (RFC 2483 CRLF-separated
+    ///   `file://` URIs) via `xclip -selection clipboard -t
+    ///   text/uri-list -i` or `wl-copy --type text/uri-list`,
+    ///   so GTK / Qt file-selection consumers read them.
+    ///
+    /// **Why `&mut self` and not `&self`**: matches the
+    /// existing `set_text` / `set_image` pattern. The
+    /// underlying Win32 / NSPasteboard / Linux tool APIs all
+    /// maintain per-process state that mutates on write
+    /// (NSPasteboard bumps `changeCount`; `OpenClipboard` /
+    /// `CloseClipboard` toggle a per-thread lock; the Linux
+    /// subprocess fork mutates the process state). Treating
+    /// these writes as `&self` would force every impl to
+    /// internal-mutable state — `&mut self` keeps the trait
+    /// honest.
+    ///
+    /// **Default returns `Err(Unsupported)`** — same rationale
+    /// as the image methods. Backends that have not opted in
+    /// to file-write support compile unchanged; the dispatcher's
+    /// STEP-4.3 caller treats `Unsupported` as "skip and
+    /// continue" (the inbound file-apply path still succeeds —
+    /// the files just don't land on the local clipboard).
+    fn set_files(&mut self, _files: &[PathBuf]) -> Result<(), ClipboardError> {
+        Err(ClipboardError::Unsupported(
+            "file-write not implemented for this backend (M4 STEP-4.2 in flight)".into(),
+        ))
+    }
 }
 
 /// **M3a STEP-3a.2** — file-selection change event.
@@ -1037,6 +1103,47 @@ mod tests {
         assert!(
             matches!(result, Err(ClipboardError::Unsupported(_))),
             "DummyBackend::set_dib_image must default to Err(Unsupported); got {result:?}"
+        );
+    }
+
+    // === M4 STEP-4.2 — set_files default impl + DummyBackend ===
+
+    /// `DummyBackend::set_files` returns
+    /// `Err(ClipboardError::Unsupported)` via the trait-level
+    /// default impl. STEP-4.2 pins the default behaviour for
+    /// backends that have not yet implemented the file-write
+    /// path; the STEP-4.3 dispatcher treats `Unsupported` as
+    /// "skip the local injection, continue the daemon loop"
+    /// (the inbound file-apply still succeeds — the bytes just
+    /// don't land on the local clipboard).
+    #[test]
+    fn dummy_backend_set_files_returns_unsupported() {
+        let mut backend = DummyBackend::new();
+        let paths = vec![
+            std::path::PathBuf::from("/tmp/a"),
+            std::path::PathBuf::from("/tmp/b"),
+        ];
+        let result = backend.set_files(&paths);
+        assert!(
+            matches!(result, Err(ClipboardError::Unsupported(_))),
+            "DummyBackend::set_files must default to Err(Unsupported); got {result:?}"
+        );
+    }
+
+    /// `DummyBackend::set_files` on an empty slice still returns
+    /// `Err(Unsupported)` (the default impl does not branch on
+    /// path count). The dispatcher guarantees a non-empty batch
+    /// before reaching this method, so the empty case is
+    /// unspecified by the trait contract — pinning the default
+    /// here documents that a future platform impl must decide
+    /// its own empty-slice policy.
+    #[test]
+    fn dummy_backend_set_files_empty_slice_returns_unsupported() {
+        let mut backend = DummyBackend::new();
+        let result = backend.set_files(&[]);
+        assert!(
+            matches!(result, Err(ClipboardError::Unsupported(_))),
+            "DummyBackend::set_files(&[]) must default to Err(Unsupported); got {result:?}"
         );
     }
 

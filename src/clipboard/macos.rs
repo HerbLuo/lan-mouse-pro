@@ -57,8 +57,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use objc2_app_kit::{NSBitmapImageFileType, NSPasteboard};
-use objc2_foundation::{NSData, NSString};
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_app_kit::{NSBitmapImageFileType, NSPasteboard, NSPasteboardWriting};
+use objc2_foundation::{NSArray, NSData, NSString, NSURL};
 
 use super::{ClipboardBackend, ClipboardError, ImageBytes, Mime};
 
@@ -687,6 +689,94 @@ impl ClipboardBackend for MacOsPasteboard {
             paths.push(PathBuf::from(s));
         }
         if paths.is_empty() { None } else { Some(paths) }
+    }
+
+    /// **M4 STEP-4.2** — write a list of absolute file paths to
+    /// `NSPasteboard.generalPasteboard()` via
+    /// `writeObjects(_:)` of `NSArray<ProtocolObject<dyn
+    /// NSPasteboardWriting>>`. Each path becomes an `NSURL`
+    /// file URL, and macOS's pasteboard advertises the
+    /// selection to Finder / file-selection consumers via
+    /// `NSFilenamesPboardType` (the legacy identifier Finder
+    /// still publishes alongside `public.file-url`).
+    ///
+    /// **API type constraint** (PLAN §3 STEP-4.2 planer round
+    /// 2 review — the actual signature is
+    /// `writeObjects(&self, objects: &NSArray<ProtocolObject<dyn
+    /// NSPasteboardWriting>>) -> bool`, NOT
+    /// `NSArray<NSURL>`). The conversion is
+    /// `NSURL::fileURLWithPath(&nsstring)` →
+    /// `ProtocolObject::from_retained(nsurl)` to get a
+    /// `Retained<ProtocolObject<dyn NSPasteboardWriting>>`,
+    /// then collect into a slice and pass to
+    /// `NSArray::from_retained_slice`.
+    ///
+    /// **`NSPasteboardWriting` conformance**: objc2-app-kit
+    /// 0.3.2 declares
+    /// `extern_conformance!(unsafe impl NSPasteboardWriting for NSURL {})`
+    /// at `objc2-app-kit-0.3.2/src/generated/NSPasteboard.rs:847-849`.
+    /// Without that, `ProtocolObject::from_retained(nsurl)`
+    /// would fail to compile (`P: ImplementedBy<NSURL>` bound).
+    ///
+    /// **`clearContents()` first**: same rationale as
+    /// `set_image` / `set_dib_image` — wipe any prior image /
+    /// text representation so the write is deterministic
+    /// (otherwise a previous PNG may survive and confuse Finder
+    /// when it reads `NSFilenamesPboardType`).
+    ///
+    /// **`changeCount` invalidation**: the write bumps
+    /// `NSPasteboard.changeCount()`, so the
+    /// `MacOsPasteboard::image_cache` must be dropped (the
+    /// next `current_image` would otherwise return stale
+    /// bytes cached at the pre-write changeCount).
+    ///
+    /// **Empty input**: returns `Ok(())` without touching the
+    /// pasteboard. The dispatcher's STEP-4.3 caller guarantees
+    /// a non-empty batch, but defensive against a misbehaving
+    /// upstream.
+    fn set_files(&mut self, files: &[PathBuf]) -> Result<(), ClipboardError> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        // Build NSURL file URLs. Each NSURL is wrapped via
+        // `ProtocolObject::from_retained` so it can be stored in
+        // the heterogeneous `NSArray<ProtocolObject<dyn
+        // NSPasteboardWriting>>` that `writeObjects`
+        // accepts.
+        let mut proto_objects: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> =
+            Vec::with_capacity(files.len());
+        for path in files {
+            let path_str = path.to_string_lossy();
+            let ns_string = NSString::from_str(&path_str);
+            let ns_url = NSURL::fileURLWithPath(&ns_string);
+            // SAFETY: `ProtocolObject::from_retained` requires
+            // `P: ImplementedBy<NSURL>`, which holds because
+            // objc2-app-kit 0.3.2 declares the conformance.
+            // `NSURL: Message + 'static` is satisfied by the
+            // generated extern_class macro.
+            let proto: Retained<ProtocolObject<dyn NSPasteboardWriting>> =
+                ProtocolObject::from_retained(ns_url);
+            proto_objects.push(proto);
+        }
+        let array = NSArray::from_retained_slice(&proto_objects);
+        let pb = NSPasteboard::generalPasteboard();
+        // Wipe prior representations (text / image / file) so
+        // the new file list is the only thing Finder reads.
+        let _ = pb.clearContents();
+        let ok = pb.writeObjects(&array);
+        // Bump the cached changeCount: `writeObjects` and
+        // `clearContents` both increment `changeCount()` on
+        // generalPasteboard, so the next `current_image` must
+        // re-read.
+        self.image_cache = None;
+        if ok {
+            Ok(())
+        } else {
+            Err(ClipboardError::Io(format!(
+                "NSPasteboard::writeObjects returned false ({} files)",
+                files.len()
+            )))
+        }
     }
 }
 
@@ -2214,5 +2304,164 @@ mod tests {
         let decoded = image::load_from_memory(&synthetic).expect("synthetic BMP must decode");
         assert_eq!(decoded.width(), 4);
         assert_eq!(decoded.height(), 2);
+    }
+
+    // === M4 STEP-4.2 — set_files integration test (real pasteboard) ===
+
+    /// **Real pasteboard round-trip for `set_files`** (PLAN §3
+    /// STEP-4.2 planer round 2 review: "退化为集成式真实
+    /// pasteboard 写入断言"). objc2 AppKit's
+    /// `NSPasteboard.writeObjects` is impractical to mock
+    /// without spinning up a full ObjC runtime fakery, so the
+    /// canonical STEP-4.2 test exercises the real
+    /// `NSPasteboard.generalPasteboard()` and verifies:
+    ///
+    /// 1. **`changeCount` increments** after `set_files` —
+    ///    proves the write actually mutated the pasteboard
+    ///    (a no-op stub would leave changeCount unchanged).
+    /// 2. **`current_files` round-trips the original paths**
+    ///    via `NSFilenamesPboardType` — proves the pasteboard
+    ///    now advertises a file-selection that the
+    ///    dispatcher-side `current_files` reader can extract
+    ///    unchanged.
+    /// 3. **The `image_cache` is invalidated** after the
+    ///    write (the next `current_image` would otherwise
+    ///    serve stale bytes — same contract as `set_image` /
+    ///    `set_dib_image`).
+    ///
+    /// **Path selection**: use `/tmp` paths (the daemon has
+    /// permission to write them; the pasteboard publishes
+    /// them as file URLs without touching the filesystem, so
+    /// existence is not required — the daemon advertises the
+    /// URL, the receiving app opens it later).
+    #[test]
+    fn set_files_writes_paths_to_pasteboard_and_round_trips_via_current_files() {
+        let _lock = lock_for_test();
+        let mut backend = MacOsPasteboard::new().expect("new");
+        let _guard = FilesClipboardGuard::new();
+
+        // Seed the image cache so we can verify the
+        // invalidation side-effect of `set_files`. Mirrors
+        // `set_image_invalidates_change_count_cache`.
+        write_pasteboard_bytes(NS_PASTEBOARD_TYPE_PNG, &test_png_bytes());
+        let _ = backend
+            .current_image()
+            .expect("current_image returns Some for PNG-only pasteboard");
+        assert!(
+            backend.image_cache.is_some(),
+            "image_cache must be populated before set_files (precondition)"
+        );
+
+        let pb = NSPasteboard::generalPasteboard();
+        let cc_before = pb.changeCount();
+
+        let paths = vec![
+            PathBuf::from("/tmp/lan-mouse-step-4.2-a.bin"),
+            PathBuf::from("/tmp/lan-mouse-step-4.2-b.bin"),
+        ];
+        backend
+            .set_files(&paths)
+            .expect("set_files must succeed on macOS");
+
+        // (1) changeCount incremented.
+        let cc_after = pb.changeCount();
+        assert!(
+            cc_after > cc_before,
+            "changeCount must increment after set_files (before={cc_before}, after={cc_after})"
+        );
+
+        // (3) image_cache invalidated.
+        assert!(
+            backend.image_cache.is_none(),
+            "set_files must drop the image_cache so the next current_image re-reads"
+        );
+
+        // (2) current_files round-trips the original paths.
+        let recovered = backend
+            .current_files()
+            .expect("current_files must return Some after set_files");
+        assert_eq!(
+            recovered.len(),
+            paths.len(),
+            "round-trip path count (recovered={recovered:?})"
+        );
+        for (orig, rec) in paths.iter().zip(recovered.iter()) {
+            assert_eq!(
+                rec, orig,
+                "round-trip path identity (orig={orig:?}, recovered={rec:?})"
+            );
+        }
+    }
+
+    /// RAII guard that saves the pasteboard's
+    /// `NSFilenamesPboardType` representation on construction
+    /// and restores it on Drop. Mirrors `ImageClipboardGuard`'s
+    /// role for the file-selection write tests. Without the
+    /// guard the `set_files` test would clobber any file
+    /// selection the user happened to have on their
+    /// pasteboard.
+    ///
+    /// **Save path**: `propertyListForType(_)` for
+    /// `NSFilenamesPboardType` returns an `NSArray<NSString>` —
+    /// we reinterpret the `AnyObject` pointer as
+    /// `NSArray<NSString>` (same as `current_files`'s read
+    /// path) and retain it.
+    ///
+    /// **Restore path**: clear the pasteboard, then write the
+    /// saved `NSArray<NSString>` back via `writeObjects(_:)` —
+    /// the same entry point `set_files` uses, with each
+    /// `NSString` wrapped via `ProtocolObject::from_retained`
+    /// (NSString conforms to `NSPasteboardWriting` via
+    /// `objc2-app-kit 0.3.2 NSPasteboard.rs:851-857`).
+    struct FilesClipboardGuard {
+        saved_files: Option<Retained<objc2_foundation::NSArray<objc2_foundation::NSString>>>,
+    }
+
+    impl FilesClipboardGuard {
+        fn new() -> Self {
+            let pb = NSPasteboard::generalPasteboard();
+            let ns_type = NSString::from_str(NS_PASTEBOARD_TYPE_FILENAMES);
+            let saved_files: Option<
+                Retained<objc2_foundation::NSArray<objc2_foundation::NSString>>,
+            > = unsafe {
+                pb.propertyListForType(&ns_type).map(|plist| {
+                    // `propertyListForType:` for
+                    // `NSFilenamesPboardType` returns an
+                    // `NSArray<NSString>` (AppKit
+                    // contract — same as
+                    // `MacOsPasteboard::current_files`'s
+                    // reinterpret cast). Use
+                    // `cast_unchecked` to transfer
+                    // ownership of the retain count.
+                    Retained::cast_unchecked(plist)
+                })
+            };
+            Self { saved_files }
+        }
+    }
+
+    impl Drop for FilesClipboardGuard {
+        fn drop(&mut self) {
+            let pb = NSPasteboard::generalPasteboard();
+            let _ = pb.clearContents();
+            if let Some(arr) = self.saved_files.take() {
+                let proto_objects: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = arr
+                    .iter()
+                    .map(|ns_string: Retained<objc2_foundation::NSString>| {
+                        // SAFETY: NSString conforms to
+                        // NSPasteboardWriting via objc2-app-kit
+                        // 0.3.2 NSPasteboard.rs:851-857. The
+                        // iterator yields an owned
+                        // `Retained<NSString>` we can hand off
+                        // to `ProtocolObject::from_retained`
+                        // (which takes ownership of the retain
+                        // count).
+                        ProtocolObject::from_retained(ns_string)
+                    })
+                    .collect();
+                let restored = NSArray::from_retained_slice(&proto_objects);
+                let _ = pb.writeObjects(&restored);
+            }
+        }
     }
 }
