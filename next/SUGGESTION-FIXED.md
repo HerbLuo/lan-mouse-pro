@@ -197,3 +197,39 @@
 - **Plan 偏差**：1 处隐性偏差（windows.rs 未本地验证落地，是 1a.3 的隐性 scope gap；本轮就地把 gap 补上）。0 处功能性偏差（修复后 windows.rs 在 Windows + Linux 双 cross-compile + macOS native 均绿）。
 - **解决 STEP**：out-of-scope cleanup（M1a / STEP-P2-M1a-1a.3 follow-up；不在任何 PLAN STEP 内，仅响应 SUGGESTION #S-2 的本地验证诉求）
 
+---
+
+## #S-5 — `dispatch_files` 用常量 `DEFAULT_MAX_FILE_SIZE = 50 MiB`（IPC schema 扩展后切到 `Config::max_file_size()` getter）
+
+- **触发 STEP**：STEP-P2-M3a-3a.2
+- **现象**：`src/service.rs::DEFAULT_MAX_FILE_SIZE = 50 * 1024 * 1024`（PLAN §3 STEP-3a.2 评审 #25 默认值）写死在 `Service::new` 字段 `max_file_size` 中。`lan_mouse_ipc::ClipboardConfig.max_file_size` 字段 M3b STEP-3b.1 才落地，`Config::max_file_size()` getter 同步落地。
+- **解决方案**（M4 STEP-4.1 落地）：
+  - `src/service.rs:391-394` — 移除 `Service::max_file_size: u64` 字段；doc-comment 改为指向新的 [`Service::max_file_size`] getter
+  - `src/service.rs:1141-1147` — `Service::new` 不再初始化 `max_file_size` 字段（已删除）
+  - `src/service.rs:2197-2204` — 新增 `Service::max_file_size(&self) -> u64` getter，live-read `self.config.clipboard_config().max_file_size`（`Config` 内部 fallback 到 `DEFAULT_MAX_FILE_SIZE` 当 TOML 缺字段）
+  - `src/service.rs:2838` — `dispatch_files` 调用 `dispatch_files_decide(paths, last_fingerprint, self.max_file_size())`（之前是 `self.max_file_size` 字段访问）
+  - `src/config.rs:38` — `pub(crate) use crate::service::DEFAULT_MAX_FILE_SIZE`（re-export）
+  - `src/config.rs:896` — `Config::clipboard_config()` `max_file_size: cb.max_file_size.unwrap_or(DEFAULT_MAX_FILE_SIZE)` fallback
+  - `src/config.rs:909-917` — 新增 `Config::max_file_size()` getter（live read）
+  - `src/config.rs:951-955` — `Config::set_clipboard_config()` omit-on-default pattern（用户用 50 MiB 时不写入 TOML）
+  - `src/config.rs:1327-1365` — 新增 `config_max_file_size_getter_tracks_toml_changes` 单测覆盖 getter 在 IPC 改动下立即生效
+  - `lan-mouse-ipc/src/lib.rs` — `ClipboardConfig.max_file_size: u64` 加 `#[serde(default = "default_max_file_size")]`（50 MiB）
+- **结果**：`cargo test --workspace --lib` 全绿；`set_clipboard_config` 写入新 `max_file_size` 后下次 inbound / 下一个 dispatch tick 立刻生效（live read，无需 daemon restart）
+- **解决 STEP**：M4 / STEP-P2-M4-4.1
+
+---
+
+## #S-8 — 默认 `accept_dir` 硬编码 `<home>/lan-mouse/`（IPC schema 收紧后由 `Config::clipboard_config()` 兜底）
+
+- **触发 STEP**：STEP-P2-M3a-3a.3
+- **现象**：`src/service.rs::default_accept_dir()` 在用户没配置 `ClipboardConfig::accept_dir` 时 fallback 到 `<$HOME 或 $USERPROFILE>/lan-mouse/`。`lan-mouse-ipc::ClipboardConfig.accept_dir: Option<PathBuf>` 字段已存在，但 `set_clipboard_config` IPC handler 不接 Service 字段（参考 #S-7）。
+- **解决方案**（M4 STEP-4.1 落地）：
+  - `lan-mouse-ipc/src/lib.rs` — `ClipboardConfig::accept_dir` 从 `Option<PathBuf>` 改为 **required `PathBuf`**（auto-accept 是唯一模式，必须有 target）；IPC `Default` impl 用本地 `default_accept_dir()` helper（`$HOME` → `$USERPROFILE` → `/tmp/lan-mouse` 链）
+  - `lan-mouse-ipc/src/lib.rs` — 新增单测 `clipboard_config_accept_dir_required`（缺 `accept_dir` 字段 = deserialize error）+ `clipboard_config_partial_missing_default_helpers`（`accept_dir` 必须显式提供）
+  - `src/service.rs:4540` — `default_accept_dir()` 升级为 `pub(crate)`（之前 `fn` private）
+  - `src/config.rs:24` — `pub(crate) use crate::service::default_accept_dir`（re-export）
+  - `src/config.rs:887-889` — `Config::clipboard_config()` 在 TOML 缺 `accept_dir` 时 fallback 到 `default_accept_dir()`（保持 M3a 的 env-based fallback 语义）
+  - `src/config.rs:947-949` — `Config::set_clipboard_config()` 把 `accept_dir` 写入 TOML（`Some(cfg.accept_dir)` — 不走 omit-on-default，因为 required 字段必须持久化）
+- **结果**：行为兼容 pre-M4（缺 TOML 字段 → fallback 到 `<home>/lan-mouse/`），IPC schema 收紧（`accept_dir` 必填 wire），M5 STEP-5.4 加 GUI textbox + dir-picker 时用户可显式覆盖
+- **解决 STEP**：M4 / STEP-P2-M4-4.1
+

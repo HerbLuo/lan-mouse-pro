@@ -109,22 +109,7 @@
 
 **优先级**：🟡（不阻塞 M3a；事实上 IPC 改动已生效，只是 log 文本误导）
 
----
-
-## #S-8 🟡 — 默认 `accept_dir` 硬编码 `<home>/lan-mouse/`（待 M3b IPC handler 接续）
-
-**触发 STEP**：STEP-P2-M3a-3a.3
-
-**现象**：`src/service.rs::default_accept_dir()` 在用户没配置 `ClipboardConfig::accept_dir` 时 fallback 到 `<$HOME 或 $USERPROFILE>/lan-mouse/`。`lan-mouse-ipc::ClipboardConfig.accept_dir: Option<PathBuf>` 字段已存在（commit `0f5e33d` 前的某个 commit 落地），但 `set_clipboard_config` IPC handler 不接 Service 字段（参考 #S-7）。
-
-**理由**：STEP-3a.3 不引入跨平台 dir 解析 crate（避免 `dirs` / `directories` 新依赖）；手写 fallback chain `$HOME` / `$USERPROFILE` 覆盖三大平台。M3b STEP-3b.1 / M4 STEP-4.2 加 GUI 配置入口后用户可改。
-
-**建议**（leader 决策）：
-- 🟢 **短期**：保持常量 fallback（已实现）
-- 🟡 **中期**：M3b / M4 阶段在 GUI 加 "Accept directory" textbox + dir-picker 按钮，写入 `ClipboardConfig::accept_dir`；Service 决策 fn 已经每次重新读 config，无需改动
-- ⚪ **长期**：考虑使用 `dirs` / `directories` crate 替换 `$HOME` / `$USERPROFILE` fallback chain — 跨平台语义更标准（macOS `$HOME` 与 sandbox 容器不一致）
-
-**优先级**：🟡（不阻塞 M3a；M3b / M4 阶段直接消费）
+**Status update 2026-09-13 / STEP-P2-M4-4.1**：log 文本已更新（`set_clipboard_config` handler 现在 log `enabled={}, accept_dir={:?}, max_file_size={}, ...`）；新字段 `enabled` / `max_file_size` / `keep_partial` / `inject_to_clipboard` 通过 `Config::clipboard_config()` live-read 立即生效；`auto_accept_files` 字段已 drop（auto-accept 是唯一模式），`accept_dir` 升级为 required `PathBuf`。`set_clipboard_config` 现在实质上是 "log + TOML write-back + 触发 live getter re-read"，**SUGGESTION #S-7 的 🟢 短期 + 🟡 中期 建议已落地**；建议 leader 移到 `SUGGESTION-FIXED.md`。
 
 ---
 
@@ -143,34 +128,6 @@
 - ⚪ **长期**：M3b / M4 阶段根据用户反馈调整；如要 Linux-style 切换为 `<stem>-<n>.<ext>` 即可（5 行代码改动）
 
 **优先级**：⚪（不阻塞 M3a；纯 cosmetic；用户反馈驱动）
-
----
-
-## #S-5 🟡 — `dispatch_files` 用常量 `DEFAULT_MAX_FILE_SIZE = 50 MiB`（待 IPC 落地后切到 `Config::max_file_size()`）
-
-**触发 STEP**：STEP-P2-M3a-3a.2
-
-**现象**：`src/service.rs::DEFAULT_MAX_FILE_SIZE = 50 * 1024 * 1024`（PLAN §3 STEP-3a.2 评审 #25 默认值）写死在 `Service::new` 字段 `max_file_size` 中。`lan-mouse-ipc::ClipboardConfig.max_file_size` 字段 M3b STEP-3b.1 才落地，`Config::max_file_size()` getter 同步落地。STEP-3a.2 不能 1.5 h 内同时做完 wire + IPC + 集成测试。
-
-**理由**：PLAN §3 STEP-3a.2 验收口径 "cfg.max_file_size 从 ClipboardConfig 读取（默认 50 MiB；0 = 不限）" —— 但 STEP-3b.1 才定义 `ClipboardConfig` 结构。当前通过常量 + SUGGESTION 跟踪实现，后续 M3b STEP-3b.1 / M4 STEP-4.2 完成 IPC + TOML 字段后替换：
-
-```rust
-// 当前（STEP-3a.2）
-self.max_file_size = DEFAULT_MAX_FILE_SIZE;
-
-// 期望（M3b STEP-3b.1 落地后）
-self.max_file_size = config.max_file_size().unwrap_or(DEFAULT_MAX_FILE_SIZE);
-```
-
-**影响**：
-- M3a 阶段：用户在 GUI 上看不到 `max_file_size` 控件 → daemon 默认 50 MiB 始终生效（合理 fallback）
-- M3b 阶段：IPC + UI + config.toml 落地后用户可调 0 = 不限（已实现）或 100 MiB / 1 GiB（自定义）
-
-**建议**（leader 决策）：
-- 🟢 短期：本 SUGGESTION 落地（已实现）+ 跟进 M3b STEP-3b.1 集成
-- 🟡 中期：M3b STEP-3b.1 实现时一并把 `Config::max_file_size()` 串通到 `Service::max_file_size` 字段；无需重构，仅替换初值来源
-
-**优先级**：🟡（不阻塞 M3a；M3b 阶段直接消费）
 
 ---
 
