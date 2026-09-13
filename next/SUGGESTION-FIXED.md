@@ -263,3 +263,23 @@
   - 建议 M5 / post-M5 hotfix 阶段加 `maybe_inject_files_to_clipboard_e2e_loopback_short_circuits_after_one_round_trip` 测试（mock backend + 模拟 batch_fingerprint vs local fingerprint 不匹配场景）
 - **Plan 偏差**：无 M4 STEP-4.3 偏差条目；这是 4.3 / 4.2 协同引入的真机 integration bug（4.3 loopback pre-stamp fingerprint 选择 + 4.2 set_files Win32 真机首次入 production 的 Win32 path 副作用），单 STEP 内静态分析无法精准定位
 - **解决 STEP**：M4 hotfix（用户 2026-09-13 18:12 - 18:30 直接修复；不在 PLAN STEP 内；M5 STEP-5.1+ 之后无需重做）
+
+---
+
+## #P2.3 (M3a validator carry-forward) — `write_and_verify_file_blocking` post-write fsync before remove / rename
+
+- **触发 STEP**：STEP-P2-M3a-3a.2（initial落地）+ M3a validator `next/STEP-VALIDATION-P2-M3a-FULL.md` P2.3 carry-forward 标记
+- **现象**：`src/service.rs::write_and_verify_file_blocking` 之前 `std::fs::write` + sha256 verify + `std::fs::remove_file` 无 `sync_all` 在 write 后；power loss 在 OS page-cache flush 前可能撕裂文件。image branch 已用 `f.sync_all().await`（M2a/M2b 修过 pre-fix state）；file branch 漏同步。
+- **严重度**：P2 (validator) — design smell；low risk (daemon runs on desktop, not DB); 极端 edge case。
+- **解决方案**（M5 STEP-5.1 落地，commit `2629d72`）：
+  - 重构 `write_and_verify_file_blocking`：
+    1. **写入 `<name>.partial` 中间文件**（`File::create + write_all + sync_all()` —— fsync-then-rename 模式闭合 P2.3）
+    2. sha256 verify against partial bytes
+    3. 验证通过：`rename <name>.partial → final landed path`（atomic on POSIX / NTFS）
+    4. 验证失败：remove `<name>.partial`（`keep_partial=false`）或保留（`keep_partial=true`，postmortem 用）
+  - 新 `keep_partial: bool` 参数透传（从 4.1 IPC `ClipboardConfig.keep_partial` 字段 → 4.3 `Service::keep_partial()` getter → 5.1 接进 `write_and_verify_file_blocking`）
+  - 14 新单测 + 1 扩展测试覆盖：
+    - `write_and_verify_file_blocking_keep_partial_preserves_on_mismatch`（新增）
+    - 现有 `write_and_verify_file_blocking_mismatch_deletes_partial` 加 `<name>.partial` 路径断言
+- **结果**：fsync-then-rename 模式同时闭合 validator P2.3（fsync 缺失）+ 提供 atomic replace + 默认 .partial 删除（除非用户开 keep_partial）
+- **解决 STEP**：M5 / STEP-P2-M5-5.1
