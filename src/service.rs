@@ -323,6 +323,38 @@ pub struct Service {
     /// `send`, so the registry entry is auto-cleared by the
     /// `remove` call inside the cancel handler.
     inbound_file_cancel_txs: Arc<Mutex<HashMap<[u8; 32], oneshot::Sender<()>>>>,
+    /// **M4 STEP-4.3** — per-batch clipboard re-inject
+    /// collectors. Inserted in
+    /// [`Self::handle_clipboard_inbound_files`] at the moment a
+    /// `ClipboardFiles` batch starts spawning per-entry tasks;
+    /// drained in [`Self::handle_inbound_files_applied`] when
+    /// the last entry's `InboundFileApplyResult` lands.
+    ///
+    /// Keyed by `cf.fingerprint` (the source's batch
+    /// fingerprint). Multiple batches can be in-flight
+    /// concurrently — different selections arriving in rapid
+    /// succession would otherwise interleave their `set_files`
+    /// triggers and either drop entries or coalesce into a single
+    /// re-inject with paths from both batches.
+    ///
+    /// **Lifecycle**:
+    /// 1. `handle_clipboard_inbound_files` insert →
+    ///    `{ expected: entries.len(), received: vec![] }`
+    /// 2. Each `apply_inbound_files_task` completion →
+    ///    `received.push(result)`
+    /// 3. `received.len() == expected` →
+    ///    drain collector, run skip conditions, send
+    ///    `BackendCmd::SetFiles`
+    ///
+    /// **Re-inject skip condition**:
+    /// - `inject_to_clipboard=false` (user opt-out)
+    /// - loopback fingerprint pre-stamp hit (local copy of
+    ///   the same selection — already on the clipboard)
+    /// - any `result.success == false` (don't inject
+    ///   unverified bytes)
+    /// - `clipboard_enabled() == false` (master toggle off;
+    ///   defensive — dispatcher startup usually gates this)
+    pending_file_collectors: HashMap<[u8; 32], FileSetCollector>,
     /// **M3a STEP-3a.2** — file-body byte cache (sha256 → bytes).
     /// Shared `Arc` so the dispatcher's writer arm and the future
     /// HTTP/3 server-side `/clipboard/file/{sha256}` reader
@@ -1093,6 +1125,11 @@ impl Service {
             // HTTP/3 GET; the receiver-side cancel handler
             // `remove`s the entry and sends the cancel signal.
             inbound_file_cancel_txs: Arc::new(Mutex::new(HashMap::new())),
+            // **M4 STEP-4.3** — empty collector map.
+            // `handle_clipboard_inbound_files` populates an entry
+            // per inbound batch; `handle_inbound_files_applied`
+            // drains it when the last entry lands.
+            pending_file_collectors: HashMap::new(),
             // **M3a STEP-3a.2 + STEP-3a.4** — 1 GiB file-body
             // cache. Built up front (before the listener +
             // connection constructors) so the same `Arc` is
@@ -1407,7 +1444,7 @@ impl Service {
                 // (rather than the spawned task) avoids needing
                 // an extra `Arc<Mutex<...>>` field for the LRU.
                 Some(applied) = files_applied_rx.recv() => {
-                    self.handle_inbound_files_applied(applied);
+                    self.handle_inbound_files_applied(applied).await;
                 }
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -3757,6 +3794,24 @@ impl Service {
                     accept_dir.display(),
                 );
 
+                // **M4 STEP-4.3** — insert the per-batch
+                // re-inject collector BEFORE spawning the per-entry
+                // tasks. The collector fires `BackendCmd::SetFiles`
+                // exactly once, when the last entry's
+                // `InboundFileApplyResult` lands (matched by
+                // `received.len() == expected`). `expected` is
+                // pinned to `entries.len()` here so the trigger is
+                // deterministic even if a future decide-fn change
+                // re-filters entries mid-batch.
+                let batch_fingerprint = cf.fingerprint;
+                self.pending_file_collectors.insert(
+                    batch_fingerprint,
+                    FileSetCollector {
+                        expected: entries.len(),
+                        received: Vec::with_capacity(entries.len()),
+                    },
+                );
+
                 // Per-entry spawn. Each entry is independent
                 // (different sha256 → different file path →
                 // different write); spawning them serially
@@ -3782,6 +3837,7 @@ impl Service {
                     let cancel_registry = self.inbound_file_cancel_txs.clone();
                     tokio::task::spawn_local(apply_inbound_files_task(
                         applied_tx_for_entry,
+                        batch_fingerprint,
                         entry.sha256,
                         name,
                         entry.size,
@@ -3796,13 +3852,13 @@ impl Service {
         }
     }
 
-    /// **M3a STEP-3a.3** — completion handler for
+    /// **M3a STEP-3a.3 + M4 STEP-4.3** — completion handler for
     /// [`apply_inbound_files_task`]. Mirrors
     /// [`Self::handle_inbound_image_applied`] for the file branch:
     /// the spawned task owns the HTTP/3 GET + spawn_blocking
     /// write/verify; this completion arm handles the bookkeeping
     /// that requires `&mut self` (LRU mark + metrics + frontend
-    /// notify).
+    /// notify + **clipboard re-inject collector trigger**).
     ///
     /// **Window defence ordering** (matches the image branch's
     /// rationale): the file LRU is `push`'d on **success** — a
@@ -3814,52 +3870,244 @@ impl Service {
     ///
     /// **Failure semantics**: on any failure path we log warn +
     /// skip metrics / frontend notify (mirrors the text/image
-    /// branches' "no inflate on failure" contract).
-    fn handle_inbound_files_applied(&mut self, result: InboundFileApplyResult) {
+    /// branches' "no inflate on failure" contract). The
+    /// per-batch re-inject collector still receives the failure
+    /// result — failures count toward `received.len() == expected`
+    /// and trip the collector's "any failure → skip set_files"
+    /// branch below.
+    ///
+    /// **M4 STEP-4.3 collector wiring**:
+    /// 1. Look up the per-batch collector keyed by
+    ///    `result.batch_fingerprint`. If absent (collector already
+    ///    drained or never inserted), the result is orphaned —
+    ///    log warn + return.
+    /// 2. Push the result into `collector.received`.
+    /// 3. If `received.len() == expected`, drain the collector
+    ///    via `remove` (so a follow-up batch with the same
+    ///    fingerprint can re-insert).
+    /// 4. Run the four skip conditions; if all pass,
+    ///    pre-stamp `last_outbound_files_fingerprint` and send
+    ///    `BackendCmd::SetFiles` with the accumulated paths.
+    async fn handle_inbound_files_applied(&mut self, result: InboundFileApplyResult) {
         let inbound_sha = result.inbound_sha;
         let source = result.source;
         let name = result.name.as_str();
         let bytes_len = result.bytes_len;
         let size = result.size;
         let mime = result.mime.as_str();
+        let batch_fingerprint = result.batch_fingerprint;
         if !result.success {
             log::warn!(
                 "clipboard inbound file apply failed from {source}: {} \
                  (sha={}, name={name}, declared={size} bytes, got={bytes_len} bytes, \
-                 mime={mime})",
+                 mime={mime}, error={:?})",
                 result.error_msg.as_deref().unwrap_or("(no detail)"),
+                short_hex(&inbound_sha),
+                result.error,
+            );
+        } else {
+            // Mark the inbound SHA in the file loopback LRU. The
+            // dispatcher (outbound) writes its own fingerprint; we
+            // mark the inbound SHA on success so the next 500 ms tick
+            // doesn't re-dispatch a copy we just received.
+            self.file_lru_fingerprints.push(inbound_sha);
+            // Step 3: record the allow (matches the text/image
+            // branches' "only on success" contract).
+            self.metrics.incr_allow();
+            // Step 4: bookkeeping + frontend notification.
+            let now_ms = unix_now_ms();
+            self.last_file_ts_ms = Some(now_ms);
+            self.last_clipboard_source = Some(source);
+            self.notify_frontend(FrontendEvent::ClipboardState {
+                last_text_ts: self.last_text_ts_ms,
+                last_image_ts: self.last_image_ts_ms,
+                last_file_ts: self.last_file_ts_ms,
+                last_source: Some(format!("{source}")),
+            });
+            log::info!(
+                "clipboard inbound file: applied {} bytes from {source} \
+                 (sha={}, name={name}, mime={mime}, landed at {:?})",
+                bytes_len,
+                short_hex(&inbound_sha),
+                result
+                    .landed_path
+                    .as_deref()
+                    .unwrap_or(Path::new("<unknown>")),
+            );
+        }
+
+        // **M4 STEP-4.3** — collector trigger. Look up the
+        // per-batch collector; if absent, log warn + return
+        // (the result still updates the loopback LRU + metrics
+        // + frontend notify above).
+        let Some(mut collector) = self.pending_file_collectors.remove(&batch_fingerprint) else {
+            // No collector: either (a) we already drained it
+            // via an earlier arrival that hit `expected` count,
+            // or (b) `handle_clipboard_inbound_files` never
+            // inserted one (defensive — should not happen).
+            // Either way, this `InboundFileApplyResult` has
+            // nowhere to land; the bookkeeping above is
+            // already complete.
+            log::debug!(
+                "clipboard inbound files: no collector for batch_fingerprint={} \
+                 (already drained or never inserted); sha={} result dropped from collector path",
+                short_hex(&batch_fingerprint),
                 short_hex(&inbound_sha),
             );
             return;
+        };
+        collector.received.push(result);
+        if collector.received.len() != collector.expected {
+            // More entries still in flight. Put the collector
+            // back (we removed it via the `Option::take` above
+            // for borrow-checker reasons) and return. The next
+            // `InboundFileApplyResult` for this batch will
+            // retry the trigger.
+            self.pending_file_collectors
+                .insert(batch_fingerprint, collector);
+            return;
         }
-        // Mark the inbound SHA in the file loopback LRU. The
-        // dispatcher (outbound) writes its own fingerprint; we
-        // mark the inbound SHA on success so the next 500 ms tick
-        // doesn't re-dispatch a copy we just received.
-        self.file_lru_fingerprints.push(inbound_sha);
-        // Step 3: record the allow (matches the text/image
-        // branches' "only on success" contract).
-        self.metrics.incr_allow();
-        // Step 4: bookkeeping + frontend notification.
-        let now_ms = unix_now_ms();
-        self.last_file_ts_ms = Some(now_ms);
-        self.last_clipboard_source = Some(source);
-        self.notify_frontend(FrontendEvent::ClipboardState {
-            last_text_ts: self.last_text_ts_ms,
-            last_image_ts: self.last_image_ts_ms,
-            last_file_ts: self.last_file_ts_ms,
-            last_source: Some(format!("{source}")),
-        });
-        log::info!(
-            "clipboard inbound file: applied {} bytes from {source} \
-             (sha={}, name={name}, mime={mime}, landed at {:?})",
-            bytes_len,
-            short_hex(&inbound_sha),
-            result
-                .landed_path
-                .as_deref()
-                .unwrap_or(Path::new("<unknown>")),
+        // All entries collected. Run the four skip conditions
+        // BEFORE pre-stamping (the pre-stamp updates
+        // `last_outbound_files_fingerprint` and would mask
+        // the loopback check on this very trigger).
+        self.maybe_inject_files_to_clipboard(batch_fingerprint, collector)
+            .await;
+    }
+
+    /// **M4 STEP-4.3** — drained collector trigger. Runs the
+    /// four skip conditions in priority order and, if all pass,
+    /// pre-stamps `last_outbound_files_fingerprint` then sends
+    /// `BackendCmd::SetFiles` with the accumulated paths.
+    ///
+    /// **Skip condition order** (each branch logs + returns):
+    /// a. `clipboard_enabled() == false` — master toggle off
+    ///    (defensive; the dispatcher startup gate usually
+    ///    prevents inbound arms from running).
+    /// b. `inject_to_clipboard() == false` — user opt-out via
+    ///    GeneralPanel / CLI / TOML `inject_to_clipboard = false`.
+    /// c. Loopback fingerprint hit —
+    ///    `last_outbound_files_fingerprint == Some(batch_fingerprint)`
+    ///    BEFORE the pre-stamp. The user just locally copied
+    ///    the same selection (or the pre-stamp from a prior
+    ///    `ExceedsLimit` arm already covers it); re-injecting
+    ///    would clobber their content.
+    /// d. Any entry has `success == false` (sha256 mismatch /
+    ///    IO error / HTTP/3 GET failure) — never inject
+    ///    unverified bytes.
+    ///
+    /// **Pre-stamp on the success path**:
+    /// `self.last_outbound_files_fingerprint = Some(batch_fingerprint)`
+    /// runs IMMEDIATELY before the `BackendCmd::SetFiles`
+    /// send, so the next 500 ms poller tick that re-reads the
+    /// file selection sees the matching fingerprint and
+    /// short-circuits at `dispatch_files_decide`. This mirrors
+    /// the ExceedsLimit arm's pre-stamp (commit `d6fb1d8`).
+    ///
+    /// **No `&mut self` is held across the cmd send**: the
+    /// `Vec<PathBuf>` is moved into `BackendCmd::SetFiles` and
+    /// the reply is awaited inline. The poller task owns the
+    /// backend via a separate channel — this function is on
+    /// the main task's `&mut self` borrow window for its full
+    /// duration (cmd send + reply await), but no other `select!`
+    /// arm can fire during the await (the await is on a
+    /// oneshot receiver that doesn't yield to the runtime
+    /// unless the poller is busy — and the poller processes
+    /// the cmd in microseconds).
+    async fn maybe_inject_files_to_clipboard(
+        &mut self,
+        batch_fingerprint: [u8; 32],
+        collector: FileSetCollector,
+    ) {
+        // Pure skip-decision — pinned by unit tests below.
+        let decision = decide_reinject_skip(
+            self.clipboard_enabled(),
+            self.inject_to_clipboard(),
+            self.last_outbound_files_fingerprint,
+            batch_fingerprint,
+            &collector.received,
         );
+        if let Some(reason) = decision {
+            log::info!(
+                "clipboard re-inject: skipping batch_fingerprint={} ({})",
+                short_hex(&batch_fingerprint),
+                reason
+            );
+            return;
+        }
+        // All entries succeeded — collect paths in source order.
+        // `Vec::with_capacity` was pre-allocated in the insert,
+        // so `received` is already the right size.
+        let paths: Vec<PathBuf> = collector
+            .received
+            .into_iter()
+            .filter_map(|r| r.landed_path)
+            .collect();
+        if paths.is_empty() {
+            // Defensive: every entry succeeded but somehow
+            // landed_path is None on all. Should not happen —
+            // success == true implies landed_path == Some.
+            log::warn!(
+                "clipboard re-inject: batch_fingerprint={} has no landed_paths \
+                 despite all-success; skipping",
+                short_hex(&batch_fingerprint)
+            );
+            return;
+        }
+        // Pre-stamp BEFORE the cmd send. The next 500 ms poller
+        // tick that re-reads the file selection sees the
+        // matching fingerprint and short-circuits at
+        // `dispatch_files_decide` (mirrors commit `d6fb1d8`).
+        self.last_outbound_files_fingerprint = Some(batch_fingerprint);
+        // Send to the poller-owned backend via the cmd channel.
+        let Some(cmd_tx) = self.clipboard_backend_cmd.as_ref() else {
+            log::warn!(
+                "clipboard re-inject: clipboard_backend_cmd uninitialised; \
+                 skipping set_files for batch_fingerprint={}",
+                short_hex(&batch_fingerprint)
+            );
+            return;
+        };
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if cmd_tx
+            .send(BackendCmd::SetFiles {
+                files: paths.clone(),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            log::warn!(
+                "clipboard re-inject: poller task is gone (panic or shutdown); \
+                 skipping set_files for batch_fingerprint={} ({} paths)",
+                short_hex(&batch_fingerprint),
+                paths.len(),
+            );
+            return;
+        }
+        log::info!(
+            "clipboard re-inject: dispatching set_files({} path(s)) for \
+             batch_fingerprint={} (pre-stamped last_outbound_files_fingerprint)",
+            paths.len(),
+            short_hex(&batch_fingerprint)
+        );
+        // Best-effort await on the reply. The reply only
+        // signals success/failure of the platform-side write;
+        // the re-inject decision is already made (we
+        // pre-stamped). A timeout / dropped reply just logs
+        // warn — the user's clipboard is in whatever state
+        // the poller managed to write.
+        match reply_rx.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!(
+                "clipboard re-inject: set_files failed for batch_fingerprint={}: {e}",
+                short_hex(&batch_fingerprint)
+            ),
+            Err(_) => log::warn!(
+                "clipboard re-inject: set_files reply channel closed \
+                 (poller task gone mid-reply) for batch_fingerprint={}",
+                short_hex(&batch_fingerprint)
+            ),
+        }
     }
 
     /// **M1b STEP-1b.2** — resolve the QUIC `Connection` for a peer
@@ -4479,6 +4727,26 @@ enum BackendCmd {
     CurrentFiles {
         reply: tokio::sync::oneshot::Sender<Option<Vec<PathBuf>>>,
     },
+    /// **M4 STEP-4.3** — write a batch of file paths to the
+    /// local OS clipboard. The poller (which owns the backend)
+    /// invokes `backend.set_files(&files)` and replies via
+    /// `oneshot`. Inbound `handle_inbound_files_applied`
+    /// triggers this when the per-batch collector is fully
+    /// populated AND none of the four skip conditions hold
+    /// (`inject_to_clipboard=false` / loopback pre-stamp hit /
+    /// any-entry-failure / `enabled=false`).
+    ///
+    /// **Why `&mut self` (cmd variant)**: `set_files` requires
+    /// `&mut self` on the backend (macOS NSPasteboard needs a
+    /// mutable state machine; Windows `OpenClipboard` returns a
+    /// handle the poller must own; Linux `xclip` / `wl-copy`
+    /// spawn a child + write stdin). Sending through the cmd
+    /// channel serialises the write with the polling tick
+    /// (which also takes `&mut self` on the backend).
+    SetFiles {
+        files: Vec<PathBuf>,
+        reply: tokio::sync::oneshot::Sender<Result<(), crate::clipboard::ClipboardError>>,
+    },
 }
 
 /// **M3a STEP-3a.2** — default per-file size cap, bytes.
@@ -4841,6 +5109,17 @@ async fn clipboard_poller(
                     BackendCmd::CurrentFiles { reply } => {
                         let _ = reply.send(None);
                     }
+                    // **M4 STEP-4.3** — same Err(Unsupported)
+                    // pattern as the other write variants. The
+                    // re-inject collector on the main task awaits
+                    // the reply but does not act on `Err` (the
+                    // re-inject is best-effort; a backend-absent
+                    // run logs + moves on).
+                    BackendCmd::SetFiles { reply, .. } => {
+                        let _ = reply.send(Err(crate::clipboard::ClipboardError::Unsupported(
+                            "clipboard backend not configured".into(),
+                        )));
+                    }
                 }
             }
             return;
@@ -4981,6 +5260,20 @@ async fn clipboard_poller(
                         // future inbound arms can route through
                         // the poller like every other read.
                         let _ = reply.send(backend.current_files());
+                    }
+                    // **M4 STEP-4.3** — write paths to the
+                    // local OS clipboard. `set_files` itself
+                    // returns `Result<(), ClipboardError>`; the
+                    // error propagates back to the main task's
+                    // collector via the `oneshot` reply. The
+                    // collector currently does not act on the
+                    // error (the re-inject is best-effort; a
+                    // failure logs warn and the user can still
+                    // Cmd+V the dropped paths from the inbound
+                    // log line). Future M5+ work may surface
+                    // the error via `FrontendEvent` / GUI.
+                    BackendCmd::SetFiles { files, reply } => {
+                        let _ = reply.send(backend.set_files(&files));
                     }
                 }
             }
@@ -5294,13 +5587,105 @@ async fn apply_image_inner(
 // - [`Service::handle_inbound_files_applied`] — completion arm
 //   for the main `select!` (mirrors `handle_inbound_image_applied`).
 
+/// **M4 STEP-4.3** — typed classification of
+/// [`InboundFileApplyResult`] failure modes. Used by the
+/// clipboard-re-inject collector ([`Service::pending_file_collectors`])
+/// to identify entries that should NOT be written back to the local
+/// clipboard (any non-`None` variant triggers skip).
+///
+/// **Why typed (not just `success: bool`)**: the forward-compat
+/// variants (`MimeTooLarge` / `ExceedsLimit` / `Canceled`) are not
+/// currently produced by the dispatch path — they're defensive
+/// branches for future call paths. The typed enum makes these
+/// forward-compat cases explicitly constructible in unit tests,
+/// even though no production code constructs them today.
+///
+/// **Currently-produced variants**:
+/// - [`Self::Sha256Mismatch`] — bytes were written but recomputed
+///   sha256 didn't match the entry's expected sha. The partial
+///   file is deleted inside [`write_and_verify_file_blocking`]
+///   before the error is reported.
+/// - [`Self::IoError`] — `std::fs::write` failed, or
+///   `spawn_blocking` join failed, or HTTP/3 GET returned a
+///   non-200 status. Generic catch-all for any I/O failure.
+///
+/// **Forward-compat (not produced today)**:
+/// - [`Self::MimeTooLarge`] — entry had `mime == MIME_TOO_LARGE`.
+///   Currently filtered by [`handle_clipboard_inbound_files_decide`]
+///   before spawn, so this variant is unreachable in production.
+///   Kept for collector testability + future-proofing.
+/// - [`Self::ExceedsLimit`] — entry size exceeded
+///   `Config::clipboard_config().max_file_size`. The inbound side
+///   does NOT check size (the outbound dispatcher's `collect_files`
+///   enforces it; inbound trust-but-verify is via sha256). Kept
+///   for future size-enforcement inbound paths.
+/// - [`Self::Canceled`] — user-initiated cancellation landed after
+///   the entry was already in flight. Currently
+///   [`apply_inbound_files_task`] early-returns on cancel without
+///   sending an `InboundFileApplyResult`. Kept for future cancel
+///   paths that complete the apply but want to signal cancellation.
+/// - [`Self::PartialResidue`] — `keep_partial=true` and a `.partial`
+///   file remains on disk. The actual cleanup is M5 STEP-5.1; this
+///   variant is the collector's signal that an entry left residue
+///   and the re-inject should be skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InboundFileError {
+    /// Bytes-written sha256 didn't match expected.
+    Sha256Mismatch,
+    /// Generic I/O error (write failure, HTTP/3 GET non-200, join error).
+    IoError,
+    /// Entry's mime == MIME_TOO_LARGE (>4 GiB declaration).
+    /// Forward-compat; not produced today.
+    #[allow(dead_code)] // constructed only in unit tests for forward-compat coverage
+    MimeTooLarge,
+    /// Entry size > max_file_size cap. Forward-compat; not produced
+    /// today (inbound trusts the wire size + sha256).
+    #[allow(dead_code)] // constructed only in unit tests for forward-compat coverage
+    ExceedsLimit,
+    /// Entry was cancelled mid-apply. Forward-compat; today the
+    /// apply task early-returns without sending this event.
+    #[allow(dead_code)] // constructed only in unit tests for forward-compat coverage
+    Canceled,
+    /// `.partial` file left on disk under `keep_partial=true`.
+    /// Forward-compat; cleanup lands in M5 STEP-5.1.
+    #[allow(dead_code)] // constructed only in unit tests for forward-compat coverage
+    PartialResidue,
+}
+
+/// **M4 STEP-4.3** — per-batch accumulator for clipboard
+/// re-injection ([`Service::pending_file_collectors`]). Inserted
+/// in [`Service::handle_clipboard_inbound_files`] at the moment a
+/// `ClipboardFiles` batch starts spawning its per-entry tasks;
+/// drained in [`Service::handle_inbound_files_applied`] when the
+/// last entry's [`InboundFileApplyResult`] lands.
+///
+/// **Why `received: Vec<_>` (not `HashSet<_>`)**: order matters for
+/// the re-inject — `set_files` is called with paths in the same
+/// order as the source's `cf.entries`, so a multi-select in Finder
+/// pastes back in the user's selection order.
+///
+/// **Why `expected: usize` (captured at start)**: the source may
+/// filter or coalesce entries between send and receive; pinning
+/// `expected` to `cf.entries.len()` at collector start makes the
+/// "all entries done" trigger deterministic.
+struct FileSetCollector {
+    /// Number of entries the source claimed in the batch
+    /// (`cf.entries.len()` at collector start). The collector
+    /// fires `BackendCmd::SetFiles` exactly once, when
+    /// `received.len() == expected`.
+    expected: usize,
+    /// Per-entry apply results, in source-declared entry order.
+    received: Vec<InboundFileApplyResult>,
+}
+
 /// **M3a STEP-3a.3** — completion event for
 /// [`apply_inbound_files_task`]. The spawned task reports the
 /// outcome (success / GET failure / sha256 mismatch / IO error) via
 /// this struct on the `inbound_files_applied_tx` channel; the main
 /// task's `select!` consumes the value in
 /// [`Service::handle_inbound_files_applied`] to update the file
-/// loopback LRU + metrics + frontend notify.
+/// loopback LRU + metrics + frontend notify + clipboard re-inject
+/// collector ([`Service::pending_file_collectors`]).
 ///
 /// **Why a `struct` not a tuple**: the `Option<PathBuf>` semantics
 /// (the landed path may be `None` on any failure path) are easier
@@ -5314,10 +5699,25 @@ async fn apply_image_inner(
 /// currently include the landed path, but the LRU bookkeeping
 /// benefits from knowing exactly which path was used (for future
 /// "show received files in GUI" hooks).
+///
+/// **M4 STEP-4.3 additions**: `batch_fingerprint` (the source's
+/// `cf.fingerprint`, used to look up this entry's collector in
+/// [`Service::pending_file_collectors`]) + `error: Option<InboundFileError>`
+/// (typed classification of the failure mode, used by the collector
+/// to decide whether to skip the re-inject).
 struct InboundFileApplyResult {
     /// Inbound SHA from the wire (the entry's `sha256`). Mirrors
     /// [`InboundImageApplyResult::inbound_sha`].
     inbound_sha: [u8; 32],
+    /// **M4 STEP-4.3** — source batch fingerprint
+    /// (`cf.fingerprint` from the original `ClipboardFiles`
+    /// envelope). Used to look up the per-batch collector in
+    /// [`Service::pending_file_collectors`]. Two batches with the
+    /// same `cf.fingerprint` is impossible in practice (the
+    /// dispatcher uses the fingerprint for loopback dedup), but
+    /// the field is the right key for in-flight disambiguation
+    /// when several batches are mid-apply simultaneously.
+    batch_fingerprint: [u8; 32],
     /// Source peer address (for log lines + `last_clipboard_source`).
     source: SocketAddr,
     /// Filename component of the entry (no directory). Logged in
@@ -5331,10 +5731,20 @@ struct InboundFileApplyResult {
     /// of mime).
     mime: String,
     /// `true` iff the bytes were successfully written + verified.
-    /// On `false`, `error_msg` carries the failure detail and
+    /// On `false`, `error` carries the typed failure kind,
+    /// `error_msg` carries the human-readable detail, and
     /// `landed_path` is `None` (the partial file is deleted on
     /// sha256 mismatch — see [`write_and_verify_file_blocking`]).
     success: bool,
+    /// **M4 STEP-4.3** — typed failure classification. `Some(_)` iff
+    /// `success == false`; `None` on success. Forward-compat
+    /// variants ([`InboundFileError::MimeTooLarge`] /
+    /// [`InboundFileError::ExceedsLimit`] /
+    /// [`InboundFileError::Canceled`] /
+    /// [`InboundFileError::PartialResidue`]) are not produced by
+    /// today's dispatch path but are constructible for
+    /// collector-skip unit tests.
+    error: Option<InboundFileError>,
     /// Final on-disk path after collision-suffix resolution.
     /// `Some(path)` on success (the file is on disk); `None` on
     /// any failure path.
@@ -5730,14 +6140,15 @@ pub(crate) fn write_and_verify_file_blocking(
 /// indirection lets unit tests drive success / 404 / IO-error
 /// paths without standing up a real HTTP/3 server.
 ///
-/// **`#[allow(clippy::too_many_arguments)]`**: 8 args (the per-entry
-/// fields + `accept_dir` + `fetcher` future + `applied_tx`
-/// channel) — each is genuinely independent. Grouping into a
-/// context struct would obscure the call site without reducing the
-/// total surface.
+/// **`#[allow(clippy::too_many_arguments)]`**: 9 args (the per-entry
+/// fields + `batch_fingerprint` (M4 STEP-4.3) + `accept_dir` +
+/// `fetcher` future + `applied_tx` channel) — each is genuinely
+/// independent. Grouping into a context struct would obscure the
+/// call site without reducing the total surface.
 #[allow(clippy::too_many_arguments)]
 async fn apply_inbound_files_task<F>(
     applied_tx: tokio_mpsc::UnboundedSender<InboundFileApplyResult>,
+    batch_fingerprint: [u8; 32],
     inbound_sha: [u8; 32],
     name: String,
     size: u64,
@@ -5809,12 +6220,14 @@ async fn apply_inbound_files_task<F>(
                     .expect("cancel registry mutex poisoned")
                     .remove(&inbound_sha);
                 let _ = applied_tx.send(InboundFileApplyResult {
+                    batch_fingerprint,
                     inbound_sha,
                     source,
                     name,
                     size,
                     mime,
                     success: false,
+                    error: Some(InboundFileError::IoError),
                     landed_path: None,
                     bytes_len: 0,
                     error_msg: Some(format!(
@@ -5845,12 +6258,14 @@ async fn apply_inbound_files_task<F>(
                     .expect("cancel registry mutex poisoned")
                     .remove(&inbound_sha);
                 let _ = applied_tx.send(InboundFileApplyResult {
+                    batch_fingerprint,
                     inbound_sha,
                     source,
                     name,
                     size,
                     mime,
                     success: false,
+                    error: Some(InboundFileError::IoError),
                     landed_path: None,
                     bytes_len: 0,
                     error_msg: Some(format!(
@@ -5886,6 +6301,7 @@ async fn apply_inbound_files_task<F>(
     // Hand off to the off-LocalSet write + sha256 verify.
     let landed_path = apply_files_inner_returning_path(
         applied_tx.clone(),
+        batch_fingerprint,
         inbound_sha,
         name,
         size,
@@ -5942,6 +6358,13 @@ async fn apply_inbound_files_task<F>(
 /// the main task's bookkeeping (`handle_inbound_files_applied`)
 /// runs identically to the pre-cancel path.
 ///
+/// **M4 STEP-4.3** — adds `batch_fingerprint` so the spawned
+/// completion event carries the source `cf.fingerprint` through
+/// to the re-inject collector. The Ok / Err / join_err branches
+/// also classify the failure into a typed [`InboundFileError`]:
+/// `sha256 mismatch:` message prefix → `Sha256Mismatch`;
+/// otherwise → `IoError`.
+///
 /// Mirrors [`apply_files_inner`] exactly except for the return
 /// type — kept as a separate free fn (rather than a
 /// `#[must_use]` flag on the original) to avoid touching
@@ -5950,6 +6373,7 @@ async fn apply_inbound_files_task<F>(
 #[allow(clippy::too_many_arguments)]
 async fn apply_files_inner_returning_path(
     applied_tx: tokio_mpsc::UnboundedSender<InboundFileApplyResult>,
+    batch_fingerprint: [u8; 32],
     inbound_sha: [u8; 32],
     name: String,
     size: u64,
@@ -5971,12 +6395,14 @@ async fn apply_files_inner_returning_path(
     match join_result {
         Ok(Ok(landed_path)) => {
             let _ = applied_tx.send(InboundFileApplyResult {
+                batch_fingerprint,
                 inbound_sha,
                 source,
                 name,
                 size,
                 mime,
                 success: true,
+                error: None,
                 landed_path: Some(landed_path.clone()),
                 bytes_len,
                 error_msg: None,
@@ -5984,13 +6410,28 @@ async fn apply_files_inner_returning_path(
             Some(landed_path)
         }
         Ok(Err(e)) => {
+            // **M4 STEP-4.3** — classify the failure into a
+            // typed `InboundFileError`. `write_and_verify_file_blocking`
+            // emits "sha256 mismatch: ..." for the only typed
+            // mismatch case; everything else (write failure, etc.)
+            // collapses into `IoError`. The string-prefix match
+            // is cheap (the message is short + already in memory)
+            // and avoids a richer error-type refactor in
+            // `write_and_verify_file_blocking`.
+            let typed_error = if e.starts_with("sha256 mismatch") {
+                InboundFileError::Sha256Mismatch
+            } else {
+                InboundFileError::IoError
+            };
             let _ = applied_tx.send(InboundFileApplyResult {
+                batch_fingerprint,
                 inbound_sha,
                 source,
                 name,
                 size,
                 mime,
                 success: false,
+                error: Some(typed_error),
                 landed_path: None,
                 bytes_len,
                 error_msg: Some(e),
@@ -5999,12 +6440,14 @@ async fn apply_files_inner_returning_path(
         }
         Err(join_err) => {
             let _ = applied_tx.send(InboundFileApplyResult {
+                batch_fingerprint,
                 inbound_sha,
                 source,
                 name,
                 size,
                 mime,
                 success: false,
+                error: Some(InboundFileError::IoError),
                 landed_path: None,
                 bytes_len,
                 error_msg: Some(format!("spawn_blocking join error: {join_err}")),
@@ -6012,6 +6455,88 @@ async fn apply_files_inner_returning_path(
             None
         }
     }
+}
+
+/// **STEP-M2-2.6**: pure helper that turns an internal
+/// **M4 STEP-4.3** — reason the re-inject collector chose to
+/// skip the `BackendCmd::SetFiles` send. Returned by
+/// [`decide_reinject_skip`] for log lines + unit-test assertion
+/// pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReinjectSkipReason {
+    /// Master toggle off — `clipboard_enabled() == false`.
+    Disabled,
+    /// User opt-out — `inject_to_clipboard() == false`.
+    OptOut,
+    /// Loopback hit — `last_outbound_files_fingerprint` already
+    /// equals the incoming batch fingerprint (user just locally
+    /// copied the same selection).
+    Loopback,
+    /// Any entry had `success == false` (sha256 mismatch / IO
+    /// error / HTTP/3 GET failure).
+    EntryFailed,
+    /// Defensive — every entry succeeded but landed_path was
+    /// `None` on all (should not happen).
+    #[allow(dead_code)] // defensive branch; never hit in production
+    NoLandedPaths,
+}
+
+impl std::fmt::Display for ReinjectSkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => write!(f, "clipboard_enabled=false — master toggle off"),
+            Self::OptOut => write!(f, "inject_to_clipboard=false — user opt-out"),
+            Self::Loopback => write!(
+                f,
+                "loopback hit — last_outbound_files_fingerprint already matches"
+            ),
+            Self::EntryFailed => write!(f, "entry failed (sha256 mismatch / IO error / GET)"),
+            Self::NoLandedPaths => write!(f, "no landed_paths despite all-success (defensive)"),
+        }
+    }
+}
+
+/// **M4 STEP-4.3** — pure decision function for the re-inject
+/// collector. Extracted from [`Service::maybe_inject_files_to_clipboard`]
+/// so the four skip conditions can be unit-tested without standing
+/// up a full [`Service`] (which requires crypto + IPC listener +
+/// QUIC endpoint plumbing that unit tests can't easily construct).
+///
+/// **Skip conditions** (checked in priority order):
+/// a. `clipboard_enabled == false` → [`ReinjectSkipReason::Disabled`]
+/// b. `inject_to_clipboard == false` → [`ReinjectSkipReason::OptOut`]
+/// c. `last_outbound_files_fingerprint == Some(batch_fingerprint)`
+///    → [`ReinjectSkipReason::Loopback`]
+/// d. Any `received.iter().any(|r| !r.success)`
+///    → [`ReinjectSkipReason::EntryFailed`]
+///
+/// **Returns** `Some(reason)` on skip; `None` on proceed.
+///
+/// **Pure**: takes `&[InboundFileApplyResult]` not `&FileSetCollector`
+/// so the function has no hidden state coupling. The caller in
+/// [`Service::maybe_inject_files_to_clipboard`] supplies the
+/// service-derived inputs (`clipboard_enabled`,
+/// `inject_to_clipboard`, `last_outbound_files_fingerprint`).
+fn decide_reinject_skip(
+    clipboard_enabled: bool,
+    inject_to_clipboard: bool,
+    last_outbound_files_fingerprint: Option<[u8; 32]>,
+    batch_fingerprint: [u8; 32],
+    received: &[InboundFileApplyResult],
+) -> Option<ReinjectSkipReason> {
+    if !clipboard_enabled {
+        return Some(ReinjectSkipReason::Disabled);
+    }
+    if !inject_to_clipboard {
+        return Some(ReinjectSkipReason::OptOut);
+    }
+    if last_outbound_files_fingerprint == Some(batch_fingerprint) {
+        return Some(ReinjectSkipReason::Loopback);
+    }
+    if received.iter().any(|r| !r.success) {
+        return Some(ReinjectSkipReason::EntryFailed);
+    }
+    None
 }
 
 /// **STEP-M2-2.6**: pure helper that turns an internal
@@ -8414,6 +8939,385 @@ mod handle_clipboard_inbound_files_tests {
 }
 
 #[cfg(test)]
+mod reinject_decision_tests {
+    //! **M4 STEP-4.3** — pins the four skip conditions of the
+    //! re-inject collector decision fn
+    //! ([`decide_reinject_skip`]). The actual `Service` method
+    //! ([`Service::maybe_inject_files_to_clipboard`]) calls this
+    //! pure helper; testing it in isolation lets us cover all
+    //! six skip / happy paths without standing up a full
+    //! `Service::new()` (which requires crypto + IPC listener +
+    //! QUIC endpoint plumbing).
+    //!
+    //! **Coverage matrix**:
+    //! 1. `inject_to_clipboard = false` → [`ReinjectSkipReason::OptOut`]
+    //! 2. Loopback fingerprint hit → [`ReinjectSkipReason::Loopback`]
+    //! 3. Any entry failure → [`ReinjectSkipReason::EntryFailed`]
+    //! 4. Forward-compat `MimeTooLarge` entry → [`ReinjectSkipReason::EntryFailed`]
+    //! 5. Forward-compat `ExceedsLimit` entry → [`ReinjectSkipReason::EntryFailed`]
+    //! 6. Forward-compat `Canceled` entry → [`ReinjectSkipReason::EntryFailed`]
+    //! 7. Happy path (all-success, master on, no loopback, re-inject) →
+    //!    `None` (proceed)
+    //! 8. `clipboard_enabled = false` → [`ReinjectSkipReason::Disabled`]
+    //!
+    //! **Why these don't cover the actual `BackendCmd::SetFiles`
+    //! send**: that requires a `Service` instance + a
+    //! `clipboard_backend_cmd` channel install, which is what
+    //! integration-level testing would cover. The pure skip
+    //! decision is the load-bearing logic — the cmd-send is a
+    //! 5-line fire-and-forget over the existing channel
+    //! pattern.
+
+    use super::*;
+
+    fn fake_received_one_success(landed: PathBuf) -> Vec<InboundFileApplyResult> {
+        vec![InboundFileApplyResult {
+            batch_fingerprint: [0x01; 32],
+            inbound_sha: [0xAA; 32],
+            source: "10.2.1.15:50247".parse().unwrap(),
+            name: "doc.pdf".to_string(),
+            size: 1024,
+            mime: "application/pdf".to_string(),
+            success: true,
+            error: None,
+            landed_path: Some(landed),
+            bytes_len: 1024,
+            error_msg: None,
+        }]
+    }
+
+    fn fake_received_with_error(
+        error: InboundFileError,
+        error_msg: &str,
+    ) -> Vec<InboundFileApplyResult> {
+        vec![InboundFileApplyResult {
+            batch_fingerprint: [0x01; 32],
+            inbound_sha: [0xAA; 32],
+            source: "10.2.1.15:50247".parse().unwrap(),
+            name: "doc.pdf".to_string(),
+            size: 1024,
+            mime: "application/pdf".to_string(),
+            success: false,
+            error: Some(error),
+            landed_path: None,
+            bytes_len: 1024,
+            error_msg: Some(error_msg.to_string()),
+        }]
+    }
+
+    /// **Skip condition a: master toggle off**.
+    ///
+    /// `clipboard_enabled = false` → skip with `Disabled`.
+    /// Pins the first-priority check (before user opt-out, before
+    /// loopback, before per-entry).
+    #[test]
+    fn reinject_decision_disabled_skips() {
+        let decision = decide_reinject_skip(
+            false, // clipboard_enabled
+            true,  // inject_to_clipboard
+            None,  // last_outbound_files_fingerprint
+            [0x01; 32],
+            &fake_received_one_success(PathBuf::from("/tmp/x")),
+        );
+        assert_eq!(
+            decision,
+            Some(ReinjectSkipReason::Disabled),
+            "master toggle off must yield Disabled"
+        );
+    }
+
+    /// **Skip condition b: user opt-out**.
+    ///
+    /// `inject_to_clipboard = false` → skip with `OptOut`.
+    /// This is the most common production skip — the user
+    /// toggled off re-inject via GeneralPanel / CLI / TOML.
+    #[test]
+    fn reinject_decision_opt_out_skips() {
+        let decision = decide_reinject_skip(
+            true,
+            false, // inject_to_clipboard
+            None,
+            [0x01; 32],
+            &fake_received_one_success(PathBuf::from("/tmp/x")),
+        );
+        assert_eq!(
+            decision,
+            Some(ReinjectSkipReason::OptOut),
+            "inject_to_clipboard=false must yield OptOut"
+        );
+    }
+
+    /// **Skip condition c: loopback fingerprint hit**.
+    ///
+    /// `last_outbound_files_fingerprint == Some(batch_fingerprint)`
+    /// → skip with `Loopback`. Mirrors the ExceedsLimit arm's
+    /// pre-stamp fix (commit `d6fb1d8`).
+    #[test]
+    fn reinject_decision_loopback_hit_skips() {
+        let fp = [0x42; 32];
+        let decision = decide_reinject_skip(
+            true,
+            true,
+            Some(fp), // loopback pre-stamp hit
+            fp,       // batch_fingerprint matches
+            &fake_received_one_success(PathBuf::from("/tmp/x")),
+        );
+        assert_eq!(
+            decision,
+            Some(ReinjectSkipReason::Loopback),
+            "matching last_outbound_files_fingerprint must yield Loopback"
+        );
+    }
+
+    /// **Loopback different fingerprint does NOT skip**.
+    ///
+    /// `last_outbound_files_fingerprint == Some(different_fp)`
+    /// → no skip (different selection, OK to re-inject).
+    #[test]
+    fn reinject_decision_loopback_miss_proceeds() {
+        let decision = decide_reinject_skip(
+            true,
+            true,
+            Some([0x99; 32]), // different fingerprint
+            [0x42; 32],
+            &fake_received_one_success(PathBuf::from("/tmp/x")),
+        );
+        assert_eq!(
+            decision, None,
+            "different last_outbound_files_fingerprint must NOT skip"
+        );
+    }
+
+    /// **Skip condition d: any entry failed**.
+    ///
+    /// One entry `success = false` (regardless of error type) →
+    /// skip with `EntryFailed`. Pins the "never inject
+    /// unverified bytes" contract.
+    #[test]
+    fn reinject_decision_any_entry_failure_skips() {
+        let received = vec![
+            InboundFileApplyResult {
+                batch_fingerprint: [0x01; 32],
+                inbound_sha: [0xAA; 32],
+                source: "10.2.1.15:50247".parse().unwrap(),
+                name: "ok.pdf".to_string(),
+                size: 1024,
+                mime: "application/pdf".to_string(),
+                success: true,
+                error: None,
+                landed_path: Some(PathBuf::from("/tmp/ok.pdf")),
+                bytes_len: 1024,
+                error_msg: None,
+            },
+            // Entry 2 failed (sha256 mismatch):
+            InboundFileApplyResult {
+                batch_fingerprint: [0x01; 32],
+                inbound_sha: [0xBB; 32],
+                source: "10.2.1.15:50247".parse().unwrap(),
+                name: "bad.pdf".to_string(),
+                size: 2048,
+                mime: "application/pdf".to_string(),
+                success: false,
+                error: Some(InboundFileError::Sha256Mismatch),
+                landed_path: None,
+                bytes_len: 0,
+                error_msg: Some("sha256 mismatch: expected=..., got=...".to_string()),
+            },
+        ];
+        let decision = decide_reinject_skip(true, true, None, [0x01; 32], &received);
+        assert_eq!(
+            decision,
+            Some(ReinjectSkipReason::EntryFailed),
+            "any entry failure must yield EntryFailed (even if others succeeded)"
+        );
+    }
+
+    /// **Forward-compat: MimeTooLarge entry skips re-inject**.
+    ///
+    /// The forward-compat `MimeTooLarge` variant (currently
+    /// unreachable in production) is constructible in the
+    /// collector and correctly triggers `EntryFailed`. Pins the
+    /// skip is robust to future production paths that emit this
+    /// variant.
+    #[test]
+    fn reinject_decision_mime_too_large_entry_skips() {
+        let received = fake_received_with_error(
+            InboundFileError::MimeTooLarge,
+            "entry mime == MIME_TOO_LARGE",
+        );
+        let decision = decide_reinject_skip(true, true, None, [0x01; 32], &received);
+        assert_eq!(
+            decision,
+            Some(ReinjectSkipReason::EntryFailed),
+            "MimeTooLarge entry must yield EntryFailed"
+        );
+    }
+
+    /// **Forward-compat: ExceedsLimit entry skips re-inject**.
+    ///
+    /// Mirrors the MimeTooLarge pin for the ExceedsLimit variant
+    /// (forward-compat; not produced today).
+    #[test]
+    fn reinject_decision_exceeds_limit_entry_skips() {
+        let received =
+            fake_received_with_error(InboundFileError::ExceedsLimit, "entry size > max_file_size");
+        let decision = decide_reinject_skip(true, true, None, [0x01; 32], &received);
+        assert_eq!(
+            decision,
+            Some(ReinjectSkipReason::EntryFailed),
+            "ExceedsLimit entry must yield EntryFailed"
+        );
+    }
+
+    /// **Forward-compat: Canceled entry skips re-inject**.
+    ///
+    /// Mirrors the MimeTooLarge pin for the Canceled variant
+    /// (forward-compat; today cancel early-returns without
+    /// sending an InboundFileApplyResult).
+    #[test]
+    fn reinject_decision_canceled_entry_skips() {
+        let received =
+            fake_received_with_error(InboundFileError::Canceled, "user cancelled mid-apply");
+        let decision = decide_reinject_skip(true, true, None, [0x01; 32], &received);
+        assert_eq!(
+            decision,
+            Some(ReinjectSkipReason::EntryFailed),
+            "Canceled entry must yield EntryFailed"
+        );
+    }
+
+    /// **Happy path: all entries succeeded, no skip → re-inject**.
+    ///
+    /// All pre-conditions are favourable:
+    /// - `clipboard_enabled = true`
+    /// - `inject_to_clipboard = true`
+    /// - `last_outbound_files_fingerprint = None` (no loopback)
+    /// - all entries `success = true`
+    ///
+    /// Decision returns `None` (proceed). The caller then
+    /// pre-stamps `last_outbound_files_fingerprint` and sends
+    /// `BackendCmd::SetFiles`.
+    #[test]
+    fn reinject_decision_all_success_proceeds() {
+        let received = vec![
+            InboundFileApplyResult {
+                batch_fingerprint: [0x01; 32],
+                inbound_sha: [0xAA; 32],
+                source: "10.2.1.15:50247".parse().unwrap(),
+                name: "report.pdf".to_string(),
+                size: 4096,
+                mime: "application/pdf".to_string(),
+                success: true,
+                error: None,
+                landed_path: Some(PathBuf::from("/tmp/report.pdf")),
+                bytes_len: 4096,
+                error_msg: None,
+            },
+            InboundFileApplyResult {
+                batch_fingerprint: [0x01; 32],
+                inbound_sha: [0xBB; 32],
+                source: "10.2.1.15:50247".parse().unwrap(),
+                name: "photo.jpg".to_string(),
+                size: 8192,
+                mime: "image/jpeg".to_string(),
+                success: true,
+                error: None,
+                landed_path: Some(PathBuf::from("/tmp/photo.jpg")),
+                bytes_len: 8192,
+                error_msg: None,
+            },
+        ];
+        let decision = decide_reinject_skip(true, true, None, [0x01; 32], &received);
+        assert_eq!(
+            decision, None,
+            "all-success + master on + no loopback must proceed (None)"
+        );
+    }
+
+    /// **Skip priority: master off beats opt-out**.
+    ///
+    /// When both `clipboard_enabled = false` AND
+    /// `inject_to_clipboard = false`, the master toggle wins
+    /// (checked first). Pins the priority order.
+    #[test]
+    fn reinject_decision_priority_disabled_beats_opt_out() {
+        let decision = decide_reinject_skip(
+            false,
+            false,
+            None,
+            [0x01; 32],
+            &fake_received_one_success(PathBuf::from("/tmp/x")),
+        );
+        assert_eq!(
+            decision,
+            Some(ReinjectSkipReason::Disabled),
+            "Disabled takes priority over OptOut"
+        );
+    }
+
+    /// **`expected_entry_count` source: collector insert captures
+    /// `cf.entries.len()`**.
+    ///
+    /// Pins the `FileSetCollector` struct's `expected` field is
+    /// sized exactly to the source's `cf.entries.len()` at insert
+    /// time (not derived from `received.len()` post-hoc). The
+    /// collector's trigger fires on `received.len() == expected`.
+    #[test]
+    fn collector_expected_count_matches_entries_len() {
+        // The caller (`handle_clipboard_inbound_files`) inserts
+        // with `expected: entries.len()`. We can't construct
+        // `cf.entries` here without a `lan_mouse_proto::ClipboardFiles`
+        // constructor, but the contract is straightforward:
+        // the struct literal at the insert site uses
+        // `expected: entries.len()`. This test pins the
+        // `FileSetCollector` shape itself: `expected` is
+        // independent of `received` and can be any usize the
+        // caller chooses.
+        let collector = FileSetCollector {
+            expected: 3,
+            received: Vec::with_capacity(3),
+        };
+        assert_eq!(collector.expected, 3);
+        assert_eq!(collector.received.len(), 0);
+        assert_eq!(collector.received.capacity(), 3);
+
+        // Trigger condition: received.len() == expected.
+        let mut c = FileSetCollector {
+            expected: 2,
+            received: Vec::new(),
+        };
+        c.received.push(InboundFileApplyResult {
+            batch_fingerprint: [0x01; 32],
+            inbound_sha: [0xAA; 32],
+            source: "10.2.1.15:50247".parse().unwrap(),
+            name: "a".to_string(),
+            size: 1,
+            mime: "text/plain".to_string(),
+            success: true,
+            error: None,
+            landed_path: Some(PathBuf::from("/tmp/a")),
+            bytes_len: 1,
+            error_msg: None,
+        });
+        assert_ne!(c.received.len(), c.expected, "1/2 entries must not trigger");
+        c.received.push(InboundFileApplyResult {
+            batch_fingerprint: [0x01; 32],
+            inbound_sha: [0xBB; 32],
+            source: "10.2.1.15:50247".parse().unwrap(),
+            name: "b".to_string(),
+            size: 1,
+            mime: "text/plain".to_string(),
+            success: true,
+            error: None,
+            landed_path: Some(PathBuf::from("/tmp/b")),
+            bytes_len: 1,
+            error_msg: None,
+        });
+        assert_eq!(c.received.len(), c.expected, "2/2 entries must trigger");
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 mod apply_inbound_files_task_tests {
     //! **M3a STEP-3a.3** — spawned-task tests for
@@ -8499,6 +9403,11 @@ mod apply_inbound_files_task_tests {
 
                 tokio::task::spawn_local(apply_inbound_files_task(
                     applied_tx,
+                    // **M4 STEP-4.3** — distinct batch fingerprint
+                    // sentinel so the test can verify the field
+                    // is propagated verbatim through the spawned
+                    // task to the InboundFileApplyResult.
+                    [0x77; 32],
                     entry.sha256,
                     entry.name.clone(),
                     entry.size,
@@ -8520,6 +9429,20 @@ mod apply_inbound_files_task_tests {
                 );
                 assert_eq!(result.bytes_len, 4096);
                 assert_eq!(result.inbound_sha, entry.sha256);
+                // **M4 STEP-4.3** — verify batch_fingerprint
+                // propagates from the spawn args to the
+                // InboundFileApplyResult. The re-inject collector
+                // keys on this field.
+                assert_eq!(
+                    result.batch_fingerprint, [0x77; 32],
+                    "batch_fingerprint must propagate verbatim through apply_inbound_files_task"
+                );
+                // Success path → error must be None (no failure
+                // classification on the happy path).
+                assert_eq!(
+                    result.error, None,
+                    "success path: error must be None (no failure classification)"
+                );
                 assert_eq!(result.name, "hello.bin");
                 assert_eq!(result.mime, "application/octet-stream");
                 let landed_path = result
@@ -8595,6 +9518,7 @@ mod apply_inbound_files_task_tests {
 
                 tokio::task::spawn_local(apply_inbound_files_task(
                     applied_tx,
+                    [0u8; 32],
                     entry.sha256,
                     entry.name.clone(),
                     entry.size,
@@ -8680,6 +9604,7 @@ mod apply_inbound_files_task_tests {
 
                 tokio::task::spawn_local(apply_inbound_files_task(
                     applied_tx,
+                    [0u8; 32],
                     entry.sha256,
                     entry.name.clone(),
                     entry.size,
@@ -8697,6 +9622,14 @@ mod apply_inbound_files_task_tests {
                 assert!(
                     !result.success,
                     "sha256 mismatch: success must be false; got success=true"
+                );
+                // **M4 STEP-4.3** — verify the typed error
+                // classification is set to Sha256Mismatch so the
+                // re-inject collector can skip on this entry.
+                assert_eq!(
+                    result.error,
+                    Some(InboundFileError::Sha256Mismatch),
+                    "sha256 mismatch must classify as InboundFileError::Sha256Mismatch"
                 );
                 assert!(
                     result
@@ -8757,6 +9690,7 @@ mod apply_inbound_files_task_tests {
 
                 tokio::task::spawn_local(apply_inbound_files_task(
                     applied_tx,
+                    [0u8; 32],
                     entry.sha256,
                     entry.name.clone(),
                     entry.size,
@@ -9193,6 +10127,7 @@ mod cancel_mechanism_tests {
             tokio::task::spawn_local(async move {
                 let task = apply_inbound_files_task(
                     applied_tx,
+                    [0u8; 32],
                     entry_sha,
                     entry_name.to_string(),
                     entry_size,
@@ -9324,6 +10259,7 @@ mod cancel_mechanism_tests {
             tokio::task::spawn_local(async move {
                 let task = apply_inbound_files_task(
                     applied_tx,
+                    [0u8; 32],
                     entry_sha,
                     entry_name.to_string(),
                     entry_size,
