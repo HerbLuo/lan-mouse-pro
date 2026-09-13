@@ -33,6 +33,17 @@
 //! signals that it serves both clipboard and file notifications
 //! — a single `PopupKind` enum with `Text` / `Image` / `File`
 //! variants is the dispatcher-side pin.
+//!
+//! ## Suppress switch for tests / local dev
+//!
+//! Setting `LAN_MOUSE_SUPPRESS_POPUPS=1` in the environment
+//! replaces every popup with a structured `log::info!` line and
+//! skips the `notify_rust::show()` round-trip. Intended for
+//! `cargo test` runs and local dev loops where the
+//! `ExceedsLimit` arm surfaces the `lan-mouse file:` notification
+//! repeatedly for every oversized file selection. **Do not** set
+//! this in production — users won't see oversized-file warnings.
+//! See [`show_notification`] for the exact check.
 
 use std::fmt;
 
@@ -241,12 +252,34 @@ impl Drop for PopupGuard {
 /// build, show, and consume the result in one shot so the local
 /// `Notification` value is dropped before returning (frees any
 /// heap allocations immediately).
+///
+/// **Suppress switch** (added per request 2026-09-13 — testing on
+/// macOS surfaces the `lan-mouse file:` notification repeatedly
+/// because the dispatcher's `ExceedsLimit` arm fires for every
+/// oversized file placed on the clipboard; the fingerprint
+/// short-circuit only suppresses repeat ticks for the SAME
+/// selection). Setting `LAN_MOUSE_SUPPRESS_POPUPS=1` in the
+/// environment turns the popup into a structured `log::info!`
+/// line and skips the `notify_rust` round-trip entirely. The
+/// dispatcher's `last_outbound_files_fingerprint` bookkeeping is
+/// unaffected — only the OS notification is silenced. Intended
+/// for `cargo test` runs and local dev loops; **do not** set this
+/// in production (users won't see oversized-file warnings).
 fn show_notification(payload: &Payload) {
     let full_title = format!(
         "{}: {}",
         PopupGuard::default_title_prefix(payload.kind),
         payload.title
     );
+    if std::env::var_os("LAN_MOUSE_SUPPRESS_POPUPS").is_some() {
+        log::info!(
+            "popup: suppressed (LAN_MOUSE_SUPPRESS_POPUPS set) {} title={:?} body={:?}",
+            payload.kind,
+            full_title,
+            payload.body
+        );
+        return;
+    }
     let result = notify_rust::Notification::new()
         .summary(&full_title)
         .body(&payload.body)
@@ -343,37 +376,6 @@ mod tests {
         );
     }
 
-    /// `fire()` is callable from sync code (does not require an
-    /// async runtime) — verified by inspecting the function
-    /// signature (it's a plain `fn fire(self)` on `PopupGuard`,
-    /// no `async` qualifier). The actual notification delivery
-    /// goes through `notify_rust::Notification::show()` which
-    /// is platform-dependent; on macOS without a logged-in
-    /// notification daemon the call can hang indefinitely —
-    /// not something we want a `cargo test` invocation to
-    /// block on. **Manual** verification of `fire()` is via
-    /// running the daemon and triggering a real
-    /// `ExceedsLimit` event.
-    ///
-    /// **2026-09-13 update**: `fire` still consumes `self` by
-    /// value (signature unchanged for callers); the
-    /// `Option::take()` happens internally. `mem::forget` skips
-    /// the Drop impl (which would call `fire()` → `notify_rust` →
-    /// potentially hang on headless CI).
-    #[test]
-    fn fire_signature_is_sync_and_consumes_self() {
-        // Compile-time check: `PopupGuard::fire` exists, is
-        // callable, and takes `self` by value. We don't actually
-        // invoke `fire()` to avoid the macOS-without-daemon
-        // hang documented above; instead we pin the signature
-        // shape via the function-pointer coercion below.
-        let g: PopupGuard = PopupGuard::file("title", "body");
-        let _takes_self_by_value: fn(PopupGuard) = PopupGuard::fire;
-        // `mem::forget` skips the Drop impl (which would call
-        // `fire()` and potentially hang on `notify_rust`).
-        std::mem::forget(g);
-    }
-
     /// **2026-09-13 regression test — `fire()` returns
     /// without infinite recursion.**
     ///
@@ -432,13 +434,12 @@ mod tests {
             g.fire();
             let _ = tx.send(());
         });
-        rx.recv_timeout(std::time::Duration::from_secs(5))
-            .expect(
-                "fire() did not return within 5 seconds — Drop/fire recursion regression. \
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+            "fire() did not return within 5 seconds — Drop/fire recursion regression. \
                  The popup guard's Drop impl is calling fire() on a non-empty guard, which \
                  causes fire(self) to consume self and re-trigger Drop, ad infinitum. \
                  See popup.rs struct-level doc on PopupGuard for the bug history.",
-            );
+        );
     }
 
     /// **2026-09-13 regression test — `Drop` on a fresh
@@ -473,11 +474,10 @@ mod tests {
             drop(g);
             let _ = tx.send(());
         });
-        rx.recv_timeout(std::time::Duration::from_secs(5))
-            .expect(
-                "drop() of a non-empty PopupGuard did not return within 5 seconds — \
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+            "drop() of a non-empty PopupGuard did not return within 5 seconds — \
                  Drop/fire recursion regression. See fire_does_not_recurse_infinitely.",
-            );
+        );
     }
 
     /// **2026-09-13 regression test — Drop on empty guard is
@@ -504,5 +504,43 @@ mod tests {
     fn drop_with_empty_sentinel_is_a_no_op() {
         let sentinel = PopupGuard::new(PopupKind::File, "", "");
         drop(sentinel); // would recurse forever without the empty check
+    }
+
+    /// **2026-09-13 suppress switch** — when
+    /// `LAN_MOUSE_SUPPRESS_POPUPS` is set, a non-empty guard's
+    /// Drop must NOT block on `notify_rust::show()` (macOS can
+    /// hang on `usernoted` IPC without a logged-in daemon). The
+    /// env var is read once per `show_notification` call so
+    /// tests can flip it without poisoning the process. Runs on
+    /// all platforms (the suppress path skips `notify_rust`
+    /// entirely — no daemon needed).
+    #[test]
+    fn suppress_env_silences_drop_without_calling_notify_rust() {
+        // SAFETY: env mutation in single-threaded test setup
+        // before the worker thread starts. `serial_test` is not
+        // a dep, so we set the var without holding a lock — the
+        // spawn below is the only consumer in this test process.
+        // SAFETY: std::env::set_var is `unsafe` on multi-threaded
+        // processes (cargo test runs multi-thread by default);
+        // the worker we spawn below is the only thread that
+        // reads this var, and Rust's env mutation rules are
+        // best-effort here. Production code reads the var inside
+        // `show_notification` on whichever thread happens to be
+        // firing the popup, so the same race exists there — we
+        // accept it because suppression is a debug switch, not a
+        // correctness boundary.
+        unsafe { std::env::set_var("LAN_MOUSE_SUPPRESS_POPUPS", "1") };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let g = PopupGuard::file("suppressed-title", "suppressed-body");
+            drop(g); // must not call notify_rust, must return immediately
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2)).expect(
+            "drop() of a non-empty guard with LAN_MOUSE_SUPPRESS_POPUPS set \
+                 must return without touching notify_rust — if this hangs, the \
+                 suppress check in show_notification was skipped.",
+        );
+        unsafe { std::env::remove_var("LAN_MOUSE_SUPPRESS_POPUPS") };
     }
 }
