@@ -474,65 +474,150 @@ mod input_channel_tests {
 mod clipboard_config_tests {
     use super::*;
 
-    /// `ClipboardConfig::default()` — "files auto-accept on, all
-    /// sync enabled, accept_dir = None" shape (the 2026-09-13
-    /// new-default; `auto_accept_files` flipped from `false` to
-    /// `true` so cross-machine file copy works without manually
-    /// editing `config.toml`).
+    /// **M4 STEP-4.1** — `ClipboardConfig::default()` is the
+    /// "files auto-accept, all sync enabled, `accept_dir` resolved
+    /// from `$HOME`/`USERPROFILE`/tmp fallback" shape. Pins the
+    /// 8-field post-M4 expansion (`auto_accept_files` dropped,
+    /// `enabled` + `max_file_size` + `keep_partial` +
+    /// `inject_to_clipboard` added, `accept_dir` promoted from
+    /// `Option<PathBuf>` to required `PathBuf`).
     #[test]
-    fn clipboard_config_default_is_files_auto_accept_shape() {
+    fn clipboard_config_default_is_post_m4_shape() {
         let cfg = ClipboardConfig::default();
-        assert!(cfg.auto_accept_files);
-        assert_eq!(cfg.accept_dir, None);
+        assert!(cfg.enabled);
+        // `accept_dir` is now required — `Default` populates a
+        // non-empty home-derived path (or `/tmp/lan-mouse` fallback
+        // in headless CI). The exact value is environment-dependent
+        // so we assert "non-empty" rather than a specific string.
+        assert!(!cfg.accept_dir.as_os_str().is_empty());
         assert!(!cfg.ignore_text);
         assert!(!cfg.ignore_images);
         assert!(!cfg.ignore_files);
+        // 50 MiB default — matches the legacy `DEFAULT_MAX_FILE_SIZE`
+        // constant (file_meta.rs / dispatch_files_decide path).
+        assert_eq!(cfg.max_file_size, 50 * 1024 * 1024);
+        // Post-M4 default: keep_partial = false (拔网后默认清 .partial)
+        assert!(!cfg.keep_partial);
+        // Post-M4 default: inject_to_clipboard = true (落盘后自动入剪贴板)
+        assert!(cfg.inject_to_clipboard);
     }
 
-    /// Round-trip with all fields populated.
+    /// Round-trip with all 8 fields populated.
     #[test]
     fn clipboard_config_round_trip_populated() {
         let cfg = ClipboardConfig {
-            auto_accept_files: true,
-            accept_dir: Some(PathBuf::from("/tmp/received")),
+            enabled: false,
+            accept_dir: PathBuf::from("/tmp/received"),
             ignore_text: true,
             ignore_images: false,
             ignore_files: true,
+            max_file_size: 1024 * 1024 * 1024, // 1 GiB
+            keep_partial: true,
+            inject_to_clipboard: false,
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: ClipboardConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back, cfg);
     }
 
-    /// **Wire compat**: a payload missing every field (an empty `{}`
-    /// or a payload that only carries unrelated fields) must
-    /// deserialize as the legacy default. The combination of
-    /// `#[serde(default)]` on each field + `Default for
-    /// ClipboardConfig` makes this the canonical compat contract.
+    /// **Wire compat**: a payload missing only the 5 fields that
+    /// carry `#[serde(default = "...")]` helpers
+    /// (`enabled` / `max_file_size` / `inject_to_clipboard`) still
+    /// deserializes cleanly to the legacy defaults (`true` / 50 MiB
+    /// / `true`). The other 5 fields are required (`accept_dir` /
+    /// `ignore_*` / `keep_partial` — the latter 3 are `bool`
+    /// defaulted via `#[serde(default)]` so a missing bool field
+    /// also lands on the default).
     #[test]
-    fn clipboard_config_missing_fields_default_to_legacy() {
-        let empty = "{}";
-        let cfg: ClipboardConfig = serde_json::from_str(empty).unwrap();
-        assert_eq!(cfg, ClipboardConfig::default());
-    }
-
-    /// **Wire compat**: a payload missing one specific field
-    /// (`accept_dir`) must deserialize with the rest preserved. This
-    /// pins the per-field `#[serde(default)]` contract — a future
-    /// payload that drops `accept_dir` while keeping the others
-    /// still round-trips cleanly.
-    #[test]
-    fn clipboard_config_partial_missing_accept_dir() {
+    fn clipboard_config_partial_missing_default_helpers() {
         let payload = r#"{
-            "auto_accept_files": true,
+            "accept_dir": "/tmp/x",
             "ignore_text": true
         }"#;
         let cfg: ClipboardConfig = serde_json::from_str(payload).unwrap();
-        assert!(cfg.auto_accept_files);
+        assert!(cfg.enabled);
+        assert_eq!(cfg.accept_dir, PathBuf::from("/tmp/x"));
         assert!(cfg.ignore_text);
-        assert_eq!(cfg.accept_dir, None);
         assert!(!cfg.ignore_images);
         assert!(!cfg.ignore_files);
+        assert_eq!(cfg.max_file_size, 50 * 1024 * 1024);
+        assert!(!cfg.keep_partial);
+        assert!(cfg.inject_to_clipboard);
+    }
+
+    /// **Wire compat**: `inject_to_clipboard` missing from the
+    /// payload deserializes to `true` (the new M4 default —
+    /// "files should be re-injected into the local clipboard after
+    /// landing so user can Cmd+V them directly"). Pins the
+    /// `#[serde(default = "default_inject_to_clipboard")]` helper
+    /// so a pre-M4 wire payload that omits the field does not
+    /// silently flip the user's preference off.
+    #[test]
+    fn clipboard_config_inject_to_clipboard_defaults_to_true() {
+        let payload = r#"{
+            "accept_dir": "/tmp/x",
+            "enabled": false
+        }"#;
+        let cfg: ClipboardConfig = serde_json::from_str(payload).unwrap();
+        assert!(cfg.inject_to_clipboard);
+        assert!(!cfg.enabled);
+    }
+
+    /// **Wire compat**: `max_file_size = 0` deserializes as-is
+    /// (no helper overrides 0). The `0 = no limit` semantic is
+    /// enforced downstream in `dispatch_files_decide` /
+    /// `collect_files_blocking` (file_meta.rs:68 doc: "`0` means
+    /// "no limit", in which case this variant is unreachable").
+    /// This test pins the wire contract: a 0 is preserved through
+    /// serde round-trip (no `unwrap_or(DEFAULT)` magic at the IPC
+    /// layer).
+    #[test]
+    fn clipboard_config_max_file_size_zero_is_no_limit() {
+        let cfg = ClipboardConfig {
+            max_file_size: 0,
+            ..ClipboardConfig::default()
+        };
+        let s = serde_json::to_string(&cfg).unwrap();
+        let back: ClipboardConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.max_file_size, 0);
+    }
+
+    /// **`accept_dir` is required (not Optional)**: a payload with
+    /// no `accept_dir` field fails to deserialize. Pins the M4
+    /// spec "accept_dir 必填语义" — auto-accept means we always
+    /// need a target, so the field type changes from
+    /// `Option<PathBuf>` to required `PathBuf`.
+    #[test]
+    fn clipboard_config_accept_dir_required() {
+        let payload = r#"{ "enabled": true }"#;
+        let result: Result<ClipboardConfig, _> = serde_json::from_str(payload);
+        assert!(
+            result.is_err(),
+            "missing required `accept_dir` field must fail to deserialize"
+        );
+    }
+
+    /// **drop `auto_accept_files` wire compat**: an old-style
+    /// payload (M0c shape with `auto_accept_files: true`) is
+    /// gracefully accepted — the unknown field is silently ignored
+    /// by serde (default behavior). The deserialized config lands
+    /// on the M4 defaults (no error, but `auto_accept_files` is
+    /// effectively dropped: auto-accept is the only mode now).
+    #[test]
+    fn clipboard_config_drop_auto_accept_files_compat() {
+        let payload = r#"{
+            "accept_dir": "/tmp/received",
+            "auto_accept_files": true,
+            "ignore_text": false
+        }"#;
+        let cfg: ClipboardConfig = serde_json::from_str(payload).unwrap();
+        // `auto_accept_files` is gone from the struct — the unknown
+        // field is silently ignored. `enabled` lands on the M4
+        // default of `true` (no behavioural regression for users
+        // who had `auto_accept_files = true` and are now
+        // implicitly auto-accepting).
+        assert!(cfg.enabled);
+        assert_eq!(cfg.accept_dir, PathBuf::from("/tmp/received"));
     }
 
     /// `FrontendRequest::SetClipboardConfig` round-trip — the wire
@@ -541,11 +626,14 @@ mod clipboard_config_tests {
     #[test]
     fn request_set_clipboard_config_round_trip() {
         let cfg = ClipboardConfig {
-            auto_accept_files: true,
-            accept_dir: Some(PathBuf::from("/Users/me/Downloads")),
+            enabled: true,
+            accept_dir: PathBuf::from("/Users/me/Downloads"),
             ignore_text: false,
             ignore_images: false,
             ignore_files: false,
+            max_file_size: 50 * 1024 * 1024,
+            keep_partial: false,
+            inject_to_clipboard: true,
         };
         let req = FrontendRequest::SetClipboardConfig(cfg.clone());
         let s = serde_json::to_string(&req).unwrap();
@@ -797,42 +885,63 @@ mod monitor_info_tests {
     }
 }
 
-/// **M0c / PLAN-2** — daemon-global clipboard configuration. The
-/// clipboard listener is daemon-global (one OS clipboard feeds all
-/// peers) and the receive directory is also global — this struct lives
-/// at `lan_mouse_ipc::ClipboardConfig` (not under `ClientConfig`),
-/// per PLAN §5 评审 #4 second round.
+/// **M4 STEP-4.1 / PLAN-2.1** — daemon-global clipboard
+/// configuration. The clipboard listener is daemon-global (one OS
+/// clipboard feeds all peers) and the receive directory is also
+/// global — this struct lives at `lan_mouse_ipc::ClipboardConfig`
+/// (not under `ClientConfig`), per PLAN §5 评审 #4 second round.
 ///
-/// Every field carries `#[serde(default)]` so a payload missing any
-/// subset of fields deserializes as the legacy default
-/// (auto-accept off / ignore-* off / `accept_dir = None`). The
-/// `Default` impl matches that legacy shape.
+/// **Post-M4 schema (8 fields)**:
+/// - `enabled` — master on/off for the entire clipboard sync
+///   subsystem (default `true`); when `false` the dispatcher does
+///   not start and key/mouse paths are unaffected.
+/// - `accept_dir: PathBuf` — **required** since auto-accept is the
+///   only mode (post-drop of `auto_accept_files`); a missing field
+///   on the wire now fails to deserialize (vs. the pre-M4
+///   `Option<PathBuf>` which silently landed on `None`).
+/// - `ignore_text / ignore_images / ignore_files` — per-kind toggle
+///   to drop the corresponding stream before it crosses StreamC.
+///   Distinct from `enabled = false` which disables the whole
+///   subsystem; these let the user opt-out of a single channel
+///   while keeping text / image / file sync active.
+/// - `max_file_size` — per-file ceiling in bytes; default 50 MiB,
+///   `0 = no limit` (enforced in `collect_files_blocking` /
+///   `dispatch_files_decide`).
+/// - `keep_partial` — `true` ⇒ on disconnect / cancel the
+///   `.partial` file is preserved for postmortem; `false` (default)
+///   ⇒ `std::fs::remove_file` runs in M5 STEP-5.1.
+/// - `inject_to_clipboard` — `true` (default) ⇒ after files land
+///   locally, the daemon pushes the file paths into the OS
+///   clipboard so the user can Cmd+V directly. `false` ⇒ skip
+///   the inject (file is on disk only).
+///
+/// **drop `auto_accept_files`**: pre-M4 payloads carrying that
+/// field still deserialize (serde silently ignores unknown fields),
+/// but the value is now meaningless — auto-accept is the only
+/// mode. See `clipboard_config_drop_auto_accept_files_compat` test.
 ///
 /// Frontend request: [`FrontendRequest::SetClipboardConfig`]. TOML
 /// key: `[clipboard]` section in `config.toml`.
-///
-/// **Default for `auto_accept_files`** is `true` (changed 2026-09-13
-/// from the legacy `false` after the ListenTask / poller fixes
-/// landed end-to-end and the missing-M3b-Toaster-ask UX cost
-/// outweighed the rogue-peer risk for trusted LAN deployments).
-/// Set `auto_accept_files = false` explicitly in `[clipboard]` TOML
-/// to restore the old "must opt in" behaviour.
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ClipboardConfig {
-    /// Auto-accept incoming `ClipboardFiles` (no Toaster prompt). The
-    /// files land in `accept_dir`. Default `true` — files copy across
-    /// the LAN out-of-the-box. Set `false` to require explicit opt-in
-    /// (M3b will wire the GUI Toaster ask for the false case).
-    #[serde(default = "default_auto_accept_files")]
-    pub auto_accept_files: bool,
-    /// Receive directory for auto-accepted files. `None` means
-    /// "daemon default" (typically `$HOME/Downloads/lan-mouse` or the
-    /// OS-appropriate temp dir — wired in M3b).
-    #[serde(default)]
-    pub accept_dir: Option<PathBuf>,
-    /// Disable text sync (do not push / pull text via StreamC). The
-    /// `#[serde(default)]` makes "missing field = false (text sync
-    /// enabled)" — pre-M0c payloads deserialize to the legacy
+    /// Master toggle for the entire clipboard sync subsystem.
+    /// Default `true`. When `false`, the dispatcher's outbound
+    /// tick is skipped and inbound arms early-return at the first
+    /// `config.clipboard_config().enabled` check — key/mouse
+    /// paths are unaffected. Distinct from `ignore_files` (per-
+    /// kind filter) which keeps text / image sync active.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// Receive directory for auto-accepted files. **Required**
+    /// (auto-accept means we always need a target — pre-M4 this
+    /// was `Option<PathBuf>` and `None` meant "daemon default";
+    /// post-M4 the daemon fills this in via
+    /// [`Config::clipboard_config`] before any inbound arm reads
+    /// it, so the wire contract tightens to required).
+    pub accept_dir: PathBuf,
+    /// Disable text sync (do not push / pull text via StreamC).
+    /// `#[serde(default)]` ⇒ missing field = false (text sync
+    /// enabled). Pre-M0c payloads deserialize to the legacy
     /// "all sync enabled" state.
     #[serde(default)]
     pub ignore_text: bool,
@@ -842,35 +951,97 @@ pub struct ClipboardConfig {
     /// Disable file sync. Same compat contract as `ignore_text`.
     #[serde(default)]
     pub ignore_files: bool,
+    /// Per-file size ceiling in bytes. Default 50 MiB. `0` means
+    /// "no limit" — `collect_files_blocking` skips the
+    /// `ExceedsLimit` arm when this is 0 (file_meta.rs:68 doc).
+    /// Mirrors `src/config.rs::DEFAULT_MAX_FILE_SIZE`.
+    #[serde(default = "default_max_file_size")]
+    pub max_file_size: u64,
+    /// `true` ⇒ keep `.partial` files on disconnect / cancel
+    /// (for debugging). `false` (default) ⇒ M5 STEP-5.1 will
+    /// `std::fs::remove_file` them on disconnect.
+    #[serde(default)]
+    pub keep_partial: bool,
+    /// `true` (default) ⇒ after files land locally, push the
+    /// landed paths into the local OS clipboard so the user can
+    /// Cmd+V directly. `false` ⇒ files land on disk only, no
+    /// clipboard re-inject (M4 STEP-4.2 + 4.3 wiring).
+    #[serde(default = "default_inject_to_clipboard")]
+    pub inject_to_clipboard: bool,
 }
 
 /// Helper for `#[serde(default = "...")]` on
-/// [`ClipboardConfig::auto_accept_files`]. Returns the new default
-/// (`true` — files auto-accept on, after the 2026-09-13 change).
-/// Kept as a free function so serde can borrow a path; mirror the
-/// `true` value in the manual [`Default`] impl below.
-fn default_auto_accept_files() -> bool {
+/// [`ClipboardConfig::enabled`]. `true` mirrors the
+/// `Default` impl.
+fn default_enabled() -> bool {
+    true
+}
+
+/// Helper for `#[serde(default = "...")]` on
+/// [`ClipboardConfig::max_file_size`]. Returns the 50 MiB default
+/// (matches `src/config.rs::DEFAULT_MAX_FILE_SIZE`).
+fn default_max_file_size() -> u64 {
+    50 * 1024 * 1024
+}
+
+/// Helper for `#[serde(default = "...")]` on
+/// [`ClipboardConfig::inject_to_clipboard`]. `true` mirrors the
+/// `Default` impl — files should auto-appear in the local
+/// clipboard after landing.
+fn default_inject_to_clipboard() -> bool {
     true
 }
 
 impl Default for ClipboardConfig {
-    /// New "files work out-of-the-box" default:
-    /// - `auto_accept_files: true` (changed 2026-09-13 from `false`
-    ///   — see the type-level doc comment for rationale)
-    /// - `accept_dir: None` (daemon picks the OS-appropriate temp /
-    ///   `$HOME/Downloads/lan-mouse` in M3b)
+    /// M4 STEP-4.1 default shape:
+    /// - `enabled: true` (clipboard sync on; user opts out via
+    ///   `[clipboard] enabled = false` in TOML or the GUI).
+    /// - `accept_dir: <env-derived>` (resolved from `$HOME` /
+    ///   `$USERPROFILE` at IPC layer; falls back to
+    ///   `/tmp/lan-mouse` for headless CI / Docker).
     /// - `ignore_text / ignore_images / ignore_files: false` (all
-    ///   clipboard sync channels enabled by default, unchanged from
-    ///   the legacy shape).
+    ///   sync channels enabled by default; unchanged from the M0c
+    ///   legacy shape).
+    /// - `max_file_size: 50 MiB` (unchanged from
+    ///   `DEFAULT_MAX_FILE_SIZE`).
+    /// - `keep_partial: false` (M5 STEP-5.1 will remove .partial
+    ///   on disconnect by default; user opts in via TOML).
+    /// - `inject_to_clipboard: true` (M4 STEP-4.2 + 4.3 will wire
+    ///   the OS clipboard re-inject; user opts out via TOML).
     fn default() -> Self {
         Self {
-            auto_accept_files: true,
-            accept_dir: None,
+            enabled: true,
+            accept_dir: default_accept_dir(),
             ignore_text: false,
             ignore_images: false,
             ignore_files: false,
+            max_file_size: 50 * 1024 * 1024,
+            keep_partial: false,
+            inject_to_clipboard: true,
         }
     }
+}
+
+/// Resolve the default `accept_dir` for [`ClipboardConfig::default`].
+///
+/// **Cross-platform fallback chain**: `$HOME` (macOS / Linux) →
+/// `$USERPROFILE` (Windows) → `/tmp/lan-mouse` if neither env var
+/// is set. Mirrors `service::default_accept_dir` — kept as a
+/// separate copy so the IPC crate has no service-layer
+/// dependency.
+///
+/// **Why a hardcoded subdirectory (not `dirs::download_dir`)**:
+/// the daemon has zero `dirs` / `directories` dependencies. A
+/// hardcoded subdirectory is portable; on macOS the full path is
+/// `~/lan-mouse/`, on Windows `%USERPROFILE%\lan-mouse\`, on
+/// Linux `~/lan-mouse/`.
+fn default_accept_dir() -> PathBuf {
+    let home = cfg!(unix)
+        .then(|| std::env::var("HOME").ok().map(PathBuf::from))
+        .flatten()
+        .or_else(|| std::env::var("USERPROFILE").ok().map(PathBuf::from));
+    let base = home.unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join("lan-mouse")
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
