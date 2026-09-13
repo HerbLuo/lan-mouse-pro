@@ -115,9 +115,9 @@
 | M2a — 剪贴板图片 + macOS | ~6 h | macOS 复制截图 → 对端粘贴为 PNG / DIB 字节级一致；**双向端到端 (A↔B)** | ✅ 完成 |
 | M2b — 剪贴板图片 + Windows / Linux | ~6 h | 三平台图片剪贴板端到端（macOS↔Windows 走 DIB）；**双向端到端 (A↔B)** | ✅ 完成 |
 | **M3a** — 复制文件 + HTTP/3 transfer | ~9 h | 200 MiB SHA-256 一致 + 取消响应 + popup 模块 + 50 MiB 早拒绝 | ✅ 完成 |
-| **M3b** — 文件接收（auto-accept） + GUI 配置 + CLI | **~8.5 h** | 100 Mbps LAN < 30 s + 拔网清晰报错 + GUI enabled/accept_dir/max_file_size 配置 + CLI 子命令 | ⏸️ 用户验证 M3a 后启动 |
+| **M3b** — 文件接收（auto-accept）+ GUI 配置 + CLI + 剪贴板回灌 | **~11.5 h** | 100 Mbps LAN < 30 s + 拔网清晰报错 + GUI enabled/accept_dir/max_file_size/inject_to_clipboard 配置 + CLI 子命令 + **`set_files` trait 三平台落地** + **文件落盘后自动入剪贴板** | ⏸️ 用户验证 M3a 后启动 |
 | **~~M4~~** | ~~5 h~~ | (合并到 M3b) | (cancelled) |
-| **合计** | **~49 h** | (was ~55.5 h) | |
+| **合计** | **~52 h** | (was ~55.5 h) | |
 
 > **STEP 时长门**：每 STEP 控制在人类实现 1.5 h（AI ~30 min）左右；超过 3 h 必拆。
 > **M3 已知范围扩大风险**：若 M3a 估时实际超 10 h，按"接收端落盘 + 200 MiB 性能"与"UI / 取消 / 拔网"二分拆为 M3a' / M3a''。
@@ -301,13 +301,14 @@
 
 ### M3b — 文件接收（auto-accept）+ GUI 配置 + CLI
 
-**目标**：M4 GUI 集成 + M3b 收尾**合并**到 M3b —— 落地文件接收的 auto-accept only 模式 + GUI 配置入口 + CLI 子命令 + 拔网清晰报错 + 端到端性能验证。
-**AI 估时**：~8.5 h
+**目标**：M4 GUI 集成 + M3b 收尾**合并**到 M3b —— 落地文件接收的 auto-accept only 模式 + GUI 配置入口 + CLI 子命令 + 拔网清晰报错 + 端到端性能验证 + **接收端剪贴板回灌**（文件落盘后自动入剪贴板）。
+**AI 估时**：~11.5 h
 **依赖**：M3a
 
 **用户决策（2026-09-13）**：
 1. **Auto-accept only**（no dual-mode）—— GUI 是配置入口，**不是**交互入口；Toaster accept/reject buttons **out of scope**
-2. M3b 拆为 6 个 STEP（3b.1 - 3b.6），覆盖原 M3b（4 STEPs）+ 原 M4（5 STEPs）的并集，但 Toaster UI / 可观察性卡片 / 文档全部砍掉
+2. M3b 拆为 8 个 STEP（3b.1 - 3b.7b）：原 M3b 4 STEPs（3b.1-3b.4）+ 原 M4 净保留 2 STEPs（4.2 → 3b.5、4.6 → 3b.6）+ drop M4 STEP-4.3/4.4/4.5（auto-accept only + 用户砍掉可观察卡片 / 文档）+ 原 M4 STEP-4.1 与 M3b STEP-3b.4 合并 + 用户 2026-09-13 新增 3b.7a/3b.7b（剪贴板回灌，planer round 2 拆步）；Toaster UI / 可观察性卡片 / 文档全部砍掉
+3. **2026-09-13 新增 STEP-3b.7a / 3b.7b**：用户决策加"接收端剪贴板回灌"——文件落盘后自动把 path 灌回本地剪贴板，用户可直接 Cmd+V 粘贴。**2026-09-13 审阅拆步**（planer sub-agent 确认 `set_files` trait method 在 M3a 未落地 — commit `69ebd9a` 只实现了 `current_files()` + `watch_files()` 只读路径；Linux `src/clipboard/linux.rs:392-394` 明确标注 "No file-write path on Linux: M3a only needs the **read** path; `set_files` is out of scope"），原 STEP-3b.7 拆分为 3b.7a（trait `set_files` + macOS/Windows/Linux 三平台实现）/ 3b.7b（skip conditions + 防回环 + IPC serde + GUI checkbox + TOML 集成）
 
 **人类准备**：
 - **配置接收目录**：在 config.toml 或 GUI 设置 `accept_dir = "/Users/me/Downloads/lan-mouse"`
@@ -323,21 +324,26 @@
 | **3b.4** | **1.5h** | **Vue 类型 + IPC 绑定**（drop `FileTransferRequest` 类型，保留 `FileTransferFailed`）：<br>`lan-mouse-vue/src/api/ipc.ts` 加：`ClipboardConfig` 类型（与 IPC `ClipboardConfig` 1:1 对应：enabled / accept_dir / ignore_text / ignore_images / ignore_files / max_file_size / keep_partial）+ `ClipboardState` 类型（沿用 M0c：last_text_ts / last_image_ts / last_file_ts / last_source）+ `FileTransferFailed` 类型（sha256 hex string / reason / ts_ms）<br>`lan-mouse-vue/src/store/index.ts` 维护：`state.clipboardConfig: ClipboardConfig`（从 IPC 拉初始值 + 监听 `ClipboardConfigChanged` 回写）+ `state.lastClipboardText` / `state.lastClipboardAt` / `state.lastClipboardSource`（沿用 M0c + M1b）<br>`onMounted` 监听 `ClipboardState` 事件 + `FileTransferFailed` 事件 → store 更新；新增 toast 触发（**注意**：toast 是单方向通知，不需要 actions 按钮）<br>**移除**：`FileTransferRequest` / `RespondFileTransfer` 相关类型 + store 字段（用户决策 2026-09-13） | `lan-mouse-vue/src/api/ipc.ts`、`lan-mouse-vue/src/store/index.ts`、`lan-mouse-vue/src/components/Toaster.vue`（仅增 FileTransferFailed 单方向通知，不扩 actions） | 浏览器 console 看到状态同步；FileTransferFailed 触发 Toaster 单方向通知（无 actions） |
 | **3b.5** | **1.5h** | **GeneralPanel + per-peer 配置 + TOML 落盘**（评审 #4 改写）：<br>**GeneralPanel**：加剪贴板区块 — `enabled` checkbox（master toggle）/ `accept_dir` 文本框 + dir-picker（**必填**，无 Option 概念）/ `ignore_text` / `ignore_images` / `ignore_files` 三个 ignore checkbox / `max_file_size` number input（MiB 整数输入 → 后端转 bytes，0 = 不限）/ `keep_partial` checkbox；`onChange` 调 `SetClipboardConfig`（无 handle）<br>**ConnectionRow**：每个 client 行加 `enable_clipboard_to` checkbox（label "Push clipboard to this peer"）；`onChange` 调 `SetEnableClipboardTo(handle, bool)`<br>**TOML 落盘**：`src/config.rs` TOML 加 `[clipboard]` 段（**daemon-global**）：`enabled = true` / `accept_dir = "/Users/me/Downloads/lan-mouse"` / `ignore_text = false` / `ignore_images = false` / `ignore_files = false` / `max_file_size = 52428800`（bytes 整数存，UI 显示 MiB）/ `keep_partial = false`；不挂在 `[[clients]]` 下<br>**per-client TOML 段**：`[[clients]]` 加 `enable_clipboard_to = true` 字段 | `lan-mouse-vue/src/components/GeneralPanel.vue`、`lan-mouse-vue/src/components/ConnectionsPanel.vue`、`src/config.rs`、`src/service.rs`（`set_clipboard_config` handler） | 改 checkbox 立即生效（关闭 SUGGESTION #S-7 + #S-8 + #S-5）；config.toml 落盘正确（顶层 `[clipboard]` + 每个 `[[clients]]` 内 `enable_clipboard_to`）；MiB → bytes 转换单测 |
 | **3b.6** | **~1 h** | **CLI 集成（评审 #7）**：`lan-mouse-cli` 加 `SetClipboardConfig` 子命令（与 `SetQuicIdleTimeout` 同模式：发 IPC → daemon 写 TOML → 回 echo）；参数 `--enabled` / `--accept-dir` / `--ignore-text` / `--ignore-images` / `--ignore-files` / `--max-file-size`（MiB 整数，CLI 转 bytes）/ `--keep-partial`；`SetEnableClipboardTo <handle> <bool>` 子命令；与现有 `SetMonitor` 共用同一 dispatch pattern；单测覆盖 IPC 编码（含 drop `auto_accept_files` 后兼容性） | `lan-mouse-cli/src/lib.rs` | `lan-mouse-cli SetClipboardConfig --max-file-size 100 --accept-dir /tmp/recv` 生效；`lan-mouse-cli SetEnableClipboardTo 0 false` 关掉对端 0 的剪贴板推送 |
+| **3b.7a** | **~1.5 h** | **`ClipboardBackend::set_files` trait + 三平台实现**（planer 审阅拆步 — 原 STEP-3b.7 的"前提：`set_files` 已落地"系 spec 假设错误，commit `69ebd9a` 仅含只读 `current_files()` + `watch_files()`，无 `set_files`）：<br>**trait 加方法**：`src/clipboard/mod.rs` 在 `ClipboardBackend` trait 加 `fn set_files(&self, files: &[PathBuf])` —— 语义：把一组绝对路径灌入 OS 剪贴板（macOS NSPasteboard `NSFilenamesPboardType` / Windows `CF_HDROP` / Linux X11 `text/uri-list` 或 Wayland 同等 mime），调用方保证 paths 都已落盘且 SHA-256 校验通过；返回 `Result<()>`（失败 log warn，不 panic）<br>**macOS 实现**：`src/clipboard/macos.rs` 用 `NSPasteboard.general().clearContents()` + `writeObjects(&ns_array)` 灌入（**注意类型修正 — planer round 2 审阅**：`writeObjects` 签名是 `fn writeObjects(&self, objects: &NSArray<ProtocolObject<dyn NSPasteboardWriting>>) -> bool`，**不是** `NSArray<NSURL>`；NSURL 通过 `ProtocolObject::from_retained(nsurl)` 包装；objc2-app-kit 0.3.2 已为 NSURL 实现 `extern_conformance!(unsafe impl NSPasteboardWriting for NSURL {});`）。NSArray 构造：`NSArray::from_retained_slice(&[ProtocolObject::from_retained(NSURL::fileURLWithPath(&nsstring))])`<br>**Windows 实现**：`src/clipboard/windows.rs` 用 `OpenClipboard` + `EmptyClipboard` + `SetClipboardData(CF_HDROP, hdrop)` + `GlobalAlloc(GHND, ...)` + `GlobalLock` + `DragQueryFileW` 构造 DROPFILES 结构（DROPFILES header + 双重 null-terminated file paths；现有 windows.rs 已有 CF_DIBV5 / CF_BITMAP 写入经验可直接复用）<br>**Linux 实现**：`src/clipboard/linux.rs` —— X11 走 `xclip -selection clipboard -t text/uri-list -i`（子进程 `tokio::process`，stdin 写入 RFC 2483 URI list），Wayland 走 `wl-copy --type text/uri-list < file`；删掉"no file-write path on Linux"注释<br>**RFC 2483 URI list 格式细节**（**planer round 2 审阅补 — 参考 `src/clipboard/linux.rs:398` `wl-paste --type text/uri-list` 读取路径对称**）：`<file:///abs/path1>\r\n<file:///abs/path2>\r\n`，每行一个 URI，CRLF 结尾，多 URI 间 CRLF 分隔；以 `file://` 前缀 + 绝对路径编码；构造函数：`fn build_uri_list(paths: &[PathBuf]) -> String { paths.iter().map(|p| format!("file://{}\r\n", p.display())).collect() }`<br>**测试**：<br>• Windows 单测：mock `SetClipboardData(CF_HDROP, ...)` → 参数捕获 + DROPFILES bytes 解析验证（`DragQueryFileW` 解码对比原 paths）<br>• Linux 单测：mock `xclip` / `wl-copy` 子进程 → 拦截 `Command::spawn` 后断言 args 含 `-t text/uri-list` + stdin payload 含预期 CRLF URI list<br>• macOS 单测（**planer round 2 审阅补**：objc2 AppKit 难以纯 mock；**退化为集成式真实 pasteboard 写入断言** —— 调 `set_files` 前后比对 `NSPasteboard.general().changeCount()` 递增 + `readObjectsForClasses([NSURL.self], options: nil)` 拿到原 paths；与现有 `src/clipboard/macos.rs:1327, 1347` 真实 pasteboard 单测模式一致） | `src/clipboard/mod.rs`（trait 加方法）、`src/clipboard/macos.rs`、`src/clipboard/windows.rs`、`src/clipboard/linux.rs`（删 "out of scope" 注释 + 实现） | `cargo build -p lan-mouse --features <platform>` 编译通过；Windows / Linux 单测验证 mock 平台 API 被调用一次 + 参数正确；macOS 单测验证 changeCount 递增 + round-trip 读回 paths |
+| **3b.7b** | **~1.5 h** | **接收端剪贴板回灌 + skip conditions + 防回环 + IPC 集成**（依赖 3b.7a）：<br>**调用点 + 时序**（**planer round 2 审阅修正 — 实际应在 `handle_inbound_files_applied`，不在 `handle_clipboard_inbound_files`**）：M3a 已落地的 `apply_inbound_files_task`（`src/service.rs:5678`）每 entry 独立 spawned；每 entry 落盘完成后通过 `InboundFileApplyResult { fingerprint, sha256, landed_path, error }` mpsc 回到主 `select!` 的 `handle_inbound_files_applied`（`src/service.rs:3762`）——**只有这里持有 `landed_path`**。<br>→ 本 STEP 真正的回灌代码插点：**collector 在 `handle_inbound_files_applied`** 累积 `HashMap<[u8; 32], Vec<(FileEntry, PathBuf)>>`（per-fingerprint 的 landed_path 列表）；当某 fingerprint 的**全部** entry 都收齐（应用层用 `expected_entry_count` 判断）时：<br>1. **pre-stamp 防回环**：`self.last_outbound_files_fingerprint.insert(fingerprint)` 先于 `set_files`（参考 commit `d6fb1d8` 的 ExceedsLimit arm pre-stamp 修复 — 防止本地 poller watcher 在 `set_files` 后立刻触发 `dispatch_files` 重广播给原对端形成死循环）<br>2. **skip conditions 检查**（任一命中即跳过 `set_files`）：<br>   a. `inject_to_clipboard=false` → 跳过（用户主动关）<br>   b. `last_outbound_files_fingerprint` **在 pre-stamp 之前查询**已命中（用户在本地刚复制过同 selection） → 跳过<br>   c. 任意 entry `error != None`（sha256 mismatch / IO error / `keep_partial=true` 残留 .partial） → 跳过整个 batch（不注入未验证 bytes）<br>   d. **forward-compat 跳过**（保留位置但当前 dispatch 不可达，详见注①）：`MIME_TOO_LARGE` / `ExceedsLimit` / `Canceled` entry → 跳过；当前 `handle_clipboard_inbound_files_decide` 已过滤 `AllMimeTooLarge` / 单 entry `ExceedsLimit`，`FileTransferCancel` 早返回不发 `InboundFileApplyResult`，所以这些 entry **当前不可达 set_files 调用点**；保留 skip 是为未来 dispatch 策略变化（per-entry 决策）兜底<br>3. **set_files**：`backend.set_files(&paths)`，传 collector 累积的 `Vec<PathBuf>`（注意：不是 `&[PathBuf]`，参考 3b.7a trait 签名）<br>**配置开关**：`lan_mouse_ipc::ClipboardConfig` 加 `inject_to_clipboard: bool` 字段（`#[serde(default)]` 默认 `true`）—— 用户可在 GUI 关掉回灌，只落盘不入剪贴板；`src/config.rs` TOML `[clipboard]` 段同步加 `inject_to_clipboard = true` 字段<br>**GUI 控件**：在 `lan-mouse-vue/src/components/GeneralPanel.vue` 的 clipboard 区块加 `inject_to_clipboard` checkbox（**只加这一个 checkbox**，不延展到 M4 砍掉的可观察卡片 —— 用户已确认不延展）<br>**注 ①**：`MIME_TOO_LARGE` / `ExceedsLimit` / `Canceled` 在当前 dispatch 流程中**不可达** `set_files` 调用点（planer round 2 审阅发现）。保留 skip 是 forward-compat；测试矩阵的对应行验证的是 collector 在收到这些 entry 时正确跳过（即便当前 dispatch 路径不触发，仍作为防御性测项保留）。<br>**测试**：单测覆盖 4 个 skip condition + happy path（含 collector 等待全部 entry 就绪）；serde round-trip 单测缺字段 = `true` | `lan-mouse-ipc/src/lib.rs`（`ClipboardConfig.inject_to_clipboard` 字段 + serde round-trip）、`src/service.rs::handle_inbound_files_applied`（collector 累积 + pre-stamp + 调 `set_files`，含 skip condition 分支）、`lan-mouse-vue/src/components/GeneralPanel.vue`（checkbox）、`src/config.rs`（TOML `[clipboard]` 段加字段） | mock collector 验证 pre-stamp + 全部 entry 落盘后 `set_files(&[PathBuf])` 被调用一次（每路径正确）；`inject_to_clipboard=false` 时 `set_files` 不被调用；回环指纹命中时 `set_files` 不被调用；任一 entry 落盘失败时 `set_files` 不被调用；forward-compat `MIME_TOO_LARGE` entry collector 跳过 `set_files`；forward-compat `ExceedsLimit` / `Canceled` entry collector 跳过 `set_files`；IPC serde round-trip：`ClipboardConfig` 缺 `inject_to_clipboard` 字段 = 默认 `true` |
 
 **M3b 里程碑交付**：
-- GUI 可配置剪贴板（enabled / accept_dir / max_file_size / ignore_* / keep_partial）
+- GUI 可配置剪贴板（enabled / accept_dir / max_file_size / ignore_* / keep_partial / inject_to_clipboard）
 - per-peer `enable_clipboard_to` 细粒度开关
 - 200 MiB 文件端到端（100 Mbps LAN < 30 s / Wi-Fi < 60 s，**双向**）
 - 源端取消响应（cancel < 1 s，沿用 M3a STEP-3a.5）
 - 拔网清晰报错（`FileTransferFailed` IPC + .partial 默认删除，**双向**）
 - keepalive↔idle race 实测（30 s 内不关链 + Pong 间隔 ≤ 600 ms）
 - CLI 子命令支持
+- **`ClipboardBackend::set_files` trait + macOS / Windows / Linux 三平台实现**（STEP-3b.7a）
+- **剪贴板回灌**（STEP-3b.7b）：文件落盘后自动灌回本地剪贴板（`inject_to_clipboard=true` 默认开启），用户可一键 Cmd+V 粘贴，无需手动 navigate 到 `accept_dir`；pre-stamp 防回环 + 4 类 skip condition 覆盖完整
 
 **M3b 已知限制**（原 M3b + M4 已知限制并集）：
 - **无 accept/reject UI**（auto-accept only；用户决策 2026-09-13）—— 用户无法在 GUI 拒绝单次文件接收；如需拒绝，关闭 `enabled` 整体开关 或 `ignore_files: bool`
 - **无 clipboard state card / amber 高亮 / 回环统计显示**（M4 原 STEP-4.4 砍掉；M1b STEP-1b.3 的 `service::clipboard::metrics` 仍 log，但 UI 不展示）
 - **无 README.md / DOC.md 文档章节**（M4 原 STEP-4.5 砍掉；后续 PLAN 补）
 - 断点续传仅 stub（沿用 M3a；M3a `?range=` HTTP/3 接口已留）
+- **STEP-3b.7b 剪贴板回灌无 UI 提示**（mid-edit 场景下可能覆盖用户当前剪贴板内容；用户决策 2026-09-13：M3b 不做提示，仅行为层面实现；M4 砍掉的可观察卡片如未来恢复可承载"剪贴板刚被远端文件替换"提示）
 
 ---
 
@@ -345,13 +351,14 @@
 
 > **用户决策 2026-09-13**：M4 取消，并入 M3b。理由：auto-accept only 模式不需要 Toaster accept/reject UI；可观察性卡片（clipboard state card / 5 s amber 高亮 / 回环跳过统计）砍掉；README/DOC.md 文档章节砍掉。详见 M3b 已知限制段。
 >
-> 原 M4 5 STEPs（4.1 / 4.2 / 4.3 / 4.4 / 4.5）→ 拆分并入新 M3b：
-> - 原 STEP-4.1（Vue 类型 + IPC 绑定）→ 新 M3b STEP-3b.4（drop `FileTransferRequest` 类型）
+> 原 M4 6 STEPs（4.1 / 4.2 / 4.3 / 4.4 / 4.5 / 4.6）→ 拆分并入新 M3b：
+> - 原 STEP-4.1（Vue 类型 + IPC 绑定）→ 与新 M3b STEP-3b.4 合并（planer round 2 算式修正 — 同主题不重复编号）
 > - 原 STEP-4.2（GeneralPanel + per-peer 配置 + TOML 落盘）→ 新 M3b STEP-3b.5（ClipboardConfig 字段全部更新：drop `auto_accept_files`、新增 `enabled` + `keep_partial`）
 > - 原 STEP-4.3（Toaster `FileTransferRequest` 接受/拒绝）→ **DROP**（auto-accept only）
 > - 原 STEP-4.4（剪贴板状态卡片 + 5 s amber 高亮 + 回环跳过统计）→ **DROP**（用户决策 2026-09-13）
 > - 原 STEP-4.5（README.md / DOC.md / config.toml 文档同步）→ **DROP**（后续 PLAN 补）
 > - 原 STEP-4.6（CLI 集成）→ 新 M3b STEP-3b.6
+> - **2026-09-13 用户新增**接收端剪贴板回灌 → 新 M3b STEP-3b.7a（`set_files` trait + 三平台实现，planer 审阅拆步）+ STEP-3b.7b（skip conditions + 防回环 + IPC serde + GUI checkbox + TOML 集成；planer round 2 修调用点 — 在 `handle_inbound_files_applied` + collector，不在 `handle_clipboard_inbound_files`）
 
 ---
 
@@ -367,13 +374,13 @@
 | M2a | 6h | macOS 4K 截图字节级一致 **（双向端到端 A↔B）** | ✅ 完成 |
 | M2b | 6h | 三平台图片互传矩阵 **（双向端到端 A↔B）** | ✅ 完成 |
 | M3a | 9h | 200 MiB 文件落盘 + SHA-256 + 取消 **（双向端到端 A↔B）** | ✅ 完成 |
-| M3b | 8.5h | auto-accept + GUI 配置 + 拔网清晰报错 + 性能双档 **（双向端到端 A↔B）** | ⏸️ 用户验证 M3a 后启动 |
+| M3b | 11.5h | auto-accept + GUI 配置 + 拔网清晰报错 + 性能双档 + `set_files` 三平台 + 剪贴板回灌 **（双向端到端 A↔B）** | ⏸️ 用户验证 M3a 后启动 |
 | ~~M4~~ | ~~5h~~ | (合并到 M3b，cancelled) | (cancelled) |
-| **合计** | **~49 h** | (was ~55.5 h，省 6.5 h 因 M3b/M4 合并去重 + drop Toaster UI / 可观察卡片 / 文档) | |
+| **合计** | **~52 h** | (was ~55.5 h，省 3.5 h 因 M3b/M4 合并去重 + drop Toaster UI / 可观察卡片 / 文档; 3b.7a/b 拆步 +2h 因 `set_files` trait 未在 M3a 落地) | |
 
 > **校准系数**：与 `PLAN-1` 一致，30 min AI ≈ 1.5 h 人类。`image` crate 编译时间 + h3 crate 体积可能拉长 M2 / M0b/M0c，预留 ±20 % buffer。
 >
-> **M3b 拆分原则**：合并后 M3b 估时 ~8.5 h（仍在 12 h 边界内），不需要再拆。若 STEP-3b.3（端到端性能 + 收尾）实测超 1.5 h，按"性能双档 vs. keepalive↔idle race"二分拆为 3b.3a / 3b.3b。
+> **M3b 拆分原则**：合并后 M3b 估时 ~11.5 h（贴近 12 h 边界），**已预防性拆 STEP-3b.7 为 3b.7a（trait 适配）/ 3b.7b（skip conditions + 集成）**。若 STEP-3b.3（端到端性能 + 收尾）实测超 1.5 h，按"性能双档 vs. keepalive↔idle race"二分拆为 3b.3a / 3b.3b。若 STEP-3b.7a 单平台实现超 1.5 h AI（macOS / Windows / Linux 中某一特别复杂），LEADER 介入按平台拆 3b.7a-i / 3b.7a-ii / 3b.7a-iii。
 >
 > **M3a 风险点（已解决）**：HTTP/3 200 MiB 流式传输 + 取消 + 拔网在 M3a STEP-3a.5 整批审后 PASS-with-followup（cancel < 1 s 端到端、quinn stream-finish race 已加 receiver-side cancel signal 兜底），无后续拆分需要。
 
@@ -434,6 +441,10 @@
    - 新 M3b STEP-3b.5 在 GUI GeneralPanel 加 `max_file_size` number input（MiB 整数 → 后端转 bytes 整数存 TOML），用户可调至 0（不限）/ 100 MiB / 1 GiB 等任意值
    - **变更影响**：M3a 已落地的 50 MiB 早拒绝 PopupGuard 路径（`PopupKind::ExceedsLimit` → `popup.rs::fire()`）保持不变；只把上限值从 hardcoded 常量改为 config-driven
    - **验收**：M3b STEP-3b.5 改 max_file_size = 100 后，60 MiB 文件应**不再**触发 ExceedsLimit popup，正常落盘（双向 A→B + B→A 各跑一次）
+
+---
+
+26. **【用户决策 2026-09-13】接收端剪贴板回灌可能覆盖用户当前剪贴板内容**：STEP-3b.7b 在文件落盘成功后自动调 `backend.set_files(&[PathBuf])` 灌回本地剪贴板；若用户正在 mid-edit（剪贴板里是临时复制的内容如一段文本 / 一张截图），回灌会**无声覆盖**这些内容。**已审视、采纳**：UI 提示"剪贴板刚被远端文件替换"在 M4 砍掉的可观察卡片范畴内，本计划不承载此提示；用户在 GeneralPanel 可关 `inject_to_clipboard` checkbox 整体关闭回灌。**M3b 不做提示，仅行为层面实现**；如下游真机测试发现 mid-edit 覆盖是高频痛点，再立后续 PLAN 补 GeneralPanel 卡片。
 
 ---
 
@@ -590,6 +601,18 @@
 | 自动 | MiB → bytes 转换单测（UI 输入 100 MiB → TOML 存 104857600） | 单测绿 | 3b.5 |
 | 自动 | `lan-mouse-cli SetClipboardConfig` IPC 编码单测（含 drop `auto_accept_files` 兼容性） | 单测绿 | 3b.6 |
 | 自动 | `lan-mouse-cli SetEnableClipboardTo` IPC 编码单测 | 单测绿 | 3b.6 |
+| 自动 | `ClipboardBackend::set_files` trait method 编译 + dummy 实现通过 | 单测绿 | 3b.7a |
+| 自动 | macOS `set_files` 单测：mock `NSPasteboard.writeObjects` → 被调用一次 + 参数含预期 paths | 单测绿 | 3b.7a |
+| 自动 | Windows `set_files` 单测：mock `SetClipboardData(CF_HDROP, hdrop)` → 参数捕获 + DROPFILES 结构验证 | 单测绿 | 3b.7a |
+| 自动 | Linux `set_files` 单测：mock `xclip -selection clipboard -t text/uri-list -i` 或 `wl-copy` 子进程 → args 断言 | 单测绿 | 3b.7a |
+| 自动 | mock backend 接收 ClipboardFiles 后 pre-stamp + `set_files` 被调用一次 | 单测绿 | 3b.7b |
+| 自动 | `inject_to_clipboard=false` 时 `set_files` 不调用 | 单测绿 | 3b.7b |
+| 自动 | 回环指纹命中时 `set_files` 不调用（pre-stamp 前查询） | 单测绿 | 3b.7b |
+| 自动 | 落盘失败（sha256 mismatch / IO error / .partial 残留）时 `set_files` 不调用 | 单测绿 | 3b.7b |
+| 自动 | `MIME_TOO_LARGE` entry 跳过 `set_files` | 单测绿 | 3b.7b |
+| 自动 | `ExceedsLimit` entry 跳过 `set_files` | 单测绿 | 3b.7b |
+| 自动 | `Canceled` entry 跳过 `set_files` | 单测绿 | 3b.7b |
+| 自动 | `ClipboardConfig` serde round-trip `inject_to_clipboard` 缺字段 = true | 单测绿 | 3b.7b |
 | 自动 | `cargo fmt --check` + `cargo clippy --workspace --all-targets -- -D warnings` | 无 diff / 无 warning | 3b.3 |
 | 自动 | `cd lan-mouse-vue && pnpm build` 产物 OK | 0 error | 3b.4 |
 | 自动 | 三平台编译通过 | CI matrix 全绿 | 3b.3 |
@@ -605,6 +628,10 @@
 | **人类** | keepalive↔idle race：200 MiB 完成后 30 s 内连接仍 active（用 `lsof -i UDP:4252` / netstat 观察）；60 s 静默期不 disconnect | 终端 + 日志 | 3b.3 |
 | **人类** | `lan-mouse-cli SetClipboardConfig --max-file-size 100 --accept-dir /tmp/recv --enabled` 生效（config.toml 落盘 + daemon reload） | config.toml diff | 3b.6 |
 | **人类** | `lan-mouse-cli SetEnableClipboardTo 0 false` 关掉对端 0 的剪贴板推送 | 日志 | 3b.6 |
+| **人类** | macOS 真机剪贴板回灌（双向）：(a) **A→B**：A 端 Finder 复制文件 → B 端落盘后**自动**入剪贴板 → B 端 Cmd+V 直接粘贴出该文件；(b) **B→A**：反过来同样跑一次 | 录屏 / 截图（两个方向各一段） | 3b.7a / 3b.7b |
+| **人类** | Windows 真机剪贴板回灌（双向）：(a) **A→B** + (b) **B→A** 同 macOS 验证步骤 | 同上 | 3b.7a / 3b.7b |
+| **人类** | Linux 真机剪贴板回灌（双向）：(a) **A→B** + (b) **B→A** 同 macOS 验证步骤（X11 / Wayland 按系统走） | 同上 | 3b.7a / 3b.7b |
+| **人类** | 关掉回灌：GeneralPanel `inject_to_clipboard = false` 后复制文件 → 落盘但**不**入剪贴板；恢复后正常回灌 | 录屏（两个状态切换各一段） | 3b.7b |
 
 ### ~~M4 — GUI 集成 + 文档~~（cancelled，已合并到 M3b）
 
@@ -635,6 +662,6 @@
 
 ---
 
-> **本文档定稿时间**：2026-09-06（初版） / 2026-09-13（M3b 重写：合并 M4 + drop Toaster UI / 可观察卡片 / 文档 + 拆 6 STEPs）
+> **本文档定稿时间**：2026-09-06（初版） / 2026-09-13（M3b 重写：合并 M4 + drop Toaster UI / 可观察卡片 / 文档 + 拆 6 STEPs） / 2026-09-13（M3b STEP-3b.7a / 3b.7b 新增：接收端剪贴板回灌 — planer 审阅拆步：`set_files` trait 未在 M3a 落地，需先补三平台实现再集成 skip conditions + IPC serde + GUI checkbox + TOML；`ClipboardConfig.inject_to_clipboard` 字段）
 > **作者**：Claude（基于用户 `REQUIREMENT.md` + `TECHNOLOGY.md` + 现有 codebase 调查）
 > **下一步**：用户真机验证 M3a → 确认 / 调整 M3b 范围 → 启动 M3b STEP-3b.1
