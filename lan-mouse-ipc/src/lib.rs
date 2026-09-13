@@ -474,12 +474,15 @@ mod input_channel_tests {
 mod clipboard_config_tests {
     use super::*;
 
-    /// `ClipboardConfig::default()` — legacy "all sync enabled,
-    /// auto-accept off, accept_dir = None" shape.
+    /// `ClipboardConfig::default()` — "files auto-accept on, all
+    /// sync enabled, accept_dir = None" shape (the 2026-09-13
+    /// new-default; `auto_accept_files` flipped from `false` to
+    /// `true` so cross-machine file copy works without manually
+    /// editing `config.toml`).
     #[test]
-    fn clipboard_config_default_is_legacy_shape() {
+    fn clipboard_config_default_is_files_auto_accept_shape() {
         let cfg = ClipboardConfig::default();
-        assert!(!cfg.auto_accept_files);
+        assert!(cfg.auto_accept_files);
         assert_eq!(cfg.accept_dir, None);
         assert!(!cfg.ignore_text);
         assert!(!cfg.ignore_images);
@@ -807,12 +810,20 @@ mod monitor_info_tests {
 ///
 /// Frontend request: [`FrontendRequest::SetClipboardConfig`]. TOML
 /// key: `[clipboard]` section in `config.toml`.
-#[derive(Debug, Default, Eq, PartialEq, Clone, Serialize, Deserialize)]
+///
+/// **Default for `auto_accept_files`** is `true` (changed 2026-09-13
+/// from the legacy `false` after the ListenTask / poller fixes
+/// landed end-to-end and the missing-M3b-Toaster-ask UX cost
+/// outweighed the rogue-peer risk for trusted LAN deployments).
+/// Set `auto_accept_files = false` explicitly in `[clipboard]` TOML
+/// to restore the old "must opt in" behaviour.
+#[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize)]
 pub struct ClipboardConfig {
     /// Auto-accept incoming `ClipboardFiles` (no Toaster prompt). The
-    /// files land in `accept_dir`. Default `false` — the user must
-    /// explicitly opt in via the GUI checkbox (M3b wiring).
-    #[serde(default)]
+    /// files land in `accept_dir`. Default `true` — files copy across
+    /// the LAN out-of-the-box. Set `false` to require explicit opt-in
+    /// (M3b will wire the GUI Toaster ask for the false case).
+    #[serde(default = "default_auto_accept_files")]
     pub auto_accept_files: bool,
     /// Receive directory for auto-accepted files. `None` means
     /// "daemon default" (typically `$HOME/Downloads/lan-mouse` or the
@@ -831,6 +842,35 @@ pub struct ClipboardConfig {
     /// Disable file sync. Same compat contract as `ignore_text`.
     #[serde(default)]
     pub ignore_files: bool,
+}
+
+/// Helper for `#[serde(default = "...")]` on
+/// [`ClipboardConfig::auto_accept_files`]. Returns the new default
+/// (`true` — files auto-accept on, after the 2026-09-13 change).
+/// Kept as a free function so serde can borrow a path; mirror the
+/// `true` value in the manual [`Default`] impl below.
+fn default_auto_accept_files() -> bool {
+    true
+}
+
+impl Default for ClipboardConfig {
+    /// New "files work out-of-the-box" default:
+    /// - `auto_accept_files: true` (changed 2026-09-13 from `false`
+    ///   — see the type-level doc comment for rationale)
+    /// - `accept_dir: None` (daemon picks the OS-appropriate temp /
+    ///   `$HOME/Downloads/lan-mouse` in M3b)
+    /// - `ignore_text / ignore_images / ignore_files: false` (all
+    ///   clipboard sync channels enabled by default, unchanged from
+    ///   the legacy shape).
+    fn default() -> Self {
+        Self {
+            auto_accept_files: true,
+            accept_dir: None,
+            ignore_text: false,
+            ignore_images: false,
+            ignore_files: false,
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

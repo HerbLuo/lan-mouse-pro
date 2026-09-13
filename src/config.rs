@@ -809,10 +809,11 @@ impl Config {
     }
 
     /// **M0c / PLAN-2** — get the persisted clipboard config. Reads
-    /// the TOML `[clipboard]` section; missing section → legacy
-    /// default (auto-accept off / ignore-* off / accept_dir = None).
-    /// Used by `Service::set_clipboard_config` and (in M1a+) by the
-    /// clipboard backend to seed its runtime state.
+    /// the TOML `[clipboard]` section; missing section → default
+    /// (auto-accept ON / ignore-* off / accept_dir = None — the
+    /// 2026-09-13 new-default, see `lan_mouse_ipc::ClipboardConfig`
+    /// doc). Used by `Service::set_clipboard_config` and (in M1a+)
+    /// by the clipboard backend to seed its runtime state.
     pub fn clipboard_config(&self) -> ClipboardConfig {
         let Some(toml) = self.config_toml.as_ref() else {
             return ClipboardConfig::default();
@@ -821,7 +822,12 @@ impl Config {
             return ClipboardConfig::default();
         };
         ClipboardConfig {
-            auto_accept_files: cb.auto_accept_files.unwrap_or(false),
+            // 2026-09-13: was `unwrap_or(false)` — flipped to `true`
+            // so cross-machine file copy works without the user
+            // hand-editing `config.toml`. An explicit
+            // `auto_accept_files = false` in `[clipboard]` still
+            // wins because `unwrap_or` only fires on `None`.
+            auto_accept_files: cb.auto_accept_files.unwrap_or(true),
             accept_dir: cb.accept_dir.clone(),
             ignore_text: cb.ignore_text.unwrap_or(false),
             ignore_images: cb.ignore_images.unwrap_or(false),
