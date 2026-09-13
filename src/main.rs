@@ -35,6 +35,26 @@ enum LanMouseError {
 }
 
 fn main() {
+    // **2026-09-13 SUGGESTION #S-12 — diagnostic panic hook.**
+    // Windows `set_files` 真机 segfault 调查 (see
+    // `next/BUG-INVESTIGATION-WINDOWS-SET-FILES-CRASH.md`): a
+    // STATUS_ACCESS_VIOLATION from native code (win32k.sys / kernel32)
+    // looks identical to a Rust panic that aborts through a native
+    // frame. This hook is the cheapest way to disambiguate — if the
+    // crash is a Rust panic, the hook fires first and the panic
+    // location + backtrace land on stderr *before* the OS terminates
+    // us. If no `=== RUST PANIC ===` block appears, the crash is a
+    // true native exception and we need a crash dump (procdump +
+    // WinDbg) to localise it. Installed as the very first statement
+    // of `main()` so any subsequent panic is captured — including
+    // panics inside `install_crypto_provider` / logging init.
+    std::panic::set_hook(Box::new(|panic_info| {
+        eprintln!("=== RUST PANIC ===");
+        eprintln!("{panic_info}");
+        eprintln!("{:?}", std::backtrace::Backtrace::force_capture());
+        eprintln!("==================");
+    }));
+
     // Install the rustls crypto provider before any
     // `rustls::ClientConfig::builder` / `ServerConfig::builder` runs. Must be
     // the first statement of `main()` (before logging, config, or service
